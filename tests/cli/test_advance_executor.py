@@ -75,8 +75,8 @@ from gza.review_verify_state import (
     persist_recredited_verify_gate_artifact,
     persist_verify_gate_artifact,
 )
-from gza.runtime_context import RuntimeExecutionContext
 from gza.runner import CROSS_PROJECT_TAG, _make_review_verify_result
+from gza.runtime_context import RuntimeExecutionContext
 from gza.verify_fix_outcome import effective_verify_fix_completion_outcome
 
 from .conftest import make_store, setup_config
@@ -4043,6 +4043,123 @@ def test_execute_advance_action_rejects_retired_noop_verify_action(tmp_path: Pat
     assert result.message == "unsupported action: verify_" "noop_improve_then_review"
 
 
+def test_verify_only_noop_recovery_blocks_unsafe_cross_project_child_budget(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    root_config = tmp_path / "gza.yaml"
+    root_config.write_text(
+        root_config.read_text(encoding="utf-8")
+        + "\nverify_command: ./bin/root-verify\n"
+        + "autonomous_verify_timeout_seconds: 600\n"
+        + "autonomous_verify_bootstrap_timeout_seconds: 600\n"
+        + "autonomous_verify_min_margin_seconds: 60\n",
+        encoding="utf-8",
+    )
+    worktree_path = tmp_path / "verify-only-worktree"
+    child_dir = worktree_path / "libs" / "bar"
+    child_dir.mkdir(parents=True)
+    (child_dir / "gza.yaml").write_text(
+        "project_name: bar\n"
+        "project_id: bar\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
+        "verify_command: ./bin/tests\n"
+        "autonomous_verify_timeout_seconds: 120\n"
+        "autonomous_verify_bootstrap_timeout_seconds: 600\n"
+        "autonomous_verify_min_margin_seconds: 60\n",
+        encoding="utf-8",
+    )
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    runtime_context = RuntimeExecutionContext.from_config(config)
+
+    impl = store.add("Implement verify-only no-op recovery", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/verify-only-cross-project-budget")
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 8, 29, 10, 0, tzinfo=UTC)
+    review.output_content = "## Blockers\n\n### B1 verify_command failure\n\n## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(review)
+
+    noop_improve = store.add(
+        "No-op improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        same_branch=True,
+        tags=(CROSS_PROJECT_TAG,),
+    )
+    assert noop_improve.id is not None
+    noop_improve.branch = impl.branch
+    noop_improve.status = "completed"
+    noop_improve.completed_at = datetime(2026, 8, 29, 11, 0, tzinfo=UTC)
+    noop_improve.changed_diff = False
+    store.update(noop_improve)
+
+    root_git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda ref: "head-1" if ref == impl.branch else None,
+        worktree_add_existing=lambda *_args, **_kwargs: None,
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+    worktree_git = SimpleNamespace(
+        repo_dir=worktree_path,
+        default_branch=lambda: "main",
+        rev_parse_if_exists=lambda ref: {"HEAD": "head-1", "main": "base-1", "origin/main": "base-1"}.get(ref),
+        get_diff_name_status=lambda *_args, **_kwargs: "M\tlibs/bar/lib.py\n",
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=root_git,
+        runtime_context=runtime_context,
+    )
+
+    with (
+        patch("gza.cli.advance_executor.tempfile.mkdtemp", return_value=str(worktree_path)),
+        patch("gza.cli.advance_executor.Git", return_value=worktree_git),
+        patch("gza.runner._run_review_verify_command") as mock_verify,
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "recover_verify_only_noop_review",
+                "review_task": review,
+                "latest_noop_improve_task": noop_improve,
+                "current_branch_head_sha": "head-1",
+            },
+            context=context,
+        )
+
+    mock_verify.assert_not_called()
+    assert result.status == "skip"
+    assert result.attention_type == "needs_discussion"
+    artifacts = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+    assert artifacts
+    latest = artifacts[0].metadata
+    assert latest is not None
+    assert latest["result"]["status"] == "unavailable"
+    assert latest["aggregate_details"]["scopes"][0]["exit_status"] == "insufficient verify budget margin"
+
+
 def test_verify_gate_execution_persists_current_passing_owner_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6211,6 +6328,7 @@ def test_completed_no_source_timeout_verify_fix_rerun_persists_green_then_plans_
         reviewed_base_sha="base-1",
         working_directory=str(tmp_path),
         failure="verify_command timed out after 120s",
+        output="gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=1.0",
     )
     persist_verify_gate_artifact(
         store,
@@ -6345,7 +6463,6 @@ def test_completed_legacy_timeout_verify_fix_dry_run_does_not_persist_upgrade(tm
     config.autonomous_verify_timeout_seconds = 120
     config.review_verify_timeout_grace_seconds = 5.0
     config.worktree_path.mkdir(parents=True, exist_ok=True)
-    runtime_context = RuntimeExecutionContext.from_config(config)
     monkeypatch.setenv("PATH", "/ambient/bin")
     monkeypatch.setenv("PROJECT_ONLY_TOKEN", "ambient-token")
     monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
@@ -6370,6 +6487,7 @@ def test_completed_legacy_timeout_verify_fix_dry_run_does_not_persist_upgrade(tm
         reviewed_base_sha="base-1",
         working_directory=str(tmp_path),
         failure="verify_command timed out after 120s",
+        output="gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=1.0",
     )
     persist_verify_gate_artifact(
         store,
@@ -6496,6 +6614,7 @@ def test_completed_legacy_timeout_verify_fix_rerun_uses_managed_worktree_not_dir
         reviewed_base_sha="base-1",
         working_directory=str(tmp_path),
         failure="verify_command timed out after 120s",
+        output="gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=1.0",
     )
     persist_verify_gate_artifact(
         store,
@@ -6658,6 +6777,7 @@ def test_completed_no_source_timeout_verify_fix_rerun_atomic_persistence_failure
         reviewed_base_sha="base-1",
         working_directory=str(tmp_path),
         failure="verify_command timed out after 120s",
+        output="gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=1.0",
     )
     persist_verify_gate_artifact(
         store,
@@ -6740,6 +6860,11 @@ def test_completed_no_source_timeout_verify_fix_rerun_atomic_persistence_failure
         reviewed_base_sha="base-1",
         working_directory=str(worktree_path),
         failure=None if rerun_status == "passed" else "verify_command timed out after 120s",
+        output=(
+            None
+            if rerun_status == "passed"
+            else "gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=1.0"
+        ),
     )
     with (
         patch("gza.cli.advance_executor.Git", return_value=worktree_git),
@@ -7049,6 +7174,7 @@ def test_completed_no_source_timeout_verify_fix_rerun_refusals_do_not_clear_gate
         reviewed_base_sha="base-1",
         working_directory=str(tmp_path),
         failure="verify_command timed out after 120s",
+        output="gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=1.0",
     )
     persist_verify_gate_artifact(
         store,
@@ -7135,6 +7261,11 @@ def test_completed_no_source_timeout_verify_fix_rerun_refusals_do_not_clear_gate
             "verify_command timed out after 120s"
             if refusal == "rerun_timeout"
             else ("pytest failed" if refusal == "rerun_failed" else None)
+        ),
+        output=(
+            "gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=1.0"
+            if refusal == "rerun_timeout"
+            else None
         ),
     )
 

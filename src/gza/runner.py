@@ -36,6 +36,9 @@ from .canonical_checkout import CANONICAL_CHECKOUT_ATTENTION_REASON, check_canon
 from .commit_messages import build_task_commit_message
 from .config import (
     APP_NAME,
+    DEFAULT_AUTONOMOUS_VERIFY_BOOTSTRAP_TIMEOUT_SECONDS,
+    DEFAULT_AUTONOMOUS_VERIFY_MIN_MARGIN_SECONDS,
+    DEFAULT_AUTONOMOUS_VERIFY_OBSERVATION_MAX_AGE_HOURS,
     DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS,
     DEFAULT_REVIEW_CONTEXT_FILE_LIMIT,
     DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD,
@@ -172,14 +175,18 @@ from .review_verdict import (
     validate_review_report_contract,
 )
 from .review_verify_state import (
+    KNOWN_FULL_VERIFY_PHASES,
     VERIFY_GATE_ARTIFACT_KIND,
     VerifyEpoch,
+    latest_successful_full_verify_runtime_observation,
     latest_verify_result_for_epoch,
     normalized_verify_command,
     persist_verify_gate_artifact,
     persist_verify_gate_artifact_with_verify_fix_outcome,
     refresh_preserved_rebase_review_verify_heads,
     resolve_verify_owner_task,
+    summarize_verify_phases,
+    validate_verify_phase_summary,
     verify_result_is_timeout_origin,
 )
 from .runtime_context import RuntimeExecutionContext, build_dotenv_runtime_env, normalize_subprocess_env
@@ -3461,6 +3468,7 @@ class ReviewVerifyResult:
     working_directory: str | None = None
     failure: str | None = None
     output: str | None = None
+    duration_seconds: float | None = None
     artifact_id: int | None = None
     artifact_path: str | None = None
     failure_origin: str | None = None
@@ -3560,6 +3568,7 @@ def _make_verify_result(
     failure: str | None = None,
     failure_origin: str | None = None,
     output: str | bytes | None = None,
+    duration_seconds: float | None = None,
 ) -> VerificationResult:
     """Build a structured lifecycle verify result."""
     if status == "failed" and failure_origin is None:
@@ -3576,6 +3585,7 @@ def _make_verify_result(
         failure=failure,
         failure_origin=failure_origin,
         output=_combine_verify_output(output),
+        duration_seconds=duration_seconds,
     )
 
 
@@ -3600,6 +3610,7 @@ def _make_review_verify_result(
     working_directory: str | None = None,
     failure: str | None = None,
     output: str | bytes | None = None,
+    duration_seconds: float | None = None,
 ) -> ReviewVerifyResult:
     """Compatibility wrapper for legacy review-specific callers."""
     return _make_verify_result(
@@ -3613,6 +3624,7 @@ def _make_review_verify_result(
         working_directory=working_directory,
         failure=failure,
         output=output,
+        duration_seconds=duration_seconds,
     )
 
 
@@ -3969,8 +3981,21 @@ def _build_cross_project_verify_aggregate_details(
     ]
     aggregate_failure_origin = (
         "timeout"
-        if failed_origins and all(origin == "timeout" for origin in failed_origins)
-        else ("test_failure" if failed_origins else None)
+        if unavailable_count == 0 and failed_origins and all(origin == "timeout" for origin in failed_origins)
+        else (
+            "test_failure"
+            if failed_origins
+            and (
+                unavailable_count == 0
+                or any(
+                    entry.result is not None
+                    and entry.result.status == "failed"
+                    and _verify_result_has_structured_failed_phase(entry.result)
+                    for entry in project_results
+                )
+            )
+            else None
+        )
     )
     phase_results: list[dict[str, Any]] = []
     completed_phase_names: list[str] = []
@@ -3982,6 +4007,13 @@ def _build_cross_project_verify_aggregate_details(
     for entry in project_results:
         diagnostics = _build_project_phase_diagnostics(entry.result)
         tree_fingerprint = _review_verify_tree_fingerprint(entry.result)
+        phase_summary = None
+        phase_summary_invalid_reason = None
+        if entry.result is not None:
+            phase_summary, phase_summary_invalid_reason = validate_verify_phase_summary(
+                summarize_verify_phases(command=entry.result.command, output=entry.result.output),
+                require_known_full_verify_partition=normalized_verify_command(entry.result.command) == "./bin/tests",
+            )
         scope_entries.append(
             {
                 "scope": entry.scope,
@@ -4000,6 +4032,8 @@ def _build_cross_project_verify_aggregate_details(
                 "skip_reason": entry.skip_reason,
                 "tree_fingerprint": tree_fingerprint,
                 "phase_diagnostics": diagnostics,
+                "phase_summary": phase_summary,
+                "phase_summary_invalid_reason": phase_summary_invalid_reason,
             }
         )
         for key, target in (
@@ -4189,6 +4223,8 @@ def _validate_phase_summary_details(
             if scope_status in {"skipped", "unavailable"}:
                 continue
             diagnostics = scope.get("phase_diagnostics")
+            if not isinstance(diagnostics, dict):
+                diagnostics = scope.get("phase_summary")
             scope_failure_origin = scope.get("failure_origin")
             scope_validation = _validate_phase_summary_details(
                 diagnostics,
@@ -4234,11 +4270,116 @@ def validate_verify_phase_evidence_from_metadata(metadata: object) -> PhaseEvide
         return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="missing result")
     result_status = result.get("status")
     failure_origin = result.get("failure_origin")
-    return _validate_phase_summary_details(
-        metadata.get("aggregate_details"),
-        result_status=result_status if isinstance(result_status, str) else None,
-        failure_origin=failure_origin if isinstance(failure_origin, str) else None,
+    aggregate_details = metadata.get("aggregate_details")
+    if isinstance(aggregate_details, dict):
+        return _validate_phase_summary_details(
+            aggregate_details,
+            result_status=result_status if isinstance(result_status, str) else None,
+            failure_origin=failure_origin if isinstance(failure_origin, str) else None,
+        )
+    command = result.get("command")
+    command_identity = command if isinstance(command, str) else None
+    phase_summary, invalid_reason = validate_verify_phase_summary(
+        metadata.get("phase_summary"),
+        require_known_full_verify_partition=normalized_verify_command(command_identity) == "./bin/tests",
     )
+    if invalid_reason is not None:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason=invalid_reason)
+    if phase_summary is None:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="missing phase_summary")
+    completed_phases = tuple(str(phase["name"]) for phase in phase_summary["completed"])
+    failed_phases = tuple(str(name) for name in phase_summary["failed"])
+    state = PHASE_EVIDENCE_RED if failed_phases else PHASE_EVIDENCE_VALID_ZERO_RED
+    return PhaseEvidenceValidation(
+        state,
+        failed_phase_names=failed_phases,
+        completed_phase_names=completed_phases,
+        not_started_phase_names=tuple(str(name) for name in phase_summary["never_started"]),
+        started_phase_names=completed_phases + tuple(str(name) for name in phase_summary["running"]),
+        phase_results=tuple(phase_summary["completed"]),
+    )
+
+
+def _verify_result_has_structured_failed_phase(result: VerificationResult) -> bool:
+    phase_summary, invalid_reason = validate_verify_phase_summary(
+        summarize_verify_phases(command=result.command, output=result.output),
+        require_known_full_verify_partition=normalized_verify_command(result.command) == "./bin/tests",
+    )
+    return invalid_reason is None and isinstance(phase_summary, dict) and bool(phase_summary.get("failed"))
+
+
+def _successful_full_suite_phase_summary(result: VerificationResult) -> dict[str, Any] | None:
+    if normalized_verify_command(result.command) != "./bin/tests":
+        return None
+    if result.status != "passed" or result.exit_status != "0":
+        return None
+    if result.duration_seconds is None or result.duration_seconds < 0:
+        return None
+    phase_summary, invalid_reason = validate_verify_phase_summary(
+        summarize_verify_phases(command=result.command, output=result.output),
+        require_known_full_verify_partition=True,
+    )
+    if invalid_reason is not None or phase_summary is None:
+        return None
+    if (
+        set(phase_summary.get("passed", ())) != set(KNOWN_FULL_VERIFY_PHASES)
+        or phase_summary.get("failed") != []
+        or phase_summary.get("running") != []
+        or phase_summary.get("never_started") != []
+    ):
+        return None
+    return phase_summary
+
+
+def _persist_cross_project_successful_full_suite_observations(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    task: Task,
+    project_results: tuple[ProjectVerificationResult, ...],
+    producer: str,
+) -> None:
+    for entry in project_results:
+        if entry.project is None or entry.result is None:
+            continue
+        phase_summary = _successful_full_suite_phase_summary(entry.result)
+        if phase_summary is None:
+            continue
+        if entry.project.config.project_id == config.project_id:
+            project_store = store
+            owner_task = task
+        else:
+            project_store = SqliteTaskStore.from_config(entry.project.config)
+            owner_task = project_store.add(
+                "Project full-suite verify runtime observation mirrored from cross-project lifecycle verify",
+                task_type="internal",
+                auto_implement=False,
+                create_review=False,
+                skip_learnings=True,
+            )
+            owner_task.status = "completed"
+            owner_task.completed_at = entry.result.captured_at
+            owner_task.branch = entry.result.reviewed_branch
+            project_store.update(owner_task)
+        project_timeout_seconds, project_timeout_grace_seconds = _resolve_review_verify_timeout_settings(
+            entry.project.config
+        )
+        persist_verify_gate_artifact(
+            project_store,
+            entry.project.config,
+            owner_task=owner_task,
+            source_task=owner_task,
+            result=entry.result,
+            verify_timeout_seconds=project_timeout_seconds,
+            verify_timeout_grace_seconds=project_timeout_grace_seconds,
+            producer=producer,
+            provenance={
+                "scope": entry.scope,
+                "working_directory": entry.working_directory,
+                "mirrored_from_cross_project_task_id": task.id,
+                "phase_summary": phase_summary,
+            },
+        )
 
 
 def _persist_lifecycle_verify_execution(
@@ -4333,6 +4474,14 @@ def _persist_lifecycle_verify_execution(
                 provenance=provenance,
                 aggregate_details=aggregate_details,
             )
+    if execution.project_results:
+        _persist_cross_project_successful_full_suite_observations(
+            config=config,
+            store=store,
+            task=task,
+            project_results=execution.project_results,
+            producer=producer,
+        )
     return persisted_result, stored_artifacts.artifact_path or ""
 
 
@@ -5692,6 +5841,100 @@ def resolve_lifecycle_verify_timeout_settings(
     return derived_timeout, grace
 
 
+def _resolve_positive_int_config(config: object, name: str, default: int) -> int:
+    value = getattr(config, name, default)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        return default
+    return value
+
+
+def _lifecycle_verify_budget_margin_failure(
+    *,
+    config: Config | object,
+    store: SqliteTaskStore,
+    owner_task: Task,
+    command: str | None,
+    timeout_seconds: int,
+    reviewed_branch: str | None,
+    reviewed_head_sha: str | None,
+    reviewed_base_sha: str | None,
+    working_directory: Path,
+    now: datetime | None = None,
+) -> ReviewVerifyResult | None:
+    """Return a loud pre-run failure when the full-suite timeout has unsafe margin."""
+    if normalized_verify_command(command) != "./bin/tests":
+        return None
+    checked_at = now or datetime.now(UTC)
+    min_margin_seconds = _resolve_positive_int_config(
+        config,
+        "autonomous_verify_min_margin_seconds",
+        DEFAULT_AUTONOMOUS_VERIFY_MIN_MARGIN_SECONDS,
+    )
+    max_age_hours = _resolve_positive_int_config(
+        config,
+        "autonomous_verify_observation_max_age_hours",
+        DEFAULT_AUTONOMOUS_VERIFY_OBSERVATION_MAX_AGE_HOURS,
+    )
+    bootstrap_timeout_seconds = _resolve_positive_int_config(
+        config,
+        "autonomous_verify_bootstrap_timeout_seconds",
+        DEFAULT_AUTONOMOUS_VERIFY_BOOTSTRAP_TIMEOUT_SECONDS,
+    )
+    observation = latest_successful_full_verify_runtime_observation(
+        store,
+        owner_task,
+        now=checked_at,
+        max_age_hours=max_age_hours,
+    )
+    if observation is None:
+        if timeout_seconds >= bootstrap_timeout_seconds:
+            warning_message = (
+                "recent successful ./bin/tests runtime observation is missing or stale; "
+                f"using conservative bootstrap floor {bootstrap_timeout_seconds}s"
+            )
+            logger.warning(warning_message)
+            console.print(f"[yellow]Warning: {warning_message}[/yellow]")
+            return None
+        failure = (
+            "insufficient verify budget margin: recent successful ./bin/tests runtime observation is missing "
+            f"or older than {max_age_hours}h, and autonomous_verify_timeout_seconds={timeout_seconds}s is below "
+            f"the conservative bootstrap floor ({bootstrap_timeout_seconds}s)"
+        )
+        return _make_verify_result(
+            "./bin/tests",
+            status="unavailable",
+            exit_status="insufficient verify budget margin",
+            captured_at=checked_at,
+            reviewed_branch=reviewed_branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_base_sha=reviewed_base_sha,
+            working_directory=str(working_directory),
+            failure=failure,
+            failure_origin="insufficient_budget_margin",
+        )
+    remaining_margin = timeout_seconds - observation.duration_seconds
+    if remaining_margin >= min_margin_seconds:
+        return None
+    failure = (
+        "insufficient verify budget margin: latest successful ./bin/tests runtime was "
+        f"{observation.duration_seconds:.1f}s at {observation.captured_at.isoformat()}, leaving "
+        f"{remaining_margin:.1f}s before autonomous_verify_timeout_seconds={timeout_seconds}s; "
+        f"required margin is at least {min_margin_seconds}s"
+    )
+    return _make_verify_result(
+        "./bin/tests",
+        status="unavailable",
+        exit_status="insufficient verify budget margin",
+        captured_at=checked_at,
+        reviewed_branch=reviewed_branch,
+        reviewed_head_sha=reviewed_head_sha,
+        reviewed_base_sha=reviewed_base_sha,
+        working_directory=str(working_directory),
+        failure=failure,
+        failure_origin="insufficient_budget_margin",
+    )
+
+
 def _run_verify_command(
     verify_command: str,
     *,
@@ -5736,6 +5979,7 @@ def _run_verify_command(
             failure=f"failed to launch verify_command: {exc}",
         )
     if result.timed_out:
+        elapsed = time.monotonic() - started_at
         timeout_diagnostic = (
             f"verify_command exceeded {timeout_seconds}s; sent SIGTERM, waited "
             f"{timeout_grace_seconds}s, and the process group exited during grace"
@@ -5756,6 +6000,7 @@ def _run_verify_command(
             working_directory=str(cwd),
             failure=f"verify_command timed out after {timeout_seconds}s",
             output=_combine_verify_output(timeout_diagnostic, result.stdout, result.stderr),
+            duration_seconds=elapsed,
         )
     elapsed = time.monotonic() - started_at
     if elapsed > (0.8 * timeout_seconds):
@@ -5775,6 +6020,7 @@ def _run_verify_command(
         reviewed_base_sha=reviewed_base_sha,
         working_directory=str(cwd),
         output=_combine_verify_output(result.stdout, result.stderr),
+        duration_seconds=elapsed,
     )
 
 
@@ -6028,10 +6274,18 @@ def _aggregate_cross_project_verify_result(
     unavailable_count = sum(1 for result in runnable_results if result.status == "unavailable")
     skipped_count = sum(1 for entry in project_results if entry.result is None)
     cannot_run_count = unavailable_count + skipped_count
+    failed_results = [result for result in runnable_results if result.status == "failed"]
+    any_structured_failed_phase = any(
+        _verify_result_has_structured_failed_phase(result) for result in failed_results
+    )
 
-    if failed_count > 0:
+    if any_structured_failed_phase:
+        status = "failed"
+    elif failed_count > 0 and unavailable_count == 0:
         status = "failed"
     elif cannot_run_count > 0:
+        status = "unavailable"
+    elif failed_count > 0:
         status = "unavailable"
     elif passed_count > 0:
         status = "passed"
@@ -6049,10 +6303,12 @@ def _aggregate_cross_project_verify_result(
 
     failure: str | None = None
     if status != "passed":
-        if failed_count > 0:
+        if status == "failed":
             failure = "one or more affected projects failed review verification"
         elif cannot_run_count > 0:
             failure = "one or more affected projects could not run review verification"
+        elif failed_count > 0:
+            failure = "mixed cross-project verification state includes timeout and unavailable scopes"
         else:
             failure = "no affected project had a runnable verify_command"
 
@@ -6061,15 +6317,14 @@ def _aggregate_cross_project_verify_result(
             return result.failure_origin
         return _classify_failed_verify_origin(exit_status=result.exit_status, failure=result.failure)
 
-    failed_origins = [
-        _failure_origin(result)
-        for result in runnable_results
-        if result.status == "failed"
-    ]
+    failed_origins = [_failure_origin(result) for result in failed_results]
     failure_origin = (
         "timeout"
-        if failed_origins and all(origin == "timeout" for origin in failed_origins)
-        else ("test_failure" if failed_origins else None)
+        if status == "failed"
+        and unavailable_count == 0
+        and failed_origins
+        and all(origin == "timeout" for origin in failed_origins)
+        else ("test_failure" if status == "failed" and failed_origins else None)
     )
 
     return _make_verify_result(
@@ -6173,10 +6428,15 @@ def _run_verify_commands_for_projects(
         project_timeout_seconds = timeout_seconds
         project_timeout_grace_seconds = timeout_grace_seconds
         if store is not None:
+            project_store = (
+                store
+                if project.config.project_id == config.project_id or project.scope_root == owning_scope_root
+                else SqliteTaskStore.from_config(project.config)
+            )
             try:
                 project_timeout_seconds, project_timeout_grace_seconds = resolve_lifecycle_verify_timeout_settings(
                     project.config,
-                    store,
+                    project_store,
                     scope=scope,
                     verify_command=project.verify_command,
                 )
@@ -6203,28 +6463,44 @@ def _run_verify_commands_for_projects(
                 section_entries.extend([f"### {scope}", "", *_strip_review_verify_heading(_format_review_verify_result(result)), ""])
                 continue
 
-        result = _run_review_verify_command(
-            project.verify_command,
-            cwd=project_cwd,
-            env=normalize_subprocess_env(
-                (
-                    runtime_context.env
-                    if runtime_context is not None
-                    and project.config.project_id == config.project_id
-                    and project.scope_root == owning_scope_root
-                    else project.runtime_context.env
+        budget_margin_failure = None
+        if store is not None:
+            budget_margin_failure = _lifecycle_verify_budget_margin_failure(
+                config=project.config,
+                store=project_store,
+                owner_task=task,
+                command=project.verify_command,
+                timeout_seconds=project_timeout_seconds,
+                reviewed_branch=reviewed_branch,
+                reviewed_head_sha=reviewed_head_sha,
+                reviewed_base_sha=reviewed_base_sha,
+                working_directory=project_cwd,
+            )
+        if budget_margin_failure is not None:
+            result = budget_margin_failure
+        else:
+            result = _run_review_verify_command(
+                project.verify_command,
+                cwd=project_cwd,
+                env=normalize_subprocess_env(
+                    (
+                        runtime_context.env
+                        if runtime_context is not None
+                        and project.config.project_id == config.project_id
+                        and project.scope_root == owning_scope_root
+                        else project.runtime_context.env
+                    ),
+                    project_cwd,
                 ),
-                project_cwd,
-            ),
-            reviewed_branch=reviewed_branch,
-            reviewed_head_sha=reviewed_head_sha,
-            reviewed_base_sha=reviewed_base_sha,
-            timeout_seconds=project_timeout_seconds,
-            timeout_grace_seconds=project_timeout_grace_seconds,
-            heartbeat_threshold_seconds=heartbeat_threshold_seconds,
-            heartbeat_interval_seconds=heartbeat_interval_seconds,
-            on_heartbeat=heartbeat_for_project(scope) if heartbeat_for_project is not None else None,
-        )
+                reviewed_branch=reviewed_branch,
+                reviewed_head_sha=reviewed_head_sha,
+                reviewed_base_sha=reviewed_base_sha,
+                timeout_seconds=project_timeout_seconds,
+                timeout_grace_seconds=project_timeout_grace_seconds,
+                heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+                on_heartbeat=heartbeat_for_project(scope) if heartbeat_for_project is not None else None,
+            )
         project_results.append(
             ProjectReviewVerifyResult(
                 project=project,
@@ -6317,6 +6593,7 @@ def _run_lifecycle_verify(
     config: Config,
     store: SqliteTaskStore | None = None,
     task: Task,
+    budget_owner_task: Task | None = None,
     worktree_git: Git,
     worktree_path: Path,
     cwd: Path,
@@ -6360,6 +6637,23 @@ def _run_lifecycle_verify(
     if verify_command is None:
         return None
     runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
+    if store is not None:
+        budget_margin_failure = _lifecycle_verify_budget_margin_failure(
+            config=config,
+            store=store,
+            owner_task=budget_owner_task or task,
+            command=verify_command,
+            timeout_seconds=timeout_seconds,
+            reviewed_branch=reviewed_branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_base_sha=reviewed_base_sha,
+            working_directory=cwd,
+        )
+        if budget_margin_failure is not None:
+            return LifecycleVerifyExecution(
+                markdown=_format_review_verify_result(budget_margin_failure),
+                aggregate_result=budget_margin_failure,
+            )
     result = _run_review_verify_command(
         verify_command,
         cwd=cwd,
@@ -6454,10 +6748,11 @@ def _capture_noop_verify_fix_timeout_rerun(
     worktree_git_env = getattr(worktree_git, "env", None)
     if worktree_git_env is None:
         worktree_git_env = RuntimeExecutionContext.from_config(config).env
-    execution = _run_lifecycle_verify(
+    lifecycle_execution = _run_lifecycle_verify(
         config=config,
         store=store,
         task=task,
+        budget_owner_task=impl_task,
         worktree_git=worktree_git,
         worktree_path=worktree_path,
         cwd=rerun_cwd,
@@ -6473,8 +6768,9 @@ def _capture_noop_verify_fix_timeout_rerun(
         reviewed_head_sha=proven_head,
         reviewed_base_sha=base_sha,
     )
-    if execution is None:
+    if lifecycle_execution is None:
         return False
+    execution = lifecycle_execution
     proven_head_after = _prove_verify_fix_rerun_head(
         task=task,
         worktree_git=worktree_git,

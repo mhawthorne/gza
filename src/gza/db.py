@@ -10534,6 +10534,34 @@ class SqliteTaskStore:
                 """,
                 (self._project_id, kind, limit),
             ).fetchall()
+
+        return [artifact for row in rows if (artifact := self._row_to_task_artifact(row)) is not None]
+
+    def list_project_artifacts(self, kind: str | None = None) -> list[TaskArtifact]:
+        """Return artifacts for the current project, newest first."""
+        if not self.supports_task_artifacts():
+            return []
+        with self._connect() as conn:
+            if kind is None:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM task_artifacts
+                    WHERE project_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    """,
+                    (self._project_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM task_artifacts
+                    WHERE project_id = ? AND kind = ?
+                    ORDER BY created_at DESC, id DESC
+                    """,
+                    (self._project_id, kind),
+                ).fetchall()
         return [artifact for row in rows if (artifact := self._row_to_task_artifact(row)) is not None]
 
     def get_artifact(self, artifact_id: int, *, task_id: str | None = None) -> TaskArtifact | None:

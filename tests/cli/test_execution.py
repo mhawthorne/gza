@@ -12335,14 +12335,41 @@ class TestIterateCommand:
         captured_at: datetime | None = None,
     ):
         from gza.review_tasks import create_or_reuse_verify_fix_task
-        from gza.review_verify_state import VerifyEpoch
-        from gza.runner import _make_review_verify_result
+        from gza.review_verify_state import VerifyEpoch, persist_verify_gate_artifact
+        from gza.runner import ReviewVerifyResult, _make_review_verify_result
 
         config = Config.load(tmp_path)
         config.verify_command = "./bin/tests"
         config.autonomous_verify_timeout_seconds = 120
         config.review_verify_timeout_grace_seconds = 5.0
         captured_at = captured_at or datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+        runtime_output = "\n".join(
+            f"gza-verify phase={event} name={phase}"
+            + (" duration_seconds=1.0" if event == "passed" else "")
+            for phase in ("ruff", "ty", "mypy", "checks", "unit", "functional")
+            for event in ("start", "passed")
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=impl,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime.now(UTC) - timedelta(minutes=1),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="prior-runtime-head",
+                reviewed_base_sha="base-head",
+                working_directory=str(tmp_path),
+                output=runtime_output,
+                duration_seconds=6.0,
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
         epoch = VerifyEpoch(
             reviewed_branch=impl.branch,
             reviewed_head_sha=head_sha,
@@ -12413,19 +12440,52 @@ class TestIterateCommand:
         invalid_legacy_scope: str | None = None,
     ):
         from gza.review_tasks import create_or_reuse_verify_fix_task
-        from gza.review_verify_state import VerifyEpoch
+        from gza.review_verify_state import VerifyEpoch, persist_verify_gate_artifact
+        from gza.runner import ReviewVerifyResult
 
         config = Config.load(tmp_path)
         config.verify_command = "./bin/tests"
         config.autonomous_verify_timeout_seconds = 120
         config.review_verify_timeout_grace_seconds = 5.0
         captured_at = datetime(2026, 8, 17, 10, 0, tzinfo=UTC)
+        runtime_output = "\n".join(
+            f"gza-verify phase={event} name={phase}"
+            + (" duration_seconds=1.0" if event == "passed" else "")
+            for phase in ("ruff", "ty", "mypy", "checks", "unit", "functional")
+            for event in ("start", "passed")
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=impl,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime.now(UTC) - timedelta(minutes=1),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="prior-runtime-head",
+                reviewed_base_sha="base-head",
+                working_directory=str(tmp_path),
+                output=runtime_output,
+                duration_seconds=6.0,
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
         epoch = VerifyEpoch(
             reviewed_branch=impl.branch,
             reviewed_head_sha=head_sha,
             verify_command="./bin/tests",
             verify_timeout_seconds=120,
             verify_timeout_grace_seconds=5.0,
+        )
+        verify_output = (
+            "verify_command timed out after 120s\n"
+            "gza-verify phase=start name=unit\n"
+            "gza-verify phase=failed name=unit duration_seconds=1.0"
         )
         output_artifact = store_command_output_artifact(
             store,
@@ -12434,7 +12494,7 @@ class TestIterateCommand:
             kind="verify_command_output",
             producer="test",
             label="verify_command_output",
-            output="verify_command timed out after 120s",
+            output=verify_output,
             command=epoch.verify_command,
             status="failed",
             exit_status="timed out",
@@ -12456,6 +12516,7 @@ class TestIterateCommand:
                 reviewed_base_sha="base-head",
                 working_directory=str(tmp_path),
                 failure="verify_command timed out after 120s",
+                output=verify_output,
                 artifact_path=output_artifact.path,
                 failure_origin="timeout",
             ),

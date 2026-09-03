@@ -19,7 +19,12 @@ from unittest.mock import ANY, MagicMock, Mock, patch
 
 import pytest
 
-from gza.advance_engine import evaluate_advance_rules
+from gza import runner
+from gza.advance_engine import (
+    PARK_REASON_VERIFY_BUDGET_EXCEEDED,
+    PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID,
+    evaluate_advance_rules,
+)
 from gza.branch_resolution import resolve_rebase_target_branch
 from gza.canonical_checkout import CanonicalCheckoutStatus
 from gza.cli import _create_improve_task, _create_rebase_task
@@ -42,14 +47,16 @@ from gza.review_verdict import ParsedReviewReport, ReviewFinding, parse_review_r
 from gza.review_verify_state import (
     VERIFY_GATE_ARTIFACT_KIND,
     VerifyEpoch,
+    latest_successful_full_verify_runtime_observation,
     latest_verify_result_for_epoch,
     persist_verify_gate_artifact,
+    summarize_verify_phases,
 )
-from gza import runner
 from gza.runner import (
     BACKUP_DIR,
     BRANCH_UNPUSHABLE_FAILURE_REASON,
     DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
+    PHASE_EVIDENCE_INDETERMINATE,
     PR_REQUIRED_FAILURE_REASON,
     REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
     REVIEW_IMPROVE_LINEAGE_LIMIT,
@@ -62,7 +69,6 @@ from gza.runner import (
     LifecycleVerifyBudgetError,
     LifecycleVerifyExecution,
     LongPhaseProgress,
-    PHASE_EVIDENCE_INDETERMINATE,
     ProjectBoundary,
     ProjectReviewVerifyResult,
     ResolvedTimeoutBudget,
@@ -89,6 +95,7 @@ from gza.runner import (
     _format_review_verify_failure,
     _format_review_verify_result,
     _get_task_output,
+    _lifecycle_verify_budget_margin_failure,
     _LongPhaseHeartbeatState,
     _monitored_review_verify_process_pipe_drain,
     _persist_lifecycle_verify_execution,
@@ -102,6 +109,7 @@ from gza.runner import (
     _restore_wip_changes,
     _retry_pr_required_code_task_completion,
     _run_inner,
+    _run_lifecycle_verify,
     _run_non_code_task,
     _run_result_to_stats,
     _run_review_verify_command,
@@ -314,7 +322,9 @@ def test_ensure_work_pr_for_completed_code_task_leaves_one_skip_note_for_non_git
 
     with patch(
         "gza.runner.ensure_task_pr",
-        return_value=Mock(ok=True, status="unsupported", pr_number=None, pr_url=None, error="project has no GitHub-capable remote"),
+        return_value=Mock(
+            ok=True, status="unsupported", pr_number=None, pr_url=None, error="project has no GitHub-capable remote"
+        ),
     ):
         outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
 
@@ -785,13 +795,10 @@ class TestTimeoutBudgeting:
 
         assert budget.minutes == 45
         assert budget.reason == (
-            "base timeout for task type 'implement'; below scaling thresholds; "
-            "hard-capped at 45m from 60m"
+            "base timeout for task type 'implement'; below scaling thresholds; hard-capped at 45m from 60m"
         )
 
-    def test_extract_verify_phase_checkpoints_ignores_phase_without_tree_fingerprint(
-        self, tmp_path: Path
-    ) -> None:
+    def test_extract_verify_phase_checkpoints_ignores_phase_without_tree_fingerprint(self, tmp_path: Path) -> None:
         log_file = tmp_path / "task.log"
         log_file.write_text(
             json.dumps(
@@ -801,8 +808,7 @@ class TestTimeoutBudgeting:
                         "type": "command_execution",
                         "command": "./bin/tests --quick",
                         "aggregated_output": (
-                            "gza-verify phase=start name=ruff\n"
-                            "gza-verify phase=passed name=ruff duration_seconds=0.0\n"
+                            "gza-verify phase=start name=ruff\ngza-verify phase=passed name=ruff duration_seconds=0.0\n"
                         ),
                         "exit_code": 0,
                     },
@@ -816,6 +822,7 @@ class TestTimeoutBudgeting:
         checkpoints = _extract_verify_phase_checkpoints(log_file, ops_log)
 
         assert checkpoints == []
+
 
 class TestWorkerLifecycleLogging:
     """Tests for worker lifecycle JSONL log events."""
@@ -838,6 +845,7 @@ class TestWorkerLifecycleLogging:
         content = ops_log_path_for(log_file).read_text().strip()
         assert content
         import json
+
         event = json.loads(content)
         assert event["type"] == "gza"
         assert event["subtype"] == "worker_lifecycle"
@@ -1115,9 +1123,7 @@ class TestReviewContextFromChain:
 
         plan_task = store.add(prompt="Plan migration", task_type="plan")
         plan_task.output_content = (
-            "# Plan\n"
-            "**Task type:** PLAN ONLY. No implementation in this row.\n"
-            "- Background constraints for the bridge."
+            "# Plan\n**Task type:** PLAN ONLY. No implementation in this row.\n- Background constraints for the bridge."
         )
         store.update(plan_task)
 
@@ -1536,11 +1542,7 @@ class TestReviewContextFromChain:
             prompt="Review rebased implementation",
             task_type="review",
             depends_on=impl_task.id,
-            review_scope=(
-                "Review mode: resolution\n"
-                f"Implementation task: {impl_task.id}\n"
-                "Rebase task: gza-2\n"
-            ),
+            review_scope=(f"Review mode: resolution\nImplementation task: {impl_task.id}\nRebase task: gza-2\n"),
         )
 
         git = MagicMock(spec=Git)
@@ -2943,10 +2945,12 @@ class TestReviewContextFromChain:
             forced_kill=False,
         )
 
-        with patch("gza.runner._run_review_verify_command_with_timeout_diagnostics", return_value=helper_result), \
-             patch("gza.runner.console.print") as mock_print, \
-             patch("gza.runner.logger.warning") as mock_warning, \
-             patch("gza.runner.time.monotonic", side_effect=[100.0, 108.3]):
+        with (
+            patch("gza.runner._run_review_verify_command_with_timeout_diagnostics", return_value=helper_result),
+            patch("gza.runner.console.print") as mock_print,
+            patch("gza.runner.logger.warning") as mock_warning,
+            patch("gza.runner.time.monotonic", side_effect=[100.0, 108.3]),
+        ):
             result = _run_review_verify_command(
                 "printf 'all good\\n'",
                 cwd=tmp_path,
@@ -2972,10 +2976,12 @@ class TestReviewContextFromChain:
             forced_kill=False,
         )
 
-        with patch("gza.runner._run_review_verify_command_with_timeout_diagnostics", return_value=helper_result), \
-             patch("gza.runner.console.print") as mock_print, \
-             patch("gza.runner.logger.warning") as mock_warning, \
-             patch("gza.runner.time.monotonic", side_effect=[200.0, 205.0]):
+        with (
+            patch("gza.runner._run_review_verify_command_with_timeout_diagnostics", return_value=helper_result),
+            patch("gza.runner.console.print") as mock_print,
+            patch("gza.runner.logger.warning") as mock_warning,
+            patch("gza.runner.time.monotonic", side_effect=[200.0, 205.0]),
+        ):
             result = _run_review_verify_command(
                 "printf 'all good\\n'",
                 cwd=tmp_path,
@@ -3107,12 +3113,7 @@ class TestReviewContextFromChain:
             return subprocess.CompletedProcess(
                 ["ps"],
                 0,
-                stdout=(
-                    " 100 1 00:00:03\n"
-                    " 101 100 00:00:05\n"
-                    " 102 101 00:00:07\n"
-                    " 200 1 00:01:00\n"
-                ),
+                stdout=(" 100 1 00:00:03\n 101 100 00:00:05\n 102 101 00:00:07\n 200 1 00:01:00\n"),
                 stderr="",
             )
 
@@ -3303,8 +3304,9 @@ class TestReviewContextFromChain:
         try:
             os.set_blocking(read_fd, False)
             selector.register(read_fd, selectors.EVENT_READ, data="stdout")
-            with patch("gza.runner._review_verify_process_group_alive", return_value=True), patch(
-                "gza.runner.time.monotonic", side_effect=[10.0, 10.2]
+            with (
+                patch("gza.runner._review_verify_process_group_alive", return_value=True),
+                patch("gza.runner.time.monotonic", side_effect=[10.0, 10.2]),
             ):
                 completed = _monitored_review_verify_process_pipe_drain(
                     process,
@@ -3599,10 +3601,7 @@ class TestReviewContextFromChain:
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
         worktree_git.get_diff_name_status.return_value = (
-            "M\tservices/foo/app.py\n"
-            "M\tlibs/bar/lib.py\n"
-            "M\tapps/baz/view.py\n"
-            "M\tmisc/tool.py\n"
+            "M\tservices/foo/app.py\nM\tlibs/bar/lib.py\nM\tapps/baz/view.py\nM\tmisc/tool.py\n"
         )
         with patch(
             "gza.runner._run_review_verify_command",
@@ -3658,6 +3657,436 @@ class TestReviewContextFromChain:
         assert verify_calls[0].kwargs["reviewed_branch"] == "feature/cross-project"
         assert verify_calls[0].kwargs["reviewed_head_sha"] == "deadbeef"
         assert verify_calls[0].kwargs["reviewed_base_sha"] == "cafebabe"
+
+    def test_cross_project_verify_preflight_blocks_unsafe_child_full_suite_when_root_command_differs(
+        self, tmp_path: Path
+    ) -> None:
+        project_dir = tmp_path / "services" / "foo"
+        child_dir = tmp_path / "libs" / "bar"
+        worktree_path = tmp_path / "worktree"
+        worktree_project_dir = worktree_path / "services" / "foo"
+        worktree_child_dir = worktree_path / "libs" / "bar"
+        project_dir.mkdir(parents=True)
+        child_dir.mkdir(parents=True)
+        worktree_project_dir.mkdir(parents=True)
+        worktree_child_dir.mkdir(parents=True)
+        root_config_text = (
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n"
+        )
+        child_config_text = (
+            "project_name: bar\n"
+            "project_id: bar\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/tests\n"
+            "autonomous_verify_timeout_seconds: 120\n"
+            "autonomous_verify_bootstrap_timeout_seconds: 600\n"
+            "autonomous_verify_min_margin_seconds: 60\n"
+        )
+        (project_dir / "gza.yaml").write_text(root_config_text)
+        (worktree_project_dir / "gza.yaml").write_text(root_config_text)
+        (child_dir / "gza.yaml").write_text(child_config_text)
+        (worktree_child_dir / "gza.yaml").write_text(child_config_text)
+        config = Config.load(project_dir)
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        store = SqliteTaskStore.from_config(config)
+        task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = "M\tlibs/bar/lib.py\n"
+
+        with patch("gza.runner._run_review_verify_command") as mock_verify:
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                store=store,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=600,
+                timeout_grace_seconds=5.0,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+            )
+
+        mock_verify.assert_not_called()
+        assert outcome is not None
+        assert outcome.aggregate_result.status == "unavailable"
+        assert outcome.project_results[0].result is not None
+        assert outcome.project_results[0].result.exit_status == "insufficient verify budget margin"
+        assert "conservative bootstrap floor (600s)" in (outcome.project_results[0].result.failure or "")
+
+    @pytest.mark.parametrize(
+        ("duration_seconds", "expected_second_run_failure"),
+        [
+            (520.0, False),
+            (560.0, True),
+        ],
+    )
+    def test_cross_project_verify_persists_child_full_suite_runtime_for_next_preflight(
+        self,
+        tmp_path: Path,
+        duration_seconds: float,
+        expected_second_run_failure: bool,
+    ) -> None:
+        project_dir = tmp_path / "services" / "foo"
+        child_dir = tmp_path / "libs" / "bar"
+        worktree_path = tmp_path / "worktree"
+        worktree_project_dir = worktree_path / "services" / "foo"
+        worktree_child_dir = worktree_path / "libs" / "bar"
+        project_dir.mkdir(parents=True)
+        child_dir.mkdir(parents=True)
+        worktree_project_dir.mkdir(parents=True)
+        worktree_child_dir.mkdir(parents=True)
+        root_config_text = (
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n"
+        )
+        child_config_text = (
+            "project_name: bar\n"
+            "project_id: bar\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/tests\n"
+            "autonomous_verify_timeout_seconds: 600\n"
+            "autonomous_verify_bootstrap_timeout_seconds: 120\n"
+            "autonomous_verify_min_margin_seconds: 60\n"
+        )
+        (project_dir / "gza.yaml").write_text(root_config_text)
+        (worktree_project_dir / "gza.yaml").write_text(root_config_text)
+        (child_dir / "gza.yaml").write_text(child_config_text)
+        (worktree_child_dir / "gza.yaml").write_text(child_config_text)
+        config = Config.load(project_dir)
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        store = SqliteTaskStore.from_config(config)
+        task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = "M\tlibs/bar/lib.py\n"
+        output = "\n".join(
+            line
+            for phase in ("ruff", "ty", "mypy", "checks", "unit", "functional")
+            for line in (
+                f"gza-verify phase=start name={phase}",
+                f"gza-verify phase=passed name={phase} duration_seconds=1.0",
+            )
+        )
+
+        with patch(
+            "gza.runner._run_review_verify_command",
+            return_value=ReviewVerifyResult(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+                working_directory=str(worktree_child_dir),
+                output=output,
+                duration_seconds=duration_seconds,
+            ),
+        ):
+            first = _run_review_verify_commands_for_projects(
+                config=config,
+                store=store,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=600,
+                timeout_grace_seconds=5.0,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+            )
+        assert first is not None
+        _persist_lifecycle_verify_execution(
+            config,
+            store,
+            task,
+            LifecycleVerifyExecution(
+                markdown=first.markdown,
+                aggregate_result=first.aggregate_result,
+                project_results=first.project_results,
+            ),
+            producer="test",
+            timeout_seconds=600,
+            timeout_grace_seconds=5.0,
+        )
+
+        child_config = Config.load(worktree_child_dir)
+        child_store = SqliteTaskStore.from_config(child_config)
+        child_holder = child_store.list_project_artifacts(kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert child_holder.metadata is not None
+        assert child_holder.metadata["result"]["duration_seconds"] == duration_seconds
+        assert set(child_holder.metadata["phase_summary"]["passed"]) == {
+            "ruff",
+            "ty",
+            "mypy",
+            "checks",
+            "unit",
+            "functional",
+        }
+        observation = latest_successful_full_verify_runtime_observation(
+            child_store,
+            task,
+            now=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
+            max_age_hours=24,
+        )
+        assert observation is not None
+        assert observation.duration_seconds == duration_seconds
+
+        with patch(
+            "gza.runner._run_review_verify_command",
+            return_value=ReviewVerifyResult(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+                working_directory=str(worktree_child_dir),
+                output=output,
+                duration_seconds=1.0,
+            ),
+        ) as mock_verify:
+            second = _run_review_verify_commands_for_projects(
+                config=config,
+                store=store,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=600,
+                timeout_grace_seconds=5.0,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+            )
+
+        assert second is not None
+        if expected_second_run_failure:
+            mock_verify.assert_not_called()
+            assert second.project_results[0].result is not None
+            assert second.project_results[0].result.exit_status == "insufficient verify budget margin"
+        else:
+            mock_verify.assert_called_once()
+
+    def test_cross_project_child_runtime_observation_is_not_reused_by_sibling_project(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        project_dir = tmp_path / "services" / "foo"
+        child_dir = tmp_path / "libs" / "bar"
+        sibling_dir = tmp_path / "apps" / "baz"
+        worktree_path = tmp_path / "worktree"
+        for path in (
+            project_dir,
+            child_dir,
+            sibling_dir,
+            worktree_path / "services" / "foo",
+            worktree_path / "libs" / "bar",
+            worktree_path / "apps" / "baz",
+        ):
+            path.mkdir(parents=True)
+        root_config_text = (
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n"
+        )
+        child_config_text = (
+            "project_name: bar\nproject_id: bar\nprovider: codex\nmodel: gpt-5.5\n"
+            "verify_command: ./bin/tests\nautonomous_verify_timeout_seconds: 600\n"
+            "autonomous_verify_bootstrap_timeout_seconds: 120\nautonomous_verify_min_margin_seconds: 60\n"
+        )
+        sibling_config_text = (
+            "project_name: baz\nproject_id: baz\nprovider: codex\nmodel: gpt-5.5\n"
+            "verify_command: ./bin/tests\nautonomous_verify_timeout_seconds: 120\n"
+            "autonomous_verify_bootstrap_timeout_seconds: 600\nautonomous_verify_min_margin_seconds: 60\n"
+        )
+        (project_dir / "gza.yaml").write_text(root_config_text)
+        (worktree_path / "services" / "foo" / "gza.yaml").write_text(root_config_text)
+        (child_dir / "gza.yaml").write_text(child_config_text)
+        (worktree_path / "libs" / "bar" / "gza.yaml").write_text(child_config_text)
+        (sibling_dir / "gza.yaml").write_text(sibling_config_text)
+        (worktree_path / "apps" / "baz" / "gza.yaml").write_text(sibling_config_text)
+        config = Config.load(project_dir)
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        store = SqliteTaskStore.from_config(config)
+        task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        output = "\n".join(
+            line
+            for phase in ("ruff", "ty", "mypy", "checks", "unit", "functional")
+            for line in (
+                f"gza-verify phase=start name={phase}",
+                f"gza-verify phase=passed name={phase} duration_seconds=1.0",
+            )
+        )
+
+        worktree_git.get_diff_name_status.return_value = "M\tlibs/bar/lib.py\n"
+        with patch(
+            "gza.runner._run_review_verify_command",
+            return_value=ReviewVerifyResult(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+                working_directory=str(worktree_path / "libs" / "bar"),
+                output=output,
+                duration_seconds=520.0,
+            ),
+        ):
+            first = _run_review_verify_commands_for_projects(
+                config=config,
+                store=store,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=600,
+                timeout_grace_seconds=5.0,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+            )
+        assert first is not None
+        _persist_lifecycle_verify_execution(
+            config,
+            store,
+            task,
+            LifecycleVerifyExecution(
+                markdown=first.markdown,
+                aggregate_result=first.aggregate_result,
+                project_results=first.project_results,
+            ),
+            producer="test",
+            timeout_seconds=600,
+            timeout_grace_seconds=5.0,
+        )
+
+        worktree_git.get_diff_name_status.return_value = "M\tapps/baz/view.py\n"
+        with patch("gza.runner._run_review_verify_command") as mock_verify:
+            second = _run_review_verify_commands_for_projects(
+                config=config,
+                store=store,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=600,
+                timeout_grace_seconds=5.0,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+            )
+
+        mock_verify.assert_not_called()
+        assert second is not None
+        assert second.project_results[0].scope == "apps/baz"
+        assert second.project_results[0].result is not None
+        assert second.project_results[0].result.exit_status == "insufficient verify budget margin"
+
+    def test_cross_project_verify_preflight_uses_child_project_budget_not_safe_root_evidence(
+        self, tmp_path: Path
+    ) -> None:
+        project_dir = tmp_path / "services" / "foo"
+        child_dir = tmp_path / "libs" / "bar"
+        worktree_path = tmp_path / "worktree"
+        worktree_project_dir = worktree_path / "services" / "foo"
+        worktree_child_dir = worktree_path / "libs" / "bar"
+        project_dir.mkdir(parents=True)
+        child_dir.mkdir(parents=True)
+        worktree_project_dir.mkdir(parents=True)
+        worktree_child_dir.mkdir(parents=True)
+        root_config_text = (
+            "project_name: foo\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/tests\n"
+            "autonomous_verify_timeout_seconds: 600\n"
+            "autonomous_verify_bootstrap_timeout_seconds: 600\n"
+            "autonomous_verify_min_margin_seconds: 60\n"
+        )
+        child_config_text = root_config_text.replace("project_name: foo", "project_name: bar\nproject_id: bar").replace(
+            "autonomous_verify_timeout_seconds: 600",
+            "autonomous_verify_timeout_seconds: 120",
+        )
+        (project_dir / "gza.yaml").write_text(root_config_text)
+        (worktree_project_dir / "gza.yaml").write_text(root_config_text)
+        (child_dir / "gza.yaml").write_text(child_config_text)
+        (worktree_child_dir / "gza.yaml").write_text(child_config_text)
+        config = Config.load(project_dir)
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        store = SqliteTaskStore.from_config(config)
+        task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
+        source = store.add("Successful root verify source", task_type="review", depends_on=task.id)
+        assert source.id is not None
+        output = "\n".join(
+            f"gza-verify phase={event} name={phase}"
+            + (" duration_seconds=1.0" if event == "passed" else "")
+            for phase in ("ruff", "ty", "mypy", "checks", "unit", "functional")
+            for event in ("start", "passed")
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=task,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime.now(UTC),
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+                working_directory=str(project_dir),
+                output=output,
+                duration_seconds=6.0,
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = "M\tlibs/bar/lib.py\n"
+
+        with patch("gza.runner._run_review_verify_command") as mock_verify:
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                store=store,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=600,
+                timeout_grace_seconds=5.0,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+            )
+
+        mock_verify.assert_not_called()
+        assert outcome is not None
+        assert outcome.project_results[0].scope == "libs/bar"
+        assert outcome.project_results[0].result is not None
+        assert outcome.project_results[0].result.exit_status == "insufficient verify budget margin"
 
     def test_cross_project_verify_uses_discovered_execution_context_without_presentation_bleed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -3735,10 +4164,7 @@ class TestReviewContextFromChain:
         )
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
-        worktree_git.get_diff_name_status.return_value = (
-            "M\tservices/anchor/app.py\n"
-            "M\tlibs/other/lib.py\n"
-        )
+        worktree_git.get_diff_name_status.return_value = "M\tservices/anchor/app.py\nM\tlibs/other/lib.py\n"
         calls: list[dict[str, object]] = []
 
         def fake_verify(command: str, **kwargs: object) -> ReviewVerifyResult:
@@ -3793,9 +4219,15 @@ class TestReviewContextFromChain:
         worktree_project_dir = worktree_path / "server"
         project_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
-        (repo_root / "gza.yaml").write_text("project_name: gza\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n")
-        (project_dir / "gza.yaml").write_text("project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n")
-        (worktree_path / "gza.yaml").write_text("project_name: gza\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n")
+        (repo_root / "gza.yaml").write_text(
+            "project_name: gza\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n"
+        )
+        (project_dir / "gza.yaml").write_text(
+            "project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n"
+        )
+        (worktree_path / "gza.yaml").write_text(
+            "project_name: gza\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n"
+        )
         (worktree_project_dir / "gza.yaml").write_text(
             "project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n"
         )
@@ -3861,9 +4293,13 @@ class TestReviewContextFromChain:
         project_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
         (repo_root / "gza.yaml").write_text("project_name: gza\nprovider: codex\nmodel: gpt-5.5\n")
-        (project_dir / "gza.yaml").write_text("project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n")
+        (project_dir / "gza.yaml").write_text(
+            "project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n"
+        )
         (worktree_path / "gza.yaml").write_text("project_name: gza\nprovider: codex\nmodel: gpt-5.5\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n")
+        (worktree_project_dir / "gza.yaml").write_text(
+            "project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n"
+        )
 
         config = Config(
             project_dir=project_dir,
@@ -3911,9 +4347,7 @@ class TestReviewContextFromChain:
         assert verify_calls[0].args[0] == "./bin/server-verify"
         assert verify_calls[0].kwargs["cwd"] == worktree_path / "server"
 
-    def test_run_review_verify_commands_for_cross_project_prioritizes_failed_over_unavailable(
-        self, tmp_path: Path
-    ):
+    def test_run_review_verify_commands_for_cross_project_prioritizes_failed_over_unavailable(self, tmp_path: Path):
         project_dir = tmp_path / "services" / "foo"
         sibling_dir = tmp_path / "libs" / "bar"
         unavailable_dir = tmp_path / "apps" / "baz"
@@ -3927,12 +4361,24 @@ class TestReviewContextFromChain:
         worktree_project_dir.mkdir(parents=True)
         worktree_sibling_dir.mkdir(parents=True)
         worktree_unavailable_dir.mkdir(parents=True)
-        (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
-        (sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
-        (unavailable_dir / "gza.yaml").write_text("project_name: baz\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/baz-verify\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
-        (worktree_sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
-        (worktree_unavailable_dir / "gza.yaml").write_text("project_name: baz\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/baz-verify\n")
+        (project_dir / "gza.yaml").write_text(
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+        )
+        (sibling_dir / "gza.yaml").write_text(
+            "project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n"
+        )
+        (unavailable_dir / "gza.yaml").write_text(
+            "project_name: baz\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/baz-verify\n"
+        )
+        (worktree_project_dir / "gza.yaml").write_text(
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+        )
+        (worktree_sibling_dir / "gza.yaml").write_text(
+            "project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n"
+        )
+        (worktree_unavailable_dir / "gza.yaml").write_text(
+            "project_name: baz\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/baz-verify\n"
+        )
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
         config._project_boundary_cache = ProjectBoundary(
@@ -3946,9 +4392,7 @@ class TestReviewContextFromChain:
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
         worktree_git.get_diff_name_status.return_value = (
-            "M\tservices/foo/app.py\n"
-            "M\tlibs/bar/lib.py\n"
-            "M\tapps/baz/view.py\n"
+            "M\tservices/foo/app.py\nM\tlibs/bar/lib.py\nM\tapps/baz/view.py\n"
         )
 
         with patch(
@@ -3966,7 +4410,7 @@ class TestReviewContextFromChain:
                     exit_status="7",
                     captured_at=datetime(2026, 1, 1, tzinfo=UTC),
                     failure="verify failed",
-                    output="bar failed",
+                    output="gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=1.0",
                 ),
                 ReviewVerifyResult(
                     command="./bin/baz-verify",
@@ -4011,9 +4455,13 @@ class TestReviewContextFromChain:
         skipped_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
         worktree_skipped_dir.mkdir(parents=True)
-        (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (project_dir / "gza.yaml").write_text(
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+        )
         (skipped_dir / "gza.yaml").write_text("project_name: baz\nprovider: codex\nmodel: gpt-5.5\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (worktree_project_dir / "gza.yaml").write_text(
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+        )
         (worktree_skipped_dir / "gza.yaml").write_text("project_name: baz\nprovider: codex\nmodel: gpt-5.5\n")
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
@@ -4027,10 +4475,7 @@ class TestReviewContextFromChain:
 
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
-        worktree_git.get_diff_name_status.return_value = (
-            "M\tservices/foo/app.py\n"
-            "M\tapps/baz/view.py\n"
-        )
+        worktree_git.get_diff_name_status.return_value = "M\tservices/foo/app.py\nM\tapps/baz/view.py\n"
 
         with patch(
             "gza.runner._run_review_verify_command",
@@ -4065,16 +4510,18 @@ class TestReviewContextFromChain:
         assert outcome.aggregate_result.exit_status == "1 passed, 0 failed, 0 unavailable, 1 skipped"
         assert outcome.aggregate_result.failure == "one or more affected projects could not run review verification"
 
-    def test_run_review_verify_commands_for_cross_project_marks_unknown_paths_as_unavailable(
-        self, tmp_path: Path
-    ):
+    def test_run_review_verify_commands_for_cross_project_marks_unknown_paths_as_unavailable(self, tmp_path: Path):
         project_dir = tmp_path / "services" / "foo"
         worktree_path = tmp_path / "worktree"
         worktree_project_dir = worktree_path / "services" / "foo"
         project_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
-        (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (project_dir / "gza.yaml").write_text(
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+        )
+        (worktree_project_dir / "gza.yaml").write_text(
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+        )
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
         config._project_boundary_cache = ProjectBoundary(
@@ -4087,10 +4534,7 @@ class TestReviewContextFromChain:
 
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
-        worktree_git.get_diff_name_status.return_value = (
-            "M\tservices/foo/app.py\n"
-            "M\tmisc/tool.py\n"
-        )
+        worktree_git.get_diff_name_status.return_value = "M\tservices/foo/app.py\nM\tmisc/tool.py\n"
 
         with patch(
             "gza.runner._run_review_verify_command",
@@ -4137,10 +4581,18 @@ class TestReviewContextFromChain:
         sibling_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
         worktree_sibling_dir.mkdir(parents=True)
-        (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
-        (sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify-old\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
-        (worktree_sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify-new\n")
+        (project_dir / "gza.yaml").write_text(
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+        )
+        (sibling_dir / "gza.yaml").write_text(
+            "project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify-old\n"
+        )
+        (worktree_project_dir / "gza.yaml").write_text(
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+        )
+        (worktree_sibling_dir / "gza.yaml").write_text(
+            "project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify-new\n"
+        )
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
         config._project_boundary_cache = ProjectBoundary(
@@ -4179,9 +4631,7 @@ class TestReviewContextFromChain:
         assert mock_verify.call_args.args[0] == "./bin/bar-verify-new"
         assert mock_verify.call_args.kwargs["cwd"] == worktree_path / "libs" / "bar"
 
-    def test_run_review_verify_commands_for_cross_project_discovers_branch_local_project_root(
-        self, tmp_path: Path
-    ):
+    def test_run_review_verify_commands_for_cross_project_discovers_branch_local_project_root(self, tmp_path: Path):
         repo_root = tmp_path / "repo"
         worktree_path = tmp_path / "worktree"
         project_dir = repo_root / "services" / "foo"
@@ -4190,9 +4640,15 @@ class TestReviewContextFromChain:
         project_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
         worktree_branch_local_dir.mkdir(parents=True)
-        (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
-        (worktree_branch_local_dir / "gza.yaml").write_text("project_name: dre-web\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/web-verify\n")
+        (project_dir / "gza.yaml").write_text(
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+        )
+        (worktree_project_dir / "gza.yaml").write_text(
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+        )
+        (worktree_branch_local_dir / "gza.yaml").write_text(
+            "project_name: dre-web\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/web-verify\n"
+        )
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="")
         config._project_boundary_cache = ProjectBoundary(
@@ -4246,11 +4702,21 @@ class TestReviewContextFromChain:
         old_dir.mkdir(parents=True)
         renamed_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
-        (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
-        (copied_dir / "gza.yaml").write_text("project_name: copied\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/copied-verify\n")
-        (old_dir / "gza.yaml").write_text("project_name: old\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/old-verify\n")
-        (renamed_dir / "gza.yaml").write_text("project_name: renamed\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/renamed-verify\n")
+        (project_dir / "gza.yaml").write_text(
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+        )
+        (worktree_project_dir / "gza.yaml").write_text(
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+        )
+        (copied_dir / "gza.yaml").write_text(
+            "project_name: copied\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/copied-verify\n"
+        )
+        (old_dir / "gza.yaml").write_text(
+            "project_name: old\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/old-verify\n"
+        )
+        (renamed_dir / "gza.yaml").write_text(
+            "project_name: renamed\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/renamed-verify\n"
+        )
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
         config._project_boundary_cache = ProjectBoundary(
@@ -4383,9 +4849,7 @@ class TestReviewContextFromChain:
 
         mock_git = Mock(spec=Git)
         mock_git.default_branch.return_value = "main"
-        mock_git.get_diff_numstat.return_value = (
-            "1500\t400\tsrc/large_a.py\n800\t200\tsrc/large_b.py\n"
-        )
+        mock_git.get_diff_numstat.return_value = "1500\t400\tsrc/large_a.py\n800\t200\tsrc/large_b.py\n"
         mock_git.get_diff_stat.return_value = " 2 files changed, 2300 insertions(+), 600 deletions(-)"
         mock_git._run.return_value = Mock(stdout="diff --git a/src/large_a.py b/src/large_a.py\n@@ ...", returncode=0)
 
@@ -4451,12 +4915,7 @@ class TestReviewContextFromChain:
             depends_on=review1.id,
         )
         improve1.status = "completed"
-        improve1.output_content = (
-            "# Summary\n"
-            "- Fix flaky tests\n"
-            "- Tighten input validation\n"
-            "- Keep this concise\n"
-        )
+        improve1.output_content = "# Summary\n- Fix flaky tests\n- Tighten input validation\n- Keep this concise\n"
         store.update(improve1)
 
         review2 = store.add(prompt="Review 2", task_type="review", depends_on=impl_task.id)
@@ -4921,9 +5380,7 @@ class TestReviewContextFromChain:
         assert "## Review feedback to address:" not in context
         assert "Review blocker B" not in context
 
-    def test_improve_context_closure_checklist_stays_conservative_when_review_parser_degrades(
-        self, tmp_path: Path
-    ):
+    def test_improve_context_closure_checklist_stays_conservative_when_review_parser_degrades(self, tmp_path: Path):
         """Parser degradation should preserve raw review text and avoid invented blocker claims."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
@@ -5009,9 +5466,7 @@ class TestReviewContextFromChain:
         assert "Treat this as a test-performance investigation first" not in context
         assert "Inspect the captured `## verify_command result`" not in context
 
-    def test_improve_context_omits_verify_timeout_guidance_for_evidence_only_timeout_review(
-        self, tmp_path: Path
-    ):
+    def test_improve_context_omits_verify_timeout_guidance_for_evidence_only_timeout_review(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -5136,9 +5591,7 @@ class TestReviewContextFromChain:
 
         assert "## Verify Timeout Guidance" not in context
 
-    def test_improve_context_excludes_verify_timeout_guidance_for_unstructured_mixed_review(
-        self, tmp_path: Path
-    ):
+    def test_improve_context_excludes_verify_timeout_guidance_for_unstructured_mixed_review(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -5582,7 +6035,9 @@ class TestReviewContextFromChain:
         assert "## Repeated Blockers" in context
         assert "add bounded timeout and cancellation propagation" in context
 
-    def test_fix_context_repeated_blockers_supports_canonical_blocker_body_without_required_fix_label(self, tmp_path: Path):
+    def test_fix_context_repeated_blockers_supports_canonical_blocker_body_without_required_fix_label(
+        self, tmp_path: Path
+    ):
         """Repeated blocker extraction should not require an exact `Required fix:` line."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
@@ -5672,10 +6127,7 @@ class TestReviewContextFromChain:
         context = _build_context_from_chain(fix_task, store, tmp_path, git=None)
 
         assert f"Latest failed improve/resume attempt: {failed_improve.id}" in context
-        assert (
-            f"Latest failed implementation retry/resume attempt: {failed_impl_retry.id}"
-            in context
-        )
+        assert f"Latest failed implementation retry/resume attempt: {failed_impl_retry.id}" in context
         assert f"Latest failed improve/resume attempt: {failed_impl_retry.id}" not in context
 
     def test_fix_context_resolves_impl_through_resumed_fix_chain(self, tmp_path: Path):
@@ -5691,10 +6143,7 @@ class TestReviewContextFromChain:
         review = store.add(prompt="Review", task_type="review", depends_on=impl_task.id)
         review.status = "completed"
         review.output_content = (
-            "## Must-Fix\n\n"
-            "### M1: Bug\n"
-            "Required fix: handle null.\n\n"
-            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+            "## Must-Fix\n\n### M1: Bug\nRequired fix: handle null.\n\n## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
         )
         store.update(review)
 
@@ -5842,10 +6291,7 @@ class TestSnapshotTaskDbToWorktree:
         snapshot_conn.execute("CREATE TABLE writable (id INTEGER PRIMARY KEY)")
         snapshot_conn.commit()
         tables = {
-            row[0]
-            for row in snapshot_conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
+            row[0] for row in snapshot_conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
         }
         snapshot_conn.close()
         assert "writable" in tables
@@ -5960,7 +6406,6 @@ class TestStageWorktreeAgentResources:
         snapshot_path = worktree_dir / ".gza" / "gza.db"
         assert stat.S_IMODE(snapshot_path.stat().st_mode) == 0o644
 
-
     def test_run_non_code_task_creates_readonly_snapshot(self, tmp_path: Path):
         """Non-code task path should expose readonly worktree DB snapshot."""
         db_path = tmp_path / "test.db"
@@ -5988,7 +6433,9 @@ class TestStageWorktreeAgentResources:
             "write_error": None,
         }
 
-        def provider_run(_cfg, _prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _cfg, _prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             snapshot_path = work_dir / ".gza" / "gza.db"
             assert snapshot_path.exists()
             observed["snapshot_mode"] = stat.S_IMODE(snapshot_path.stat().st_mode)
@@ -6079,6 +6526,7 @@ class TestReviewTaskSlugGeneration:
 
         # Temporarily replace run and post_review_to_pr functions
         import gza.runner
+
         original_run = gza.runner.run
         original_post_review = gza.runner.post_review_to_pr
         gza.runner.run = mock_run
@@ -6125,6 +6573,7 @@ class TestReviewTaskSlugGeneration:
             pass
 
         import gza.runner
+
         original_run = gza.runner.run
         original_post_review = gza.runner.post_review_to_pr
         gza.runner.run = mock_run
@@ -6175,6 +6624,7 @@ class TestReviewTaskSlugGeneration:
             pass
 
         import gza.runner
+
         original_run = gza.runner.run
         original_post_review = gza.runner.post_review_to_pr
         gza.runner.run = mock_run
@@ -6216,6 +6666,7 @@ class TestReviewTaskSlugGeneration:
             pass
 
         import gza.runner
+
         original_run = gza.runner.run
         original_post_review = gza.runner.post_review_to_pr
         gza.runner.run = mock_run
@@ -6265,6 +6716,7 @@ class TestReviewTaskSlugGeneration:
             return 0  # Success
 
         import gza.runner
+
         original_run = gza.runner.run
 
         gza.runner.run = mock_run
@@ -6307,6 +6759,7 @@ class TestReviewTaskSlugGeneration:
             return 1  # Failure
 
         import gza.runner
+
         original_run = gza.runner.run
         gza.runner.run = mock_run_failure
 
@@ -6358,6 +6811,7 @@ class TestReviewTaskSlugGeneration:
             return 0
 
         import gza.runner
+
         original_run = gza.runner.run
         gza.runner.run = mock_run
 
@@ -6406,6 +6860,7 @@ class TestReviewTaskSlugGeneration:
             return 0
 
         import gza.runner
+
         original_run = gza.runner.run
         gza.runner.run = mock_run
 
@@ -6450,6 +6905,7 @@ class TestReviewTaskSlugGeneration:
             return 0
 
         import gza.runner
+
         original_run = gza.runner.run
         gza.runner.run = mock_run
 
@@ -6519,6 +6975,7 @@ class TestGenerateSlugProjectPrefix:
         """Default path keeps YYYYMMDD-project_prefix-prompt format."""
         slug = generate_slug("Normal task prompt", project_prefix="gza")
         assert slug.endswith("-gza-normal-task-prompt") or "-gza-normal-task-prompt-" in slug
+
 
 class TestTaskIdExistsBranchStrategy:
     """Tests for _slug_exists using branch_strategy patterns."""
@@ -6728,9 +7185,7 @@ class TestComputeSlugOverride:
         result = _compute_slug_override(review_task, store)
         assert result == "improve-migration-observability"
 
-    def test_missing_ancestor_during_based_on_walk_uses_last_resolved_prompt(
-        self, caplog: pytest.LogCaptureFixture
-    ):
+    def test_missing_ancestor_during_based_on_walk_uses_last_resolved_prompt(self, caplog: pytest.LogCaptureFixture):
         """Missing parent while walking ancestors uses last resolved task prompt."""
         mid = Task(id="gza-mid", prompt="Mid ancestor prompt", task_type="implement", based_on="gza-root")
         child = Task(
@@ -6753,9 +7208,7 @@ class TestComputeSlugOverride:
             "missing_parent=gza-root; using last resolved ancestor #gza-mid"
         ) in caplog.text
 
-    def test_missing_review_target_falls_back_to_review_prompt_and_warns(
-        self, caplog: pytest.LogCaptureFixture
-    ):
+    def test_missing_review_target_falls_back_to_review_prompt_and_warns(self, caplog: pytest.LogCaptureFixture):
         """Missing review depends_on target falls back to review prompt."""
         review_task = Task(
             id="gza-review",
@@ -6774,9 +7227,7 @@ class TestComputeSlugOverride:
             "falling back to review task prompt"
         ) in caplog.text
 
-    def test_cycle_in_based_on_chain_uses_last_resolved_prompt_and_warns(
-        self, caplog: pytest.LogCaptureFixture
-    ):
+    def test_cycle_in_based_on_chain_uses_last_resolved_prompt_and_warns(self, caplog: pytest.LogCaptureFixture):
         """Cycle in based_on walk should stop and use last resolved prompt."""
         a = Task(id="gza-a", prompt="Root A prompt", task_type="implement", based_on="gza-b")
         b = Task(id="gza-b", prompt="Root B prompt", task_type="implement", based_on="gza-a")
@@ -6815,6 +7266,7 @@ class TestComputeSlugOverride:
         task = store.add(prompt="Explore codebase", task_type="explore")
         result = _compute_slug_override(task, store)
         assert result is None
+
 
 class TestReviewNextSteps:
     """Tests for next steps output after review task completion."""
@@ -6887,9 +7339,11 @@ class TestReviewNextSteps:
         def capture_print(*args, **kwargs):
             printed_lines.append(str(args[0]) if args else "")
 
-        with patch('gza.runner.console') as mock_runner_console, \
-             patch('gza.console.console') as mock_console_console, \
-             patch('gza.runner.post_review_to_pr'):
+        with (
+            patch("gza.runner.console") as mock_runner_console,
+            patch("gza.console.console") as mock_console_console,
+            patch("gza.runner.post_review_to_pr"),
+        ):
             # task_footer prints via gza.console.console; runner.py prints
             # pre/post diagnostic lines via gza.runner.console. Route both
             # through the same capture function so the assertion sees the
@@ -6897,9 +7351,7 @@ class TestReviewNextSteps:
             mock_runner_console.print.side_effect = capture_print
             mock_console_console.print.side_effect = capture_print
 
-            exit_code = _run_non_code_task(
-                review_task, config, store, mock_provider, mock_git, resume=False
-            )
+            exit_code = _run_non_code_task(review_task, config, store, mock_provider, mock_git, resume=False)
 
             assert exit_code == 0
 
@@ -6972,14 +7424,14 @@ class TestReviewNextSteps:
         def capture_print(*args, **kwargs):
             printed_lines.append(str(args[0]) if args else "")
 
-        with patch('gza.runner.console') as mock_runner_console, \
-             patch('gza.console.console') as mock_console_console, \
-             patch('gza.runner.post_review_to_pr'):
+        with (
+            patch("gza.runner.console") as mock_runner_console,
+            patch("gza.console.console") as mock_console_console,
+            patch("gza.runner.post_review_to_pr"),
+        ):
             mock_runner_console.print.side_effect = capture_print
             mock_console_console.print.side_effect = capture_print
-            exit_code = _run_non_code_task(
-                review_task, config, store, mock_provider, mock_git, resume=False
-            )
+            exit_code = _run_non_code_task(review_task, config, store, mock_provider, mock_git, resume=False)
 
         assert exit_code == 0
         # task_footer emits Rich markup like "[bright_white]Verdict:[/bright_white]",
@@ -7038,14 +7490,11 @@ class TestReviewNextSteps:
         def capture_print(*args, **kwargs):
             printed_lines.append(str(args[0]) if args else "")
 
-        with patch('gza.runner.console') as mock_runner_console, \
-             patch('gza.console.console') as mock_console_console:
+        with patch("gza.runner.console") as mock_runner_console, patch("gza.console.console") as mock_console_console:
             mock_runner_console.print.side_effect = capture_print
             mock_console_console.print.side_effect = capture_print
 
-            exit_code = _run_non_code_task(
-                explore_task, config, store, mock_provider, mock_git, resume=False
-            )
+            exit_code = _run_non_code_task(explore_task, config, store, mock_provider, mock_git, resume=False)
 
             assert exit_code == 0
 
@@ -7157,7 +7606,9 @@ class TestRunNonCodeTaskDockerGitMetadata:
         worktree_review_dir.mkdir(parents=True, exist_ok=True)
         report_file = worktree_review_dir / f"{review_task.slug}.md"
 
-        def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             assert (worktree_path / ".git").read_text() == original_git_content
             assert host_commondir.read_text() == original_commondir_content
             assert host_gitdir.read_text() == original_gitdir_content
@@ -7309,7 +7760,9 @@ class TestRunNonCodeTaskWorktreeReportDir:
 
         worktree_path = config.worktree_path / f"{review_task.slug}-review"
 
-        def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             # Simulate provider writing the report file in the worktree
             worktree_review_dir = worktree_path / ".gza" / "reviews"
             worktree_review_dir.mkdir(parents=True, exist_ok=True)
@@ -7335,9 +7788,7 @@ class TestRunNonCodeTaskWorktreeReportDir:
         mock_git.get_diff.return_value = ""
 
         with patch("gza.runner.post_review_to_pr"):
-            exit_code = _run_non_code_task(
-                review_task, config, store, mock_provider, mock_git, resume=False
-            )
+            exit_code = _run_non_code_task(review_task, config, store, mock_provider, mock_git, resume=False)
 
         assert exit_code == 0
         # Verify the report was copied from worktree to project dir
@@ -7393,11 +7844,7 @@ class TestRunNonCodeTaskPRPosting:
         pr_post_called = []
 
         def mock_post_review_to_pr(review_task, impl_task, store, project_dir, required=False, **kwargs):
-            pr_post_called.append({
-                'review_id': review_task.id,
-                'impl_id': impl_task.id,
-                'required': required
-            })
+            pr_post_called.append({"review_id": review_task.id, "impl_id": impl_task.id, "required": required})
 
         # Mock provider
         mock_provider = Mock()
@@ -7427,23 +7874,22 @@ class TestRunNonCodeTaskPRPosting:
         report_file.write_text("# Review\n\nLooks good!")
 
         import gza.runner
+
         original_post_review = gza.runner.post_review_to_pr
         gza.runner.post_review_to_pr = mock_post_review_to_pr
 
         try:
             # Call _run_non_code_task
-            exit_code = _run_non_code_task(
-                review_task, config, store, mock_provider, mock_git, resume=False
-            )
+            exit_code = _run_non_code_task(review_task, config, store, mock_provider, mock_git, resume=False)
 
             # Verify success
             assert exit_code == 0
 
             # Verify post_review_to_pr was called
             assert len(pr_post_called) == 1
-            assert pr_post_called[0]['review_id'] == review_task.id
-            assert pr_post_called[0]['impl_id'] == impl_task.id
-            assert pr_post_called[0]['required'] is False
+            assert pr_post_called[0]["review_id"] == review_task.id
+            assert pr_post_called[0]["impl_id"] == impl_task.id
+            assert pr_post_called[0]["required"] is False
         finally:
             gza.runner.post_review_to_pr = original_post_review
 
@@ -7485,7 +7931,9 @@ class TestMaxStepsHandling:
         config = self._make_non_code_config(tmp_path, max_steps=20)
         report_text = "# Plan\n\n- recovered from log\n"
 
-        def provider_run(_config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             marker_text = "".join(f"[GZA_FAILURE:{marker}]\n" for marker in log_markers)
             log_file.write_text(f"tool output\n{marker_text}")
             if include_report_result:
@@ -7791,7 +8239,9 @@ class TestMaxStepsHandling:
         config.timeout_minutes = 10
         config.max_steps = 2
 
-        def provider_run(_config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             log_file.write_text("tool output\n[GZA_FAILURE:TEST_FAILURE]\n")
             return RunResult(
                 exit_code=0,
@@ -7836,7 +8286,9 @@ class TestMaxStepsHandling:
         config.timeout_minutes = 10
         config.max_steps = 20
 
-        def provider_run(_config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             log_file.write_text("tool output\n[GZA_FAILURE:TEST_FAILURE]\n")
             return RunResult(
                 exit_code=124,
@@ -7881,7 +8333,9 @@ class TestMaxStepsHandling:
         config.timeout_minutes = 10
         config.max_steps = 20
 
-        def provider_run(_config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             log_file.write_text("tool output\n[GZA_FAILURE:TEST_FAILURE]\n")
             return RunResult(
                 exit_code=124,
@@ -8194,14 +8648,13 @@ class TestMaxStepsHandling:
         report_file.write_text("# Exploration\n\nFindings here.")
 
         import gza.runner
+
         original_post_review = gza.runner.post_review_to_pr
         gza.runner.post_review_to_pr = mock_post_review_to_pr
 
         try:
             # Call _run_non_code_task
-            exit_code = _run_non_code_task(
-                explore_task, config, store, mock_provider, mock_git, resume=False
-            )
+            exit_code = _run_non_code_task(explore_task, config, store, mock_provider, mock_git, resume=False)
 
             # Verify success
             assert exit_code == 0
@@ -8240,7 +8693,9 @@ class TestNonCodeWorktreeCleanup:
         config = self._make_config(tmp_path)
         worktree_path = config.worktree_path / f"{task.slug}-explore"
 
-        def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             # Simulate the provider creating the report inside the worktree
             report_dir = worktree_path / ".gza" / "explorations"
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -8281,7 +8736,9 @@ class TestNonCodeWorktreeCleanup:
         config = self._make_config(tmp_path)
         worktree_path = config.worktree_path / f"{task.slug}-explore"
 
-        def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             report_dir = worktree_path / ".gza" / "explorations"
             report_dir.mkdir(parents=True, exist_ok=True)
             (report_dir / f"{task.slug}.md").write_text("# Exploration\n\nFindings.")
@@ -8339,8 +8796,7 @@ class TestNonCodeWorktreeCleanup:
 
         worktree_path = config.worktree_path / f"{task.slug}-explore"
 
-        with patch("gza.runner.console") as mock_runner_console, \
-             patch("gza.console.console") as mock_console_console:
+        with patch("gza.runner.console") as mock_runner_console, patch("gza.console.console") as mock_console_console:
             mock_runner_console.print.side_effect = capture_print
             mock_console_console.print.side_effect = capture_print
             exit_code = _run_non_code_task(task, config, store, mock_provider, mock_git, resume=False)
@@ -8403,14 +8859,20 @@ class TestFailureReasonGroundTruth:
 
         config = self._make_config(tmp_path, db_path)
 
-        def provider_run(_config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             marker_text = "".join(f"[GZA_FAILURE:{marker}]\n" for marker in log_markers)
             log_file.write_text(f"agent command output\n{marker_text}")
             return RunResult(
                 exit_code=exit_code,
                 duration_seconds=12.0,
-                num_steps_computed=num_steps_computed if num_steps_computed is not None else (51 if error_type == "max_steps" else None),
-                num_turns_computed=num_turns_computed if num_turns_computed is not None else (51 if error_type == "max_turns" else None),
+                num_steps_computed=num_steps_computed
+                if num_steps_computed is not None
+                else (51 if error_type == "max_steps" else None),
+                num_turns_computed=num_turns_computed
+                if num_turns_computed is not None
+                else (51 if error_type == "max_turns" else None),
                 session_id=session_id,
                 error_type=error_type,
             )
@@ -8558,7 +9020,9 @@ class TestFailureReasonGroundTruth:
 
         captured_timeout: dict[str, int] = {}
 
-        def provider_run(run_config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            run_config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             captured_timeout["minutes"] = run_config.timeout_minutes
             log_file.write_text("agent command output\n")
             return RunResult(
@@ -8814,7 +9278,9 @@ class TestFailureReasonGroundTruth:
 
         config = self._make_config(tmp_path, db_path)
 
-        def provider_run(_config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, _prompt, log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             log_file.write_text("agent command output\n[GZA_FAILURE:TEST_FAILURE]\n")
             return RunResult(
                 exit_code=124,
@@ -9095,14 +9561,20 @@ class TestRunStepPersistenceIntegration:
 
         provider = ClaudeProvider()
         json_lines = [
-            json.dumps({
-                "type": "assistant",
-                "message": {"id": "msg_1", "content": [], "usage": {}},
-            }) + "\n",
-            json.dumps({
-                "type": "assistant",
-                "message": {"id": "msg_2", "content": [], "usage": {}},
-            }) + "\n",
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"id": "msg_1", "content": [], "usage": {}},
+                }
+            )
+            + "\n",
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"id": "msg_2", "content": [], "usage": {}},
+                }
+            )
+            + "\n",
             json.dumps({"type": "result", "subtype": "success", "num_turns": 2, "total_cost_usd": 0.0}) + "\n",
         ]
 
@@ -9332,11 +9804,10 @@ class TestResumeVerificationPrompt:
         # Mock provider to capture the prompt
         captured_prompts = []
 
-        def mock_provider_run(config, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
-            captured_prompts.append({
-                'prompt': prompt,
-                'resume_session_id': resume_session_id
-            })
+        def mock_provider_run(
+            config, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
+            captured_prompts.append({"prompt": prompt, "resume_session_id": resume_session_id})
             return RunResult(
                 exit_code=0,
                 duration_seconds=10.0,
@@ -9347,10 +9818,11 @@ class TestResumeVerificationPrompt:
             )
 
         # Mock provider and git
-        with patch('gza.runner.get_provider') as mock_get_provider, \
-             patch('gza.runner.Git') as mock_git_class, \
-             patch('gza.runner.load_dotenv'):
-
+        with (
+            patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
+            patch("gza.runner.load_dotenv"),
+        ):
             mock_provider = Mock()
             mock_provider.name = "TestProvider"
             mock_provider.check_credentials.return_value = True
@@ -9402,8 +9874,8 @@ class TestResumeVerificationPrompt:
 
             # Verify prompt was captured
             assert len(captured_prompts) == 1
-            prompt = captured_prompts[0]['prompt']
-            resume_session_id = captured_prompts[0]['resume_session_id']
+            prompt = captured_prompts[0]["prompt"]
+            resume_session_id = captured_prompts[0]["resume_session_id"]
 
             # Verify verification instructions are in the prompt
             assert "interrupted" in prompt.lower()
@@ -9453,11 +9925,10 @@ class TestResumeVerificationPrompt:
         # Mock provider to capture the prompt
         captured_prompts = []
 
-        def mock_provider_run(config, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
-            captured_prompts.append({
-                'prompt': prompt,
-                'resume_session_id': resume_session_id
-            })
+        def mock_provider_run(
+            config, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
+            captured_prompts.append({"prompt": prompt, "resume_session_id": resume_session_id})
             return RunResult(
                 exit_code=0,
                 duration_seconds=10.0,
@@ -9486,19 +9957,17 @@ class TestResumeVerificationPrompt:
         report_file.write_text("# Review\n\nLooks good!")
 
         # Mock post_review_to_pr to avoid GitHub CLI dependency
-        with patch('gza.runner.post_review_to_pr'):
+        with patch("gza.runner.post_review_to_pr"):
             # Call _run_non_code_task with resume=True
-            exit_code = _run_non_code_task(
-                review_task, config, store, mock_provider, mock_git, resume=True
-            )
+            exit_code = _run_non_code_task(review_task, config, store, mock_provider, mock_git, resume=True)
 
         # Verify success
         assert exit_code == 0
 
         # Verify prompt was captured
         assert len(captured_prompts) == 1
-        prompt = captured_prompts[0]['prompt']
-        resume_session_id = captured_prompts[0]['resume_session_id']
+        prompt = captured_prompts[0]["prompt"]
+        resume_session_id = captured_prompts[0]["resume_session_id"]
 
         # Verify verification instructions are in the prompt
         assert "paused" in prompt.lower()
@@ -9556,7 +10025,9 @@ class TestResumeVerificationPrompt:
 
         captured_prompts: list[str] = []
 
-        def provider_run(_config, prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             captured_prompts.append(prompt)
             report_dir = _work_dir / ".gza" / "reviews"
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -9582,9 +10053,7 @@ class TestResumeVerificationPrompt:
         mock_git.get_diff_stat.return_value = ""
 
         with patch("gza.runner.post_review_to_pr"):
-            exit_code = _run_non_code_task(
-                resumed_review, config, store, mock_provider, mock_git, resume=True
-            )
+            exit_code = _run_non_code_task(resumed_review, config, store, mock_provider, mock_git, resume=True)
 
         assert exit_code == 0
         assert len(captured_prompts) == 1
@@ -9638,7 +10107,9 @@ class TestNonCodeReportArtifactContract:
         config.timeout_minutes = 10
         config.max_steps = 50
 
-        def provider_run(_config, _prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, _prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             review_dir = work_dir / ".gza" / "reviews"
             review_dir.mkdir(parents=True, exist_ok=True)
             (review_dir / f"{prior_review.slug}.md").write_text("# Review\n\nVerdict: APPROVED")
@@ -9660,12 +10131,12 @@ class TestNonCodeReportArtifactContract:
         mock_git._run.return_value = Mock(returncode=0)
 
         mock_console = Mock()
-        with patch("gza.runner.post_review_to_pr"), patch("gza.runner.console", mock_console), patch(
-            "gza.runner.maybe_auto_regenerate_learnings", return_value=None
+        with (
+            patch("gza.runner.post_review_to_pr"),
+            patch("gza.runner.console", mock_console),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
         ):
-            exit_code = _run_non_code_task(
-                resumed_review, config, store, mock_provider, mock_git, resume=True
-            )
+            exit_code = _run_non_code_task(resumed_review, config, store, mock_provider, mock_git, resume=True)
 
         assert exit_code == 0
         refreshed = store.get(resumed_review.id)
@@ -9822,9 +10293,12 @@ class TestNonCodeReportArtifactContract:
 
         review_text = "# Review\n\n**Verdict: APPROVED**\n\nLooks good."
 
-        def provider_run(_config, _prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, _prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             # Agent outputs text to stdout (captured as 'result' event) but does NOT write the file.
             import json as _json
+
             with open(log_file, "a") as f:
                 f.write(_json.dumps({"type": "result", "subtype": "success", "result": review_text}) + "\n")
             return RunResult(
@@ -9844,10 +10318,12 @@ class TestNonCodeReportArtifactContract:
         mock_git.default_branch.return_value = "main"
         mock_git._run.return_value = Mock(returncode=0)
 
-        with patch("gza.runner.post_review_to_pr"), patch("gza.runner.console"), patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
-            exit_code = _run_non_code_task(
-                review_task, config, store, mock_provider, mock_git, resume=False
-            )
+        with (
+            patch("gza.runner.post_review_to_pr"),
+            patch("gza.runner.console"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            exit_code = _run_non_code_task(review_task, config, store, mock_provider, mock_git, resume=False)
 
         assert exit_code == 0
         refreshed = store.get(review_task.id)
@@ -9896,7 +10372,9 @@ class TestNonCodeReportArtifactContract:
             "Verdict: CHANGES_REQUESTED\n"
         )
 
-        def provider_run(_config, _prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, _prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             import json as _json
 
             with open(log_file, "a") as f:
@@ -9918,12 +10396,12 @@ class TestNonCodeReportArtifactContract:
         mock_git.default_branch.return_value = "main"
         mock_git._run.return_value = Mock(returncode=0)
 
-        with patch("gza.runner.post_review_to_pr"), patch("gza.runner.console"), patch(
-            "gza.runner.maybe_auto_regenerate_learnings", return_value=None
+        with (
+            patch("gza.runner.post_review_to_pr"),
+            patch("gza.runner.console"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
         ):
-            exit_code = _run_non_code_task(
-                review_task, config, store, mock_provider, mock_git, resume=False
-            )
+            exit_code = _run_non_code_task(review_task, config, store, mock_provider, mock_git, resume=False)
 
         assert exit_code == 0
         refreshed = store.get(review_task.id)
@@ -9967,7 +10445,9 @@ class TestNonCodeReportArtifactContract:
             "Verdict: CHANGES_REQUESTED\n"
         )
 
-        def provider_run(_config, _prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, _prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             import json as _json
 
             with open(log_file, "a") as f:
@@ -9994,16 +10474,15 @@ class TestNonCodeReportArtifactContract:
         def capture_print(*args, **kwargs):
             printed_lines.append(str(args[0]) if args else "")
 
-        with patch("gza.runner.post_review_to_pr"), patch("gza.runner.console") as mock_runner_console, patch(
-            "gza.console.console"
-        ) as mock_console_console, patch(
-            "gza.runner.maybe_auto_regenerate_learnings", return_value=None
+        with (
+            patch("gza.runner.post_review_to_pr"),
+            patch("gza.runner.console") as mock_runner_console,
+            patch("gza.console.console") as mock_console_console,
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
         ):
             mock_runner_console.print.side_effect = capture_print
             mock_console_console.print.side_effect = capture_print
-            exit_code = _run_non_code_task(
-                review_task, config, store, mock_provider, mock_git, resume=False
-            )
+            exit_code = _run_non_code_task(review_task, config, store, mock_provider, mock_git, resume=False)
 
         assert exit_code == 0
         refreshed = store.get(review_task.id)
@@ -10111,9 +10590,7 @@ class TestNonCodeReportArtifactContract:
         mock_git._run.return_value = Mock(returncode=0)
 
         with patch("gza.runner.console"):
-            exit_code = _run_non_code_task(
-                review_task, config, store, mock_provider, mock_git, resume=False
-            )
+            exit_code = _run_non_code_task(review_task, config, store, mock_provider, mock_git, resume=False)
 
         assert exit_code == 0
         refreshed = store.get(review_task.id)
@@ -10157,9 +10634,7 @@ class TestNonCodeReportArtifactContract:
         mock_git._run.return_value = Mock(returncode=0)
 
         with patch("gza.runner.console"):
-            exit_code = _run_non_code_task(
-                review_task, config, store, mock_provider, mock_git, resume=False
-            )
+            exit_code = _run_non_code_task(review_task, config, store, mock_provider, mock_git, resume=False)
 
         assert exit_code == 0
         refreshed = store.get(review_task.id)
@@ -10187,7 +10662,9 @@ class TestNonCodeReportArtifactContract:
         config.timeout_minutes = 10
         config.max_steps = 50
 
-        def provider_run(_config, _prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, _prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             review_dir = work_dir / ".gza" / "reviews"
             review_dir.mkdir(parents=True, exist_ok=True)
             (review_dir / "20260212-review-feature-ambiguous-old.md").write_text("# Review\n\nVerdict: APPROVED")
@@ -10211,9 +10688,7 @@ class TestNonCodeReportArtifactContract:
 
         mock_console = Mock()
         with patch("gza.runner.console", mock_console):
-            exit_code = _run_non_code_task(
-                review_task, config, store, mock_provider, mock_git, resume=False
-            )
+            exit_code = _run_non_code_task(review_task, config, store, mock_provider, mock_git, resume=False)
 
         assert exit_code == 0
         refreshed = store.get(review_task.id)
@@ -10301,7 +10776,9 @@ class TestPersistResolvedConfig:
 
         provider_called_after_update = []
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def mock_provider_run(
+            cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             # Record whether store.update was already called with persisted values
             provider_called_after_update.append(
                 any(s["model"] == "claude-sonnet-4-6" and s["provider"] == "claude" for s in persisted_states)
@@ -10315,11 +10792,12 @@ class TestPersistResolvedConfig:
                 error_type=None,
             )
 
-        with patch("gza.runner.get_provider") as mock_get_provider, \
-             patch("gza.runner.Git") as mock_git_class, \
-             patch("gza.runner.load_dotenv"), \
-             patch("gza.runner.SqliteTaskStore") as mock_store_cls:
-
+        with (
+            patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.SqliteTaskStore") as mock_store_cls,
+        ):
             mock_store_cls.from_config.return_value = store
 
             mock_provider = Mock()
@@ -10352,14 +10830,14 @@ class TestPersistResolvedConfig:
             run(config, task_id=task.id)
 
         # store.update must have been called with the resolved model and provider
-        assert any(
-            s["model"] == "claude-sonnet-4-6" and s["provider"] == "claude"
-            for s in persisted_states
-        ), f"Expected store.update called with resolved model/provider, got: {persisted_states}"
+        assert any(s["model"] == "claude-sonnet-4-6" and s["provider"] == "claude" for s in persisted_states), (
+            f"Expected store.update called with resolved model/provider, got: {persisted_states}"
+        )
 
         # The persist must have happened before the provider ran
-        assert provider_called_after_update and provider_called_after_update[0], \
+        assert provider_called_after_update and provider_called_after_update[0], (
             "store.update with resolved values must occur before provider.run is called"
+        )
 
         # Verify the task in the DB has the resolved values
         updated_task = store.get(task.id)
@@ -10389,6 +10867,7 @@ class TestBackupDatabase:
         assert backup_dir.exists()
 
         from datetime import datetime
+
         hour_stamp = datetime.now().strftime("%Y%m%d%H")
         backup_file = backup_dir / f"gza-{hour_stamp}.db.zst"
         assert backup_file.exists()
@@ -10605,7 +11084,9 @@ class TestNoChangesWithExistingCommits:
         assert runtime_context.env["PROJECT_TOKEN"] == "captured-token"
         assert runtime_context.env["GZA_DB_PATH"] == str(db_path.resolve())
 
-    def test_resume_with_existing_commits_and_no_new_changes_succeeds(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    def test_resume_with_existing_commits_and_no_new_changes_succeeds(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
         """When resuming, if there are no uncommitted changes but the branch already has
         commits from a previous run, the task should succeed (not fail with 'No changes made')."""
         db_path = tmp_path / "test.db"
@@ -10622,7 +11103,9 @@ class TestNoChangesWithExistingCommits:
 
         config = self._make_config(tmp_path, db_path)
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def mock_provider_run(
+            cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             return RunResult(
                 exit_code=0,
                 duration_seconds=5.0,
@@ -10632,10 +11115,11 @@ class TestNoChangesWithExistingCommits:
                 error_type=None,
             )
 
-        with patch('gza.runner.get_provider') as mock_get_provider, \
-             patch('gza.runner.Git') as mock_git_class, \
-             patch('gza.runner.load_dotenv'):
-
+        with (
+            patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
+            patch("gza.runner.load_dotenv"),
+        ):
             mock_provider = Mock()
             mock_provider.name = "TestProvider"
             mock_provider.check_credentials.return_value = True
@@ -10695,7 +11179,9 @@ class TestNoChangesWithExistingCommits:
 
         config = self._make_config(tmp_path, db_path)
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def mock_provider_run(
+            cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             return RunResult(
                 exit_code=0,
                 duration_seconds=5.0,
@@ -10705,10 +11191,11 @@ class TestNoChangesWithExistingCommits:
                 error_type=None,
             )
 
-        with patch('gza.runner.get_provider') as mock_get_provider, \
-             patch('gza.runner.Git') as mock_git_class, \
-             patch('gza.runner.load_dotenv'):
-
+        with (
+            patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
+            patch("gza.runner.load_dotenv"),
+        ):
             mock_provider = Mock()
             mock_provider.name = "TestProvider"
             mock_provider.check_credentials.return_value = True
@@ -10944,9 +11431,7 @@ class TestTaskClaimSafety:
         assert refreshed.failure_reason == expected_reason
         assert refreshed.log_file is not None
         transcript_content = (tmp_path / refreshed.log_file).read_text()
-        ops_log = (tmp_path / refreshed.log_file).with_name(
-            f"{Path(refreshed.log_file).stem}.ops.jsonl"
-        )
+        ops_log = (tmp_path / refreshed.log_file).with_name(f"{Path(refreshed.log_file).stem}.ops.jsonl")
         ops_content = ops_log.read_text()
         assert transcript_content == ""
         assert expected_reason in ops_content
@@ -10956,9 +11441,7 @@ class TestTaskClaimSafety:
         import json
 
         execution_events = [
-            json.loads(line)
-            for line in ops_content.splitlines()
-            if line.strip() and '"subtype": "execution"' in line
+            json.loads(line) for line in ops_content.splitlines() if line.strip() and '"subtype": "execution"' in line
         ]
         assert execution_events
         execution_event = execution_events[-1]
@@ -11026,9 +11509,7 @@ class TestTaskClaimSafety:
 
         log_content = ops_log_path_for(tmp_path / refreshed.log_file).read_text()
         execution_events = [
-            json.loads(line)
-            for line in log_content.splitlines()
-            if line.strip() and '"subtype": "execution"' in line
+            json.loads(line) for line in log_content.splitlines() if line.strip() and '"subtype": "execution"' in line
         ]
         assert execution_events
         execution_event = execution_events[-1]
@@ -11393,7 +11874,9 @@ class TestSameBranchLineageWalk:
 
         config = self._make_config(tmp_path, db_path)
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def mock_provider_run(
+            cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             return RunResult(
                 exit_code=0,
                 duration_seconds=5.0,
@@ -11403,10 +11886,11 @@ class TestSameBranchLineageWalk:
                 error_type=None,
             )
 
-        with patch('gza.runner.get_provider') as mock_get_provider, \
-             patch('gza.runner.Git') as mock_git_class, \
-             patch('gza.runner.load_dotenv'):
-
+        with (
+            patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
+            patch("gza.runner.load_dotenv"),
+        ):
             mock_provider = Mock()
             mock_provider.name = "TestProvider"
             mock_provider.check_credentials.return_value = True
@@ -11446,7 +11930,9 @@ class TestSameBranchLineageWalk:
         # Direct source found — no "via" message expected
         assert "via" not in output
 
-    def test_same_branch_walks_chain_when_immediate_source_has_no_branch(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    def test_same_branch_walks_chain_when_immediate_source_has_no_branch(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
         """When the immediate source task has no branch, walk based_on chain to find ancestor."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
@@ -11482,7 +11968,9 @@ class TestSameBranchLineageWalk:
 
         config = self._make_config(tmp_path, db_path)
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def mock_provider_run(
+            cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             return RunResult(
                 exit_code=0,
                 duration_seconds=5.0,
@@ -11492,10 +11980,11 @@ class TestSameBranchLineageWalk:
                 error_type=None,
             )
 
-        with patch('gza.runner.get_provider') as mock_get_provider, \
-             patch('gza.runner.Git') as mock_git_class, \
-             patch('gza.runner.load_dotenv'):
-
+        with (
+            patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
+            patch("gza.runner.load_dotenv"),
+        ):
             mock_provider = Mock()
             mock_provider.name = "TestProvider"
             mock_provider.check_credentials.return_value = True
@@ -11536,7 +12025,9 @@ class TestSameBranchLineageWalk:
         assert "via" in output
         assert f"{killed_task.id}" in output
 
-    def test_same_branch_walks_chain_when_immediate_branch_does_not_exist(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    def test_same_branch_walks_chain_when_immediate_branch_does_not_exist(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
         """When the immediate source task has a branch field but that branch no longer exists,
         walk the based_on chain to find an ancestor with a valid branch."""
         db_path = tmp_path / "test.db"
@@ -11573,7 +12064,9 @@ class TestSameBranchLineageWalk:
 
         config = self._make_config(tmp_path, db_path)
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def mock_provider_run(
+            cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             return RunResult(
                 exit_code=0,
                 duration_seconds=5.0,
@@ -11583,10 +12076,11 @@ class TestSameBranchLineageWalk:
                 error_type=None,
             )
 
-        with patch('gza.runner.get_provider') as mock_get_provider, \
-             patch('gza.runner.Git') as mock_git_class, \
-             patch('gza.runner.load_dotenv'):
-
+        with (
+            patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
+            patch("gza.runner.load_dotenv"),
+        ):
             mock_provider = Mock()
             mock_provider.name = "TestProvider"
             mock_provider.check_credentials.return_value = True
@@ -11598,9 +12092,11 @@ class TestSameBranchLineageWalk:
             mock_git.default_branch.return_value = "main"
             mock_git._run.return_value = Mock(returncode=0)
             mock_git.worktree_list.return_value = []
+
             # The middle task's branch doesn't exist; the impl_task's branch does
             def branch_exists(branch: str) -> bool:
                 return branch == "test/20260301-implement-feature"
+
             mock_git.branch_exists.side_effect = branch_exists
 
             mock_worktree_git = Mock()
@@ -11628,7 +12124,9 @@ class TestSameBranchLineageWalk:
         assert "test/20260301-implement-feature" in output
         assert "via" in output
 
-    def test_same_branch_fails_when_no_ancestor_has_valid_branch(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    def test_same_branch_fails_when_no_ancestor_has_valid_branch(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
         """When no ancestor in the chain has a valid branch, fail with a clear error."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
@@ -11652,10 +12150,11 @@ class TestSameBranchLineageWalk:
 
         config = self._make_config(tmp_path, db_path)
 
-        with patch('gza.runner.get_provider') as mock_get_provider, \
-             patch('gza.runner.Git') as mock_git_class, \
-             patch('gza.runner.load_dotenv'):
-
+        with (
+            patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
+            patch("gza.runner.load_dotenv"),
+        ):
             mock_provider = Mock()
             mock_provider.name = "TestProvider"
             mock_provider.check_credentials.return_value = True
@@ -11706,10 +12205,11 @@ class TestSameBranchLineageWalk:
 
         config = self._make_config(tmp_path, db_path)
 
-        with patch('gza.runner.get_provider') as mock_get_provider, \
-             patch('gza.runner.Git') as mock_git_class, \
-             patch('gza.runner.load_dotenv'):
-
+        with (
+            patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
+            patch("gza.runner.load_dotenv"),
+        ):
             mock_provider = Mock()
             mock_provider.name = "TestProvider"
             mock_provider.check_credentials.return_value = True
@@ -11931,9 +12431,7 @@ class TestExtractedRunInnerHelpers:
         assert store.get("gza-4") is None
         assert store.add("next task").id == "gza-4"
 
-    def test_direct_rebase_runtime_uses_persisted_branch_after_parent_branch_mutation(
-        self, tmp_path: Path
-    ) -> None:
+    def test_direct_rebase_runtime_uses_persisted_branch_after_parent_branch_mutation(self, tmp_path: Path) -> None:
         store = SqliteTaskStore(tmp_path / "test.db")
         config = self._make_config(tmp_path)
         impl = store.add(prompt="impl", task_type="implement")
@@ -12051,9 +12549,7 @@ class TestExtractedRunInnerHelpers:
         assert renamed_branch.id is not None
         assert resolve_rebase_target_branch(store, renamed_branch) == "feature/new"
 
-    def test_branchless_legacy_rebase_runtime_falls_back_to_lineage_branch(
-        self, tmp_path: Path
-    ) -> None:
+    def test_branchless_legacy_rebase_runtime_falls_back_to_lineage_branch(self, tmp_path: Path) -> None:
         store = SqliteTaskStore(tmp_path / "test.db")
         config = self._make_config(tmp_path)
         impl = store.add(prompt="impl", task_type="implement")
@@ -12239,11 +12735,7 @@ class TestExtractedRunInnerHelpers:
         assert refreshed is not None
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "PROVIDER_EMPTY_TURN"
-        ops_entries = [
-            json.loads(line)
-            for line in ops_log_path_for(log_file).read_text().splitlines()
-            if line.strip()
-        ]
+        ops_entries = [json.loads(line) for line in ops_log_path_for(log_file).read_text().splitlines() if line.strip()]
         outcome_entry = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
         assert outcome_entry["failure_reason"] == "PROVIDER_EMPTY_TURN"
         assert outcome_entry["stderr_tail"] == "provider stderr line"
@@ -12325,11 +12817,7 @@ class TestExtractedRunInnerHelpers:
         assert unit.head_sha == "deadbeef"
         assert unit.base_sha == "cafebabe"
 
-        ops_entries = [
-            json.loads(line)
-            for line in ops_log_path_for(log_file).read_text().splitlines()
-            if line.strip()
-        ]
+        ops_entries = [json.loads(line) for line in ops_log_path_for(log_file).read_text().splitlines() if line.strip()]
         outcome_entry = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
         assert outcome_entry["message"] == "Outcome: completed (moot: no unique commits vs target)"
         assert outcome_entry["completion_reason"] == "VERIFIED_EMPTY_NOOP"
@@ -12556,11 +13044,7 @@ class TestExtractedRunInnerHelpers:
         assert unit is not None
         assert unit.state == "empty"
 
-        ops_entries = [
-            json.loads(line)
-            for line in ops_log_path_for(log_file).read_text().splitlines()
-            if line.strip()
-        ]
+        ops_entries = [json.loads(line) for line in ops_log_path_for(log_file).read_text().splitlines() if line.strip()]
         outcome_entry = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
         assert outcome_entry["message"] == "Outcome: completed (moot: no unique commits vs target)"
         assert outcome_entry["completion_reason"] == "VERIFIED_EMPTY_NOOP"
@@ -13114,7 +13598,10 @@ class TestExtractedRunInnerHelpers:
         worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
         worktree_summary_path.write_text("## Summary\n\n- done\n")
 
-        with patch("gza.runner._squash_wip_commits"), patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
             rc = _complete_code_task(
                 task,
                 config,
@@ -13167,7 +13654,10 @@ class TestExtractedRunInnerHelpers:
         worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
         worktree_summary_path.write_text("## Summary\n\n- done\n")
 
-        with patch("gza.runner._squash_wip_commits"), patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
             rc = _complete_code_task(
                 task,
                 config,
@@ -13322,7 +13812,9 @@ class TestExtractedRunInnerHelpers:
         assert outcome.kind == "ready"
         assert outcome.status == "cached"
 
-    def test_ensure_work_pr_revalidates_cached_pr_before_reuse(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    def test_ensure_work_pr_revalidates_cached_pr_before_reuse(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
         """Cached PR reuse should reflect the revalidated PR URL and avoid fake push output."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
@@ -13549,8 +14041,7 @@ class TestExtractedRunInnerHelpers:
 
         ops_entries = [json.loads(line) for line in ops_log_path_for(log_file).read_text().splitlines()]
         assert any(
-            entry["message"]
-            == "Skipping auto-review for "
+            entry["message"] == "Skipping auto-review for "
             f"{task.id}: completed with no task commits; nothing to review."
             for entry in ops_entries
         )
@@ -13604,9 +14095,7 @@ class TestExtractedRunInnerHelpers:
 
         ops_entries = [json.loads(line) for line in ops_log_path_for(log_file).read_text().splitlines()]
         assert any(
-            entry["message"]
-            == "Skipping auto-review for "
-            f"{task.id}: no unique commits vs target (nothing to review)."
+            entry["message"] == f"Skipping auto-review for {task.id}: no unique commits vs target (nothing to review)."
             for entry in ops_entries
         )
 
@@ -15205,8 +15694,8 @@ class TestExtractedRunInnerHelpers:
         worktree_git = Mock(spec=Git)
         worktree_git.can_merge.return_value = True
         worktree_git.branch_exists.return_value = True
-        worktree_git.rev_parse_if_exists.side_effect = (
-            lambda ref: "abc1234" if ref == impl.branch else "target-sha" if ref == "main" else None
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: (
+            "abc1234" if ref == impl.branch else "target-sha" if ref == "main" else None
         )
 
         with (
@@ -15289,8 +15778,8 @@ class TestExtractedRunInnerHelpers:
         worktree_git = Mock(spec=Git)
         worktree_git.can_merge.return_value = True
         worktree_git.branch_exists.return_value = True
-        worktree_git.rev_parse_if_exists.side_effect = (
-            lambda ref: "abc1234" if ref == impl.branch else "target-sha" if ref == "main" else None
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: (
+            "abc1234" if ref == impl.branch else "target-sha" if ref == "main" else None
         )
 
         with (
@@ -15408,15 +15897,18 @@ class TestExtractedRunInnerHelpers:
         assert rc == 0
         sync_branch.assert_not_called()
         run_review.assert_not_called()
-        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in capsys.readouterr().out
+        assert (
+            "cleared verify-origin blocker from persisted passing no-op improve verify evidence"
+            not in capsys.readouterr().out
+        )
 
         refreshed_impl = store.get(impl.id)
         assert refreshed_impl is not None
         stale_head_git = Mock(spec=Git)
         stale_head_git.can_merge.return_value = True
         stale_head_git.branch_exists.return_value = True
-        stale_head_git.rev_parse_if_exists.side_effect = (
-            lambda ref: "new-head" if ref == impl.branch else "target-sha" if ref == "main" else None
+        stale_head_git.rev_parse_if_exists.side_effect = lambda ref: (
+            "new-head" if ref == impl.branch else "target-sha" if ref == "main" else None
         )
 
         next_action = determine_next_action(
@@ -15503,7 +15995,16 @@ class TestExtractedRunInnerHelpers:
         assert store.list_artifacts(impl.id, kind="review_clearance") == []
 
     @pytest.mark.parametrize(
-        ("label", "review_report", "review_status", "review_branch", "review_head_sha", "improve_branch", "improve_head_sha", "captured_offset_seconds"),
+        (
+            "label",
+            "review_report",
+            "review_status",
+            "review_branch",
+            "review_head_sha",
+            "improve_branch",
+            "improve_head_sha",
+            "captured_offset_seconds",
+        ),
         [
             (
                 "mixed_code_blocker",
@@ -15843,7 +16344,9 @@ class TestExtractedRunInnerHelpers:
                 "gza.runner.compute_improve_changed_diff",
                 return_value=ImproveDiffResult(changed_diff=False, detail="no (no tracked improve changes)"),
             ),
-            patch("gza.runner._capture_noop_improve_review_verify_result", side_effect=overwrite_green_with_unavailable) as capture_verify,
+            patch(
+                "gza.runner._capture_noop_improve_review_verify_result", side_effect=overwrite_green_with_unavailable
+            ) as capture_verify,
             patch("gza.runner.sync_task_branch_if_live_pr") as sync_branch,
             patch("gza.runner._create_and_run_review_task") as run_review,
             patch("gza.runner.task_footer"),
@@ -15930,8 +16433,7 @@ class TestExtractedRunInnerHelpers:
         store.update(improve)
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
-            "verify_command: uv run pytest tests/ -q\n",
+            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\nverify_command: uv run pytest tests/ -q\n",
             encoding="utf-8",
         )
         config = Config.load(tmp_path)
@@ -16011,7 +16513,9 @@ class TestExtractedRunInnerHelpers:
         lifecycle_git.is_merged.return_value = False
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
-        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "cafebabe", impl.branch: "abc1234"}.get(ref)
+        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "cafebabe", impl.branch: "abc1234"}.get(
+            ref
+        )
         lifecycle_git.is_ancestor.return_value = False
         lifecycle_git.count_commits_behind_checked.return_value = 0
         lifecycle_git.count_commits_ahead_checked.return_value = 1
@@ -16088,8 +16592,7 @@ class TestExtractedRunInnerHelpers:
         store.update(improve)
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
-            "verify_command: uv run pytest tests/ -q\n",
+            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\nverify_command: uv run pytest tests/ -q\n",
             encoding="utf-8",
         )
         config = Config.load(tmp_path)
@@ -16207,8 +16710,7 @@ class TestExtractedRunInnerHelpers:
         store.update(improve)
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
-            "verify_command: uv run pytest tests/ -q\n",
+            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\nverify_command: uv run pytest tests/ -q\n",
             encoding="utf-8",
         )
         config = Config.load(tmp_path)
@@ -16316,8 +16818,7 @@ class TestExtractedRunInnerHelpers:
         store.update(improve)
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
-            "verify_command: uv run pytest tests/ -q\n",
+            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\nverify_command: uv run pytest tests/ -q\n",
             encoding="utf-8",
         )
         config = Config.load(tmp_path)
@@ -16783,8 +17284,7 @@ class TestExtractedRunInnerHelpers:
         store.update(improve)
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
-            "verify_command: uv run pytest tests/ -q\n",
+            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\nverify_command: uv run pytest tests/ -q\n",
             encoding="utf-8",
         )
         config = Config.load(tmp_path)
@@ -16800,7 +17300,10 @@ class TestExtractedRunInnerHelpers:
                 "gza.runner.compute_improve_changed_diff",
                 return_value=ImproveDiffResult(changed_diff=False, detail="no (no tracked improve changes)"),
             ),
-            patch("gza.runner._capture_noop_improve_review_verify_result", wraps=_capture_noop_improve_review_verify_result) as capture_verify,
+            patch(
+                "gza.runner._capture_noop_improve_review_verify_result",
+                wraps=_capture_noop_improve_review_verify_result,
+            ) as capture_verify,
             patch("gza.runner._run_review_verify_command") as run_verify,
             patch("gza.runner.sync_task_branch_if_live_pr") as sync_branch,
             patch("gza.runner._create_and_run_review_task") as run_review,
@@ -16835,7 +17338,9 @@ class TestExtractedRunInnerHelpers:
         lifecycle_git.is_merged.return_value = False
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
-        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "cafebabe", impl.branch: "abc1234"}.get(ref)
+        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "cafebabe", impl.branch: "abc1234"}.get(
+            ref
+        )
         lifecycle_git.is_ancestor.return_value = False
         lifecycle_git.count_commits_behind_checked.return_value = 0
         lifecycle_git.count_commits_ahead_checked.return_value = 1
@@ -17828,7 +18333,7 @@ class TestExtractedRunInnerHelpers:
         assert refreshed.failure_reason == BRANCH_UNPUSHABLE_FAILURE_REASON
         assert refreshed.output_content == "summary"
         log_text = ops_log_path_for(log_file).read_text()
-        assert f'Outcome: failed ({BRANCH_UNPUSHABLE_FAILURE_REASON})' in log_text
+        assert f"Outcome: failed ({BRANCH_UNPUSHABLE_FAILURE_REASON})" in log_text
 
     def test_complete_code_task_stale_wip_push_rejection_marks_branch_unpushable(
         self,
@@ -17855,8 +18360,7 @@ class TestExtractedRunInnerHelpers:
         worktree_git.count_commits_ahead.return_value = 1
         worktree_git.needs_push.return_value = True
         worktree_git.push_branch.side_effect = GitError(
-            "push rejected: origin/feature/stale-wip still points to "
-            "'WIP: gza task interrupted'"
+            "push rejected: origin/feature/stale-wip still points to 'WIP: gza task interrupted'"
         )
 
         summary_dir = tmp_path / ".gza" / "summaries"
@@ -18045,8 +18549,8 @@ class TestExtractedRunInnerHelpers:
         tmp_path: Path,
         entrypoint: str,
     ) -> None:
-        store, config, impl, verify_fix, verify_epoch, git = (
-            self._setup_branch_unpushable_noop_timeout_verify_fix(tmp_path)
+        store, config, impl, verify_fix, verify_epoch, git = self._setup_branch_unpushable_noop_timeout_verify_fix(
+            tmp_path
         )
         rerun_result = ReviewVerifyResult(
             command="./bin/tests",
@@ -18111,8 +18615,8 @@ class TestExtractedRunInnerHelpers:
         tmp_path: Path,
         entrypoint: str,
     ) -> None:
-        store, config, impl, verify_fix, verify_epoch, git = (
-            self._setup_branch_unpushable_noop_timeout_verify_fix(tmp_path)
+        store, config, impl, verify_fix, verify_epoch, git = self._setup_branch_unpushable_noop_timeout_verify_fix(
+            tmp_path
         )
         rerun_result = ReviewVerifyResult(
             command="./bin/tests",
@@ -18171,8 +18675,8 @@ class TestExtractedRunInnerHelpers:
         entrypoint: str,
         rerun_status: str,
     ) -> None:
-        store, config, impl, verify_fix, verify_epoch, git = (
-            self._setup_branch_unpushable_noop_timeout_verify_fix(tmp_path)
+        store, config, impl, verify_fix, verify_epoch, git = self._setup_branch_unpushable_noop_timeout_verify_fix(
+            tmp_path
         )
         rerun_result = ReviewVerifyResult(
             command="./bin/tests",
@@ -18233,9 +18737,7 @@ class TestExtractedRunInnerHelpers:
     def test_run_can_retry_pr_required_failure_via_work_pr(self, tmp_path: Path):
         """`gza work <task> --pr` should recover failed PR_REQUIRED tasks without rerunning provider."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: default\n"
-            "db_path: .gza/gza.db\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\nproject_id: default\ndb_path: .gza/gza.db\n"
         )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -18266,9 +18768,7 @@ class TestExtractedRunInnerHelpers:
     def test_run_work_pr_branchless_pr_required_does_not_rewrite_fresh_pr_required(self, tmp_path: Path):
         """Legacy branchless PR_REQUIRED rows should not be re-failed through the compatibility retry path."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: default\n"
-            "db_path: .gza/gza.db\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\nproject_id: default\ndb_path: .gza/gza.db\n"
         )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -18293,9 +18793,7 @@ class TestExtractedRunInnerHelpers:
     def test_run_can_retry_pr_required_failure_via_persisted_create_pr(self, tmp_path: Path):
         """Stored create_pr intent should recover failed PR_REQUIRED tasks without needing `work --pr`."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: default\n"
-            "db_path: .gza/gza.db\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\nproject_id: default\ndb_path: .gza/gza.db\n"
         )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -18336,9 +18834,7 @@ class TestExtractedRunInnerHelpers:
     def test_run_pr_required_retry_for_improve_resolves_parent_comments(self, tmp_path: Path):
         """Improve completion should resolve only unresolved feedback comments on the root implementation task."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: default\n"
-            "db_path: .gza/gza.db\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\nproject_id: default\ndb_path: .gza/gza.db\n"
         )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -18387,9 +18883,7 @@ class TestExtractedRunInnerHelpers:
     def test_run_pr_required_retry_for_improve_only_resolves_comments_in_snapshot(self, tmp_path: Path):
         """Improve completion should leave comments added after improve creation unresolved."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: default\n"
-            "db_path: .gza/gza.db\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\nproject_id: default\ndb_path: .gza/gza.db\n"
         )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -18438,9 +18932,7 @@ class TestExtractedRunInnerHelpers:
     def test_run_pr_required_retry_for_chained_improve_updates_root_implementation_state(self, tmp_path: Path):
         """PR-required improve retries should apply completion side effects to the implementation root."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: default\n"
-            "db_path: .gza/gza.db\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\nproject_id: default\ndb_path: .gza/gza.db\n"
         )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -18509,9 +19001,7 @@ class TestExtractedRunInnerHelpers:
     def test_run_pr_required_retry_for_rebase_treats_published_head_as_pr_only_retry(self, tmp_path: Path):
         """A published rebase PR retry should skip the stale non-advancing baseline path."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: default\n"
-            "db_path: .gza/gza.db\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\nproject_id: default\ndb_path: .gza/gza.db\n"
         )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -18969,6 +19459,7 @@ class TestExtractedRunInnerHelpers:
         mock_worktree_git.status_porcelain.return_value = set()
         mock_worktree_git.has_changes.return_value = False
         mock_worktree_git.rev_parse.return_value = "head-new"
+
         def rev_parse_if_exists(ref: str) -> str | None:
             if ref == parent.branch:
                 return "head-new"
@@ -19007,7 +19498,10 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_parent.merge_status == "merged"
 
         surfaced = capsys.readouterr()
-        assert "Git error: Failed to resolve rebased branch publication refs for feature/rebase-parent: remote lookup boom" in surfaced.out
+        assert (
+            "Git error: Failed to resolve rebased branch publication refs for feature/rebase-parent: remote lookup boom"
+            in surfaced.out
+        )
 
         assert refreshed.log_file is not None
         log_file = config.project_dir / refreshed.log_file
@@ -19022,9 +19516,7 @@ class TestExtractedRunInnerHelpers:
     ) -> None:
         """Rebase PR retries must fail before completion-side state if publication fails."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: default\n"
-            "db_path: .gza/gza.db\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\nproject_id: default\ndb_path: .gza/gza.db\n"
         )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -19117,9 +19609,7 @@ class TestExtractedRunInnerHelpers:
     ) -> None:
         """PR-required rebase retries should publish before re-running PR setup."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: default\n"
-            "db_path: .gza/gza.db\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\nproject_id: default\ndb_path: .gza/gza.db\n"
         )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -19201,9 +19691,7 @@ class TestExtractedRunInnerHelpers:
     ) -> None:
         """Rebase PR retries must fail before completion-side state if publication lookup fails."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: default\n"
-            "db_path: .gza/gza.db\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\nproject_id: default\ndb_path: .gza/gza.db\n"
         )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -19251,6 +19739,7 @@ class TestExtractedRunInnerHelpers:
         git = Mock(spec=Git)
         git.default_branch.return_value = "main"
         git.rev_parse.return_value = "head-new"
+
         def retry_rev_parse_if_exists(ref: str) -> str | None:
             if ref == task.branch:
                 return "head-new"
@@ -19598,7 +20087,9 @@ class TestExtractedRunInnerHelpers:
         with (
             patch("gza.runner._resolve_code_task_branch_name", return_value=task.branch),
             patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("worktree setup should not run")),
-            patch("gza.runner.isolated_rebase_checkout", side_effect=AssertionError("isolated checkout should not run")),
+            patch(
+                "gza.runner.isolated_rebase_checkout", side_effect=AssertionError("isolated checkout should not run")
+            ),
         ):
             rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
 
@@ -19703,13 +20194,19 @@ class TestExtractedRunInnerHelpers:
 
         with (
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
-            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch(
+                "gza.runner._setup_code_task_worktree",
+                side_effect=AssertionError("shared worktree path should be skipped"),
+            ),
             patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()) as isolated_checkout,
             patch("gza.runner._stage_worktree_agent_resources", return_value=0),
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch("gza.runner.capture_rebase_diff_baseline", side_effect=capture_baseline),
             patch("gza.runner.is_rebase_in_progress", return_value=False),
             patch("gza.runner.import_isolated_rebase_tip") as import_tip,
@@ -19791,9 +20288,7 @@ class TestExtractedRunInnerHelpers:
             shadow_git = [v for v in run_config.docker_volumes if v.endswith(":/workspace/.git:ro")]
             assert len(shadow_git) == 1
             assert Path(shadow_git[0].split(":")[0]).read_text() == "gitdir: /gza-git/worktree\n"
-            shadow_commondir = [
-                v for v in run_config.docker_volumes if v.endswith(":/gza-git/worktree/commondir:ro")
-            ]
+            shadow_commondir = [v for v in run_config.docker_volumes if v.endswith(":/gza-git/worktree/commondir:ro")]
             assert len(shadow_commondir) == 1
             assert Path(shadow_commondir[0].split(":")[0]).read_text() == "/gza-git/common\n"
             return RunResult(
@@ -19828,7 +20323,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch("gza.runner._complete_code_task", side_effect=complete_code_task),
             patch(
                 "gza.runner.check_canonical_checkout_invariant",
@@ -19923,7 +20421,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch("gza.runner._compute_tree_fingerprint", side_effect=compute_tree_fingerprint) as compute_fingerprint,
             patch("gza.runner._save_wip_changes", side_effect=save_wip_changes) as save_wip,
             patch("gza.runner._persist_timeout_resume_checkpoint") as persist_checkpoint,
@@ -20001,7 +20502,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch("gza.runner._complete_code_task", side_effect=AssertionError("should not complete")),
             patch(
                 "gza.runner.check_canonical_checkout_invariant",
@@ -20088,7 +20592,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch("gza.runner._resolve_run_failure", side_effect=KeyboardInterrupt),
             patch("gza.runner._save_wip_changes", side_effect=save_wip_changes) as save_wip,
             patch("gza.runner._complete_code_task", side_effect=AssertionError("should not complete")),
@@ -20153,7 +20660,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch("gza.runner.sanitize_provider_prompt", side_effect=KeyboardInterrupt),
             patch("gza.runner._call_provider_run", side_effect=AssertionError("provider should not run")),
             patch("gza.runner._complete_code_task", side_effect=AssertionError("should not complete")),
@@ -20245,13 +20755,19 @@ class TestExtractedRunInnerHelpers:
 
         with (
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
-            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch(
+                "gza.runner._setup_code_task_worktree",
+                side_effect=AssertionError("shared worktree path should be skipped"),
+            ),
             patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
             patch("gza.runner._stage_worktree_agent_resources", return_value=0),
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch(
                 "gza.runner.capture_rebase_diff_baseline",
                 return_value=RebaseDiffBaseline(
@@ -20318,16 +20834,9 @@ class TestExtractedRunInnerHelpers:
         isolated_path = tmp_path / "isolated-rebase-stale-superseded"
         isolated_path.mkdir(parents=True, exist_ok=True)
         (isolated_path / ".git").mkdir(exist_ok=True)
-        isolated_summary = (
-            isolated_path
-            / ".gza"
-            / "summaries"
-            / "20260512-runner-rebase-stale-import-superseded.md"
-        )
+        isolated_summary = isolated_path / ".gza" / "summaries" / "20260512-runner-rebase-stale-import-superseded.md"
         isolated_summary.parent.mkdir(parents=True, exist_ok=True)
-        isolated_summary.write_text(
-            "Successfully rebased and published the losing isolated head.\n"
-        )
+        isolated_summary.write_text("Successfully rebased and published the losing isolated head.\n")
 
         isolated_git = Mock(spec=Git)
         isolated_git.repo_dir = isolated_path
@@ -20373,13 +20882,19 @@ class TestExtractedRunInnerHelpers:
 
         with (
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
-            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch(
+                "gza.runner._setup_code_task_worktree",
+                side_effect=AssertionError("shared worktree path should be skipped"),
+            ),
             patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
             patch("gza.runner._stage_worktree_agent_resources", return_value=0),
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
             patch(
                 "gza.runner.capture_rebase_diff_baseline",
@@ -20423,12 +20938,7 @@ class TestExtractedRunInnerHelpers:
             "Successfully rebased and published the losing isolated head."
         )
 
-        copied_summary = (
-            tmp_path
-            / ".gza"
-            / "summaries"
-            / "20260512-runner-rebase-stale-import-superseded.md"
-        )
+        copied_summary = tmp_path / ".gza" / "summaries" / "20260512-runner-rebase-stale-import-superseded.md"
         assert copied_summary.read_text() == refreshed.output_content
 
         assert refreshed.log_file is not None
@@ -20515,13 +21025,19 @@ class TestExtractedRunInnerHelpers:
 
         with (
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
-            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch(
+                "gza.runner._setup_code_task_worktree",
+                side_effect=AssertionError("shared worktree path should be skipped"),
+            ),
             patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
             patch("gza.runner._stage_worktree_agent_resources", return_value=0),
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
             patch(
                 "gza.runner.capture_rebase_diff_baseline",
@@ -20624,13 +21140,19 @@ class TestExtractedRunInnerHelpers:
 
         with (
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
-            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch(
+                "gza.runner._setup_code_task_worktree",
+                side_effect=AssertionError("shared worktree path should be skipped"),
+            ),
             patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
             patch("gza.runner._stage_worktree_agent_resources", return_value=0),
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
             patch(
                 "gza.runner.capture_rebase_diff_baseline",
@@ -20742,13 +21264,19 @@ class TestExtractedRunInnerHelpers:
 
         with (
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
-            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch(
+                "gza.runner._setup_code_task_worktree",
+                side_effect=AssertionError("shared worktree path should be skipped"),
+            ),
             patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
             patch("gza.runner._stage_worktree_agent_resources", return_value=0),
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
             patch(
                 "gza.runner.capture_rebase_diff_baseline",
@@ -20853,19 +21381,23 @@ class TestExtractedRunInnerHelpers:
         mock_main_git = Mock(spec=Git)
         mock_main_git.default_branch.return_value = "main"
         mock_main_git.current_branch.return_value = "main"
-        mock_main_git.is_ancestor.side_effect = lambda ancestor, branch: (
-            ancestor == "main" and branch == parent.branch
-        )
+        mock_main_git.is_ancestor.side_effect = lambda ancestor, branch: ancestor == "main" and branch == parent.branch
 
         with (
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
-            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch(
+                "gza.runner._setup_code_task_worktree",
+                side_effect=AssertionError("shared worktree path should be skipped"),
+            ),
             patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
             patch("gza.runner._stage_worktree_agent_resources", return_value=0),
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
             patch(
                 "gza.runner.capture_rebase_diff_baseline",
@@ -20976,13 +21508,19 @@ class TestExtractedRunInnerHelpers:
 
         with (
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
-            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch(
+                "gza.runner._setup_code_task_worktree",
+                side_effect=AssertionError("shared worktree path should be skipped"),
+            ),
             patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
             patch("gza.runner._stage_worktree_agent_resources", return_value=0),
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch(
                 "gza.runner.capture_rebase_diff_baseline",
                 return_value=RebaseDiffBaseline(
@@ -21089,7 +21627,9 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_parent.merge_status == "unmerged"
 
         surfaced = capsys.readouterr().out
-        assert "Warning: rebase diff comparison unavailable for recovered/resumed rebase; treating as changed" in surfaced
+        assert (
+            "Warning: rebase diff comparison unavailable for recovered/resumed rebase; treating as changed" in surfaced
+        )
         assert "Changed Diff: yes (review must be refreshed)" in surfaced
         assert "rebase diff comparison unavailable for recovered/resumed rebase; treating as changed" in caplog.text
 
@@ -21253,16 +21793,15 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_failed_rebase.review_cleared_at is None
 
         surfaced = capsys.readouterr().out
-        assert "Warning: rebase diff comparison unavailable for recovered/resumed rebase; treating as changed" in surfaced
+        assert (
+            "Warning: rebase diff comparison unavailable for recovered/resumed rebase; treating as changed" in surfaced
+        )
         assert "Changed Diff: yes (review must be refreshed)" in surfaced
         assert "rebase diff comparison unavailable for recovered/resumed rebase; treating as changed" in caplog.text
 
     def test_rebase_task_fails_when_provider_leaves_rebase_in_progress(self, tmp_path: Path, capsys) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "provider: codex\n"
-            "model: gpt-5\n"
-            "project_name: runner-rebase-progress\n"
-            "use_docker: false\n"
+            "provider: codex\nmodel: gpt-5\nproject_name: runner-rebase-progress\nuse_docker: false\n"
         )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
@@ -21410,13 +21949,19 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner.load_dotenv"),
             patch("gza.runner.get_provider", return_value=mock_provider),
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
-            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch(
+                "gza.runner._setup_code_task_worktree",
+                side_effect=AssertionError("shared worktree path should be skipped"),
+            ),
             patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
             patch("gza.runner._stage_worktree_agent_resources", return_value=0) as stage_resources,
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch(
                 "gza.runner.capture_rebase_diff_baseline",
                 return_value=RebaseDiffBaseline(
@@ -21426,7 +21971,12 @@ class TestExtractedRunInnerHelpers:
                 ),
             ),
             patch("gza.runner.is_rebase_in_progress", return_value=False),
-            patch("gza.runner.import_isolated_rebase_tip", side_effect=GitError("git worktree list --porcelain failed: fatal: Invalid path '/gza-git': No such file or directory")),
+            patch(
+                "gza.runner.import_isolated_rebase_tip",
+                side_effect=GitError(
+                    "git worktree list --porcelain failed: fatal: Invalid path '/gza-git': No such file or directory"
+                ),
+            ),
             patch("gza.runner._complete_code_task", side_effect=AssertionError("should fail before completion")),
             patch("gza.runner.task_footer"),
         ):
@@ -21476,12 +22026,12 @@ class TestExtractedRunInnerHelpers:
         summary_path = summary_dir / f"{task.slug}.md"
         worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.slug}.md"
         worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
-        worktree_summary_path.write_text(
-            "- Use task summary for commit subject\n"
-            "- Include task metadata trailers\n"
-        )
+        worktree_summary_path.write_text("- Use task summary for commit subject\n- Include task metadata trailers\n")
 
-        with patch("gza.runner._squash_wip_commits"), patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
             rc = _complete_code_task(
                 task,
                 config,
@@ -21545,7 +22095,10 @@ class TestExtractedRunInnerHelpers:
         summary_path = summary_dir / f"{task.slug}.md"
         worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.slug}.md"
 
-        with patch("gza.runner._squash_wip_commits"), patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
             rc = _complete_code_task(
                 task,
                 config,
@@ -21568,7 +22121,10 @@ class TestExtractedRunInnerHelpers:
     @pytest.mark.parametrize(
         ("summary_error", "expected_warning"),
         [
-            (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), "Failed to read summary file for commit subject"),
+            (
+                UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+                "Failed to read summary file for commit subject",
+            ),
             (OSError("simulated read error"), "Failed to read summary file for commit subject"),
         ],
     )
@@ -21730,6 +22286,7 @@ class TestWriteLogEntry:
     def test_creates_file_and_writes_jsonl(self, tmp_path: Path) -> None:
         """write_log_entry keeps the transcript path and routes gza entries to ops."""
         import json
+
         log_file = tmp_path / "task.log"
         entry = {"type": "gza", "subtype": "info", "message": "Hello"}
         write_log_entry(log_file, entry)
@@ -21742,6 +22299,7 @@ class TestWriteLogEntry:
     def test_appends_multiple_entries(self, tmp_path: Path) -> None:
         """write_log_entry appends gza entries to the derived ops stream."""
         import json
+
         log_file = tmp_path / "task.log"
         entry1 = {"type": "gza", "subtype": "info", "message": "First"}
         entry2 = {"type": "gza", "subtype": "branch", "message": "Second", "branch": "feat/x"}
@@ -21914,11 +22472,7 @@ class TestExceptionHandlerMarkFailed:
 
         log_file = config.project_dir / refreshed.log_file
         assert log_file.exists()
-        ops_entries = [
-            json.loads(line)
-            for line in ops_log_path_for(log_file).read_text().splitlines()
-            if line.strip()
-        ]
+        ops_entries = [json.loads(line) for line in ops_log_path_for(log_file).read_text().splitlines() if line.strip()]
         outcome = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
         assert outcome["message"] == setup_error
         assert outcome["failure_reason"] == "GIT_ERROR"
@@ -21963,7 +22517,9 @@ class TestExceptionHandlerMarkFailed:
                 "gza.runner._project_boundary",
                 return_value=ProjectBoundary(repo_root=tmp_path, scope_root=Path("."), local_dependencies=()),
             ),
-            patch("gza.runner._stage_worktree_agent_resources", side_effect=AssertionError("provider prep should not run")),
+            patch(
+                "gza.runner._stage_worktree_agent_resources", side_effect=AssertionError("provider prep should not run")
+            ),
             patch("gza.runner._copy_learnings_to_worktree", side_effect=AssertionError("provider prep should not run")),
             patch("gza.runner.build_prompt", side_effect=AssertionError("provider should not run")),
         ):
@@ -21987,11 +22543,7 @@ class TestExceptionHandlerMarkFailed:
 
         assert refreshed.log_file is not None
         log_file = config.project_dir / refreshed.log_file
-        ops_entries = [
-            json.loads(line)
-            for line in ops_log_path_for(log_file).read_text().splitlines()
-            if line.strip()
-        ]
+        ops_entries = [json.loads(line) for line in ops_log_path_for(log_file).read_text().splitlines() if line.strip()]
         outcome = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
         assert outcome["failure_reason"] == "WORKSPACE_NOT_POPULATED"
         assert outcome["phase"] == "workspace_setup"
@@ -22087,10 +22639,15 @@ class TestExceptionHandlerMarkFailed:
                 "gza.runner._project_boundary",
                 return_value=ProjectBoundary(repo_root=tmp_path, scope_root=Path("."), local_dependencies=()),
             ),
-            patch("gza.runner._stage_worktree_agent_resources", side_effect=AssertionError("provider prep should not run")),
+            patch(
+                "gza.runner._stage_worktree_agent_resources", side_effect=AssertionError("provider prep should not run")
+            ),
             patch("gza.runner._copy_learnings_to_worktree", side_effect=AssertionError("provider prep should not run")),
             patch("gza.runner.build_prompt", side_effect=AssertionError("provider should not run")),
-            patch("gza.runner._prepare_validated_docker_worktree_git_metadata", side_effect=AssertionError("provider prep should not run")),
+            patch(
+                "gza.runner._prepare_validated_docker_worktree_git_metadata",
+                side_effect=AssertionError("provider prep should not run"),
+            ),
             patch("gza.runner._call_provider_run", side_effect=AssertionError("provider should not run")),
         ):
             rc = _run_non_code_task(task, config, store, provider, git, resume=False)
@@ -22113,11 +22670,7 @@ class TestExceptionHandlerMarkFailed:
 
         assert refreshed.log_file is not None
         log_file = config.project_dir / refreshed.log_file
-        ops_entries = [
-            json.loads(line)
-            for line in ops_log_path_for(log_file).read_text().splitlines()
-            if line.strip()
-        ]
+        ops_entries = [json.loads(line) for line in ops_log_path_for(log_file).read_text().splitlines() if line.strip()]
         outcome = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
         assert outcome["failure_reason"] == "WORKSPACE_NOT_POPULATED"
         assert outcome["phase"] == "workspace_setup"
@@ -22209,11 +22762,7 @@ class TestExceptionHandlerMarkFailed:
 
         log_file = config.project_dir / refreshed.log_file
         assert log_file.exists()
-        ops_entries = [
-            json.loads(line)
-            for line in ops_log_path_for(log_file).read_text().splitlines()
-            if line.strip()
-        ]
+        ops_entries = [json.loads(line) for line in ops_log_path_for(log_file).read_text().splitlines() if line.strip()]
         outcome = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
         assert outcome["message"] == setup_error
         assert outcome["failure_reason"] == "GIT_ERROR"
@@ -22263,14 +22812,8 @@ class TestExceptionHandlerMarkFailed:
 
         log_file = config.project_dir / refreshed.log_file
         assert log_file.exists()
-        conversation_entries = [
-            json.loads(line)
-            for line in log_file.read_text().splitlines()
-            if line.strip()
-        ]
-        startup_entry = next(
-            entry for entry in conversation_entries if entry.get("subtype") == "startup_failure"
-        )
+        conversation_entries = [json.loads(line) for line in log_file.read_text().splitlines() if line.strip()]
+        startup_entry = next(entry for entry in conversation_entries if entry.get("subtype") == "startup_failure")
         assert startup_entry["message"] == startup_error
         assert startup_entry["failure_reason"] == "GIT_ERROR"
         assert startup_entry["phase"] == "runner_startup"
@@ -22279,11 +22822,7 @@ class TestExceptionHandlerMarkFailed:
         assert startup_entry["error_type"] == "GitError"
         assert startup_entry["error_detail"] == startup_error
 
-        ops_entries = [
-            json.loads(line)
-            for line in ops_log_path_for(log_file).read_text().splitlines()
-            if line.strip()
-        ]
+        ops_entries = [json.loads(line) for line in ops_log_path_for(log_file).read_text().splitlines() if line.strip()]
         ops_start = next(entry for entry in ops_entries if entry.get("subtype") == "startup_failure")
         assert ops_start["phase"] == "runner_startup"
         outcome = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
@@ -22338,25 +22877,15 @@ class TestExceptionHandlerMarkFailed:
 
         log_file = config.project_dir / refreshed.log_file
         assert log_file.exists()
-        conversation_entries = [
-            json.loads(line)
-            for line in log_file.read_text().splitlines()
-            if line.strip()
-        ]
-        startup_entry = next(
-            entry for entry in conversation_entries if entry.get("subtype") == "startup_failure"
-        )
+        conversation_entries = [json.loads(line) for line in log_file.read_text().splitlines() if line.strip()]
+        startup_entry = next(entry for entry in conversation_entries if entry.get("subtype") == "startup_failure")
         assert startup_entry["phase"] == "workspace_setup"
         assert startup_entry["setup_phase"] == "worktree_add"
         assert startup_entry["branch"] == "feature/workspace-setup-failure"
         assert startup_entry["error_type"] == "GitError"
         assert startup_entry["error_detail"] == setup_error
 
-        ops_entries = [
-            json.loads(line)
-            for line in ops_log_path_for(log_file).read_text().splitlines()
-            if line.strip()
-        ]
+        ops_entries = [json.loads(line) for line in ops_log_path_for(log_file).read_text().splitlines() if line.strip()]
         ops_start = next(entry for entry in ops_entries if entry.get("subtype") == "startup_failure")
         assert ops_start["phase"] == "workspace_setup"
         assert ops_start["setup_phase"] == "worktree_add"
@@ -22386,7 +22915,9 @@ class TestExceptionHandlerMarkFailed:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
 
-        store.mark_failed(task, log_file=str(log_file.relative_to(tmp_path)), branch="test-branch", failure_reason="GIT_ERROR")
+        store.mark_failed(
+            task, log_file=str(log_file.relative_to(tmp_path)), branch="test-branch", failure_reason="GIT_ERROR"
+        )
 
         # Verify task is now failed
         updated_task = store.get(task.id)
@@ -22410,7 +22941,9 @@ class TestExceptionHandlerMarkFailed:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
 
-        store.mark_failed(task, log_file=str(log_file.relative_to(tmp_path)), branch="test-branch", failure_reason="INTERRUPTED")
+        store.mark_failed(
+            task, log_file=str(log_file.relative_to(tmp_path)), branch="test-branch", failure_reason="INTERRUPTED"
+        )
 
         updated_task = store.get(task.id)
         assert updated_task.status == "failed"
@@ -22498,10 +23031,7 @@ class TestLoadDotenv:
 
         home_gza, project_dir = self._setup_dirs(tmp_path, monkeypatch)
         (home_gza / ".env").write_text(
-            "# This is a comment\n"
-            "\n"
-            "MY_TEST_KEY=valid_value\n"
-            "# COMMENTED_OUT=should_not_exist\n"
+            "# This is a comment\n\nMY_TEST_KEY=valid_value\n# COMMENTED_OUT=should_not_exist\n"
         )
         monkeypatch.delenv("MY_TEST_KEY", raising=False)
         monkeypatch.delenv("COMMENTED_OUT", raising=False)
@@ -22870,7 +23400,7 @@ class TestLoadDotenv:
         monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "ambient-worktree"))
         config = Config.load(project_dir)
         config.verify_command = (
-            f"{sys.executable} -c \"import os, pathlib; "
+            f'{sys.executable} -c "import os, pathlib; '
             "print(pathlib.Path.cwd()); "
             "print(os.environ.get('PWD')); "
             "print(os.environ.get('PROJECT_VERIFY_TOKEN')); "
@@ -22884,6 +23414,7 @@ class TestLoadDotenv:
 
         execution = _run_lifecycle_verify(
             config=config,
+            store=store,
             task=task,
             worktree_git=worktree_git,
             worktree_path=project_dir,
@@ -22903,6 +23434,433 @@ class TestLoadDotenv:
         assert str(poisoned_pwd) not in (execution.aggregate_result.output or "")
         assert os.environ["PROJECT_VERIFY_TOKEN"] == "ambient-after-capture"
         assert os.environ["GIT_WORK_TREE"] == str(tmp_path / "ambient-worktree")
+
+    def _persist_successful_full_suite_runtime(
+        self,
+        store: SqliteTaskStore,
+        config: Config,
+        impl: Task,
+        *,
+        captured_at: datetime,
+        phase_duration_seconds: float,
+        duration_seconds: float | None = None,
+    ) -> None:
+        source = store.add("Successful verify source", task_type="review", depends_on=impl.id)
+        assert source.id is not None
+        output_lines: list[str] = []
+        for phase in ("ruff", "ty", "mypy", "checks", "unit", "functional"):
+            output_lines.append(f"gza-verify phase=start name={phase}")
+            output_lines.append(f"gza-verify phase=passed name={phase} duration_seconds={phase_duration_seconds}")
+        output = "\n".join(output_lines)
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=captured_at,
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(config.project_dir),
+                output=output,
+                duration_seconds=duration_seconds,
+            ),
+            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+            producer="test",
+        )
+
+    def test_lifecycle_verify_budget_margin_accepts_recent_successful_full_suite_runtime(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=600,
+            autonomous_verify_min_margin_seconds=60,
+            autonomous_verify_observation_max_age_hours=24,
+            autonomous_verify_bootstrap_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/verify-budget-margin"
+        store.update(impl)
+        self._persist_successful_full_suite_runtime(
+            store,
+            config,
+            impl,
+            captured_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+            phase_duration_seconds=80.0,
+            duration_seconds=480.0,
+        )
+
+        failure = _lifecycle_verify_budget_margin_failure(
+            config=config,
+            store=store,
+            owner_task=impl,
+            command="./bin/tests",
+            timeout_seconds=600,
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=tmp_path,
+            now=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
+        )
+
+        assert failure is None
+
+    def test_lifecycle_verify_preflight_launches_at_bootstrap_floor_without_runtime_evidence(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=600,
+            autonomous_verify_min_margin_seconds=60,
+            autonomous_verify_observation_max_age_hours=24,
+            autonomous_verify_bootstrap_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/verify-budget-margin"
+        store.update(impl)
+        worktree_git = Mock(spec=Git)
+
+        with patch(
+            "gza.runner._run_review_verify_command",
+            return_value=ReviewVerifyResult(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                output="passed\n",
+                duration_seconds=1.0,
+            ),
+        ) as mock_verify:
+            execution = _run_lifecycle_verify(
+                config=config,
+                store=store,
+                task=impl,
+                worktree_git=worktree_git,
+                worktree_path=tmp_path,
+                cwd=tmp_path,
+                timeout_seconds=600,
+                timeout_grace_seconds=5.0,
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+            )
+
+        mock_verify.assert_called_once()
+        assert execution is not None
+        assert execution.aggregate_result.status == "passed"
+        assert execution.aggregate_result.exit_status == "0"
+
+    def test_lifecycle_verify_budget_margin_fails_loudly_before_unsafe_full_suite_runtime(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=600,
+            autonomous_verify_min_margin_seconds=60,
+            autonomous_verify_observation_max_age_hours=24,
+            autonomous_verify_bootstrap_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/verify-budget-margin"
+        store.update(impl)
+        self._persist_successful_full_suite_runtime(
+            store,
+            config,
+            impl,
+            captured_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+            phase_duration_seconds=92.0,
+            duration_seconds=552.0,
+        )
+
+        failure = _lifecycle_verify_budget_margin_failure(
+            config=config,
+            store=store,
+            owner_task=impl,
+            command="./bin/tests",
+            timeout_seconds=600,
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=tmp_path,
+            now=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
+        )
+
+        assert failure is not None
+        assert failure.status == "unavailable"
+        assert failure.exit_status == "insufficient verify budget margin"
+        assert failure.failure_origin == "insufficient_budget_margin"
+        assert "latest successful ./bin/tests runtime was 552.0s" in (failure.failure or "")
+
+    def test_lifecycle_verify_budget_margin_uses_persisted_wall_clock_runtime_over_phase_sum(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=600,
+            autonomous_verify_min_margin_seconds=60,
+            autonomous_verify_observation_max_age_hours=24,
+            autonomous_verify_bootstrap_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/verify-budget-margin"
+        store.update(impl)
+        self._persist_successful_full_suite_runtime(
+            store,
+            config,
+            impl,
+            captured_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+            phase_duration_seconds=80.0,
+            duration_seconds=560.0,
+        )
+
+        failure = _lifecycle_verify_budget_margin_failure(
+            config=config,
+            store=store,
+            owner_task=impl,
+            command="./bin/tests",
+            timeout_seconds=600,
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=tmp_path,
+            now=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
+        )
+
+        assert failure is not None
+        assert failure.exit_status == "insufficient verify budget margin"
+        assert "latest successful ./bin/tests runtime was 560.0s" in (failure.failure or "")
+
+    @pytest.mark.parametrize(
+        ("phase_duration_seconds", "expected_failure"),
+        [
+            (92.0, True),
+            (80.0, False),
+        ],
+    )
+    def test_lifecycle_verify_budget_margin_uses_project_scope_runtime_observation(
+        self,
+        tmp_path: Path,
+        phase_duration_seconds: float,
+        expected_failure: bool,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=600,
+            autonomous_verify_min_margin_seconds=60,
+            autonomous_verify_observation_max_age_hours=24,
+            autonomous_verify_bootstrap_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        task_a = store.add("Implement feature A", task_type="implement")
+        assert task_a.id is not None
+        task_a.branch = "feature/verify-budget-margin-a"
+        store.update(task_a)
+        task_b = store.add("Implement feature B", task_type="implement")
+        assert task_b.id is not None
+        task_b.branch = "feature/verify-budget-margin-b"
+        store.update(task_b)
+        self._persist_successful_full_suite_runtime(
+            store,
+            config,
+            task_a,
+            captured_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+            phase_duration_seconds=phase_duration_seconds,
+            duration_seconds=phase_duration_seconds * 6,
+        )
+
+        failure = _lifecycle_verify_budget_margin_failure(
+            config=config,
+            store=store,
+            owner_task=task_b,
+            command="./bin/tests",
+            timeout_seconds=600,
+            reviewed_branch=task_b.branch,
+            reviewed_head_sha="head-b",
+            reviewed_base_sha="base-1",
+            working_directory=tmp_path,
+            now=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
+        )
+
+        assert (failure is not None) is expected_failure
+        if failure is not None:
+            assert failure.exit_status == "insufficient verify budget margin"
+            assert "latest successful ./bin/tests runtime was 552.0s" in (failure.failure or "")
+
+    def test_lifecycle_verify_budget_margin_missing_project_observation_follows_bootstrap_policy(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            autonomous_verify_min_margin_seconds=60,
+            autonomous_verify_observation_max_age_hours=24,
+            autonomous_verify_bootstrap_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/verify-budget-margin"
+        store.update(impl)
+
+        failure = _lifecycle_verify_budget_margin_failure(
+            config=config,
+            store=store,
+            owner_task=impl,
+            command="./bin/tests",
+            timeout_seconds=120,
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=tmp_path,
+            now=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
+        )
+
+        assert failure is not None
+        assert failure.exit_status == "insufficient verify budget margin"
+        assert "observation is missing or older than 24h" in (failure.failure or "")
+        assert "conservative bootstrap floor (600s)" in (failure.failure or "")
+
+    @pytest.mark.parametrize(
+        ("timeout_seconds", "expected_failure"),
+        [
+            (600, False),
+            (660, False),
+            (120, True),
+        ],
+    )
+    def test_lifecycle_verify_budget_margin_missing_or_stale_observation_follows_bootstrap_policy(
+        self,
+        tmp_path: Path,
+        timeout_seconds: int,
+        expected_failure: bool,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=timeout_seconds,
+            autonomous_verify_min_margin_seconds=60,
+            autonomous_verify_observation_max_age_hours=24,
+            autonomous_verify_bootstrap_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/verify-budget-margin"
+        store.update(impl)
+        self._persist_successful_full_suite_runtime(
+            store,
+            config,
+            impl,
+            captured_at=datetime(2026, 8, 27, 12, 0, tzinfo=UTC),
+            phase_duration_seconds=80.0,
+        )
+
+        failure = _lifecycle_verify_budget_margin_failure(
+            config=config,
+            store=store,
+            owner_task=impl,
+            command="./bin/tests",
+            timeout_seconds=timeout_seconds,
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=tmp_path,
+            now=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
+        )
+
+        assert (failure is not None) is expected_failure
+        if failure is not None:
+            assert failure.exit_status == "insufficient verify budget margin"
+            assert "observation is missing or older than 24h" in (failure.failure or "")
+
+    def test_lifecycle_verify_budget_margin_ignores_phase_sum_when_wall_clock_missing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=600,
+            autonomous_verify_min_margin_seconds=60,
+            autonomous_verify_observation_max_age_hours=24,
+            autonomous_verify_bootstrap_timeout_seconds=660,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/verify-budget-margin"
+        store.update(impl)
+        self._persist_successful_full_suite_runtime(
+            store,
+            config,
+            impl,
+            captured_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+            phase_duration_seconds=88.0,
+            duration_seconds=None,
+        )
+
+        failure = _lifecycle_verify_budget_margin_failure(
+            config=config,
+            store=store,
+            owner_task=impl,
+            command="./bin/tests",
+            timeout_seconds=600,
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=tmp_path,
+            now=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
+        )
+
+        assert failure is not None
+        assert failure.exit_status == "insufficient verify budget margin"
+        assert "observation is missing or older than 24h" in (failure.failure or "")
+        assert "conservative bootstrap floor (660s)" in (failure.failure or "")
 
 
 class TestDependencyMergePrecondition:
@@ -22958,7 +23916,9 @@ class TestDependencyMergePrecondition:
         dep_task.slug = "20260412-upstream-failed"
         dep_task.branch = "test/original-upstream-branch"
         store.mark_in_progress(dep_task)
-        store.mark_failed(dep_task, branch=dep_task.branch, log_file="logs/upstream-failed.log", failure_reason="UNKNOWN")
+        store.mark_failed(
+            dep_task, branch=dep_task.branch, log_file="logs/upstream-failed.log", failure_reason="UNKNOWN"
+        )
 
         retry_task = store.add(prompt="Retry upstream task", task_type="implement", based_on=dep_task.id)
         retry_task.slug = "20260412-upstream-retry"
@@ -23427,6 +24387,7 @@ class TestDependencyMergePrecondition:
         assert target_branch == "main"
         assert git_error is None
 
+
 class TestGetPlanForTask:
     def test_finds_plan_via_depends_on_only(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
@@ -23580,14 +24541,15 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = (
-            "printf 'gza-verify phase=failed name=pytest duration_seconds=3.5\\n"
-            "lint failed\\n' && exit 7"
+            "printf 'gza-verify phase=failed name=pytest duration_seconds=3.5\\nlint failed\\n' && exit 7"
         )
         config.autonomous_verify_timeout_seconds = 120
 
         captured_prompts: list[str] = []
 
-        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             captured_prompts.append(prompt)
             report_dir = work_dir / ".gza" / "reviews"
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -23612,9 +24574,7 @@ class TestProviderPromptSanitization:
         git.get_diff.return_value = ""
         git.get_diff_stat.return_value = ""
 
-        with patch("gza.runner._run_lifecycle_verify") as run_lifecycle_verify, patch(
-            "gza.runner.post_review_to_pr"
-        ):
+        with patch("gza.runner._run_lifecycle_verify") as run_lifecycle_verify, patch("gza.runner.post_review_to_pr"):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
         assert exit_code == 0
@@ -23658,7 +24618,9 @@ class TestProviderPromptSanitization:
         config.verify_command = "printf 'all good\\n'"
         config.autonomous_verify_timeout_seconds = 120
 
-        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             report_dir = work_dir / ".gza" / "reviews"
             report_dir.mkdir(parents=True, exist_ok=True)
             (report_dir / f"{task.slug}.md").write_text("# Review\n\nVerdict: APPROVED")
@@ -23682,9 +24644,7 @@ class TestProviderPromptSanitization:
         git.get_diff.return_value = ""
         git.get_diff_stat.return_value = ""
 
-        with patch("gza.runner._run_lifecycle_verify") as run_lifecycle_verify, patch(
-            "gza.runner.post_review_to_pr"
-        ):
+        with patch("gza.runner._run_lifecycle_verify") as run_lifecycle_verify, patch("gza.runner.post_review_to_pr"):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
         assert exit_code == 0
@@ -23724,7 +24684,9 @@ class TestProviderPromptSanitization:
         config.verify_command = "./bin/tests"
         config.autonomous_verify_timeout_seconds = 120
 
-        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             report_dir = work_dir / ".gza" / "reviews"
             report_dir.mkdir(parents=True, exist_ok=True)
             (report_dir / f"{task.slug}.md").write_text("# Review\n\nVerdict: CHANGES_REQUESTED")
@@ -23748,9 +24710,7 @@ class TestProviderPromptSanitization:
         git.get_diff.return_value = ""
         git.get_diff_stat.return_value = ""
 
-        with patch("gza.runner._run_lifecycle_verify") as run_lifecycle_verify, patch(
-            "gza.runner.post_review_to_pr"
-        ):
+        with patch("gza.runner._run_lifecycle_verify") as run_lifecycle_verify, patch("gza.runner.post_review_to_pr"):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
         assert exit_code == 0
@@ -23792,7 +24752,9 @@ class TestProviderPromptSanitization:
 
         captured_prompts: list[str] = []
 
-        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             captured_prompts.append(prompt)
             report_dir = work_dir / ".gza" / "reviews"
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -23851,10 +24813,14 @@ class TestProviderPromptSanitization:
             project_results=(),
         )
 
-        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
-             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"), \
-             patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify) as mock_cross_project_verify, \
-             patch("gza.runner.post_review_to_pr"):
+        with (
+            patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"),
+            patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"),
+            patch(
+                "gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify
+            ) as mock_cross_project_verify,
+            patch("gza.runner.post_review_to_pr"),
+        ):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
         assert exit_code == 0
@@ -24692,6 +25658,856 @@ class TestProviderPromptSanitization:
         assert action["type"] != "verify_gate"
 
     @pytest.mark.parametrize(
+        ("output", "failure_origin", "expected_action_type", "expected_reason"),
+        [
+            (
+                "\n".join(
+                    [
+                        "gza-verify phase=start name=ruff",
+                        "gza-verify phase=passed name=ruff duration_seconds=1.4",
+                        "gza-verify phase=start name=ty",
+                        "gza-verify phase=passed name=ty duration_seconds=1.4",
+                        "gza-verify phase=start name=mypy",
+                        "gza-verify phase=passed name=mypy duration_seconds=25.6",
+                        "gza-verify phase=start name=checks",
+                        "gza-verify phase=passed name=checks duration_seconds=4.9",
+                        "gza-verify phase=start name=unit",
+                        "gza-verify phase=passed name=unit duration_seconds=558.9",
+                    ]
+                ),
+                "timeout",
+                "needs_discussion",
+                PARK_REASON_VERIFY_BUDGET_EXCEEDED,
+            ),
+            (
+                "gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=3.25",
+                "test_failure",
+                "create_verify_fix",
+                None,
+            ),
+            (
+                "gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=3.25",
+                "timeout",
+                "create_verify_fix",
+                None,
+            ),
+            (
+                "",
+                "timeout",
+                "needs_discussion",
+                PARK_REASON_VERIFY_BUDGET_EXCEEDED,
+            ),
+        ],
+    )
+    def test_verify_gate_timeout_budget_routing_depends_on_failed_phase_evidence(
+        self,
+        tmp_path: Path,
+        output: str,
+        failure_origin: str,
+        expected_action_type: str,
+        expected_reason: str | None,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/verify-budget-routing"
+        impl.has_commits = True
+        store.update(impl)
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
+        review.review_verify_head_sha = "head-1"
+        review.output_content = "# Review\n\nVerdict: APPROVED\n"
+        store.update(review)
+
+        improve = store.add(
+            "Improve feature",
+            task_type="improve",
+            depends_on=review.id,
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert improve.id is not None
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 8, 28, 18, 30, tzinfo=UTC)
+        improve.branch = impl.branch
+        improve.changed_diff = True
+        improve.review_verify_head_sha = "head-1"
+        store.update(improve)
+
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=improve,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 37, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 600s",
+                output=output,
+                failure_origin=failure_origin,
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+
+        lifecycle_git = Mock()
+        lifecycle_git.can_merge.return_value = True
+        lifecycle_git.is_merged.return_value = False
+        lifecycle_git.branch_exists.return_value = True
+        lifecycle_git.ref_exists.return_value = False
+        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
+        lifecycle_git.is_ancestor.return_value = False
+        lifecycle_git.count_commits_behind_checked.return_value = 0
+        lifecycle_git.count_commits_ahead_checked.return_value = 1
+        lifecycle_git.get_diff_name_status.return_value = ""
+        lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
+
+        action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
+
+        assert action["type"] == expected_action_type, action
+        if expected_reason is not None:
+            assert action["needs_attention_reason"] == expected_reason
+            if output:
+                assert "completed phases: ruff, ty, mypy, checks, unit" in action["description"]
+                assert "never-started phases: functional" in action["description"]
+            else:
+                assert "completed phases:" not in action["description"]
+                assert "never-started phases: ruff, ty, mypy, checks, unit, functional" in action["description"]
+            assert action["verify_phase_summary"]["failed"] == []
+            assert action["verify_phase_summary"]["completed_count"] == (5 if output else 0)
+            assert action["verify_phase_summary"]["never_started"] == (
+                ["functional"] if output else ["ruff", "ty", "mypy", "checks", "unit", "functional"]
+            )
+            assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+        else:
+            assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    def test_verify_gate_timeout_with_malformed_phase_summary_parks_as_invalid_evidence(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/verify-malformed-summary"
+        impl.has_commits = True
+        store.update(impl)
+
+        source = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert source.id is not None
+        source.status = "completed"
+        source.completed_at = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
+        source.review_verify_head_sha = "head-1"
+        source.output_content = "# Review\n\nVerdict: APPROVED\n"
+        store.update(source)
+
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 37, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 600s",
+                output="gza-verify phase=start name=unit\n",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        artifact = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert artifact.metadata is not None
+        malformed = dict(artifact.metadata)
+        malformed["phase_summary"] = {"completed": [], "passed": [], "running": [], "never_started": []}
+        store.add_artifact(
+            impl.id,
+            kind=artifact.kind,
+            label=artifact.label,
+            path=artifact.path,
+            content_type=artifact.content_type,
+            byte_size=artifact.byte_size,
+            sha256=artifact.sha256,
+            created_at=artifact.created_at,
+            producer=artifact.producer,
+            command=artifact.command,
+            status=artifact.status,
+            exit_status=artifact.exit_status,
+            head_sha=artifact.head_sha,
+            metadata=malformed,
+            artifact_id=artifact.id,
+        )
+
+        lifecycle_git = Mock()
+        lifecycle_git.can_merge.return_value = True
+        lifecycle_git.is_merged.return_value = False
+        lifecycle_git.branch_exists.return_value = True
+        lifecycle_git.ref_exists.return_value = False
+        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
+        lifecycle_git.is_ancestor.return_value = False
+        lifecycle_git.count_commits_behind_checked.return_value = 0
+        lifecycle_git.count_commits_ahead_checked.return_value = 1
+        lifecycle_git.get_diff_name_status.return_value = ""
+        lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
+
+        action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
+
+        assert action["type"] == "needs_discussion"
+        assert action["needs_attention_reason"] == PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID
+        assert "phase_summary.failed must be a list" in action["description"]
+        assert "verify_phase_summary" not in action
+        assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    def _lifecycle_git_for_head(self, branch: str) -> Mock:
+        lifecycle_git = Mock()
+        lifecycle_git.can_merge.return_value = True
+        lifecycle_git.is_merged.return_value = False
+        lifecycle_git.branch_exists.return_value = True
+        lifecycle_git.ref_exists.return_value = False
+        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", branch: "head-1"}.get(ref)
+        lifecycle_git.is_ancestor.return_value = False
+        lifecycle_git.count_commits_behind_checked.return_value = 0
+        lifecycle_git.count_commits_ahead_checked.return_value = 1
+        lifecycle_git.get_diff_name_status.return_value = ""
+        lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch_name: ResolvedMergeSourceRef(branch_name)
+        return lifecycle_git
+
+    def _setup_approved_impl_for_verify_gate(self, tmp_path: Path) -> tuple[SqliteTaskStore, Config, Task, Task]:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/verify-legacy-budget-routing"
+        impl.has_commits = True
+        store.update(impl)
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
+        review.review_verify_head_sha = "head-1"
+        review.output_content = "# Review\n\nVerdict: APPROVED\n"
+        store.update(review)
+        improve = store.add(
+            "Improve feature",
+            task_type="improve",
+            depends_on=review.id,
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert improve.id is not None
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 8, 28, 18, 30, tzinfo=UTC)
+        improve.branch = impl.branch
+        improve.changed_diff = True
+        improve.review_verify_head_sha = "head-1"
+        store.update(improve)
+        return store, config, impl, improve
+
+    def _persist_legacy_timeout_gate_without_summary(
+        self,
+        store: SqliteTaskStore,
+        config: Config,
+        impl: Task,
+        source: Task,
+        *,
+        raw_output: str | None,
+    ) -> None:
+        artifact_path: str | None = None
+        artifact_id: int | None = None
+        if raw_output is not None:
+            assert impl.id is not None
+            artifact_path = f".gza/artifacts/{impl.id}/legacy-verify-output.txt"
+            resolved = Path(config.project_dir) / artifact_path
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.write_text(raw_output, encoding="utf-8")
+            artifact = store.add_artifact(
+                impl.id,
+                kind="verify_command_output",
+                label="verify_command",
+                path=artifact_path,
+                byte_size=len(raw_output.encode("utf-8")),
+                sha256="0" * 64,
+                created_at=datetime(2026, 8, 28, 18, 36, tzinfo=UTC),
+                producer="test",
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                head_sha="head-1",
+            )
+            artifact_id = artifact.id
+        else:
+            artifact_path = ".gza/artifacts/missing/legacy-verify-output.txt"
+
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 37, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(config.project_dir),
+                failure="verify_command timed out after 600s",
+                output=raw_output or "",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            output_artifact_id=artifact_id,
+            output_artifact_task_id=impl.id,
+            output_artifact_path=artifact_path,
+            producer="test",
+        )
+        assert impl.id is not None
+        gate = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert gate.metadata is not None
+        legacy_metadata = dict(gate.metadata)
+        legacy_metadata.pop("phase_summary", None)
+        result_payload = dict(legacy_metadata["result"])
+        result_payload.pop("failure_origin", None)
+        legacy_metadata["result"] = result_payload
+        store.add_artifact(
+            impl.id,
+            kind=gate.kind,
+            label=gate.label,
+            path=gate.path,
+            content_type=gate.content_type,
+            byte_size=gate.byte_size,
+            sha256=gate.sha256,
+            created_at=gate.created_at,
+            producer=gate.producer,
+            command=gate.command,
+            status=gate.status,
+            exit_status=gate.exit_status,
+            head_sha=gate.head_sha,
+            metadata=legacy_metadata,
+            artifact_id=gate.id,
+        )
+
+    @pytest.mark.parametrize(
+        ("raw_output", "expected_action_type", "expected_reason"),
+        [
+            (
+                "\n".join(
+                    [
+                        "gza-verify phase=start name=ruff",
+                        "gza-verify phase=passed name=ruff duration_seconds=1.4",
+                        "gza-verify phase=start name=unit",
+                        "gza-verify phase=passed name=unit duration_seconds=10.0",
+                    ]
+                ),
+                "needs_discussion",
+                PARK_REASON_VERIFY_BUDGET_EXCEEDED,
+            ),
+            (
+                "gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=3.25",
+                "create_verify_fix",
+                None,
+            ),
+            (None, "needs_discussion", PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID),
+        ],
+    )
+    def test_verify_gate_legacy_timeout_artifact_resolves_phase_evidence(
+        self,
+        tmp_path: Path,
+        raw_output: str | None,
+        expected_action_type: str,
+        expected_reason: str | None,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        self._persist_legacy_timeout_gate_without_summary(
+            store,
+            config,
+            impl,
+            review,
+            raw_output=raw_output,
+        )
+
+        action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
+
+        assert action["type"] == expected_action_type, action
+        if expected_reason is not None:
+            assert action["needs_attention_reason"] == expected_reason
+        if expected_reason == PARK_REASON_VERIFY_BUDGET_EXCEEDED:
+            assert action["verify_phase_summary"]["failed"] == []
+        if expected_reason == PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID:
+            assert "persisted verify output is unavailable" in action["description"]
+            assert "verify_phase_summary" not in action
+        if expected_action_type != "create_verify_fix":
+            assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    @pytest.mark.parametrize(
+        ("project_outputs", "expected_aggregate_status", "expected_action_type", "expected_reason"),
+        [
+            (
+                (
+                    ("services/foo", "./bin/foo-verify", "failed", "timed out", "timeout", "gza-verify phase=start name=unit\n"),
+                    (
+                        "libs/bar",
+                        "./bin/bar-verify",
+                        "passed",
+                        "0",
+                        None,
+                        "gza-verify phase=start name=unit\ngza-verify phase=passed name=unit duration_seconds=2.0",
+                    ),
+                ),
+                "failed",
+                "needs_discussion",
+                PARK_REASON_VERIFY_BUDGET_EXCEEDED,
+            ),
+            (
+                (
+                    (
+                        "services/foo",
+                        "./bin/foo-verify",
+                        "failed",
+                        "timed out",
+                        "timeout",
+                        "gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=3.25",
+                    ),
+                ),
+                "failed",
+                "create_verify_fix",
+                None,
+            ),
+            (
+                (
+                    ("services/foo", "./bin/tests", "failed", "timed out", "timeout", "gza-verify phase=start name=unit\n"),
+                    ("libs/bar", "./bin/tests", "unavailable", "launch failed", None, ""),
+                ),
+                "unavailable",
+                "needs_discussion",
+                None,
+            ),
+            (
+                (
+                    ("services/foo", "./bin/foo-verify", "failed", "timed out", "timeout", "gza-verify phase=start name=unit\n"),
+                    ("libs/bar", "./bin/bar-verify", "unavailable", "launch failed", None, ""),
+                ),
+                "unavailable",
+                "needs_discussion",
+                None,
+            ),
+            (
+                (
+                    (
+                        "services/foo",
+                        "./bin/tests",
+                        "failed",
+                        "timed out",
+                        "timeout",
+                        "gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=3.25",
+                    ),
+                    ("libs/bar", "./bin/tests", "unavailable", "launch failed", None, ""),
+                ),
+                "failed",
+                "create_verify_fix",
+                None,
+            ),
+        ],
+    )
+    def test_verify_gate_cross_project_timeout_aggregate_preserves_phase_evidence(
+        self,
+        tmp_path: Path,
+        project_outputs: tuple[tuple[str, str, str, str, str | None, str], ...],
+        expected_aggregate_status: str,
+        expected_action_type: str,
+        expected_reason: str | None,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        config.verify_command = "(per-project verify_command)"
+        project_results = []
+        for scope, command, status, exit_status, failure_origin, output in project_outputs:
+            project_results.append(
+                ProjectReviewVerifyResult(
+                    project=None,
+                    scope=scope,
+                    working_directory=scope,
+                    result=ReviewVerifyResult(
+                        command=command,
+                        status=status,
+                        exit_status=exit_status,
+                        captured_at=datetime(2026, 8, 28, 18, 37, tzinfo=UTC),
+                        reviewed_branch=impl.branch,
+                        reviewed_head_sha="head-1",
+                        reviewed_base_sha="base-1",
+                        working_directory=scope,
+                        failure="verify_command timed out after 600s" if failure_origin == "timeout" else None,
+                        output=output,
+                        failure_origin=failure_origin,
+                    ),
+                )
+            )
+        aggregate = _aggregate_cross_project_verify_result(
+            command="(per-project verify_command)",
+            captured_at=datetime(2026, 8, 28, 18, 38, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            project_results=project_results,
+        )
+        assert aggregate.status == expected_aggregate_status
+        if expected_aggregate_status == "unavailable":
+            assert aggregate.failure_origin is None
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=aggregate,
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+            aggregate_details={
+                "runnable_count": len(project_results),
+                "scopes": [
+                    {
+                        "scope": entry.scope,
+                        "working_directory": entry.working_directory,
+                        "status": entry.result.status if entry.result is not None else "skipped",
+                        "exit_status": entry.result.exit_status if entry.result is not None else None,
+                        "failure_origin": entry.result.failure_origin if entry.result is not None else None,
+                        "command_identity": (
+                            entry.result.command if entry.result is not None else None
+                        ),
+                        "phase_summary": (
+                            summarize_verify_phases(command=entry.result.command, output=entry.result.output)
+                            if entry.result is not None
+                            else None
+                        ),
+                    }
+                    for entry in project_results
+                ],
+            },
+        )
+
+        action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
+
+        assert action["type"] == expected_action_type, action
+        if expected_reason is not None:
+            assert action["needs_attention_reason"] == expected_reason
+            assert action["verify_phase_summary"]["failed"] == []
+        if expected_action_type != "create_verify_fix":
+            assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    def test_verify_gate_timeout_with_contradictory_phase_summary_parks_as_invalid_evidence(self, tmp_path: Path) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 37, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 600s",
+                output="gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=3.25",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        gate = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert gate.metadata is not None
+        malformed = dict(gate.metadata)
+        malformed["phase_summary"] = {
+            "completed": [{"name": "unit", "status": "failed", "duration_seconds": 3.25}],
+            "passed": [],
+            "failed": [],
+            "running": [],
+            "never_started": [],
+            "last_observed": "unit",
+            "observed_count": 1,
+            "completed_count": 1,
+            "total_duration_seconds": 3.25,
+        }
+        store.add_artifact(
+            impl.id,
+            kind=gate.kind,
+            label=gate.label,
+            path=gate.path,
+            content_type=gate.content_type,
+            byte_size=gate.byte_size,
+            sha256=gate.sha256,
+            created_at=gate.created_at,
+            producer=gate.producer,
+            command=gate.command,
+            status=gate.status,
+            exit_status=gate.exit_status,
+            head_sha=gate.head_sha,
+            metadata=malformed,
+            artifact_id=gate.id,
+        )
+
+        action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
+
+        assert action["type"] == "needs_discussion"
+        assert action["needs_attention_reason"] == PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID
+        assert "phase_summary.failed does not match completed failed phases" in action["description"]
+        assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    @pytest.mark.parametrize(
+        ("phase_summary", "expected_reason"),
+        [
+            (
+                {
+                    "completed": [],
+                    "passed": [],
+                    "failed": [],
+                    "running": [],
+                    "never_started": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+                    "last_observed": "unit",
+                    "observed_count": 0,
+                    "completed_count": 0,
+                    "total_duration_seconds": None,
+                },
+                "phase_summary.last_observed must be null when observed_count is zero",
+            ),
+            (
+                {
+                    "completed": [{"name": "ruff", "status": "passed", "duration_seconds": 1.0}],
+                    "passed": ["ruff"],
+                    "failed": [],
+                    "running": [],
+                    "never_started": ["ty", "mypy", "checks", "unit"],
+                    "last_observed": "ruff",
+                    "observed_count": 1,
+                    "completed_count": 1,
+                    "total_duration_seconds": 1.0,
+                },
+                "phase_summary omits known ./bin/tests phases: functional",
+            ),
+            (
+                {
+                    "completed": [
+                        {"name": "ruff", "status": "passed", "duration_seconds": 1.0},
+                        {"name": "ruff", "status": "passed", "duration_seconds": 1.0},
+                    ],
+                    "passed": ["ruff", "ruff"],
+                    "failed": [],
+                    "running": [],
+                    "never_started": ["ty", "mypy", "checks", "unit", "functional"],
+                    "last_observed": "ruff",
+                    "observed_count": 2,
+                    "completed_count": 2,
+                    "total_duration_seconds": 2.0,
+                },
+                "phase_summary.completed contains duplicate phases",
+            ),
+            (
+                {
+                    "completed": [],
+                    "passed": [],
+                    "failed": [],
+                    "running": [],
+                    "never_started": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+                    "last_observed": "unknown",
+                    "observed_count": 1,
+                    "completed_count": 0,
+                    "total_duration_seconds": None,
+                },
+                "phase_summary.last_observed must name a completed or running phase",
+            ),
+            (
+                {
+                    "completed": [],
+                    "passed": [],
+                    "failed": [],
+                    "running": [],
+                    "never_started": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+                    "last_observed": "unit",
+                    "observed_count": 1,
+                    "completed_count": 0,
+                    "total_duration_seconds": None,
+                },
+                "phase_summary.last_observed must name a completed or running phase",
+            ),
+            (
+                {
+                    "completed": [{"name": "ruff", "status": "passed", "duration_seconds": 1.0}],
+                    "passed": ["ruff"],
+                    "failed": [],
+                    "running": ["unit"],
+                    "never_started": ["ty", "mypy", "checks", "functional"],
+                    "last_observed": "unit",
+                    "observed_count": 1,
+                    "completed_count": 1,
+                    "total_duration_seconds": 1.0,
+                },
+                "phase_summary.observed_count must include completed phases and running starts",
+            ),
+        ],
+    )
+    def test_verify_gate_timeout_with_malformed_known_phase_summary_parks_as_invalid_evidence(
+        self,
+        tmp_path: Path,
+        phase_summary: dict[str, object],
+        expected_reason: str,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 37, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 600s",
+                output="gza-verify phase=start name=unit\n",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        gate = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert gate.metadata is not None
+        malformed = dict(gate.metadata)
+        malformed["phase_summary"] = phase_summary
+        store.add_artifact(
+            impl.id,
+            kind=gate.kind,
+            label=gate.label,
+            path=gate.path,
+            content_type=gate.content_type,
+            byte_size=gate.byte_size,
+            sha256=gate.sha256,
+            created_at=gate.created_at,
+            producer=gate.producer,
+            command=gate.command,
+            status=gate.status,
+            exit_status=gate.exit_status,
+            head_sha=gate.head_sha,
+            metadata=malformed,
+            artifact_id=gate.id,
+        )
+
+        action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
+
+        assert action["type"] == "needs_discussion"
+        assert action["needs_attention_reason"] == PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID
+        assert expected_reason in action["description"]
+        assert PARK_REASON_VERIFY_BUDGET_EXCEEDED not in action["description"]
+        assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    def test_verify_gate_timeout_with_malformed_aggregate_phase_summary_parks_as_invalid_evidence(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        config.verify_command = "(per-project verify_command)"
+        aggregate = ReviewVerifyResult(
+            command="(per-project verify_command)",
+            status="failed",
+            exit_status="0 passed, 1 failed, 0 unavailable",
+            captured_at=datetime(2026, 8, 28, 18, 38, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="(per-project; see artifact)",
+            failure="one or more affected projects failed review verification",
+            failure_origin="timeout",
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=aggregate,
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+            aggregate_details={
+                "runnable_count": 1,
+                "scopes": [
+                    {
+                        "scope": "libs/bar",
+                        "working_directory": str(tmp_path / "libs" / "bar"),
+                        "status": "failed",
+                        "exit_status": "timed out",
+                        "command_identity": "./bin/tests",
+                        "phase_summary": {
+                            "completed": [],
+                            "passed": [],
+                            "failed": [],
+                            "running": [],
+                            "never_started": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+                            "last_observed": "unit",
+                            "observed_count": 0,
+                            "completed_count": 0,
+                            "total_duration_seconds": None,
+                        },
+                    }
+                ],
+            },
+        )
+
+        action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
+
+        assert action["type"] == "needs_discussion"
+        assert action["needs_attention_reason"] == PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID
+        assert "aggregate scope libs/bar: phase_summary.last_observed must be null" in action["description"]
+        assert PARK_REASON_VERIFY_BUDGET_EXCEEDED not in action["description"]
+        assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    @pytest.mark.parametrize(
         "pre_run_status",
         [
             {("M", "src/impl.py")},
@@ -25517,7 +27333,9 @@ class TestProviderPromptSanitization:
         config.verify_command = ""
         config.autonomous_verify_timeout_seconds = 120
 
-        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             report_dir = work_dir / ".gza" / "reviews"
             report_dir.mkdir(parents=True, exist_ok=True)
             (report_dir / f"{task.slug}.md").write_text("# Review\n\nVerdict: CHANGES_REQUESTED")
@@ -25623,10 +27441,12 @@ class TestProviderPromptSanitization:
             project_results=project_results,
         )
 
-        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
-             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"), \
-             patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify), \
-             patch("gza.runner.post_review_to_pr"):
+        with (
+            patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"),
+            patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"),
+            patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify),
+            patch("gza.runner.post_review_to_pr"),
+        ):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
         assert exit_code == 0
@@ -25665,7 +27485,9 @@ class TestProviderPromptSanitization:
 
         captured_prompts: list[str] = []
 
-        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             captured_prompts.append(prompt)
             report_dir = work_dir / ".gza" / "reviews"
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -25724,10 +27546,12 @@ class TestProviderPromptSanitization:
             project_results=(),
         )
 
-        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
-             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"), \
-             patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify), \
-             patch("gza.runner.post_review_to_pr"):
+        with (
+            patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"),
+            patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"),
+            patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify),
+            patch("gza.runner.post_review_to_pr"),
+        ):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
         assert exit_code == 0
@@ -25743,7 +27567,9 @@ class TestProviderPromptSanitization:
         assert refreshed.review_verify_base_sha is None
         assert refreshed.review_verify_branch is None
 
-    def test_cross_project_review_does_not_persist_failed_aggregate_when_other_project_is_unavailable(self, tmp_path: Path):
+    def test_cross_project_review_does_not_persist_failed_aggregate_when_other_project_is_unavailable(
+        self, tmp_path: Path
+    ):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl = store.add(prompt="Implement feature X", task_type="implement")
         impl.status = "completed"
@@ -25773,7 +27599,9 @@ class TestProviderPromptSanitization:
 
         captured_prompts: list[str] = []
 
-        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             captured_prompts.append(prompt)
             report_dir = work_dir / ".gza" / "reviews"
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -25843,10 +27671,12 @@ class TestProviderPromptSanitization:
             project_results=(),
         )
 
-        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
-             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"), \
-             patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify), \
-             patch("gza.runner.post_review_to_pr"):
+        with (
+            patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"),
+            patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"),
+            patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify),
+            patch("gza.runner.post_review_to_pr"),
+        ):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
         assert exit_code == 0
@@ -25895,7 +27725,9 @@ class TestProviderPromptSanitization:
 
         captured_prompts: list[str] = []
 
-        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             captured_prompts.append(prompt)
             report_dir = work_dir / ".gza" / "reviews"
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -25970,10 +27802,12 @@ class TestProviderPromptSanitization:
             ),
         )
 
-        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
-             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"), \
-             patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify), \
-             patch("gza.runner.post_review_to_pr"):
+        with (
+            patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"),
+            patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"),
+            patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify),
+            patch("gza.runner.post_review_to_pr"),
+        ):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
         assert exit_code == 0
@@ -26020,7 +27854,9 @@ class TestProviderPromptSanitization:
 
         captured_prompts: list[str] = []
 
-        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             captured_prompts.append(prompt)
             report_dir = work_dir / ".gza" / "reviews"
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -26095,10 +27931,12 @@ class TestProviderPromptSanitization:
             ),
         )
 
-        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
-             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"), \
-             patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify), \
-             patch("gza.runner.post_review_to_pr"):
+        with (
+            patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"),
+            patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"),
+            patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify),
+            patch("gza.runner.post_review_to_pr"),
+        ):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
         assert exit_code == 0
@@ -26142,7 +27980,9 @@ class TestProviderPromptSanitization:
 
         captured_prompts: list[str] = []
 
-        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             captured_prompts.append(prompt)
             report_dir = work_dir / ".gza" / "reviews"
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -26173,11 +28013,14 @@ class TestProviderPromptSanitization:
             stdout="partial pytest output\n",
             stderr="still running\n",
         )
-        with patch(
-            "gza.runner._run_review_verify_command_with_timeout_diagnostics",
-            return_value=timed_out,
-        ), patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
-           patch("gza.runner.post_review_to_pr"):
+        with (
+            patch(
+                "gza.runner._run_review_verify_command_with_timeout_diagnostics",
+                return_value=timed_out,
+            ),
+            patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"),
+            patch("gza.runner.post_review_to_pr"),
+        ):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
         assert exit_code == 0
@@ -26221,7 +28064,9 @@ class TestProviderPromptSanitization:
 
         captured_prompts: list[str] = []
 
-        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             captured_prompts.append(prompt)
             report_dir = work_dir / ".gza" / "reviews"
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -26280,7 +28125,9 @@ class TestProviderPromptSanitization:
 
         captured_prompts: list[str] = []
 
-        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             captured_prompts.append(prompt)
             report_dir = work_dir / ".gza" / "reviews"
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -26353,7 +28200,9 @@ class TestProviderPromptSanitization:
 
         captured_prompts: list[str] = []
 
-        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def provider_run(
+            _config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             captured_prompts.append(prompt)
             report_subdir = "reviews" if task_type == "review" else "explorations"
             report_dir = work_dir / ".gza" / report_subdir
@@ -26381,8 +28230,10 @@ class TestProviderPromptSanitization:
         git.get_diff.return_value = ""
         git.get_diff_stat.return_value = ""
 
-        with patch("gza.runner._run_review_verify_command") as mock_review_verify, \
-             patch("gza.runner.post_review_to_pr"):
+        with (
+            patch("gza.runner._run_review_verify_command") as mock_review_verify,
+            patch("gza.runner.post_review_to_pr"),
+        ):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=resume)
 
         assert exit_code == 0
@@ -26425,7 +28276,9 @@ class TestProviderPromptSanitization:
 
         captured_prompts: list[str] = []
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def mock_provider_run(
+            cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             captured_prompts.append(prompt)
             summary_dir = work_dir / ".gza" / "summaries"
             summary_dir.mkdir(parents=True, exist_ok=True)
@@ -26439,7 +28292,11 @@ class TestProviderPromptSanitization:
                 error_type=None,
             )
 
-        with patch("gza.runner.get_provider") as mock_get_provider, patch("gza.runner.Git") as mock_git_class, patch("gza.runner.load_dotenv"):
+        with (
+            patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
+            patch("gza.runner.load_dotenv"),
+        ):
             mock_provider = Mock()
             mock_provider.name = "TestProvider"
             mock_provider.check_credentials.return_value = True
@@ -26521,7 +28378,9 @@ class TestProviderPromptSanitization:
 
         captured_prompts: list[str] = []
 
-        def mock_provider_run(cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+        def mock_provider_run(
+            cfg, prompt, log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+        ):
             captured_prompts.append(prompt)
             summary_dir = work_dir / ".gza" / "summaries"
             summary_dir.mkdir(parents=True, exist_ok=True)
@@ -26535,7 +28394,11 @@ class TestProviderPromptSanitization:
                 error_type=None,
             )
 
-        with patch("gza.runner.get_provider") as mock_get_provider, patch("gza.runner.Git") as mock_git_class, patch("gza.runner.load_dotenv"):
+        with (
+            patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
+            patch("gza.runner.load_dotenv"),
+        ):
             mock_provider = Mock()
             mock_provider.name = "TestProvider"
             mock_provider.check_credentials.return_value = True
@@ -26574,7 +28437,9 @@ class TestProviderPromptSanitization:
         assert "failed to parse checkpoint file" in captured_prompts[0]
         assert "Reusable successful verify phases" not in captured_prompts[0]
 
-    def test_run_resume_without_session_id_uses_same_branch_retry_guidance(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    def test_run_resume_without_session_id_uses_same_branch_retry_guidance(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -26634,9 +28499,7 @@ class TestProviderModelParityGate:
             ("claude", "o4-mini"),
         ],
     )
-    def test_cross_family_pair_fails_preflight_before_provider_launch(
-        self, tmp_path: Path, provider: str, model: str
-    ):
+    def test_cross_family_pair_fails_preflight_before_provider_launch(self, tmp_path: Path, provider: str, model: str):
         """Cross-family provider/model pairs must fail with CONFIG_ERROR before get_provider."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
@@ -26661,9 +28524,7 @@ class TestProviderModelParityGate:
         assert refreshed.failure_reason == "CONFIG_ERROR"
 
         assert refreshed.log_file is not None
-        ops_log = (tmp_path / refreshed.log_file).with_name(
-            f"{Path(refreshed.log_file).stem}.ops.jsonl"
-        )
+        ops_log = (tmp_path / refreshed.log_file).with_name(f"{Path(refreshed.log_file).stem}.ops.jsonl")
         ops_content = ops_log.read_text()
         assert "CONFIG_ERROR" in ops_content
         assert model in ops_content
@@ -26684,9 +28545,7 @@ class TestProviderModelParityGate:
             ("gemini", "gemini-2.5-pro"),
         ],
     )
-    def test_same_family_pair_passes_parity_gate(
-        self, tmp_path: Path, provider: str, model: str
-    ):
+    def test_same_family_pair_passes_parity_gate(self, tmp_path: Path, provider: str, model: str):
         """Matching provider/model family pairs must not be blocked by the parity gate."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
@@ -26941,12 +28800,20 @@ def test_publication_recovery_uses_worktree_git_cleanliness_for_noop_timeout_ver
     store, config, impl, verify_fix, verify_epoch = _timeout_verify_fix_fixture(tmp_path)
     canonical_git = Mock(spec=Git)
     canonical_git.default_branch.return_value = "main"
-    canonical_git.rev_parse_if_exists.side_effect = lambda ref: {"HEAD": "head-1", impl.branch: "head-1", "main": "base-1"}.get(ref)
+    canonical_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "HEAD": "head-1",
+        impl.branch: "head-1",
+        "main": "base-1",
+    }.get(ref)
     canonical_git.status_porcelain.return_value = set()
 
     worktree_git = Mock(spec=Git)
     worktree_git.repo_dir = config.worktree_path / verify_fix.slug
-    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {"HEAD": "head-1", impl.branch: "head-1", "main": "base-1"}.get(ref)
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "HEAD": "head-1",
+        impl.branch: "head-1",
+        "main": "base-1",
+    }.get(ref)
     worktree_git.status_porcelain.return_value = {("M", "src/impl.py")}
 
     git_side_effect = [canonical_git, worktree_git] if entrypoint == "pr_required_retry" else [worktree_git]
@@ -26989,25 +28856,41 @@ def test_publication_recovery_cross_project_diff_scope_comes_from_worktree_head(
 ) -> None:
     (tmp_path / "services" / "foo").mkdir(parents=True)
     (tmp_path / "libs" / "bar").mkdir(parents=True)
-    (tmp_path / "services" / "foo" / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
-    (tmp_path / "libs" / "bar" / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
+    (tmp_path / "services" / "foo" / "gza.yaml").write_text(
+        "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+    )
+    (tmp_path / "libs" / "bar" / "gza.yaml").write_text(
+        "project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n"
+    )
     store, config, impl, verify_fix, verify_epoch = _timeout_verify_fix_fixture(tmp_path, cross_project=True)
     worktree_path = config.worktree_path / verify_fix.slug
     (worktree_path / "services" / "foo").mkdir(parents=True, exist_ok=True)
     (worktree_path / "libs" / "bar").mkdir(parents=True, exist_ok=True)
-    (worktree_path / "services" / "foo" / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
-    (worktree_path / "libs" / "bar" / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
+    (worktree_path / "services" / "foo" / "gza.yaml").write_text(
+        "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+    )
+    (worktree_path / "libs" / "bar" / "gza.yaml").write_text(
+        "project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n"
+    )
 
     canonical_git = Mock(spec=Git)
     canonical_git.default_branch.return_value = "main"
-    canonical_git.rev_parse_if_exists.side_effect = lambda ref: {"HEAD": "head-1", impl.branch: "head-1", "main": "base-1"}.get(ref)
+    canonical_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "HEAD": "head-1",
+        impl.branch: "head-1",
+        "main": "base-1",
+    }.get(ref)
     canonical_git.status_porcelain.return_value = set()
     canonical_git.get_diff_name_status.return_value = "M\tservices/foo/app.py\n"
 
     worktree_git = Mock(spec=Git)
     worktree_git.repo_dir = worktree_path
     worktree_git.default_branch.return_value = "main"
-    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {"HEAD": "head-1", impl.branch: "head-1", "main": "base-1"}.get(ref)
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "HEAD": "head-1",
+        impl.branch: "head-1",
+        "main": "base-1",
+    }.get(ref)
     worktree_git.status_porcelain.return_value = set()
     worktree_git.get_diff_name_status.return_value = "M\tlibs/bar/lib.py\n"
 
@@ -27056,7 +28939,9 @@ def test_publication_recovery_cross_project_diff_scope_comes_from_worktree_head(
     assert verify_fix_artifacts[0].status == "passed"
 
 
-def test_capture_noop_verify_fix_fails_closed_when_identity_is_missing(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_capture_noop_verify_fix_fails_closed_when_identity_is_missing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
     config = Config(project_dir=tmp_path, project_name="test-project", verify_command="./bin/tests")
     verify_fix = store.add("Unstructured verify fix prompt", task_type="verify_fix", same_branch=True)
@@ -27087,7 +28972,9 @@ def test_capture_noop_verify_fix_fails_closed_when_identity_is_missing(tmp_path:
     persist_verify.assert_not_called()
 
 
-def test_capture_noop_verify_fix_fails_closed_when_owner_is_missing(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_capture_noop_verify_fix_fails_closed_when_owner_is_missing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
     config = Config(project_dir=tmp_path, project_name="test-project", verify_command="./bin/tests")
     verify_epoch = VerifyEpoch(

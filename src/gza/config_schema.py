@@ -248,6 +248,24 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         "Configured timeout floor in seconds for lifecycle/automation-initiated verify_command runs. Recent full-suite observations may derive a larger effective timeout for lifecycle gates.",
     ),
     ConfigKeySpec(
+        "autonomous_verify_min_margin_seconds",
+        "int",
+        60,
+        "Minimum required margin between recent successful full-suite runtime and autonomous_verify_timeout_seconds.",
+    ),
+    ConfigKeySpec(
+        "autonomous_verify_observation_max_age_hours",
+        "int",
+        168,
+        "Maximum age for a successful full-suite runtime observation used by lifecycle verify budget preflight.",
+    ),
+    ConfigKeySpec(
+        "autonomous_verify_bootstrap_timeout_seconds",
+        "int",
+        120,
+        "Conservative minimum autonomous_verify_timeout_seconds allowed when recent full-suite runtime observations are missing or stale.",
+    ),
+    ConfigKeySpec(
         "review_verify_timeout_grace_seconds",
         "float",
         5,

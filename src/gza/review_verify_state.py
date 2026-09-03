@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
+from gza.artifact_paths import InvalidArtifactPathError, resolve_artifact_path
 from gza.artifacts import prepare_command_output_artifact, store_command_output_artifact
 from gza.db import SqliteTaskStore, Task
 from gza.git import GitError
@@ -22,6 +24,7 @@ VERIFY_GATE_ARTIFACT_KIND = "verify_gate_result"
 VERIFY_GATE_ARTIFACT_LABEL = "verify_gate_result"
 VERIFY_GATE_ARTIFACT_SCHEMA_VERSION = 1
 INVALID_STRUCTURED_FAILURE_ORIGIN = "__invalid_structured_failure_origin__"
+KNOWN_FULL_VERIFY_PHASES = ("ruff", "ty", "mypy", "checks", "unit", "functional")
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,9 @@ class VerifyGateResult:
     output_artifact_task_id: str | None = None
     output_artifact_path: str | None = None
     failure_origin: str | None = None
+    phase_summary: dict[str, Any] | None = None
+    phase_summary_invalid_reason: str | None = None
+    duration_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +117,16 @@ class MergeUnitVerifyEvidenceSelection:
     lookup: VerifyGateLookup
 
 
+@dataclass(frozen=True)
+class FullVerifyRuntimeObservation:
+    """Recent successful full-suite runtime evidence from a verify artifact."""
+
+    duration_seconds: float
+    captured_at: datetime
+    artifact_id: int | None
+    task_id: str
+
+
 def verify_result_is_timeout_origin(result: VerifyGateResult | None) -> bool:
     """Return whether a red verify result is structured timeout evidence."""
     if result is None or result.status != "failed":
@@ -123,6 +139,256 @@ def verify_result_is_timeout_origin(result: VerifyGateResult | None) -> bool:
     if exit_status in {"timed out", "timeout"}:
         return True
     return "verify_command timed out" in failure
+
+
+def verify_result_is_budget_exceeded(result: VerifyGateResult | None) -> bool:
+    """Return whether a timeout result has no executed red phase to fix in code."""
+    if not verify_result_is_timeout_origin(result):
+        return False
+    summary = result.phase_summary if result is not None else None
+    if not isinstance(summary, dict):
+        return False
+    failed = summary.get("failed")
+    return isinstance(failed, list) and len(failed) == 0
+
+
+def verify_result_has_invalid_phase_evidence(result: VerifyGateResult | None) -> bool:
+    """Return whether structured timeout routing saw malformed phase evidence."""
+    if not verify_result_is_timeout_origin(result):
+        return False
+    return bool(getattr(result, "phase_summary_invalid_reason", None))
+
+
+def latest_successful_full_verify_runtime_observation(
+    store: SqliteTaskStore,
+    owner_task: Task,
+    *,
+    now: datetime,
+    max_age_hours: int,
+) -> FullVerifyRuntimeObservation | None:
+    """Return the newest recent full ``./bin/tests`` runtime observation for the project."""
+    if owner_task.id is None or max_age_hours < 1:
+        return None
+    cutoff = now - timedelta(hours=max_age_hours)
+    for artifact in store.list_project_artifacts(kind=VERIFY_GATE_ARTIFACT_KIND):
+        metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
+        if metadata is None or metadata.get("schema_version") != VERIFY_GATE_ARTIFACT_SCHEMA_VERSION:
+            continue
+        result = _artifact_verify_result(metadata)
+        if result is None:
+            continue
+        if result.captured_at < cutoff:
+            continue
+        if normalized_verify_command(result.command) != "./bin/tests":
+            continue
+        if result.status != "passed" or result.exit_status != "0":
+            continue
+        summary = result.phase_summary
+        if summary is None:
+            continue
+        passed = summary.get("passed")
+        never_started = summary.get("never_started")
+        failed = summary.get("failed")
+        running = summary.get("running")
+        if (
+            set(passed if isinstance(passed, list) else ()) != set(KNOWN_FULL_VERIFY_PHASES)
+            or failed != []
+            or running != []
+            or never_started != []
+        ):
+            continue
+        duration = _coerce_optional_float(result.duration_seconds)
+        if isinstance(duration, bool) or not isinstance(duration, int | float) or duration < 0:
+            continue
+        return FullVerifyRuntimeObservation(
+            duration_seconds=float(duration),
+            captured_at=result.captured_at,
+            artifact_id=artifact.id,
+            task_id=artifact.task_id,
+        )
+    return None
+
+
+def _extract_verify_phase_events(output: str | None) -> list[dict[str, Any]]:
+    if not output:
+        return []
+    matches = re.finditer(
+        r"^gza-verify phase=(?P<status>start|passed|failed) name=(?P<name>[A-Za-z0-9_.-]+)"
+        r"(?: duration_seconds=(?P<duration>[0-9.]+))?"
+        r"(?: tree_fingerprint=(?P<tree_fingerprint>[0-9a-f]{64}))?$",
+        output,
+        re.MULTILINE,
+    )
+    events: list[dict[str, Any]] = []
+    for match in matches:
+        event: dict[str, Any] = {
+            "name": match.group("name"),
+            "status": match.group("status"),
+        }
+        duration = match.group("duration")
+        if duration is not None:
+            event["duration_seconds"] = float(duration)
+        tree_fingerprint = match.group("tree_fingerprint")
+        if tree_fingerprint:
+            event["tree_fingerprint"] = tree_fingerprint
+        events.append(event)
+    return events
+
+
+def summarize_verify_phases(*, command: str | None, output: str | None) -> dict[str, Any] | None:
+    """Summarize structured verify-phase output for operator-facing timeout routing."""
+    events = _extract_verify_phase_events(output)
+    command_name = normalized_verify_command(command)
+    if not events and command_name != "./bin/tests":
+        return None
+
+    completed: list[dict[str, Any]] = []
+    started: list[str] = []
+    terminal_names: set[str] = set()
+    for event in events:
+        name = event["name"]
+        status = event["status"]
+        if status == "start":
+            started.append(name)
+            continue
+        completed.append(event)
+        terminal_names.add(name)
+
+    running = [name for name in started if name not in terminal_names]
+    completed_names = [str(phase["name"]) for phase in completed]
+    observed_names = [str(event["name"]) for event in events]
+    never_started: list[str] = []
+    if command_name == "./bin/tests":
+        observed_set = set(observed_names)
+        never_started = [phase for phase in KNOWN_FULL_VERIFY_PHASES if phase not in observed_set]
+    total_duration_seconds = 0.0
+    duration_seen = False
+    for phase in completed:
+        duration = phase.get("duration_seconds")
+        if isinstance(duration, int | float):
+            total_duration_seconds += float(duration)
+            duration_seen = True
+
+    return {
+        "completed": completed,
+        "passed": [str(phase["name"]) for phase in completed if phase.get("status") == "passed"],
+        "failed": [str(phase["name"]) for phase in completed if phase.get("status") == "failed"],
+        "running": running,
+        "never_started": never_started,
+        "last_observed": observed_names[-1] if observed_names else None,
+        "observed_count": len(observed_names),
+        "completed_count": len(completed_names),
+        "total_duration_seconds": total_duration_seconds if duration_seen else None,
+    }
+
+
+def validate_verify_phase_summary(
+    value: object,
+    *,
+    require_known_full_verify_partition: bool = False,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate the complete persisted phase summary schema."""
+    if value is None:
+        return None, None
+    if not isinstance(value, dict):
+        return None, "phase_summary must be an object"
+    value_dict = cast("dict[str, Any]", value)
+    required_list_fields = ("completed", "passed", "failed", "running", "never_started")
+    for field in required_list_fields:
+        if not isinstance(value_dict.get(field), list):
+            return None, f"phase_summary.{field} must be a list"
+    completed_list = value_dict["completed"]
+    passed_list = value_dict["passed"]
+    failed_list = value_dict["failed"]
+    running_list = value_dict["running"]
+    never_started_list = value_dict["never_started"]
+    for field in ("observed_count", "completed_count"):
+        raw = value_dict.get(field)
+        if not isinstance(raw, int) or isinstance(raw, bool) or raw < 0:
+            return None, f"phase_summary.{field} must be a non-negative integer"
+    observed_count = value_dict["observed_count"]
+    completed_count = value_dict["completed_count"]
+    last_observed = value_dict.get("last_observed")
+    if last_observed is not None and not isinstance(last_observed, str):
+        return None, "phase_summary.last_observed must be a string or null"
+    total_duration = value_dict.get("total_duration_seconds")
+    if total_duration is not None:
+        if isinstance(total_duration, bool) or not isinstance(total_duration, int | float) or total_duration < 0:
+            return None, "phase_summary.total_duration_seconds must be a non-negative number or null"
+    completed_names: list[str] = []
+    for phase in completed_list:
+        if not isinstance(phase, dict):
+            return None, "phase_summary.completed entries must be objects"
+        name = phase.get("name")
+        status = phase.get("status")
+        if not isinstance(name, str) or not name:
+            return None, "phase_summary.completed entries require string name"
+        if status not in {"passed", "failed"}:
+            return None, "phase_summary.completed entries require passed or failed status"
+        duration = phase.get("duration_seconds")
+        if duration is not None:
+            if isinstance(duration, bool) or not isinstance(duration, int | float) or duration < 0:
+                return None, "phase_summary.completed duration_seconds must be non-negative"
+        completed_names.append(name)
+    for field, names in (
+        ("passed", passed_list),
+        ("failed", failed_list),
+        ("running", running_list),
+        ("never_started", never_started_list),
+    ):
+        for name in names:
+            if not isinstance(name, str) or not name:
+                return None, f"phase_summary.{field} entries must be strings"
+    passed_names = [str(name) for name in passed_list]
+    failed_names = [str(name) for name in failed_list]
+    running_names = [str(name) for name in running_list]
+    never_started_names = [str(name) for name in never_started_list]
+    if completed_count != len(completed_list):
+        return None, "phase_summary.completed_count does not match completed"
+    minimum_observed_count = completed_count + len(running_names)
+    if observed_count < minimum_observed_count:
+        return None, "phase_summary.observed_count must include completed phases and running starts"
+    if observed_count == 0 and last_observed is not None:
+        return None, "phase_summary.last_observed must be null when observed_count is zero"
+    if observed_count > 0 and last_observed is None:
+        return None, "phase_summary.last_observed is required when observed_count is non-zero"
+    for field, names in (
+        ("completed", completed_names),
+        ("passed", passed_names),
+        ("failed", failed_names),
+        ("running", running_names),
+        ("never_started", never_started_names),
+    ):
+        if len(names) != len(set(names)):
+            return None, f"phase_summary.{field} contains duplicate phases"
+    expected_passed = [str(phase["name"]) for phase in completed_list if phase.get("status") == "passed"]
+    expected_failed = [str(phase["name"]) for phase in completed_list if phase.get("status") == "failed"]
+    if passed_names != expected_passed:
+        return None, "phase_summary.passed does not match completed passed phases"
+    if failed_names != expected_failed:
+        return None, "phase_summary.failed does not match completed failed phases"
+    for first_field, first_names, second_field, second_names in (
+        ("passed", passed_names, "failed", failed_names),
+        ("completed", completed_names, "running", running_names),
+        ("completed", completed_names, "never_started", never_started_names),
+        ("running", running_names, "never_started", never_started_names),
+    ):
+        overlap = set(first_names) & set(second_names)
+        if overlap:
+            return None, f"phase_summary.{first_field} overlaps phase_summary.{second_field}"
+    if last_observed is not None and last_observed not in {*completed_names, *running_names}:
+        return None, "phase_summary.last_observed must name a completed or running phase"
+    all_state_names = completed_names + running_names + never_started_names
+    if require_known_full_verify_partition:
+        unknown_known_command_names = sorted(set(all_state_names) - set(KNOWN_FULL_VERIFY_PHASES))
+        if unknown_known_command_names:
+            return None, "phase_summary contains unknown ./bin/tests phases: " + ", ".join(unknown_known_command_names)
+        missing_known = [phase for phase in KNOWN_FULL_VERIFY_PHASES if phase not in all_state_names]
+        if missing_known:
+            return None, "phase_summary omits known ./bin/tests phases: " + ", ".join(missing_known)
+    copied: dict[str, Any] = deepcopy(value_dict)
+    copied["completed"] = [deepcopy(phase) for phase in completed_list]
+    return copied, None
 
 
 def normalized_verify_command(command: str | None) -> str | None:
@@ -292,7 +558,195 @@ def _aggregate_tree_fingerprint_is_complete(aggregate_details: dict[str, Any]) -
     return bool(fingerprints) and all(fingerprint == fingerprints[-1] for fingerprint in fingerprints)
 
 
-def _artifact_verify_result(metadata: dict[str, Any]) -> VerifyGateResult | None:
+def _read_persisted_verify_output(project_dir: Path | None, stored_path: str | None) -> str | None:
+    if project_dir is None or stored_path is None:
+        return None
+    try:
+        resolved = resolve_artifact_path(project_dir, stored_path)
+    except (InvalidArtifactPathError, OSError, RuntimeError, ValueError):
+        return None
+    try:
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return content if content.strip() else None
+
+
+def _phase_summary_from_diagnostics_details(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    phase_results = value.get("phase_results")
+    if not isinstance(phase_results, list):
+        return None
+    completed: list[dict[str, Any]] = []
+    passed: list[str] = []
+    failed: list[str] = []
+    total_duration = 0.0
+    duration_seen = False
+    for phase in phase_results:
+        if not isinstance(phase, dict):
+            return None
+        name = phase.get("name")
+        status = phase.get("status")
+        if not isinstance(name, str) or not name:
+            return None
+        if status not in {"passed", "failed"}:
+            return None
+        completed_phase: dict[str, Any] = {"name": name, "status": status}
+        if "duration_seconds" in phase:
+            completed_phase["duration_seconds"] = phase.get("duration_seconds")
+        completed.append(completed_phase)
+        if status == "passed":
+            passed.append(name)
+        else:
+            failed.append(name)
+        duration = phase.get("duration_seconds")
+        if isinstance(duration, int | float) and not isinstance(duration, bool):
+            total_duration += float(duration)
+            duration_seen = True
+
+    running = value.get("running_phase_names")
+    if not isinstance(running, list):
+        started = value.get("started_phase_names")
+        completed_names = value.get("completed_phase_names")
+        if isinstance(started, list) and isinstance(completed_names, list):
+            completed_set = {name for name in completed_names if isinstance(name, str)}
+            running = [name for name in started if isinstance(name, str) and name not in completed_set]
+        else:
+            running = []
+    never_started = value.get("not_started_phase_names")
+    if not isinstance(never_started, list):
+        never_started = value.get("never_started")
+    if not isinstance(never_started, list):
+        never_started = []
+    observed_count = len(completed) + len([name for name in running if isinstance(name, str)])
+    last_observed: str | None = None
+    if isinstance(running, list) and running:
+        last = running[-1]
+        last_observed = last if isinstance(last, str) else None
+    elif completed:
+        last_name = completed[-1].get("name")
+        last_observed = last_name if isinstance(last_name, str) else None
+    return {
+        "completed": completed,
+        "passed": passed,
+        "failed": failed,
+        "running": [name for name in running if isinstance(name, str)],
+        "never_started": [name for name in never_started if isinstance(name, str)],
+        "last_observed": last_observed,
+        "observed_count": observed_count,
+        "completed_count": len(completed),
+        "total_duration_seconds": total_duration if duration_seen else None,
+    }
+
+
+def _aggregate_phase_summary_from_details(value: object) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(value, dict):
+        return None, None
+    scopes = value.get("scopes")
+    if not isinstance(scopes, list):
+        return None, None
+    completed: list[dict[str, Any]] = []
+    passed: list[str] = []
+    failed: list[str] = []
+    running: list[str] = []
+    never_started: list[str] = []
+    observed_count = 0
+    total_duration = 0.0
+    duration_seen = False
+    last_observed: str | None = None
+    runnable_seen = False
+    for scope in scopes:
+        if not isinstance(scope, dict) or scope.get("status") == "skipped":
+            continue
+        runnable_seen = True
+        command = _coerce_optional_str(scope.get("command_identity"))
+        scope_summary = scope.get("phase_summary")
+        if scope_summary is None:
+            scope_summary = _phase_summary_from_diagnostics_details(scope.get("phase_diagnostics"))
+        summary, invalid_reason = validate_verify_phase_summary(
+            scope_summary,
+            require_known_full_verify_partition=normalized_verify_command(command) == "./bin/tests",
+        )
+        if invalid_reason is not None:
+            scope_name = scope.get("scope") if isinstance(scope.get("scope"), str) else "unknown scope"
+            return None, f"aggregate scope {scope_name}: {invalid_reason}"
+        if summary is None:
+            scope_name = scope.get("scope") if isinstance(scope.get("scope"), str) else "unknown scope"
+            return None, f"aggregate scope {scope_name}: phase_summary is missing"
+        prefix = scope.get("scope") if isinstance(scope.get("scope"), str) and scope.get("scope") else "unknown"
+        def _scoped(name: str) -> str:
+            return f"{prefix}:{name}"
+        for phase in summary["completed"]:
+            scoped_phase = deepcopy(phase)
+            scoped_phase["name"] = _scoped(str(phase["name"]))
+            completed.append(scoped_phase)
+            duration = phase.get("duration_seconds")
+            if isinstance(duration, int | float) and not isinstance(duration, bool):
+                total_duration += float(duration)
+                duration_seen = True
+        passed.extend(_scoped(str(name)) for name in summary["passed"])
+        failed.extend(_scoped(str(name)) for name in summary["failed"])
+        running.extend(_scoped(str(name)) for name in summary["running"])
+        never_started.extend(_scoped(str(name)) for name in summary["never_started"])
+        observed_count += int(summary["observed_count"])
+        if isinstance(summary["last_observed"], str):
+            last_observed = _scoped(summary["last_observed"])
+    if not runnable_seen:
+        return None, None
+    summary = {
+        "completed": completed,
+        "passed": passed,
+        "failed": failed,
+        "running": running,
+        "never_started": never_started,
+        "last_observed": last_observed,
+        "observed_count": observed_count,
+        "completed_count": len(completed),
+        "total_duration_seconds": total_duration if duration_seen else None,
+    }
+    return validate_verify_phase_summary(summary)
+
+
+def _resolve_artifact_phase_summary(
+    metadata: dict[str, Any],
+    *,
+    command: str,
+    exit_status: str,
+    failure: str | None,
+    failure_origin: str | None,
+    output_artifact_path: str | None,
+    project_dir: Path | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    summary, invalid_reason = validate_verify_phase_summary(
+        metadata.get("phase_summary"),
+        require_known_full_verify_partition=normalized_verify_command(command) == "./bin/tests",
+    )
+    if invalid_reason is not None or summary is not None:
+        return summary, invalid_reason
+
+    aggregate_summary, aggregate_invalid_reason = _aggregate_phase_summary_from_details(metadata.get("aggregate_details"))
+    if aggregate_invalid_reason is not None or aggregate_summary is not None:
+        return aggregate_summary, aggregate_invalid_reason
+
+    if failure_origin != "timeout":
+        if failure_origin is not None:
+            return None, None
+        if exit_status.strip().lower() not in {"timed out", "timeout"} and "verify_command timed out" not in (
+            failure or ""
+        ).strip().lower():
+            return None, None
+
+    output = _read_persisted_verify_output(project_dir, output_artifact_path)
+    if output is None:
+        return None, "phase_summary missing and persisted verify output is unavailable"
+    parsed = summarize_verify_phases(command=command, output=output)
+    if parsed is None:
+        return None, "phase_summary missing and persisted verify output has no structured phase evidence"
+    return validate_verify_phase_summary(parsed)
+
+
+def _artifact_verify_result(metadata: dict[str, Any], *, project_dir: Path | None = None) -> VerifyGateResult | None:
     result_payload = metadata.get("result")
     if not isinstance(result_payload, dict):
         return None
@@ -308,6 +762,17 @@ def _artifact_verify_result(metadata: dict[str, Any]) -> VerifyGateResult | None
     exit_status = _coerce_optional_str(result_payload.get("exit_status"))
     if command is None or status is None or exit_status is None:
         return None
+    failure_origin = _coerce_failure_origin(result_payload)
+    output_artifact_path = _coerce_optional_str(metadata.get("output_artifact_path"))
+    phase_summary, phase_summary_invalid_reason = _resolve_artifact_phase_summary(
+        metadata,
+        command=command,
+        exit_status=exit_status,
+        failure=_coerce_optional_str(result_payload.get("failure")),
+        failure_origin=failure_origin,
+        output_artifact_path=output_artifact_path,
+        project_dir=project_dir,
+    )
     return VerifyGateResult(
         command=command,
         status=status,
@@ -322,8 +787,11 @@ def _artifact_verify_result(metadata: dict[str, Any]) -> VerifyGateResult | None
         source_task_type=_coerce_optional_str(metadata.get("source_task_type")),
         output_artifact_id=_coerce_optional_int(metadata.get("output_artifact_id")),
         output_artifact_task_id=_coerce_optional_str(metadata.get("output_artifact_task_id")),
-        output_artifact_path=_coerce_optional_str(metadata.get("output_artifact_path")),
-        failure_origin=_coerce_failure_origin(result_payload),
+        output_artifact_path=output_artifact_path,
+        failure_origin=failure_origin,
+        phase_summary=phase_summary,
+        phase_summary_invalid_reason=phase_summary_invalid_reason,
+        duration_seconds=_coerce_optional_float(result_payload.get("duration_seconds")),
     )
 
 
@@ -345,6 +813,7 @@ def latest_verify_result_for_epoch(
     owner_task: Task,
     *,
     current_epoch: VerifyEpoch | None,
+    project_dir: Path | None = None,
 ) -> VerifyGateLookup:
     """Return the latest verify result for ``current_epoch`` with legacy fallback."""
     if owner_task.id is None:
@@ -357,7 +826,7 @@ def latest_verify_result_for_epoch(
             metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
             if metadata is None or metadata.get("schema_version") != VERIFY_GATE_ARTIFACT_SCHEMA_VERSION:
                 continue
-            result = _artifact_verify_result(metadata)
+            result = _artifact_verify_result(metadata, project_dir=project_dir)
             epoch = _artifact_verify_epoch(metadata)
             if result is None or epoch is None:
                 continue
@@ -405,6 +874,8 @@ def latest_verify_result_for_epoch(
 def latest_verify_evidence_for_owner(
     store: SqliteTaskStore,
     owner_task: Task,
+    *,
+    project_dir: Path | None = None,
 ) -> LatestVerifyEvidence | None:
     """Return the latest persisted verify evidence and its original epoch identity."""
     if owner_task.id is None:
@@ -416,7 +887,7 @@ def latest_verify_evidence_for_owner(
             metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
             if metadata is None or metadata.get("schema_version") != VERIFY_GATE_ARTIFACT_SCHEMA_VERSION:
                 continue
-            result = _artifact_verify_result(metadata)
+            result = _artifact_verify_result(metadata, project_dir=project_dir)
             epoch = _artifact_verify_epoch(metadata)
             if result is None or epoch is None:
                 continue
@@ -496,7 +967,13 @@ def resolve_verify_gate_decision(
 ) -> VerifyGateDecision:
     """Return the canonical lifecycle verify readiness for one implementation owner."""
     current_epoch = owner_task_verify_epoch(owner_task, config, git)
-    lookup = latest_verify_result_for_epoch(store, owner_task, current_epoch=current_epoch)
+    project_dir = getattr(config, "project_dir", None)
+    lookup = latest_verify_result_for_epoch(
+        store,
+        owner_task,
+        current_epoch=current_epoch,
+        project_dir=project_dir if isinstance(project_dir, Path) else None,
+    )
 
     if lookup.result is None:
         state: Literal["passed", "missing", "stale", "failed", "unavailable"] = "missing"
@@ -567,12 +1044,15 @@ def task_has_current_passing_verify_evidence(
     git: object | None,
 ) -> bool:
     """Return whether canonical verify evidence is current and passing."""
-    return resolve_verify_gate_decision(
-        store,
-        owner_task,
-        config=config,
-        git=git,
-    ).state == "passed"
+    return (
+        resolve_verify_gate_decision(
+            store,
+            owner_task,
+            config=config,
+            git=git,
+        ).state
+        == "passed"
+    )
 
 
 def resolve_verify_owner_task(store: SqliteTaskStore, task: Task) -> Task:
@@ -824,6 +1304,18 @@ def build_verify_gate_artifact_payload(
     failure_origin = getattr(result, "failure_origin", None)
     if failure_origin is not None:
         result_payload["failure_origin"] = failure_origin
+    duration_seconds = _coerce_optional_float(getattr(result, "duration_seconds", None))
+    if duration_seconds is not None:
+        result_payload["duration_seconds"] = duration_seconds
+    result_output = getattr(result, "output", None)
+    phase_summary = (
+        summarize_verify_phases(
+            command=getattr(result, "command", None),
+            output=result_output,
+        )
+        if result_output is not None
+        else None
+    )
     payload = {
         "schema_version": VERIFY_GATE_ARTIFACT_SCHEMA_VERSION,
         "verify_epoch": {
@@ -840,6 +1332,8 @@ def build_verify_gate_artifact_payload(
         "output_artifact_task_id": output_artifact_task_id,
         "output_artifact_path": output_artifact_path,
     }
+    if phase_summary is not None:
+        payload["phase_summary"] = phase_summary
     tree_fingerprint = _verify_gate_tree_fingerprint(
         provenance=provenance,
         aggregate_details=aggregate_details,
@@ -961,11 +1455,7 @@ def refresh_preserved_rebase_review_verify_heads(
     if not branch or not old_head_sha or not new_head_sha or old_head_sha == new_head_sha:
         return 0
 
-    reviews = [
-        review
-        for review in store.get_reviews_for_task(impl_task.id)
-        if review.status == "completed"
-    ]
+    reviews = [review for review in store.get_reviews_for_task(impl_task.id) if review.status == "completed"]
     if not reviews:
         return 0
     latest_review = max(
@@ -976,10 +1466,7 @@ def refresh_preserved_rebase_review_verify_heads(
         return 0
 
     refreshed = 0
-    if (
-        latest_review.review_verify_branch == branch
-        and latest_review.review_verify_head_sha == old_head_sha
-    ):
+    if latest_review.review_verify_branch == branch and latest_review.review_verify_head_sha == old_head_sha:
         latest_review.review_verify_head_sha = new_head_sha
         store.update(latest_review)
         refreshed += 1

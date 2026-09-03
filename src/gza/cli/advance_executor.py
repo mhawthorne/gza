@@ -61,6 +61,7 @@ from ..runner import (
     _capture_noop_verify_fix_timeout_rerun,
     _capture_review_verify_result,
     _format_review_verify_result,
+    _lifecycle_verify_budget_margin_failure,
     _make_review_verify_result,
     _persist_lifecycle_verify_execution,
     _persist_review_verify_result,
@@ -1349,27 +1350,46 @@ def _execute_verify_gate(
         if heartbeat_for_phase is not None:
             _verify_command_label = str(getattr(context.config, "verify_command", "")).strip() or "verify"
             print(f"Running verify gate ({_verify_command_label}) before {phase_label}...", flush=True)
-        execution = _run_lifecycle_verify(
+        budget_margin_failure = _lifecycle_verify_budget_margin_failure(
             config=context.config,
             store=context.store,
-            task=subject_task,
-            worktree_git=worktree_git,
-            worktree_path=worktree_git.repo_dir,
-            cwd=provider_cwd,
-            runtime_context=context.runtime_context,
+            owner_task=owner_task,
+            command=context.config.verify_command,
             timeout_seconds=timeout_seconds,
-            timeout_grace_seconds=timeout_grace_seconds,
             reviewed_branch=current_epoch.reviewed_branch,
             reviewed_head_sha=current_epoch.reviewed_head_sha,
             reviewed_base_sha=reviewed_base_sha,
-            heartbeat_threshold_seconds=context.config.watch.long_phase_threshold_seconds,
-            heartbeat_interval_seconds=context.config.watch.heartbeat_interval_seconds,
-            heartbeat_for_phase=(
-                (lambda phase: heartbeat_for_phase(phase, subject_task))
-                if heartbeat_for_phase is not None
-                else None
-            ),
+            working_directory=provider_cwd,
         )
+        if budget_margin_failure is None:
+            execution = _run_lifecycle_verify(
+                config=context.config,
+                store=context.store,
+                task=subject_task,
+                budget_owner_task=owner_task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_git.repo_dir,
+                cwd=provider_cwd,
+                runtime_context=context.runtime_context,
+                timeout_seconds=timeout_seconds,
+                timeout_grace_seconds=timeout_grace_seconds,
+                reviewed_branch=current_epoch.reviewed_branch,
+                reviewed_head_sha=current_epoch.reviewed_head_sha,
+                reviewed_base_sha=reviewed_base_sha,
+                heartbeat_threshold_seconds=context.config.watch.long_phase_threshold_seconds,
+                heartbeat_interval_seconds=context.config.watch.heartbeat_interval_seconds,
+                heartbeat_for_phase=(
+                    (lambda phase: heartbeat_for_phase(phase, subject_task))
+                    if heartbeat_for_phase is not None
+                    else None
+                ),
+            )
+        else:
+            execution = LifecycleVerifyExecution(
+                markdown=_format_review_verify_result(budget_margin_failure),
+                aggregate_result=budget_margin_failure,
+                project_results=(),
+            )
         if execution is None:
             unavailable_result = _make_review_verify_result(
                 str(getattr(context.config, "verify_command", "")).strip() or "(verify gate unavailable)",

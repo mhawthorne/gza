@@ -134,6 +134,9 @@ DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD = 500
 DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD = 2000
 DEFAULT_REVIEW_CONTEXT_FILE_LIMIT = 12
 DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS = 120
+DEFAULT_AUTONOMOUS_VERIFY_MIN_MARGIN_SECONDS = 60
+DEFAULT_AUTONOMOUS_VERIFY_OBSERVATION_MAX_AGE_HOURS = 168
+DEFAULT_AUTONOMOUS_VERIFY_BOOTSTRAP_TIMEOUT_SECONDS = DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS
 DEFAULT_REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS = 5
 DEFAULT_MAIN_INTEGRATION_VERIFY_RED_TTL_MINUTES = 30
 REVIEW_VERIFY_TIMEOUT_GRACE_MINIMUM_ERROR = (
@@ -176,7 +179,9 @@ VALID_CONFIG_FIELDS = {
     "quiet_period_seconds",
     "review_diff_small_threshold",
     "review_diff_medium_threshold", "review_context_file_limit", "autonomous_verify_timeout_seconds",
-    "review_verify_timeout_grace_seconds", "main_integration_verify_red_ttl_minutes",
+    "autonomous_verify_min_margin_seconds", "autonomous_verify_observation_max_age_hours",
+    "autonomous_verify_bootstrap_timeout_seconds", "review_verify_timeout_grace_seconds",
+    "main_integration_verify_red_ttl_minutes",
     "code_task_diff_timeout_medium_threshold", "code_task_diff_timeout_large_threshold",
     "code_task_diff_timeout_medium_minutes", "code_task_diff_timeout_large_minutes",
     "code_task_diff_timeout_cap_minutes",
@@ -305,6 +310,9 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "review_diff_medium_threshold": None,
     "review_context_file_limit": None,
     "autonomous_verify_timeout_seconds": None,
+    "autonomous_verify_min_margin_seconds": None,
+    "autonomous_verify_observation_max_age_hours": None,
+    "autonomous_verify_bootstrap_timeout_seconds": None,
     "review_verify_timeout_grace_seconds": None,
     "main_integration_verify_red_ttl_minutes": None,
     "code_task_diff_timeout_medium_threshold": None,
@@ -444,6 +452,9 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "review_diff_medium_threshold": None,
     "review_context_file_limit": None,
     "autonomous_verify_timeout_seconds": None,
+    "autonomous_verify_min_margin_seconds": None,
+    "autonomous_verify_observation_max_age_hours": None,
+    "autonomous_verify_bootstrap_timeout_seconds": None,
     "review_verify_timeout_grace_seconds": None,
     "main_integration_verify_red_ttl_minutes": None,
     "code_task_diff_timeout_medium_threshold": None,
@@ -1643,6 +1654,9 @@ class Config:
     review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
     review_context_file_limit: int = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
     autonomous_verify_timeout_seconds: int = DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS
+    autonomous_verify_min_margin_seconds: int = DEFAULT_AUTONOMOUS_VERIFY_MIN_MARGIN_SECONDS
+    autonomous_verify_observation_max_age_hours: int = DEFAULT_AUTONOMOUS_VERIFY_OBSERVATION_MAX_AGE_HOURS
+    autonomous_verify_bootstrap_timeout_seconds: int = DEFAULT_AUTONOMOUS_VERIFY_BOOTSTRAP_TIMEOUT_SECONDS
     review_verify_timeout_grace_seconds: float = DEFAULT_REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS
     main_integration_verify_red_ttl_minutes: int = DEFAULT_MAIN_INTEGRATION_VERIFY_RED_TTL_MINUTES
     code_task_diff_timeout_medium_threshold: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_THRESHOLD
@@ -3057,6 +3071,27 @@ class Config:
         )
         if autonomous_verify_timeout_seconds < 1:
             raise ConfigError("'autonomous_verify_timeout_seconds' must be positive")
+        autonomous_verify_min_margin_seconds = _load_strict_int_field(
+            data,
+            "autonomous_verify_min_margin_seconds",
+            DEFAULT_AUTONOMOUS_VERIFY_MIN_MARGIN_SECONDS,
+        )
+        if autonomous_verify_min_margin_seconds < 1:
+            raise ConfigError("'autonomous_verify_min_margin_seconds' must be positive")
+        autonomous_verify_observation_max_age_hours = _load_strict_int_field(
+            data,
+            "autonomous_verify_observation_max_age_hours",
+            DEFAULT_AUTONOMOUS_VERIFY_OBSERVATION_MAX_AGE_HOURS,
+        )
+        if autonomous_verify_observation_max_age_hours < 1:
+            raise ConfigError("'autonomous_verify_observation_max_age_hours' must be positive")
+        autonomous_verify_bootstrap_timeout_seconds = _load_strict_int_field(
+            data,
+            "autonomous_verify_bootstrap_timeout_seconds",
+            DEFAULT_AUTONOMOUS_VERIFY_BOOTSTRAP_TIMEOUT_SECONDS,
+        )
+        if autonomous_verify_bootstrap_timeout_seconds < 1:
+            raise ConfigError("'autonomous_verify_bootstrap_timeout_seconds' must be positive")
         review_verify_timeout_grace_seconds = _load_strict_number_field(
             data,
             "review_verify_timeout_grace_seconds",
@@ -3350,6 +3385,9 @@ class Config:
             review_diff_medium_threshold=review_diff_medium_threshold,
             review_context_file_limit=review_context_file_limit,
             autonomous_verify_timeout_seconds=autonomous_verify_timeout_seconds,
+            autonomous_verify_min_margin_seconds=autonomous_verify_min_margin_seconds,
+            autonomous_verify_observation_max_age_hours=autonomous_verify_observation_max_age_hours,
+            autonomous_verify_bootstrap_timeout_seconds=autonomous_verify_bootstrap_timeout_seconds,
             review_verify_timeout_grace_seconds=review_verify_timeout_grace_seconds,
             main_integration_verify_red_ttl_minutes=main_integration_verify_red_ttl_minutes,
             code_task_diff_timeout_medium_threshold=code_task_diff_timeout_medium_threshold,
@@ -3860,6 +3898,16 @@ class Config:
                 errors.append("'autonomous_verify_timeout_seconds' must be an integer")
             elif data["autonomous_verify_timeout_seconds"] <= 0:
                 errors.append("'autonomous_verify_timeout_seconds' must be positive")
+        for key in (
+            "autonomous_verify_min_margin_seconds",
+            "autonomous_verify_observation_max_age_hours",
+            "autonomous_verify_bootstrap_timeout_seconds",
+        ):
+            if key in data:
+                if not _is_strict_int(data[key]):
+                    errors.append(f"'{key}' must be an integer")
+                elif data[key] <= 0:
+                    errors.append(f"'{key}' must be positive")
         if "review_verify_timeout_grace_seconds" in data:
             if not _is_strict_number(data["review_verify_timeout_grace_seconds"]):
                 errors.append("'review_verify_timeout_grace_seconds' must be a number")

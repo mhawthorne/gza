@@ -136,9 +136,11 @@ from gza.review_verify_state import (
     resolve_verify_gate_decision,
     select_current_merge_unit_verify_evidence,
     verify_epoch_matches,
+    verify_result_has_invalid_phase_evidence,
     verify_result_is_timeout_origin,
 )
 from gza.runner import (
+    PHASE_EVIDENCE_INDETERMINATE,
     PHASE_EVIDENCE_RED,
     PHASE_EVIDENCE_VALID_ZERO_RED,
     PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
@@ -169,6 +171,7 @@ PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE = "verify-noop-improve-branch-tip
 PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE = "verify-noop-improve-diff-probe-unavailable"
 PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES = "verify-blocked-no-code-issues"
 PARK_REASON_VERIFY_BUDGET_EXCEEDED = "verify-budget-exceeded"
+PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID = "verify-phase-evidence-invalid"
 PARK_REASON_VERIFY_FAILED_NEEDS_FIX = "verify-failed-needs-fix"
 PARK_REASON_VERIFY_FIX_FAILED = "verify-fix-failed"
 PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE = "verify-fix-proof-unavailable"
@@ -219,6 +222,8 @@ WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS = frozenset(
         "stale-review-needs-manual-refresh",
         PARK_REASON_VERIFY_BUDGET_EXCEEDED,
         PARK_REASON_VERIFY_FAILED_NEEDS_FIX,
+        PARK_REASON_VERIFY_BUDGET_EXCEEDED,
+        PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID,
         PARK_REASON_VERIFY_FIX_FAILED,
         PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
         PARK_REASON_VERIFY_UNAVAILABLE,
@@ -581,6 +586,7 @@ def resolve_post_merge_rebase_state(
     merge_source: ResolvedMergeSourceRef | None = None,
 ) -> PostMergeRebaseState:
     """Resolve local proof that stale failed-rebase state is no longer authoritative."""
+
     def _normalize_sha(value: object) -> str | None:
         return value if isinstance(value, str) and value else None
 
@@ -590,11 +596,7 @@ def resolve_post_merge_rebase_state(
         if resolved_target is not None:
             merge_target_task = resolved_target
 
-    merge_unit = (
-        store.resolve_merge_unit_for_task(merge_target_task.id)
-        if merge_target_task.id is not None
-        else None
-    )
+    merge_unit = store.resolve_merge_unit_for_task(merge_target_task.id) if merge_target_task.id is not None else None
     merge_unit_state = merge_unit.state if merge_unit is not None else None
     if merge_state_is_terminal_for_lifecycle(merge_unit_state):
         return PostMergeRebaseState(
@@ -667,8 +669,7 @@ def resolve_post_merge_rebase_state(
             rebase_resolution_proved=False,
             reason=None,
             warning=(
-                f"fresh merge source for branch '{branch_name}' is unavailable; "
-                "cannot resolve post-merge rebase state"
+                f"fresh merge source for branch '{branch_name}' is unavailable; cannot resolve post-merge rebase state"
             ),
         )
     if not is_local_merge_proof_ref(proof_ref, branch_name):
@@ -718,9 +719,7 @@ def resolve_post_merge_rebase_state(
         )
 
     branch_equals_target = (
-        branch_tip_sha is not None
-        and target_tip_sha is not None
-        and branch_tip_sha == target_tip_sha
+        branch_tip_sha is not None and target_tip_sha is not None and branch_tip_sha == target_tip_sha
     )
     if branch_equals_target:
         return PostMergeRebaseState(
@@ -847,15 +846,18 @@ def _resolve_and_persist_post_merge_rebase_state(
         and task.has_commits
         and task_owns_merge_status(task)
     ):
-        if pending_merge_finalization_action(
-            config,
-            store,
-            task,
-            target_branch=target_branch,
-            require_already_merged=True,
-            resolved_merge_state=resolved_merge_state,
-            live_target_sha=state.target_tip_sha,
-        ) is not None:
+        if (
+            pending_merge_finalization_action(
+                config,
+                store,
+                task,
+                target_branch=target_branch,
+                require_already_merged=True,
+                resolved_merge_state=resolved_merge_state,
+                live_target_sha=state.target_tip_sha,
+            )
+            is not None
+        ):
             return state
         merge_unit = store.resolve_merge_unit_for_task(task.id)
         if merge_unit is None and bool(task.branch):
@@ -939,9 +941,7 @@ def _pending_merge_missing_proof_attention(
         merge_unit_id=merge_unit_id,
     )
     promoted_attempts = [
-        attempt
-        for attempt in attempts
-        if attempt.promotion_observed or attempt.previous_target_sha != live_target_sha
+        attempt for attempt in attempts if attempt.promotion_observed or attempt.previous_target_sha != live_target_sha
     ]
     if not promoted_attempts:
         return None
@@ -993,9 +993,7 @@ def _existing_followup_children_for_replay(
         matches = [
             child
             for child in children
-            if child.task_type == "implement"
-            and child.depends_on == impl_task.id
-            and child.prompt == prefix
+            if child.task_type == "implement" and child.depends_on == impl_task.id and child.prompt == prefix
         ]
         if len(matches) != 1:
             return None
@@ -1074,18 +1072,15 @@ def _pending_followup_finalization_action(
                     missing_proof_actions.append(missing_proof_attention)
                 continue
             report = _review_report_for_replay(config, review_task)
-            if (
-                report.verdict is None
-                and not _review_content_available_for_replay(config, review_task)
-            ):
+            if report.verdict is None and not _review_content_available_for_replay(config, review_task):
                 return _pending_merge_replay_needs_attention(
                     "pending-merge-finalization-review-content-unavailable",
                     (
                         f"Pending ordinary follow-up replay for review {review_task.id} "
                         "cannot be proven because the review report content is unavailable."
                     ),
-                        review_task=review_task,
-                    )
+                    review_task=review_task,
+                )
             if report.verdict is None:
                 invalid_traces.append(f"review {review_task.id} has malformed or unknown ordinary follow-up verdict")
                 continue
@@ -1120,9 +1115,7 @@ def _pending_followup_finalization_action(
                     merge_unit_id=merge_unit_id,
                 )
                 if len(proofs) != 1:
-                    trace = (
-                        f"review {review_task.id} has {len(proofs)} matching ordinary follow-up promotion proofs"
-                    )
+                    trace = f"review {review_task.id} has {len(proofs)} matching ordinary follow-up promotion proofs"
                     if len(proofs) == 0:
                         orphan_traces.append(trace)
                     else:
@@ -1390,12 +1383,18 @@ def pending_merge_finalization_action(
         merge_unit_id=merge_unit.id,
     )
     attention_actions = [
-        action for action in (followup_action, capped_action) if action is not None and action.get("type") == "needs_attention"
+        action
+        for action in (followup_action, capped_action)
+        if action is not None and action.get("type") == "needs_attention"
     ]
     for action in attention_actions:
         if action.get("orphan_only") is not True:
             return action
-    proven = [action for action in (followup_action, capped_action) if action is not None and action.get("type") != "needs_attention"]
+    proven = [
+        action
+        for action in (followup_action, capped_action)
+        if action is not None and action.get("type") != "needs_attention"
+    ]
     if len(proven) == 2:
         return _pending_merge_replay_needs_attention(
             "pending-merge-finalization-multiple-proof-families",
@@ -1500,9 +1499,7 @@ def count_completed_review_cycles_since_boundary(
 
     improve_tasks = store.get_improve_tasks_by_root(impl_task_id)
     return sum(
-        1
-        for task in improve_tasks
-        if task.status == "completed" and _task_event_time(task) > boundary.boundary_time
+        1 for task in improve_tasks if task.status == "completed" and _task_event_time(task) > boundary.boundary_time
     )
 
 
@@ -1528,22 +1525,14 @@ def _count_consecutive_noop_improves(improve_tasks: list[DbTask]) -> tuple[DbTas
 
 def _latest_completed_noop_improve(improve_tasks: list[DbTask]) -> DbTask | None:
     return next(
-        (
-            improve
-            for improve in improve_tasks
-            if improve.status == "completed" and improve.changed_diff is False
-        ),
+        (improve for improve in improve_tasks if improve.status == "completed" and improve.changed_diff is False),
         None,
     )
 
 
 def _latest_completed_code_changing_improve(improve_tasks: list[DbTask]) -> DbTask | None:
     return next(
-        (
-            improve
-            for improve in improve_tasks
-            if improve.status == "completed" and improve.changed_diff is True
-        ),
+        (improve for improve in improve_tasks if improve.status == "completed" and improve.changed_diff is True),
         None,
     )
 
@@ -1569,13 +1558,9 @@ def _resolve_branch_head_sha(git: Any, branch: str | None) -> BranchHeadResoluti
     except Exception as exc:
         return BranchHeadResolution(
             head_sha=None,
-            warning=(
-                f"branch-head probe failed for {branch}: {exc}"
-            ),
+            warning=(f"branch-head probe failed for {branch}: {exc}"),
         )
-    return BranchHeadResolution(
-        head_sha=head_sha if isinstance(head_sha, str) and head_sha else None
-    )
+    return BranchHeadResolution(head_sha=head_sha if isinstance(head_sha, str) and head_sha else None)
 
 
 def _task_has_current_failed_review_verify_evidence(
@@ -1706,7 +1691,11 @@ def _latest_current_passing_review_verify_task(
             current_head_sha=current_head_sha,
         ):
             continue
-        if before is not None and improve.review_verify_captured_at is not None and improve.review_verify_captured_at >= before:
+        if (
+            before is not None
+            and improve.review_verify_captured_at is not None
+            and improve.review_verify_captured_at >= before
+        ):
             continue
         return improve
     return None
@@ -1776,10 +1765,7 @@ def _baseline_run_matches_failure_signatures(
     red_failure_set = parse_review_verify_failure_set(red_result)
     if not red_failure_set.available or not red_failure_set.failing_nodes:
         return False
-    expected_signatures = {
-        _normalized_failing_node_signature(node)
-        for node in red_failure_set.failing_nodes
-    }
+    expected_signatures = {_normalized_failing_node_signature(node) for node in red_failure_set.failing_nodes}
     matched_same_signature = False
     for baseline_result in baseline_results:
         baseline_failure_set = parse_review_verify_failure_set(baseline_result)
@@ -1787,10 +1773,7 @@ def _baseline_run_matches_failure_signatures(
             continue
         if not baseline_failure_set.available or not baseline_failure_set.failing_nodes:
             return False
-        observed_signatures = {
-            _normalized_failing_node_signature(node)
-            for node in baseline_failure_set.failing_nodes
-        }
+        observed_signatures = {_normalized_failing_node_signature(node) for node in baseline_failure_set.failing_nodes}
         if observed_signatures != expected_signatures:
             return False
         matched_same_signature = True
@@ -2391,20 +2374,17 @@ def _latest_review_blocker_resolution_statuses(
     branch_head = _resolve_branch_head_sha(git, impl_task.branch)
     current_head_sha = branch_head.head_sha
     latest_reviewed_head_sha = _normalize_review_state_head_sha(review_task.review_verify_head_sha)
-    verify_blockers_cleared = (
-        allow_verify_clearance
-        and (
-            _review_has_current_verify_blocker_clearance(
-                store=store,
-                impl_task=impl_task,
-                project_dir=project_dir,
-                review_task=review_task,
-                current_branch=impl_task.branch,
-                current_head_sha=current_head_sha,
-            )
-            if current_head_sha is not None
-            else False
+    verify_blockers_cleared = allow_verify_clearance and (
+        _review_has_current_verify_blocker_clearance(
+            store=store,
+            impl_task=impl_task,
+            project_dir=project_dir,
+            review_task=review_task,
+            current_branch=impl_task.branch,
+            current_head_sha=current_head_sha,
         )
+        if current_head_sha is not None
+        else False
     )
 
     blockers: list[tuple[ReviewFinding, str, tuple[str, str] | None]] = []
@@ -2412,9 +2392,7 @@ def _latest_review_blocker_resolution_statuses(
         if finding.severity != "BLOCKER":
             continue
         finding_kind = classify_review_blocker_finding(finding)
-        fingerprint_details = (
-            get_review_finding_fingerprint_details(finding) if finding_kind == "code" else None
-        )
+        fingerprint_details = get_review_finding_fingerprint_details(finding) if finding_kind == "code" else None
         blockers.append(
             (
                 finding,
@@ -2692,39 +2670,24 @@ def _stale_review_create_review_description(ctx: AdvanceContext) -> str:
 
 def _stale_review_pending_review_description(ctx: AdvanceContext) -> str:
     if ctx.review_invalidation_reason == "branch_head_advanced":
-        return (
-            f"Run pending review {_task_id(ctx.active_review)} "
-            "(branch head advanced after latest review)"
-        )
+        return f"Run pending review {_task_id(ctx.active_review)} (branch head advanced after latest review)"
     if ctx.review_invalidation_reason == "resolution_metadata_unavailable":
-        return (
-            f"Run pending full review {_task_id(ctx.active_review)} "
-            "(resolution-review metadata unavailable)"
-        )
+        return f"Run pending full review {_task_id(ctx.active_review)} (resolution-review metadata unavailable)"
     return _rebase_pending_review_description(ctx.active_review, ctx.review_invalidated_by_rebase)
 
 
 def _stale_review_wait_review_description(ctx: AdvanceContext) -> str:
     if ctx.review_invalidation_reason == "branch_head_advanced":
-        return (
-            f"SKIP: review {_task_id(ctx.active_review)} in progress "
-            "(branch head advanced after latest review)"
-        )
+        return f"SKIP: review {_task_id(ctx.active_review)} in progress (branch head advanced after latest review)"
     if ctx.review_invalidation_reason == "resolution_metadata_unavailable":
-        return (
-            f"SKIP: full review {_task_id(ctx.active_review)} in progress "
-            "(resolution-review metadata unavailable)"
-        )
+        return f"SKIP: full review {_task_id(ctx.active_review)} in progress (resolution-review metadata unavailable)"
     return _rebase_wait_review_description(ctx.active_review, ctx.review_invalidated_by_rebase)
 
 
 def _review_freshness_probe_failed_description(ctx: AdvanceContext) -> str:
     if ctx.current_review_head_probe_warning is None:
         return "SKIP: latest review freshness could not be verified"
-    return (
-        "SKIP: latest review freshness could not be verified because "
-        f"{ctx.current_review_head_probe_warning}"
-    )
+    return f"SKIP: latest review freshness could not be verified because {ctx.current_review_head_probe_warning}"
 
 
 def _resolution_review_metadata_invalid_action(ctx: AdvanceContext) -> dict[str, Any]:
@@ -2813,18 +2776,10 @@ def _review_covers_live_head(
     current_review_head_probe_warning: str | None,
     current_review_head_is_live: bool,
 ) -> bool:
-    if (
-        review_task is None
-        or current_review_head_probe_warning is not None
-        or not current_review_head_is_live
-    ):
+    if review_task is None or current_review_head_probe_warning is not None or not current_review_head_is_live:
         return False
     reviewed_head_sha = _normalize_review_state_head_sha(review_task.review_verify_head_sha)
-    return bool(
-        reviewed_head_sha
-        and current_review_head_sha
-        and reviewed_head_sha == current_review_head_sha
-    )
+    return bool(reviewed_head_sha and current_review_head_sha and reviewed_head_sha == current_review_head_sha)
 
 
 def _review_is_fallback_full_review_evidence(
@@ -2834,14 +2789,11 @@ def _review_is_fallback_full_review_evidence(
     current_review_head_probe_warning: str | None,
     current_review_head_is_live: bool,
 ) -> bool:
-    return (
-        _review_is_plain_full_review(review_task)
-        and _review_covers_live_head(
-            review_task,
-            current_review_head_sha=current_review_head_sha,
-            current_review_head_probe_warning=current_review_head_probe_warning,
-            current_review_head_is_live=current_review_head_is_live,
-        )
+    return _review_is_plain_full_review(review_task) and _review_covers_live_head(
+        review_task,
+        current_review_head_sha=current_review_head_sha,
+        current_review_head_probe_warning=current_review_head_probe_warning,
+        current_review_head_is_live=current_review_head_is_live,
     )
 
 
@@ -2865,10 +2817,14 @@ def _stale_review_create_review_action(ctx: AdvanceContext) -> dict[str, Any]:
                 "resolution_target_sha": resolved_target_sha,
             }
         )
-    elif ctx.review_invalidation_reason in {
-        "branch_head_advanced",
-        "resolution_metadata_unavailable",
-    } and ctx.current_review_head_sha:
+    elif (
+        ctx.review_invalidation_reason
+        in {
+            "branch_head_advanced",
+            "resolution_metadata_unavailable",
+        }
+        and ctx.current_review_head_sha
+    ):
         action["review_head_sha"] = ctx.current_review_head_sha
     return action
 
@@ -2879,10 +2835,14 @@ def _stale_review_run_pending_action(ctx: AdvanceContext) -> dict[str, Any]:
         "description": _stale_review_pending_review_description(ctx),
         "review_task": ctx.active_review,
     }
-    if ctx.review_invalidation_reason in {
-        "branch_head_advanced",
-        "resolution_metadata_unavailable",
-    } and ctx.current_review_head_sha:
+    if (
+        ctx.review_invalidation_reason
+        in {
+            "branch_head_advanced",
+            "resolution_metadata_unavailable",
+        }
+        and ctx.current_review_head_sha
+    ):
         action["review_head_sha"] = ctx.current_review_head_sha
     return action
 
@@ -3128,10 +3088,7 @@ def _clear_off_topic_verify_blocker_action(ctx: AdvanceContext) -> dict[str, Any
 
 def _recover_verify_only_noop_review_description(ctx: AdvanceContext) -> str:
     latest_noop_id = _task_id(ctx.latest_noop_improve)
-    return (
-        "Fresh verify on current tip for verify-only no-op improve recovery "
-        f"(latest {latest_noop_id})"
-    )
+    return f"Fresh verify on current tip for verify-only no-op improve recovery (latest {latest_noop_id})"
 
 
 def _recover_verify_only_noop_review_action(ctx: AdvanceContext) -> dict[str, Any]:
@@ -3166,8 +3123,7 @@ def _review_blocker_adjudication_description(ctx: AdvanceContext) -> str:
     candidate = ctx.review_blocker_adjudication_candidate
     finding_id = candidate.finding.id if candidate is not None else "unknown"
     return (
-        "Create review-blocker adjudication for blocker "
-        f"{finding_id} on review {_task_id(ctx.latest_completed_review)}"
+        f"Create review-blocker adjudication for blocker {finding_id} on review {_task_id(ctx.latest_completed_review)}"
     )
 
 
@@ -3224,9 +3180,7 @@ def _noop_improve_sibling_review_attention_action(ctx: AdvanceContext) -> dict[s
     if sibling_improve is None:
         sibling_state = "That review has no improve targeting it."
     elif sibling_improve.status == "completed":
-        sibling_state = (
-            f"Completed improve {_task_id(sibling_improve)} did not clear that review's current blockers."
-        )
+        sibling_state = f"Completed improve {_task_id(sibling_improve)} did not clear that review's current blockers."
     elif sibling_improve.status == "pending":
         sibling_state = (
             f"Pending improve {_task_id(sibling_improve)} is already queued for that review, "
@@ -3261,7 +3215,11 @@ def _requires_sibling_review_attention(ctx: AdvanceContext) -> bool:
 
 def _noop_improve_needs_discussion_action(ctx: AdvanceContext) -> dict[str, Any]:
     latest_noop_id = _task_id(ctx.latest_noop_improve)
-    source = "unresolved comments remain open after" if ctx.noop_improve_trigger == "comments" else "review feedback remains unresolved after"
+    source = (
+        "unresolved comments remain open after"
+        if ctx.noop_improve_trigger == "comments"
+        else "review feedback remains unresolved after"
+    )
     return with_needs_attention(
         {
             "type": "needs_discussion",
@@ -3483,9 +3441,7 @@ def _resolve_spec_coherence_inspection(
         return SpecCoherenceInspection()
 
     matched_paths = tuple(
-        path
-        for path in parsed_name_status.changed_paths
-        if _matches_spec_coherence_path(path, patterns)
+        path for path in parsed_name_status.changed_paths if _matches_spec_coherence_path(path, patterns)
     )
     if not matched_paths:
         return SpecCoherenceInspection()
@@ -3621,11 +3577,7 @@ def _failed_task_resume_or_retry_action(ctx: AdvanceContext) -> dict[str, Any]:
     rebase_parent_task = _resolve_recovery_preflight_rebase_parent_task(ctx.store, ctx.task)
     same_branch_rebases = _get_same_branch_rebase_descendants_for_root(ctx.store, rebase_parent_task)
     active_same_branch_rebase = next(
-        (
-            rebase
-            for rebase in same_branch_rebases
-            if rebase.status in {"pending", "in_progress"}
-        ),
+        (rebase for rebase in same_branch_rebases if rebase.status in {"pending", "in_progress"}),
         None,
     )
     deferred_action = failed_recovery_decision_to_action(ctx.task, ctx.failed_recovery_decision)
@@ -4168,10 +4120,7 @@ def is_current_red_verify_gate_action(action: Mapping[str, Any]) -> bool:
 
 def is_red_verify_gate_family_action(action: Mapping[str, Any]) -> bool:
     """Return whether an action belongs to the red verify-gate bypass family."""
-    if (
-        action.get("verify_gate_phase") == "pre_merge"
-        and action.get("verify_gate_family") == "verify_fix_routing"
-    ):
+    if action.get("verify_gate_phase") == "pre_merge" and action.get("verify_gate_family") == "verify_fix_routing":
         return True
     action_type = str(action.get("type", ""))
     if action_type in _RED_VERIFY_GATE_FAMILY_ACTION_TYPES:
@@ -4324,11 +4273,7 @@ def _resolve_plan_review_state(
         default=None,
         key=_task_event_time,
     )
-    current_plan_review = (
-        active_plan_review_pending
-        or active_plan_review_running
-        or latest_completed_plan_review
-    )
+    current_plan_review = active_plan_review_pending or active_plan_review_running or latest_completed_plan_review
     current_plan_improve = active_plan_improve_pending or active_plan_improve_running
 
     plan_review_verdict: str | None = None
@@ -4528,18 +4473,13 @@ def _resolve_plan_materialization_state(
     materialized_task_ids = tuple(task.id for task in materialized_tasks if task.id is not None)
     materialized_task_id_set = set(materialized_task_ids)
     live_descendant_ids = {task.id for task in descendants if task.id is not None}
-    if (
-        len(descendants) == len(materialized_tasks)
-        and live_descendant_ids == materialized_task_id_set
-    ):
+    if len(descendants) == len(materialized_tasks) and live_descendant_ids == materialized_task_id_set:
         return PlanMaterializationState(
             materialized=True,
             task_ids=materialized_task_ids,
         )
 
-    extra_descendants = [
-        task for task in descendants if task.id is None or task.id not in materialized_task_id_set
-    ]
+    extra_descendants = [task for task in descendants if task.id is None or task.id not in materialized_task_id_set]
     partial_descendants_detected, partial_repair_candidate = (
         _classify_plan_review_slice_descendants_for_materialization_state(
             config=config,
@@ -4679,9 +4619,7 @@ def _build_plan_materialization_repair_candidate(
             return None
 
     ordered_partial_task_ids = tuple(
-        task.id
-        for spec_index, task in sorted(matched_tasks.items())
-        if task.id is not None
+        task.id for spec_index, task in sorted(matched_tasks.items()) if task.id is not None
     )
     if not ordered_partial_task_ids:
         return None
@@ -4826,10 +4764,7 @@ def _failed_rebase_still_blocks_advance(ctx: AdvanceContext) -> bool:
         return False
     if not rebase_failure_requires_manual_resolution(ctx.store, failed_rebase):
         return False
-    if (
-        ctx.post_merge_rebase_state is not None
-        and ctx.post_merge_rebase_state.rebase_resolution_proved
-    ):
+    if ctx.post_merge_rebase_state is not None and ctx.post_merge_rebase_state.rebase_resolution_proved:
         return False
 
     failed_rebase_time = _task_event_time(failed_rebase)
@@ -4945,28 +4880,20 @@ def resolve_closing_review_action(
     if latest_completed_review is None:
         follow_on_reviews = list(reviews)
     else:
-        follow_on_reviews = [
-            review
-            for review in reviews
-            if _task_event_time(review) > latest_code_change_time
-        ]
+        follow_on_reviews = [review for review in reviews if _task_event_time(review) > latest_code_change_time]
 
     if follow_on_reviews:
         active_follow_on_review = _select_active_review(follow_on_reviews)
         if active_follow_on_review is not None and active_follow_on_review.status == "pending":
             return {
                 "type": "run_review",
-                "description": (
-                    f"Run pending closing review {_task_id(active_follow_on_review)}"
-                ),
+                "description": (f"Run pending closing review {_task_id(active_follow_on_review)}"),
                 "review_task": active_follow_on_review,
             }
         if active_follow_on_review is not None and active_follow_on_review.status == "in_progress":
             return {
                 "type": "wait_review",
-                "description": (
-                    f"SKIP: closing review {_task_id(active_follow_on_review)} is in_progress"
-                ),
+                "description": (f"SKIP: closing review {_task_id(active_follow_on_review)} is in_progress"),
                 "review_task": active_follow_on_review,
             }
         # A completed follow-on review satisfies the invariant (verdict acted on elsewhere).
@@ -5181,14 +5108,14 @@ def _resolve_review_state(
             except (OSError, UnicodeError):
                 review_report = ParsedReviewReport(verdict=None, findings=(), format_version="unknown")
             review_verdict = review_report.verdict
-        followup_findings = tuple(
-            finding for finding in review_report.findings if finding.severity == "FOLLOWUP"
-        )
+        followup_findings = tuple(finding for finding in review_report.findings if finding.severity == "FOLLOWUP")
 
         if task.task_type == "implement":
             assert task.id is not None
             latest_comment_time = _latest_unresolved_comment_time(store, task.id)
-            latest_review_time = _normalize_time(latest_completed_review.completed_at or latest_completed_review.created_at)
+            latest_review_time = _normalize_time(
+                latest_completed_review.completed_at or latest_completed_review.created_at
+            )
             if latest_comment_time is not None and latest_comment_time > latest_review_time:
                 has_fresh_unresolved_comments_since_latest_review = True
 
@@ -5202,12 +5129,15 @@ def _resolve_review_state(
             current_head_sha: str | None = None
             if task.branch is not None:
                 current_head_sha = _resolve_branch_head_sha(git, task.branch).head_sha
-            if _latest_matching_verify_only_noop_review_clearance(
-                store=store,
-                task=task,
-                latest_completed_review=latest_completed_review,
-                current_head_sha=current_head_sha,
-            ) is not None:
+            if (
+                _latest_matching_verify_only_noop_review_clearance(
+                    store=store,
+                    task=task,
+                    latest_completed_review=latest_completed_review,
+                    current_head_sha=current_head_sha,
+                )
+                is not None
+            ):
                 review_cleared = False
                 effective_review_cleared_at = None
         if not review_cleared:
@@ -5242,9 +5172,8 @@ def _resolve_review_state(
                 else None
             )
         if latest_completed_review.completed_at is not None and latest_completed_code_change is not None:
-            has_improve_after_review = (
-                _task_event_time(latest_completed_code_change)
-                > _normalize_time(latest_completed_review.completed_at)
+            has_improve_after_review = _task_event_time(latest_completed_code_change) > _normalize_time(
+                latest_completed_review.completed_at
             )
 
         if (
@@ -5268,15 +5197,12 @@ def _resolve_review_state(
                 allow_verify_clearance=True,
             )
             all_current_review_blockers_cleared = bool(review_blocker_resolution_statuses) and all(
-                _review_blocker_status_clears_current_blocker(status)
-                for status in review_blocker_resolution_statuses
+                _review_blocker_status_clears_current_blocker(status) for status in review_blocker_resolution_statuses
             )
             review_blockers_invalidated = all_current_review_blockers_cleared and any(
                 status.state == "invalid" for status in review_blocker_resolution_statuses
             )
-            review_blockers_revalidated = any(
-                status.state == "valid" for status in review_blocker_resolution_statuses
-            )
+            review_blockers_revalidated = any(status.state == "valid" for status in review_blocker_resolution_statuses)
             if all_current_review_blockers_cleared:
                 review_cleared = True
             if review_blockers_revalidated:
@@ -5305,7 +5231,11 @@ def _resolve_review_state(
             )
             if needs_human_status is not None:
                 review_blocker_adjudication_needed = True
-                source_task_id = (needs_human_status.latest_artifact.metadata or {}).get("source_task_id") if needs_human_status.latest_artifact is not None else None
+                source_task_id = (
+                    (needs_human_status.latest_artifact.metadata or {}).get("source_task_id")
+                    if needs_human_status.latest_artifact is not None
+                    else None
+                )
                 if isinstance(source_task_id, str):
                     review_blocker_adjudication_needed_task = store.get(source_task_id)
             elif adjudication_needed_from_task:
@@ -5335,9 +5265,7 @@ def _resolve_review_state(
             latest_review_output_content=latest_review_output_content,
         )
 
-    max_failed_closing_review_retries = int(
-        getattr(config, "max_failed_closing_review_retries", 3)
-    )
+    max_failed_closing_review_retries = int(getattr(config, "max_failed_closing_review_retries", 3))
     closing_review_action = resolve_closing_review_action(
         task=task,
         reviews=reviews,
@@ -5443,8 +5371,7 @@ def _plain_review_target_missing_skip_action(ctx: AdvanceContext) -> dict[str, A
     return {
         "type": "skip",
         "description": (
-            f"SKIP: {ctx.task.task_type} task {task_id} does not resolve to a completed "
-            "implementation review target"
+            f"SKIP: {ctx.task.task_type} task {task_id} does not resolve to a completed implementation review target"
         ),
     }
 
@@ -5689,9 +5616,7 @@ def _review_max_cycles_needs_attention_action(ctx: AdvanceContext) -> dict[str, 
     return with_needs_attention(
         {
             "type": "max_cycles_reached",
-            "description": (
-                f"SKIP: max review cycles ({ctx.max_review_cycles}) reached, needs manual intervention"
-            ),
+            "description": (f"SKIP: max review cycles ({ctx.max_review_cycles}) reached, needs manual intervention"),
         },
         reason=PARK_REASON_REVIEW_MAX_CYCLES_REACHED,
         subject_task_id=ctx.task.id,
@@ -5743,9 +5668,7 @@ def _review_max_cycles_action(ctx: AdvanceContext) -> dict[str, Any]:
     blocker_ids = tuple(finding.id for finding in blocker_findings if isinstance(finding.id, str) and finding.id)
     if len(blocker_ids) != len(blocker_findings):
         return _review_max_cycles_needs_attention_action(ctx)
-    latest_review_mode = (
-        "resolution" if declares_resolution_review_mode(review_task.review_scope) else "plain_full"
-    )
+    latest_review_mode = "resolution" if declares_resolution_review_mode(review_task.review_scope) else "plain_full"
 
     return {
         "type": "merge",
@@ -5958,7 +5881,14 @@ def _verify_fix_failed_manual_rearm_requires_fresh_verify(
 def _verify_gate_failed_phase_names(decision: VerifyGateDecision) -> tuple[str, ...] | None:
     validation = validate_verify_phase_evidence_from_metadata(decision.lookup.artifact_metadata)
     if validation.state not in {PHASE_EVIDENCE_RED, PHASE_EVIDENCE_VALID_ZERO_RED}:
-        return None
+        result = decision.lookup.result
+        phase_summary = getattr(result, "phase_summary", None)
+        if not isinstance(phase_summary, dict):
+            return None
+        failed = phase_summary.get("failed")
+        if not isinstance(failed, list):
+            return None
+        return tuple(item for item in failed if isinstance(item, str) and item)
     return validation.failed_phase_names
 
 
@@ -5966,8 +5896,28 @@ def _verify_gate_phase_budget_summary(decision: VerifyGateDecision) -> dict[str,
     metadata = decision.lookup.artifact_metadata
     aggregate_details = metadata.get("aggregate_details") if isinstance(metadata, dict) else None
     if not isinstance(aggregate_details, dict):
-        return {}
-    summary: dict[str, Any] = {}
+        result = decision.lookup.result
+        phase_summary = getattr(result, "phase_summary", None)
+        if not isinstance(phase_summary, dict):
+            return {}
+        direct_summary = dict(phase_summary)
+        completed = phase_summary.get("completed")
+        if isinstance(completed, list):
+            direct_summary["completed_phase_names"] = tuple(
+                phase.get("name") for phase in completed if isinstance(phase, dict) and isinstance(phase.get("name"), str)
+            )
+        for source_key, target_key in (
+            ("failed", "failed_phase_names"),
+            ("never_started", "not_started_phase_names"),
+            ("running", "started_phase_names"),
+        ):
+            value = phase_summary.get(source_key)
+            if isinstance(value, list):
+                direct_summary[target_key] = tuple(item for item in value if isinstance(item, str) and item)
+        return direct_summary
+    result = decision.lookup.result
+    phase_summary = getattr(result, "phase_summary", None)
+    summary: dict[str, Any] = dict(phase_summary) if isinstance(phase_summary, dict) else {}
     for key in (
         "completed_phase_names",
         "failed_phase_names",
@@ -5985,6 +5935,8 @@ def _verify_gate_phase_budget_summary(decision: VerifyGateDecision) -> dict[str,
             if not isinstance(scope, dict):
                 continue
             diagnostics = scope.get("phase_diagnostics")
+            if not isinstance(diagnostics, dict):
+                diagnostics = scope.get("phase_summary")
             if not isinstance(diagnostics, dict):
                 continue
             scoped_summary.append(
@@ -6020,6 +5972,20 @@ def _verify_gate_phase_budget_summary(decision: VerifyGateDecision) -> dict[str,
 
 def _verify_gate_is_budget_only_timeout(decision: VerifyGateDecision) -> bool:
     validation = validate_verify_phase_evidence_from_metadata(decision.lookup.artifact_metadata)
+    if validation.state == PHASE_EVIDENCE_INDETERMINATE:
+        metadata = decision.lookup.artifact_metadata
+        aggregate_details = metadata.get("aggregate_details") if isinstance(metadata, dict) else None
+        if isinstance(aggregate_details, dict) and "phase_results" in aggregate_details:
+            return False
+        result = decision.lookup.result
+        phase_summary = getattr(result, "phase_summary", None)
+        failed = phase_summary.get("failed") if isinstance(phase_summary, dict) else None
+        return (
+            decision.state == "failed"
+            and verify_result_is_timeout_origin(result)
+            and isinstance(failed, list)
+            and not failed
+        )
     return (
         decision.state == "failed"
         and verify_result_is_timeout_origin(decision.lookup.result)
@@ -6034,6 +6000,11 @@ def _verify_budget_exceeded_action(ctx: AdvanceContext, *, phase: str, owner_tas
     not_started_names = summary.get("not_started_phase_names", ())
     completed_text = ", ".join(completed_names) if completed_names else "none recorded"
     not_started_text = ", ".join(not_started_names) if not_started_names else "unknown"
+    phase_progress_text = (
+        f"completed phases: {completed_text}; never-started phases: {not_started_text}"
+        if completed_names
+        else f"never-started phases: {not_started_text}"
+    )
     scopes = summary.get("scopes", ())
     scope_text = ""
     if scopes:
@@ -6057,7 +6028,7 @@ def _verify_budget_exceeded_action(ctx: AdvanceContext, *, phase: str, owner_tas
                 "type": "needs_discussion",
                 "description": (
                     f"SKIP: verify gate exceeded its wall-clock budget before {description_suffix}; "
-                    f"completed phases: {completed_text}; phases not started: {not_started_text}. "
+                    f"{phase_progress_text}. "
                     "No executed phase reported a failure, so no verify_fix task was created."
                     f"{scope_text}"
                 ),
@@ -6107,6 +6078,32 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext, *, phase: str = "pre_revi
             phase=phase,
         )
 
+    if (
+        decision.state == "failed"
+        and verify_result_has_invalid_phase_evidence(decision.lookup.result)
+        and validate_verify_phase_evidence_from_metadata(decision.lookup.artifact_metadata).state
+        == PHASE_EVIDENCE_INDETERMINATE
+    ):
+        result = decision.lookup.result
+        invalid_reason = getattr(result, "phase_summary_invalid_reason", None) if result is not None else None
+        detail_suffix = f": {invalid_reason}" if invalid_reason else ""
+        return _with_red_verify_gate_metadata(
+            ctx,
+            with_needs_attention(
+                {
+                    "type": "needs_discussion",
+                    "description": (
+                        "SKIP: verify_command timeout phase evidence is invalid or unavailable; "
+                        f"rerun lifecycle verify before creating verify_fix{detail_suffix}"
+                    ),
+                    "verify_epoch": current_epoch,
+                },
+                reason=PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID,
+                subject_task_id=owner_task.id,
+            ),
+            phase=phase,
+        )
+
     if _verify_gate_is_budget_only_timeout(decision):
         return _verify_budget_exceeded_action(ctx, phase=phase, owner_task=owner_task)
 
@@ -6139,10 +6136,7 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext, *, phase: str = "pre_revi
                 phase=phase,
             )
         if existing.status == "completed":
-            if (
-                decision.state == "failed"
-                and verify_result_is_timeout_origin(decision.lookup.result)
-            ):
+            if decision.state == "failed" and verify_result_is_timeout_origin(decision.lookup.result):
                 canonical_outcome = inspect_verify_fix_completion_outcome(existing)
                 if canonical_outcome.state == "invalid":
                     return _with_red_verify_gate_metadata(
@@ -6534,11 +6528,7 @@ def _active_review_requires_automation(ctx: AdvanceContext) -> bool:
     """Whether an active review should still block merge automation."""
     if ctx.review_cleared or ctx.active_review is None:
         return False
-    if (
-        ctx.review_invalidated_by_progress
-        and _is_implementation_owned_lineage(ctx)
-        and not ctx.requires_review
-    ):
+    if ctx.review_invalidated_by_progress and _is_implementation_owned_lineage(ctx) and not ctx.requires_review:
         return False
     return True
 
@@ -6555,10 +6545,7 @@ def _review_freshness_probe_failed(ctx: AdvanceContext) -> bool:
         return False
     if ctx.active_review is not None:
         return False
-    if (
-        ctx.review_invalidated_by_progress
-        and ctx.review_invalidation_reason == "resolution_metadata_unavailable"
-    ):
+    if ctx.review_invalidated_by_progress and ctx.review_invalidation_reason == "resolution_metadata_unavailable":
         return True
     if ctx.latest_reviewed_head_sha is None:
         return False
@@ -6641,8 +6628,7 @@ def _spec_coherence_needs_discussion_action(ctx: AdvanceContext) -> dict[str, An
         {
             "type": "needs_discussion",
             "description": (
-                f"SKIP: behavior-spec coherence review verdict is "
-                f"{verdict or 'unknown'}; manual discussion is required"
+                f"SKIP: behavior-spec coherence review verdict is {verdict or 'unknown'}; manual discussion is required"
             ),
             "review_task": getattr(ctx, "spec_coherence_latest_completed_review", None),
         },
@@ -6684,9 +6670,7 @@ def _closing_review_invariant_action(ctx: AdvanceContext) -> dict[str, Any]:
     if ctx.closing_review_action.get("type") == "create_review" and not ctx.create_reviews:
         review_root_task = getattr(ctx, "review_root_task", None)
         subject_task_id = (
-            review_root_task.id
-            if review_root_task is not None and review_root_task.id is not None
-            else ctx.task.id
+            review_root_task.id if review_root_task is not None and review_root_task.id is not None else ctx.task.id
         )
         if ctx.latest_completed_review is None:
             return with_needs_attention(
@@ -6936,11 +6920,7 @@ def _resolve_pre_closing_review_git_context(
     rebase_failed = max(failed_rebases, key=_task_event_time) if failed_rebases else None
 
     latest_completed_rebase: DbTask | None = None
-    completed_rebases = [
-        c
-        for c in rebase_children
-        if c.status == "completed" and c.completed_at is not None
-    ]
+    completed_rebases = [c for c in rebase_children if c.status == "completed" and c.completed_at is not None]
     if completed_rebases:
         latest_completed_rebase = max(completed_rebases, key=lambda t: t.completed_at or datetime.min)
 
@@ -6955,17 +6935,14 @@ def _resolve_pre_closing_review_git_context(
     review_cycle_boundary = ReviewCycleBoundary()
     completed_review_cycles = ctx.completed_review_cycles
     latest_reviewed_head_sha = (
-        ctx.latest_completed_review.review_verify_head_sha
-        if ctx.latest_completed_review is not None
-        else None
+        ctx.latest_completed_review.review_verify_head_sha if ctx.latest_completed_review is not None else None
     )
     current_review_head_sha: str | None = None
     current_review_head_probe_warning: str | None = None
     current_review_head_is_live = False
     if (
-        (ctx.latest_completed_review is not None and latest_reviewed_head_sha is not None)
-        or latest_completed_rebase is not None
-    ):
+        ctx.latest_completed_review is not None and latest_reviewed_head_sha is not None
+    ) or latest_completed_rebase is not None:
         (
             current_review_head_sha,
             current_review_head_probe_warning,
@@ -7007,8 +6984,7 @@ def _resolve_pre_closing_review_git_context(
         and latest_reviewed_head_sha != current_review_head_sha
         and ctx.latest_completed_code_change is not None
         and ctx.latest_completed_code_change.id != ctx.latest_completed_review.id
-        and _task_event_time(ctx.latest_completed_code_change)
-        > _task_event_time(ctx.latest_completed_review)
+        and _task_event_time(ctx.latest_completed_code_change) > _task_event_time(ctx.latest_completed_review)
     ):
         review_invalidated_by_progress = True
         if review_invalidation_reason is None:
@@ -7153,17 +7129,12 @@ def _resolve_pre_closing_review_git_context(
     if (
         (
             ctx.review_verdict == "CHANGES_REQUESTED"
-            or ctx.capped_review_content_error_reason
-            == PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE
+            or ctx.capped_review_content_error_reason == PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE
         )
         and review_root_task.id is not None
         and ctx.latest_completed_review is not None
     ):
-        completed_reviews = [
-            review
-            for review in (ctx.reviews or [])
-            if review.status == "completed"
-        ]
+        completed_reviews = [review for review in (ctx.reviews or []) if review.status == "completed"]
         review_cycle_boundary = resolve_review_cycle_boundary(
             completed_reviews=completed_reviews,
             latest_completed_review=ctx.latest_completed_review,
@@ -7192,9 +7163,7 @@ def _resolve_pre_closing_review_git_context(
         latest_completed_review=ctx.latest_completed_review,
         latest_completed_code_change=ctx.latest_completed_code_change,
         current_review_head_sha=current_review_head_sha,
-        max_failed_closing_review_retries=int(
-            getattr(config, "max_failed_closing_review_retries", 3)
-        ),
+        max_failed_closing_review_retries=int(getattr(config, "max_failed_closing_review_retries", 3)),
     )
 
     return replace(
@@ -7270,15 +7239,10 @@ def _resolve_post_closing_review_git_context(
         duplicate_blocker_streak = _count_duplicate_primary_blocker_streak(
             config,
             ctx.reviews or [],
-            [
-                rebase
-                for rebase in rebase_children
-                if rebase.status == "completed" and rebase.completed_at is not None
-            ],
+            [rebase for rebase in rebase_children if rebase.status == "completed" and rebase.completed_at is not None],
             latest_report=(
                 ctx.review_report
-                if ctx.latest_completed_review is not None
-                and ctx.latest_completed_review.output_content is None
+                if ctx.latest_completed_review is not None and ctx.latest_completed_review.output_content is None
                 else None
             ),
         )
@@ -7470,9 +7434,7 @@ def resolve_advance_context(
     assert task.id is not None
 
     effective_max_resume = max_resume_attempts if max_resume_attempts is not None else config.max_resume_attempts
-    effective_max_noop_improves = int(
-        getattr(config, "max_noop_improve_cycles", DEFAULT_MAX_NOOP_IMPROVE_CYCLES)
-    )
+    effective_max_noop_improves = int(getattr(config, "max_noop_improve_cycles", DEFAULT_MAX_NOOP_IMPROVE_CYCLES))
     failed_recovery_decision: FailedRecoveryDecision | None = None
     failed_recovery_attention_reason: str | None = None
     if task.status == "failed":
@@ -7489,10 +7451,10 @@ def resolve_advance_context(
             max_recovery_attempts=effective_max_resume,
             read_context=read_context,
         )
-    is_resumable_failed = (
-        failed_recovery_decision is not None
-        and failed_recovery_decision.action in {"resume", "retry"}
-    )
+    is_resumable_failed = failed_recovery_decision is not None and failed_recovery_decision.action in {
+        "resume",
+        "retry",
+    }
     has_resume_children = False
     resume_chain_depth = 0
     active_plan_child: DbTask | None = None
@@ -7506,18 +7468,13 @@ def resolve_advance_context(
         )
         active_plan_child = followup_state.active_plan_descendant
         active_implement_child = followup_state.active_implement_descendant
-        has_non_dropped_plan_or_implement_descendant = (
-            followup_state.has_non_dropped_plan_or_implement_descendant
-        )
+        has_non_dropped_plan_or_implement_descendant = followup_state.has_non_dropped_plan_or_implement_descendant
         if impl_based_on_ids is None:
             impl_based_on_ids = collect_non_dropped_implement_source_ids(store.get_all())
-    has_implementation_followup = (
-        task.task_type == "plan"
-        and source_task_has_implementation_followup(
-            task,
-            followup_state,
-            non_dropped_implement_source_ids=impl_based_on_ids,
-        )
+    has_implementation_followup = task.task_type == "plan" and source_task_has_implementation_followup(
+        task,
+        followup_state,
+        non_dropped_implement_source_ids=impl_based_on_ids,
     )
     if task.task_type == "plan_improve" and impl_based_on_ids is None:
         impl_based_on_ids = collect_non_dropped_implement_source_ids(store.get_all())
@@ -7736,7 +7693,9 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="failed_task_resume",
-        matches=lambda ctx: ctx.failed_recovery_decision is not None and ctx.failed_recovery_decision.action == "resume",
+        matches=lambda ctx: (
+            ctx.failed_recovery_decision is not None and ctx.failed_recovery_decision.action == "resume"
+        ),
         action=_failed_task_resume_or_retry_action,
     ),
     AdvanceRule(
@@ -7774,16 +7733,12 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.plan_review_verdict == "APPROVED"
             and ctx.validated_plan_review_manifest is not None
             and ctx.latest_completed_plan_review is not None
-            and not (
-                ctx.plan_materialization_state is not None
-                and ctx.plan_materialization_state.materialized
-            )
+            and not (ctx.plan_materialization_state is not None and ctx.plan_materialization_state.materialized)
         ),
         action=lambda ctx: {
             "type": "release_approved_plan_review",
             "description": (
-                "Release held plan after approved plan review "
-                f"{_task_id(ctx.latest_completed_plan_review)}"
+                f"Release held plan after approved plan review {_task_id(ctx.latest_completed_plan_review)}"
             ),
             "plan_source_task": ctx.latest_plan_source or ctx.task,
             "plan_review_task": ctx.latest_completed_plan_review,
@@ -7819,10 +7774,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 not ctx.auto_implement_enabled
                 or not ctx.require_plan_review_before_implement
                 or ctx.latest_completed_plan_review is None
-                or (
-                    ctx.plan_materialization_state is not None
-                    and ctx.plan_materialization_state.materialized
-                )
+                or (ctx.plan_materialization_state is not None and ctx.plan_materialization_state.materialized)
                 or (
                     ctx.plan_review_verdict == "APPROVED"
                     and ctx.validated_plan_review_manifest is not None
@@ -7878,10 +7830,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.validated_plan_review_manifest is not None
             and ctx.plan_materialization_state is not None
             and ctx.plan_materialization_state.partial_slice_descendants_detected
-            and not (
-                ctx.plan_materialization_state is not None
-                and ctx.plan_materialization_state.materialized
-            )
+            and not (ctx.plan_materialization_state is not None and ctx.plan_materialization_state.materialized)
         ),
         action=lambda ctx: with_needs_attention(
             {
@@ -7952,10 +7901,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.recoverable_plan_review_schema_version_format_error
             and ctx.active_plan_review_pending is None
             and ctx.active_plan_review_running is None
-            and not (
-                ctx.plan_materialization_state is not None
-                and ctx.plan_materialization_state.materialized
-            )
+            and not (ctx.plan_materialization_state is not None and ctx.plan_materialization_state.materialized)
         ),
         action=lambda ctx: {
             "type": "create_plan_review",
@@ -7975,17 +7921,13 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.plan_review_verdict == "APPROVED"
             and ctx.validated_plan_review_manifest is None
             and ctx.plan_review_validation_error is not None
-            and not (
-                ctx.plan_materialization_state is not None
-                and ctx.plan_materialization_state.materialized
-            )
+            and not (ctx.plan_materialization_state is not None and ctx.plan_materialization_state.materialized)
         ),
         action=lambda ctx: with_needs_attention(
             {
                 "type": "needs_discussion",
                 "description": (
-                    "SKIP: approved plan review has an invalid slice manifest"
-                    f" ({ctx.plan_review_validation_error})"
+                    f"SKIP: approved plan review has an invalid slice manifest ({ctx.plan_review_validation_error})"
                 ),
             },
             reason="plan-review-invalid-slices",
@@ -8002,10 +7944,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.require_plan_review_before_implement
             and ctx.plan_review_verdict == "APPROVED"
             and ctx.validated_plan_review_manifest is not None
-            and not (
-                ctx.plan_materialization_state is not None
-                and ctx.plan_materialization_state.materialized
-            )
+            and not (ctx.plan_materialization_state is not None and ctx.plan_materialization_state.materialized)
         ),
         action=lambda ctx: {
             "type": "materialize_plan_slices",
@@ -8024,10 +7963,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.require_plan_review_before_implement
             and ctx.plan_review_verdict == "CHANGES_REQUESTED"
             and ctx.active_plan_improve_pending is not None
-            and not (
-                ctx.plan_materialization_state is not None
-                and ctx.plan_materialization_state.materialized
-            )
+            and not (ctx.plan_materialization_state is not None and ctx.plan_materialization_state.materialized)
         ),
         action=lambda ctx: {
             "type": "run_plan_improve",
@@ -8044,10 +7980,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.require_plan_review_before_implement
             and ctx.plan_review_verdict == "CHANGES_REQUESTED"
             and ctx.active_plan_improve_running is not None
-            and not (
-                ctx.plan_materialization_state is not None
-                and ctx.plan_materialization_state.materialized
-            )
+            and not (ctx.plan_materialization_state is not None and ctx.plan_materialization_state.materialized)
         ),
         action=lambda ctx: {
             "type": "wait_plan_improve",
@@ -8064,16 +7997,12 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.require_plan_review_before_implement
             and ctx.plan_review_verdict == "CHANGES_REQUESTED"
             and ctx.completed_plan_review_cycles >= ctx.max_plan_review_cycles
-            and not (
-                ctx.plan_materialization_state is not None
-                and ctx.plan_materialization_state.materialized
-            )
+            and not (ctx.plan_materialization_state is not None and ctx.plan_materialization_state.materialized)
         ),
         action=lambda ctx: {
             "type": "create_implement",
             "description": (
-                "Create and start implement task "
-                "(accept latest plan revision after capped plan-review churn)"
+                "Create and start implement task (accept latest plan revision after capped plan-review churn)"
             ),
             "plan_review_cycle_limit_reached": True,
         },
@@ -8086,10 +8015,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.auto_implement_enabled
             and ctx.require_plan_review_before_implement
             and ctx.plan_review_verdict == "CHANGES_REQUESTED"
-            and not (
-                ctx.plan_materialization_state is not None
-                and ctx.plan_materialization_state.materialized
-            )
+            and not (ctx.plan_materialization_state is not None and ctx.plan_materialization_state.materialized)
         ),
         action=lambda ctx: {
             "type": "create_plan_improve",
@@ -8107,10 +8033,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.require_plan_review_before_implement
             and ctx.latest_completed_plan_review is not None
             and ctx.plan_review_verdict in {None, "NEEDS_DISCUSSION"}
-            and not (
-                ctx.plan_materialization_state is not None
-                and ctx.plan_materialization_state.materialized
-            )
+            and not (ctx.plan_materialization_state is not None and ctx.plan_materialization_state.materialized)
         ),
         action=lambda ctx: with_needs_attention(
             {
@@ -8243,10 +8166,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="target_already_merged",
-        matches=lambda ctx: (
-            ctx.post_merge_rebase_state is not None
-            and ctx.post_merge_rebase_state.already_merged
-        ),
+        matches=lambda ctx: ctx.post_merge_rebase_state is not None and ctx.post_merge_rebase_state.already_merged,
         action=lambda ctx: {
             "type": "skip",
             "description": _target_already_merged_description(ctx),
@@ -8284,10 +8204,12 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="spec_coherence_run_pending_review",
-        matches=lambda ctx: _spec_coherence_gate_required(ctx)
-        and not _spec_coherence_gate_currently_approved(ctx)
-        and ctx.spec_coherence_active_review is not None
-        and ctx.spec_coherence_active_review.status == "pending",
+        matches=lambda ctx: (
+            _spec_coherence_gate_required(ctx)
+            and not _spec_coherence_gate_currently_approved(ctx)
+            and ctx.spec_coherence_active_review is not None
+            and ctx.spec_coherence_active_review.status == "pending"
+        ),
         action=lambda ctx: {
             "type": "run_review",
             "description": f"Run pending behavior-spec coherence review {_task_id(ctx.spec_coherence_active_review)}",
@@ -8296,10 +8218,12 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="spec_coherence_wait_review",
-        matches=lambda ctx: _spec_coherence_gate_required(ctx)
-        and not _spec_coherence_gate_currently_approved(ctx)
-        and ctx.spec_coherence_active_review is not None
-        and ctx.spec_coherence_active_review.status == "in_progress",
+        matches=lambda ctx: (
+            _spec_coherence_gate_required(ctx)
+            and not _spec_coherence_gate_currently_approved(ctx)
+            and ctx.spec_coherence_active_review is not None
+            and ctx.spec_coherence_active_review.status == "in_progress"
+        ),
         action=lambda ctx: {
             "type": "wait_review",
             "description": f"SKIP: behavior-spec coherence review {_task_id(ctx.spec_coherence_active_review)} is in_progress",
@@ -8308,10 +8232,12 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="spec_coherence_wait_improve",
-        matches=lambda ctx: _spec_coherence_gate_required(ctx)
-        and ctx.spec_coherence_review_current
-        and ctx.spec_coherence_review_verdict == "CHANGES_REQUESTED"
-        and ctx.active_improve_running is not None,
+        matches=lambda ctx: (
+            _spec_coherence_gate_required(ctx)
+            and ctx.spec_coherence_review_current
+            and ctx.spec_coherence_review_verdict == "CHANGES_REQUESTED"
+            and ctx.active_improve_running is not None
+        ),
         action=lambda ctx: {
             "type": "wait_improve",
             "description": f"SKIP: improve task {_task_id(ctx.active_improve_running)} is in_progress",
@@ -8320,10 +8246,12 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="spec_coherence_run_pending_improve",
-        matches=lambda ctx: _spec_coherence_gate_required(ctx)
-        and ctx.spec_coherence_review_current
-        and ctx.spec_coherence_review_verdict == "CHANGES_REQUESTED"
-        and ctx.active_improve_pending is not None,
+        matches=lambda ctx: (
+            _spec_coherence_gate_required(ctx)
+            and ctx.spec_coherence_review_current
+            and ctx.spec_coherence_review_verdict == "CHANGES_REQUESTED"
+            and ctx.active_improve_pending is not None
+        ),
         action=lambda ctx: {
             "type": "run_improve",
             "description": f"Spawn worker for pending improve {_task_id(ctx.active_improve_pending)}",
@@ -8332,9 +8260,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="spec_coherence_create_improve",
-        matches=lambda ctx: _spec_coherence_gate_required(ctx)
-        and ctx.spec_coherence_review_current
-        and ctx.spec_coherence_review_verdict == "CHANGES_REQUESTED",
+        matches=lambda ctx: (
+            _spec_coherence_gate_required(ctx)
+            and ctx.spec_coherence_review_current
+            and ctx.spec_coherence_review_verdict == "CHANGES_REQUESTED"
+        ),
         action=lambda ctx: {
             "type": "improve",
             "description": "Create improve task (behavior-spec coherence review CHANGES_REQUESTED)",
@@ -8345,46 +8275,54 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="spec_coherence_needs_discussion",
-        matches=lambda ctx: _spec_coherence_gate_required(ctx)
-        and ctx.spec_coherence_review_current
-        and ctx.spec_coherence_review_verdict == "NEEDS_DISCUSSION",
+        matches=lambda ctx: (
+            _spec_coherence_gate_required(ctx)
+            and ctx.spec_coherence_review_current
+            and ctx.spec_coherence_review_verdict == "NEEDS_DISCUSSION"
+        ),
         action=_spec_coherence_needs_discussion_action,
     ),
     AdvanceRule(
         name="spec_coherence_unknown_verdict",
-        matches=lambda ctx: _spec_coherence_gate_required(ctx)
-        and ctx.spec_coherence_review_current
-        and ctx.spec_coherence_latest_completed_review is not None
-        and ctx.spec_coherence_review_verdict not in {
-            "APPROVED",
-            "CHANGES_REQUESTED",
-            "NEEDS_DISCUSSION",
-        },
+        matches=lambda ctx: (
+            _spec_coherence_gate_required(ctx)
+            and ctx.spec_coherence_review_current
+            and ctx.spec_coherence_latest_completed_review is not None
+            and ctx.spec_coherence_review_verdict
+            not in {
+                "APPROVED",
+                "CHANGES_REQUESTED",
+                "NEEDS_DISCUSSION",
+            }
+        ),
         action=_spec_coherence_unknown_verdict_action,
     ),
     AdvanceRule(
         name="spec_coherence_run_pending_ordinary_review",
-        matches=lambda ctx: _spec_coherence_gate_required(ctx)
-        and not _spec_coherence_gate_currently_approved(ctx)
-        and ctx.spec_coherence_active_review is None
-        and ctx.active_review is not None
-        and ctx.active_review.status == "pending",
+        matches=lambda ctx: (
+            _spec_coherence_gate_required(ctx)
+            and not _spec_coherence_gate_currently_approved(ctx)
+            and ctx.spec_coherence_active_review is None
+            and ctx.active_review is not None
+            and ctx.active_review.status == "pending"
+        ),
         action=lambda ctx: {
             "type": "run_review",
             "description": (
-                f"Run pending review {_task_id(ctx.active_review)} before creating the "
-                "behavior-spec coherence review"
+                f"Run pending review {_task_id(ctx.active_review)} before creating the behavior-spec coherence review"
             ),
             "review_task": ctx.active_review,
         },
     ),
     AdvanceRule(
         name="spec_coherence_wait_ordinary_review",
-        matches=lambda ctx: _spec_coherence_gate_required(ctx)
-        and not _spec_coherence_gate_currently_approved(ctx)
-        and ctx.spec_coherence_active_review is None
-        and ctx.active_review is not None
-        and ctx.active_review.status == "in_progress",
+        matches=lambda ctx: (
+            _spec_coherence_gate_required(ctx)
+            and not _spec_coherence_gate_currently_approved(ctx)
+            and ctx.spec_coherence_active_review is None
+            and ctx.active_review is not None
+            and ctx.active_review.status == "in_progress"
+        ),
         action=lambda ctx: {
             "type": "wait_review",
             "description": (
@@ -8396,9 +8334,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="spec_coherence_create_review",
-        matches=lambda ctx: _spec_coherence_gate_required(ctx)
-        and not _spec_coherence_gate_currently_approved(ctx)
-        and ctx.spec_coherence_active_review is None,
+        matches=lambda ctx: (
+            _spec_coherence_gate_required(ctx)
+            and not _spec_coherence_gate_currently_approved(ctx)
+            and ctx.spec_coherence_active_review is None
+        ),
         action=_spec_coherence_create_review_action,
     ),
     AdvanceRule(
@@ -8433,9 +8373,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="conflict_rebase_completed_but_still_blocked",
         matches=lambda ctx: (
-            not ctx.can_merge
-            and ctx.latest_completed_rebase is not None
-            and _branch_contains_target_tip(ctx)
+            not ctx.can_merge and ctx.latest_completed_rebase is not None and _branch_contains_target_tip(ctx)
         ),
         action=_rebase_did_not_unblock_merge_action,
     ),
@@ -8456,19 +8394,13 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="already_rebased_but_lineage_incomplete",
-        matches=lambda ctx: (
-            not ctx.can_merge
-            and _branch_contains_target_tip(ctx)
-            and ctx.task.status != "completed"
-        ),
+        matches=lambda ctx: not ctx.can_merge and _branch_contains_target_tip(ctx) and ctx.task.status != "completed",
         action=_already_rebased_but_lineage_incomplete_action,
     ),
     AdvanceRule(
         name="resolution_review_metadata_invalid",
         matches=lambda ctx: (
-            ctx.resolution_review_metadata_invalid
-            and _is_implementation_owned_lineage(ctx)
-            and ctx.requires_review
+            ctx.resolution_review_metadata_invalid and _is_implementation_owned_lineage(ctx) and ctx.requires_review
         ),
         action=_resolution_review_metadata_invalid_action,
     ),
@@ -8516,14 +8448,16 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_merge_source_requires_manual_resolution",
-        matches=lambda ctx: _merge_source_unavailable_requires_manual_resolution(ctx)
-        and has_valid_review_for_merge(ctx)
-        and (
-            (ctx.review_cleared and ctx.latest_completed_review is not None)
-            or (
-                (not ctx.review_cleared)
-                and ctx.latest_completed_review is not None
-                and ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
+        matches=lambda ctx: (
+            _merge_source_unavailable_requires_manual_resolution(ctx)
+            and has_valid_review_for_merge(ctx)
+            and (
+                (ctx.review_cleared and ctx.latest_completed_review is not None)
+                or (
+                    (not ctx.review_cleared)
+                    and ctx.latest_completed_review is not None
+                    and ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
+                )
             )
         ),
         action=_merge_source_unavailable_manual_resolution_action,
@@ -8599,9 +8533,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_pending",
-        matches=lambda ctx: _active_review_requires_automation(ctx)
-        and ctx.active_review is not None
-        and ctx.active_review.status == "pending",
+        matches=lambda ctx: (
+            _active_review_requires_automation(ctx)
+            and ctx.active_review is not None
+            and ctx.active_review.status == "pending"
+        ),
         action=lambda ctx: {
             "type": "run_review",
             "description": f"Spawn worker for pending review {_task_id(ctx.active_review)}",
@@ -8610,9 +8546,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_in_progress",
-        matches=lambda ctx: _active_review_requires_automation(ctx)
-        and ctx.active_review is not None
-        and ctx.active_review.status == "in_progress",
+        matches=lambda ctx: (
+            _active_review_requires_automation(ctx)
+            and ctx.active_review is not None
+            and ctx.active_review.status == "in_progress"
+        ),
         action=lambda ctx: {
             "type": "wait_review",
             "description": f"SKIP: review {_task_id(ctx.active_review)} is in_progress",
@@ -8621,11 +8559,13 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="fresh_comments_wait_improve",
-        matches=lambda ctx: ctx.task_type == "implement"
-        and ctx.latest_completed_review is not None
-        and ctx.has_fresh_unresolved_comments_since_latest_review
-        and (ctx.review_cleared or ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"})
-        and ctx.active_improve_running is not None,
+        matches=lambda ctx: (
+            ctx.task_type == "implement"
+            and ctx.latest_completed_review is not None
+            and ctx.has_fresh_unresolved_comments_since_latest_review
+            and (ctx.review_cleared or ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"})
+            and ctx.active_improve_running is not None
+        ),
         action=lambda ctx: {
             "type": "wait_improve",
             "description": (
@@ -8637,11 +8577,13 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="fresh_comments_run_pending_improve",
-        matches=lambda ctx: ctx.task_type == "implement"
-        and ctx.latest_completed_review is not None
-        and ctx.has_fresh_unresolved_comments_since_latest_review
-        and (ctx.review_cleared or ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"})
-        and ctx.active_improve_pending is not None,
+        matches=lambda ctx: (
+            ctx.task_type == "implement"
+            and ctx.latest_completed_review is not None
+            and ctx.has_fresh_unresolved_comments_since_latest_review
+            and (ctx.review_cleared or ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"})
+            and ctx.active_improve_pending is not None
+        ),
         action=lambda ctx: {
             "type": "run_improve",
             "description": (
@@ -8653,17 +8595,21 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="fresh_comments_noop_improve_limit",
-        matches=lambda ctx: ctx.task_type == "implement"
-        and ctx.noop_improve_trigger == "comments"
-        and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles,
+        matches=lambda ctx: (
+            ctx.task_type == "implement"
+            and ctx.noop_improve_trigger == "comments"
+            and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
+        ),
         action=_noop_improve_limit_action,
     ),
     AdvanceRule(
         name="fresh_comments_create_improve",
-        matches=lambda ctx: ctx.task_type == "implement"
-        and ctx.latest_completed_review is not None
-        and ctx.has_fresh_unresolved_comments_since_latest_review
-        and (ctx.review_cleared or ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}),
+        matches=lambda ctx: (
+            ctx.task_type == "implement"
+            and ctx.latest_completed_review is not None
+            and ctx.has_fresh_unresolved_comments_since_latest_review
+            and (ctx.review_cleared or ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"})
+        ),
         action=lambda ctx: {
             "type": "improve",
             "description": (
@@ -8686,12 +8632,14 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_approved_with_followups",
-        matches=lambda ctx: _can_emit_live_merge_action(ctx)
-        and has_valid_review_for_merge(ctx)
-        and (not ctx.review_cleared)
-        and ctx.latest_completed_review is not None
-        and ctx.review_verdict == "APPROVED_WITH_FOLLOWUPS"
-        and bool(ctx.followup_findings),
+        matches=lambda ctx: (
+            _can_emit_live_merge_action(ctx)
+            and has_valid_review_for_merge(ctx)
+            and (not ctx.review_cleared)
+            and ctx.latest_completed_review is not None
+            and ctx.review_verdict == "APPROVED_WITH_FOLLOWUPS"
+            and bool(ctx.followup_findings)
+        ),
         action=lambda ctx: {
             "type": "merge_with_followups",
             "description": _merge_review_description("APPROVED_WITH_FOLLOWUPS", ctx.review_preserved_by_rebase),
@@ -8701,11 +8649,13 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_approved",
-        matches=lambda ctx: _can_emit_live_merge_action(ctx)
-        and has_valid_review_for_merge(ctx)
-        and (not ctx.review_cleared)
-        and ctx.latest_completed_review is not None
-        and ctx.review_verdict == "APPROVED",
+        matches=lambda ctx: (
+            _can_emit_live_merge_action(ctx)
+            and has_valid_review_for_merge(ctx)
+            and (not ctx.review_cleared)
+            and ctx.latest_completed_review is not None
+            and ctx.review_verdict == "APPROVED"
+        ),
         action=lambda ctx: {
             "type": "merge",
             "description": _merge_review_description("APPROVED", ctx.review_preserved_by_rebase),
@@ -8714,9 +8664,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_wait_improve",
-        matches=lambda ctx: (not ctx.review_cleared)
-        and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.active_improve_running is not None,
+        matches=lambda ctx: (
+            (not ctx.review_cleared)
+            and ctx.review_verdict == "CHANGES_REQUESTED"
+            and ctx.active_improve_running is not None
+        ),
         action=lambda ctx: {
             "type": "wait_improve",
             "description": f"SKIP: improve task {_task_id(ctx.active_improve_running)} is in_progress",
@@ -8725,9 +8677,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_run_pending_improve",
-        matches=lambda ctx: (not ctx.review_cleared)
-        and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.active_improve_pending is not None,
+        matches=lambda ctx: (
+            (not ctx.review_cleared)
+            and ctx.review_verdict == "CHANGES_REQUESTED"
+            and ctx.active_improve_pending is not None
+        ),
         action=lambda ctx: {
             "type": "run_improve",
             "description": f"Spawn worker for pending improve {_task_id(ctx.active_improve_pending)}",
@@ -8736,60 +8690,66 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_clear_off_topic_verify_blocker",
-        matches=lambda ctx: (not ctx.review_cleared)
-        and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.active_improve_running is None
-        and ctx.active_improve_pending is None
-        and ctx.off_topic_verify_clearance_candidate is not None,
+        matches=lambda ctx: (
+            (not ctx.review_cleared)
+            and ctx.review_verdict == "CHANGES_REQUESTED"
+            and ctx.active_improve_running is None
+            and ctx.active_improve_pending is None
+            and ctx.off_topic_verify_clearance_candidate is not None
+        ),
         action=_clear_off_topic_verify_blocker_action,
     ),
     AdvanceRule(
         name="review_blocker_adjudication_needed",
-        matches=lambda ctx: (not ctx.review_cleared)
-        and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.review_blocker_adjudication_needed,
+        matches=lambda ctx: (
+            (not ctx.review_cleared)
+            and ctx.review_verdict == "CHANGES_REQUESTED"
+            and ctx.review_blocker_adjudication_needed
+        ),
         action=_review_blocker_adjudication_needed_action,
     ),
     AdvanceRule(
         name="review_wait_blocker_adjudication",
-        matches=lambda ctx: (not ctx.review_cleared)
-        and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.active_review_blocker_adjudication is not None
-        and ctx.active_review_blocker_adjudication.status == "in_progress",
+        matches=lambda ctx: (
+            (not ctx.review_cleared)
+            and ctx.review_verdict == "CHANGES_REQUESTED"
+            and ctx.active_review_blocker_adjudication is not None
+            and ctx.active_review_blocker_adjudication.status == "in_progress"
+        ),
         action=lambda ctx: {
             "type": "wait_review_adjudication",
-            "description": _wait_review_blocker_adjudication_description(
-                ctx.active_review_blocker_adjudication
-            ),
+            "description": _wait_review_blocker_adjudication_description(ctx.active_review_blocker_adjudication),
             "review_adjudication_task": ctx.active_review_blocker_adjudication,
         },
     ),
     AdvanceRule(
         name="review_run_pending_blocker_adjudication",
-        matches=lambda ctx: (not ctx.review_cleared)
-        and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.active_review_blocker_adjudication is not None
-        and ctx.active_review_blocker_adjudication.status == "pending",
+        matches=lambda ctx: (
+            (not ctx.review_cleared)
+            and ctx.review_verdict == "CHANGES_REQUESTED"
+            and ctx.active_review_blocker_adjudication is not None
+            and ctx.active_review_blocker_adjudication.status == "pending"
+        ),
         action=lambda ctx: {
             "type": "run_review_adjudication",
-            "description": _run_review_blocker_adjudication_description(
-                ctx.active_review_blocker_adjudication
-            ),
+            "description": _run_review_blocker_adjudication_description(ctx.active_review_blocker_adjudication),
             "review_adjudication_task": ctx.active_review_blocker_adjudication,
         },
     ),
     AdvanceRule(
         name="review_create_blocker_adjudication",
-        matches=lambda ctx: (not ctx.review_cleared)
-        and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.active_improve_running is None
-        and ctx.active_improve_pending is None
-        and ctx.review_blocker_adjudication_candidate is not None
-        and (
-            ctx.review_blocker_adjudication_candidate.dispute_artifact is None
-            or ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
-        )
-        and ctx.active_review_blocker_adjudication is None,
+        matches=lambda ctx: (
+            (not ctx.review_cleared)
+            and ctx.review_verdict == "CHANGES_REQUESTED"
+            and ctx.active_improve_running is None
+            and ctx.active_improve_pending is None
+            and ctx.review_blocker_adjudication_candidate is not None
+            and (
+                ctx.review_blocker_adjudication_candidate.dispute_artifact is None
+                or ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
+            )
+            and ctx.active_review_blocker_adjudication is None
+        ),
         action=lambda ctx: {
             "type": "create_review_adjudication",
             "description": _review_blocker_adjudication_description(ctx),
@@ -8799,64 +8759,71 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_recover_verify_only_noop_review",
-        matches=lambda ctx: (not ctx.review_cleared)
-        and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
-        and ctx.active_improve_running is None
-        and ctx.active_improve_pending is None
-        and ctx.latest_completed_review is not None
-        and ctx.latest_completed_review.review_verify_status == "failed"
-        and ctx.latest_noop_improve is not None
-        and ctx.latest_reviewed_head_sha is not None
-        and ctx.current_review_head_sha is not None
-        and ctx.current_review_head_sha == ctx.latest_reviewed_head_sha
-        and _latest_review_is_verify_blocked_only(ctx)
-        and not _task_has_current_passing_review_verify_evidence(
-            task=ctx.latest_noop_improve,
-            review_task=ctx.latest_completed_review,
-            current_branch=ctx.task.branch,
-            current_head_sha=ctx.current_review_head_sha,
-        )
-        and ctx.current_review_head_probe_warning is None
-        and ctx.noop_improve_verify_recovery_attention_message is None
-        and ctx.noop_improve_verify_probe_warning is None,
+        matches=lambda ctx: (
+            (not ctx.review_cleared)
+            and ctx.review_verdict == "CHANGES_REQUESTED"
+            and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
+            and ctx.active_improve_running is None
+            and ctx.active_improve_pending is None
+            and ctx.latest_completed_review is not None
+            and ctx.latest_completed_review.review_verify_status == "failed"
+            and ctx.latest_noop_improve is not None
+            and ctx.latest_reviewed_head_sha is not None
+            and ctx.current_review_head_sha is not None
+            and ctx.current_review_head_sha == ctx.latest_reviewed_head_sha
+            and _latest_review_is_verify_blocked_only(ctx)
+            and not _task_has_current_passing_review_verify_evidence(
+                task=ctx.latest_noop_improve,
+                review_task=ctx.latest_completed_review,
+                current_branch=ctx.task.branch,
+                current_head_sha=ctx.current_review_head_sha,
+            )
+            and ctx.current_review_head_probe_warning is None
+            and ctx.noop_improve_verify_recovery_attention_message is None
+            and ctx.noop_improve_verify_probe_warning is None
+        ),
         action=_recover_verify_only_noop_review_action,
     ),
     AdvanceRule(
         name="review_noop_improve_limit",
-        matches=lambda ctx: (not ctx.review_cleared)
-        and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
-        and ctx.active_improve_running is None
-        and ctx.active_improve_pending is None,
+        matches=lambda ctx: (
+            (not ctx.review_cleared)
+            and ctx.review_verdict == "CHANGES_REQUESTED"
+            and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
+            and ctx.active_improve_running is None
+            and ctx.active_improve_pending is None
+        ),
         action=_noop_improve_limit_action,
     ),
     AdvanceRule(
         name="review_verify_blocked_no_code_issues",
-        matches=lambda ctx: (not ctx.review_cleared)
-        and ctx.review_verdict == "CHANGES_REQUESTED"
-        and len(ctx.recent_verify_timeout_only_reviews) >= VERIFY_BLOCKED_REVIEW_THRESHOLD
-        and ctx.active_improve_running is None
-        and ctx.active_improve_pending is None,
+        matches=lambda ctx: (
+            (not ctx.review_cleared)
+            and ctx.review_verdict == "CHANGES_REQUESTED"
+            and len(ctx.recent_verify_timeout_only_reviews) >= VERIFY_BLOCKED_REVIEW_THRESHOLD
+            and ctx.active_improve_running is None
+            and ctx.active_improve_pending is None
+        ),
         action=_verify_blocked_no_code_issues_action,
     ),
     AdvanceRule(
         name="review_duplicate_blocker_no_progress",
-        matches=lambda ctx: (not ctx.review_cleared)
-        and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.duplicate_blocker_streak is not None
-        and not ctx.review_blockers_revalidated,
+        matches=lambda ctx: (
+            (not ctx.review_cleared)
+            and ctx.review_verdict == "CHANGES_REQUESTED"
+            and ctx.duplicate_blocker_streak is not None
+            and not ctx.review_blockers_revalidated
+        ),
         action=_duplicate_blocker_needs_attention_action,
     ),
     AdvanceRule(
         name="review_max_cycles",
-        matches=lambda ctx: (not ctx.review_cleared)
-        and (
-            ctx.review_verdict == "CHANGES_REQUESTED"
-            or _review_max_cycles_content_unavailable_candidate(ctx)
-        )
-        and ctx.completed_review_cycles >= ctx.max_review_cycles
-        and not ctx.review_blockers_revalidated,
+        matches=lambda ctx: (
+            (not ctx.review_cleared)
+            and (ctx.review_verdict == "CHANGES_REQUESTED" or _review_max_cycles_content_unavailable_candidate(ctx))
+            and ctx.completed_review_cycles >= ctx.max_review_cycles
+            and not ctx.review_blockers_revalidated
+        ),
         action=_review_max_cycles_action,
     ),
     AdvanceRule(
@@ -8885,25 +8852,31 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_cleared_but_sibling_review_unresolved",
-        matches=lambda ctx: _can_emit_live_merge_action(ctx)
-        and has_valid_review_for_merge(ctx)
-        and ctx.review_cleared
-        and ctx.latest_completed_review is not None
-        and _requires_sibling_review_attention(ctx),
+        matches=lambda ctx: (
+            _can_emit_live_merge_action(ctx)
+            and has_valid_review_for_merge(ctx)
+            and ctx.review_cleared
+            and ctx.latest_completed_review is not None
+            and _requires_sibling_review_attention(ctx)
+        ),
         action=_noop_improve_sibling_review_attention_action,
     ),
     AdvanceRule(
         name="reviews_all_cleared",
-        matches=lambda ctx: _can_emit_live_merge_action(ctx)
-        and has_valid_review_for_merge(ctx)
-        and ctx.review_cleared
-        and ctx.latest_completed_review is not None,
+        matches=lambda ctx: (
+            _can_emit_live_merge_action(ctx)
+            and has_valid_review_for_merge(ctx)
+            and ctx.review_cleared
+            and ctx.latest_completed_review is not None
+        ),
         action=_merge_review_cleared_action,
     ),
     AdvanceRule(
         name="no_review_merge_source_requires_manual_resolution",
-        matches=lambda ctx: _merge_source_unavailable_requires_manual_resolution(ctx)
-        and (not _is_implementation_owned_lineage(ctx) or not ctx.requires_review),
+        matches=lambda ctx: (
+            _merge_source_unavailable_requires_manual_resolution(ctx)
+            and (not _is_implementation_owned_lineage(ctx) or not ctx.requires_review)
+        ),
         action=_merge_source_unavailable_manual_resolution_action,
     ),
     AdvanceRule(
@@ -8913,23 +8886,25 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="implement_plain_review_target_missing",
-        matches=lambda ctx: ctx.requires_review
-        and ctx.task.task_type in {"improve", "rebase", "fix"}
-        and _resolve_plain_review_target_task(ctx) is None,
+        matches=lambda ctx: (
+            ctx.requires_review
+            and ctx.task.task_type in {"improve", "rebase", "fix"}
+            and _resolve_plain_review_target_task(ctx) is None
+        ),
         action=_plain_review_target_missing_skip_action,
     ),
     AdvanceRule(
         name="implement_create_review",
-        matches=lambda ctx: ctx.requires_review
-        and ctx.create_reviews
-        and _resolve_plain_review_target_task(ctx) is not None,
+        matches=lambda ctx: (
+            ctx.requires_review and ctx.create_reviews and _resolve_plain_review_target_task(ctx) is not None
+        ),
         action=lambda ctx: {"type": "create_review", "description": "Create review (required before merge)"},
     ),
     AdvanceRule(
         name="implement_needs_manual_review",
-        matches=lambda ctx: ctx.requires_review
-        and not ctx.create_reviews
-        and _resolve_plain_review_target_task(ctx) is not None,
+        matches=lambda ctx: (
+            ctx.requires_review and not ctx.create_reviews and _resolve_plain_review_target_task(ctx) is not None
+        ),
         action=lambda ctx: with_needs_attention(
             {
                 "type": "needs_discussion",

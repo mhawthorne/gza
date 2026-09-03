@@ -459,6 +459,21 @@ provider: codex
 # Default: false
 # advance_off_topic_verify_unblock: false
 
+# Conservative minimum autonomous_verify_timeout_seconds allowed when recent full-suite runtime
+# observations are missing or stale.
+# Default: 120
+# autonomous_verify_bootstrap_timeout_seconds: 120
+
+# Minimum required margin between recent successful full-suite runtime and
+# autonomous_verify_timeout_seconds.
+# Default: 60
+# autonomous_verify_min_margin_seconds: 60
+
+# Maximum age for a successful full-suite runtime observation used by lifecycle verify budget
+# preflight.
+# Default: 168
+# autonomous_verify_observation_max_age_hours: 168
+
 # Configured timeout floor in seconds for lifecycle/automation-initiated verify_command runs.
 # Recent full-suite observations may derive a larger effective timeout for lifecycle gates.
 # Default: 120

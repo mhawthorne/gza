@@ -157,6 +157,29 @@ The repair path MUST distinguish flaky from deterministic verify failures:
 - Reused or newly created remediation tasks for this gate MUST be bumped to the front of
   the runnable queue, because a red or flaky local-target verify is pipeline-critical
   system work.
+- A lifecycle `verify_command` wall-clock timeout whose structured result has
+  `failure_origin: timeout` and no reported failed phase MUST NOT create or reuse a
+  code-fixing `verify_fix` task. It MUST remain merge-blocking, but lifecycle MUST
+  surface it as the operator budget condition `verify-budget-exceeded` and preserve
+  phase progress details, including completed phases and known phases that never
+  started. A timeout that includes any reported failed phase remains a real verify
+  failure and follows the normal `verify_fix` remediation route.
+- Phase progress metadata used for that timeout classification MUST satisfy the complete
+  `phase_summary` schema: `completed`, `passed`, `failed`, `running`, and
+  `never_started` are lists; `observed_count` and `completed_count` are non-negative
+  counts; `last_observed` is a string or null; and `total_duration_seconds` is a
+  non-negative number or null. Malformed phase summaries MUST fail closed as
+  `verify-phase-evidence-invalid` instead of being interpreted as zero failures.
+- For the known `./bin/tests` lifecycle gate, automation MUST guard against a fixed
+  wall-clock cap silently becoming binding as the suite grows. Before launching
+  lifecycle verify, it MUST validate the configured timeout against recent persisted
+  successful full-suite phase evidence. If the latest successful full-suite runtime
+  leaves less than the configured minimum margin, lifecycle MUST record an
+  operator-visible unavailable result with exit status `insufficient verify budget
+  margin` before starting verify. If recent successful full-suite observations are
+  missing or stale, lifecycle MUST use the documented conservative bootstrap floor:
+  below that floor it records the same unavailable result before starting verify;
+  at or above that floor it may launch verify and refresh the observation.
 - Reused or newly created remediation tasks for this gate MUST carry the distinctive tag
   `system-main-verify` in addition to the inherited `system` and scope tags so operators
   can filter main-verify state rows and remediation work together.

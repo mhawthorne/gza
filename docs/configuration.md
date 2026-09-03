@@ -60,6 +60,9 @@ Gza reads configuration from three YAML layers:
 | `review_diff_medium_threshold` | Integer | `2000` | Total changed-line cutoff above `review_diff_small_threshold`; larger diffs use targeted excerpts instead of full inline diff |
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
 | `autonomous_verify_timeout_seconds` | Integer | `120` | Configured floor for lifecycle/automation-initiated `verify_command` runs; recent full-suite observations may derive a larger effective timeout |
+| `autonomous_verify_min_margin_seconds` | Integer | `60` | Minimum required margin between a recent successful `./bin/tests` runtime observation and `autonomous_verify_timeout_seconds` |
+| `autonomous_verify_observation_max_age_hours` | Integer | `168` | Maximum age for a successful full-suite runtime observation used by lifecycle verify budget preflight |
+| `autonomous_verify_bootstrap_timeout_seconds` | Integer | `120` | Conservative minimum autonomous verify timeout allowed when recent successful full-suite runtime observations are missing or stale |
 | `review_verify_timeout_grace_seconds` | Float | `5` | Grace period after SIGTERM before autonomous lifecycle verification escalates to SIGKILL; accepts values `>= 1` second |
 | `main_integration_verify_red_ttl_minutes` | Integer | `30` | Maximum age of a failed or unavailable local-target integration verify checkpoint before watch/advance reruns it even if the tree fingerprint is unchanged |
 | `code_task_diff_timeout_medium_threshold` | Integer | `400` | Reviewable diff-size threshold where code tasks move from the base timeout to the medium scaled timeout |
@@ -518,7 +521,7 @@ inner_verify_command: ./bin/tests --quick
 - `unit_verify_command` is optional and takes precedence for implement-like task guidance when configured.
 - `inner_verify_command` remains the fallback fast edit-loop command when `unit_verify_command` is unset.
 - When neither `unit_verify_command` nor `inner_verify_command` is set, agents should prefer targeted tests during editing and still run `verify_command` once after the last code change.
-- Autonomous lifecycle verification is separate and uses `autonomous_verify_timeout_seconds` as the configured floor, not a fixed cap. When recent persisted full-suite `./bin/tests` phase observations exceed that floor after headroom, lifecycle verify derives a larger effective timeout and records that effective value in verify provenance and local-target integration gate identity. Complete green runs count as full observations; timeout runs with completed phases and no failed phase count as conservative lower bounds. Artifact-store read failures are surfaced as lifecycle budget diagnostics instead of silently restoring the configured floor.
+- Autonomous lifecycle verification is separate and uses `autonomous_verify_timeout_seconds` as the configured floor, not a fixed cap. When recent persisted full-suite `./bin/tests` phase observations exceed that floor after headroom, lifecycle verify derives a larger effective timeout and records that effective value in verify provenance and local-target integration gate identity. Complete green runs count as full observations; timeout runs with completed phases and no failed phase count as conservative lower bounds. Artifact-store read failures are surfaced as lifecycle budget diagnostics instead of silently restoring the configured floor. For the known `./bin/tests` full-suite command, lifecycle verify also checks recent persisted project-wide green full-suite phase evidence before launch. If the latest successful runtime leaves less than `autonomous_verify_min_margin_seconds` before the effective timeout, Gza records an operator-visible `insufficient verify budget margin` unavailable result before launching verify. If recent evidence is missing or older than `autonomous_verify_observation_max_age_hours`, Gza uses the conservative bootstrap policy: the effective timeout must be at least `autonomous_verify_bootstrap_timeout_seconds`, otherwise the same unavailable result is recorded before verify starts.
 - When autonomous lifecycle verification times out, Gza sends SIGTERM to the verify process group, waits `review_verify_timeout_grace_seconds`, then escalates to SIGKILL if the process tree is still alive.
 - Local-target integration verify reuses green checkpoints until the tree fingerprint or verify-gate identity changes. The configured-gate identity includes the verify environment identity recorded with the checkpoint, using stable semantic runtime fields like runner class, platform system/machine, and Python implementation/version instead of an exact interpreter path, so a checkpoint from a different environment, or an older checkpoint that lacks that identity, is treated as stale. Failed/unavailable checkpoints are rerun after `main_integration_verify_red_ttl_minutes` even on the same tree.
 
@@ -2533,6 +2536,9 @@ docker_setup_command: "uv sync"
 timeout_minutes: 15
 max_steps: 80
 autonomous_verify_timeout_seconds: 180
+autonomous_verify_min_margin_seconds: 60
+autonomous_verify_observation_max_age_hours: 168
+autonomous_verify_bootstrap_timeout_seconds: 120
 review_verify_timeout_grace_seconds: 5
 verify_command: ./bin/tests
 unit_verify_command: ./bin/test-unit --summary -- tests/ -n 2 --dist loadscope

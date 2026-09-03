@@ -170,6 +170,12 @@ def _persist_current_verify(
     if "verify_command:" not in config_text:
         config_path.write_text(config_text + f"verify_command: {command}\n", encoding="utf-8")
     config = Config.load(tmp_path)
+    output = (
+        "gza-verify phase=start name=unit\n"
+        "gza-verify phase=failed name=unit duration_seconds=1.0"
+        if exit_status.strip().lower() in {"timed out", "timeout"}
+        else None
+    )
     persist_verify_gate_artifact(
         store,
         config,
@@ -185,6 +191,7 @@ def _persist_current_verify(
             reviewed_base_sha=base_sha,
             working_directory="/tmp/merge-unit-verify",
             failure=None if status == "passed" else f"verify gate {status}",
+            output=output,
         ),
         verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
         verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,

@@ -6917,6 +6917,7 @@ class TestShowCommand:
                 working_directory="/tmp/worktree",
                 failure="verify_command timed out after 120s",
                 failure_origin="timeout",
+                output="gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=1.0",
             ),
             verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
             verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
