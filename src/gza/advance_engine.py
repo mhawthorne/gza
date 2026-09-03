@@ -138,8 +138,8 @@ from gza.review_verify_state import (
     make_verify_epoch,
     resolve_verify_gate_decision,
     select_current_merge_unit_verify_evidence,
+    validate_verify_phase_summary,
     verify_epoch_matches,
-    verify_result_has_invalid_phase_evidence,
     verify_result_is_timeout_origin,
 )
 from gza.runner import (
@@ -148,6 +148,7 @@ from gza.runner import (
     PHASE_EVIDENCE_VALID_ZERO_RED,
     PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
     REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+    PhaseEvidenceValidation,
     ReviewVerifyResult,
     _extract_review_verify_phase_results,
     _filter_owned_artifact_paths,
@@ -5935,17 +5936,68 @@ def _verify_fix_failed_manual_rearm_requires_fresh_verify(
 
 
 def _verify_gate_failed_phase_names(decision: VerifyGateDecision) -> tuple[str, ...] | None:
-    validation = validate_verify_phase_evidence_from_metadata(decision.lookup.artifact_metadata)
-    if validation.state not in {PHASE_EVIDENCE_RED, PHASE_EVIDENCE_VALID_ZERO_RED}:
-        result = decision.lookup.result
-        phase_summary = getattr(result, "phase_summary", None)
-        if not isinstance(phase_summary, dict):
-            return None
-        failed = phase_summary.get("failed")
-        if not isinstance(failed, list):
-            return None
-        return tuple(item for item in failed if isinstance(item, str) and item)
+    validation = _verify_gate_reconciled_phase_evidence(decision)
+    if validation.state == PHASE_EVIDENCE_INDETERMINATE:
+        return None
     return validation.failed_phase_names
+
+
+def _verify_gate_reconciled_phase_evidence(decision: VerifyGateDecision) -> PhaseEvidenceValidation:
+    validation = validate_verify_phase_evidence_from_metadata(decision.lookup.artifact_metadata)
+    if validation.state != PHASE_EVIDENCE_INDETERMINATE:
+        return validation
+    metadata = decision.lookup.artifact_metadata
+    result = decision.lookup.result
+    aggregate_present = isinstance(metadata, dict) and "aggregate_details" in metadata
+    aggregate_details = metadata.get("aggregate_details") if isinstance(metadata, dict) else None
+    if aggregate_present and not isinstance(aggregate_details, dict):
+        return validation
+    if isinstance(aggregate_details, dict) and "phase_results" in aggregate_details:
+        return validation
+    if isinstance(aggregate_details, dict):
+        scopes = aggregate_details.get("scopes")
+        invalid_reason = getattr(result, "phase_summary_invalid_reason", None) if result is not None else None
+        if not isinstance(scopes, list) or invalid_reason is not None:
+            return validation
+        phase_summary = getattr(result, "phase_summary", None)
+        scoped_summary, scoped_invalid_reason = validate_verify_phase_summary(phase_summary)
+        if scoped_invalid_reason is not None:
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason=scoped_invalid_reason)
+        if scoped_summary is None:
+            return validation
+        completed_phases = tuple(str(phase["name"]) for phase in scoped_summary["completed"])
+        failed_phases = tuple(str(name) for name in scoped_summary["failed"])
+        state = PHASE_EVIDENCE_RED if failed_phases else PHASE_EVIDENCE_VALID_ZERO_RED
+        return PhaseEvidenceValidation(
+            state,
+            failed_phase_names=failed_phases,
+            completed_phase_names=completed_phases,
+            not_started_phase_names=tuple(str(name) for name in scoped_summary["never_started"]),
+            started_phase_names=completed_phases + tuple(str(name) for name in scoped_summary["running"]),
+            phase_results=tuple(scoped_summary["completed"]),
+        )
+    if isinstance(metadata, dict) and "phase_summary" in metadata:
+        return validation
+    phase_summary = getattr(result, "phase_summary", None)
+    direct_summary, invalid_reason = validate_verify_phase_summary(
+        phase_summary,
+        require_known_full_verify_partition=result.command == "./bin/tests" if result is not None else False,
+    )
+    if invalid_reason is not None:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason=invalid_reason)
+    if direct_summary is None:
+        return validation
+    completed_phases = tuple(str(phase["name"]) for phase in direct_summary["completed"])
+    failed_phases = tuple(str(name) for name in direct_summary["failed"])
+    state = PHASE_EVIDENCE_RED if failed_phases else PHASE_EVIDENCE_VALID_ZERO_RED
+    return PhaseEvidenceValidation(
+        state,
+        failed_phase_names=failed_phases,
+        completed_phase_names=completed_phases,
+        not_started_phase_names=tuple(str(name) for name in direct_summary["never_started"]),
+        started_phase_names=completed_phases + tuple(str(name) for name in direct_summary["running"]),
+        phase_results=tuple(direct_summary["completed"]),
+    )
 
 
 def _verify_gate_phase_budget_summary(decision: VerifyGateDecision) -> dict[str, Any]:
@@ -6027,21 +6079,9 @@ def _verify_gate_phase_budget_summary(decision: VerifyGateDecision) -> dict[str,
 
 
 def _verify_gate_is_budget_only_timeout(decision: VerifyGateDecision) -> bool:
-    validation = validate_verify_phase_evidence_from_metadata(decision.lookup.artifact_metadata)
+    validation = _verify_gate_reconciled_phase_evidence(decision)
     if validation.state == PHASE_EVIDENCE_INDETERMINATE:
-        metadata = decision.lookup.artifact_metadata
-        aggregate_details = metadata.get("aggregate_details") if isinstance(metadata, dict) else None
-        if isinstance(aggregate_details, dict) and "phase_results" in aggregate_details:
-            return False
-        result = decision.lookup.result
-        phase_summary = getattr(result, "phase_summary", None)
-        failed = phase_summary.get("failed") if isinstance(phase_summary, dict) else None
-        return (
-            decision.state == "failed"
-            and verify_result_is_timeout_origin(result)
-            and isinstance(failed, list)
-            and not failed
-        )
+        return False
     return (
         decision.state == "failed"
         and verify_result_is_timeout_origin(decision.lookup.result)
@@ -6155,14 +6195,16 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext, *, phase: str = "pre_revi
             phase=phase,
         )
 
+    phase_evidence_validation = _verify_gate_reconciled_phase_evidence(decision)
     if (
         decision.state == "failed"
-        and verify_result_has_invalid_phase_evidence(decision.lookup.result)
-        and validate_verify_phase_evidence_from_metadata(decision.lookup.artifact_metadata).state
-        == PHASE_EVIDENCE_INDETERMINATE
+        and verify_result_is_timeout_origin(decision.lookup.result)
+        and phase_evidence_validation.state == PHASE_EVIDENCE_INDETERMINATE
     ):
         result = decision.lookup.result
         invalid_reason = getattr(result, "phase_summary_invalid_reason", None) if result is not None else None
+        if invalid_reason is None:
+            invalid_reason = phase_evidence_validation.reason
         detail_suffix = f": {invalid_reason}" if invalid_reason else ""
         return _with_red_verify_gate_metadata(
             ctx,

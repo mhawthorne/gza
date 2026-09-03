@@ -4276,8 +4276,13 @@ def validate_verify_phase_evidence_from_metadata(metadata: object) -> PhaseEvide
         return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="missing result")
     result_status = result.get("status")
     failure_origin = result.get("failure_origin")
-    aggregate_details = metadata.get("aggregate_details")
-    if isinstance(aggregate_details, dict):
+    if "aggregate_details" in metadata:
+        aggregate_details = metadata.get("aggregate_details")
+        if not isinstance(aggregate_details, dict):
+            return PhaseEvidenceValidation(
+                PHASE_EVIDENCE_INDETERMINATE,
+                reason="malformed aggregate_details: must be an object",
+            )
         return _validate_phase_summary_details(
             aggregate_details,
             result_status=result_status if isinstance(result_status, str) else None,

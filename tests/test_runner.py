@@ -26449,6 +26449,16 @@ class TestProviderPromptSanitization:
                 "create_verify_fix",
                 None,
             ),
+            (
+                "gza-verify phase=passed name=unit duration_seconds=3.25",
+                "needs_discussion",
+                PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID,
+            ),
+            (
+                "gza-verify phase=failed name=unit duration_seconds=3.25",
+                "needs_discussion",
+                PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID,
+            ),
             (None, "needs_discussion", PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID),
         ],
     )
@@ -26476,10 +26486,101 @@ class TestProviderPromptSanitization:
         if expected_reason == PARK_REASON_VERIFY_BUDGET_EXCEEDED:
             assert action["verify_phase_summary"]["failed"] == []
         if expected_reason == PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID:
-            assert "persisted verify output is unavailable" in action["description"]
+            assert (
+                "persisted verify output is unavailable" in action["description"]
+                or "terminal phase lacks start" in action["description"]
+            )
             assert "verify_phase_summary" not in action
         if expected_action_type != "create_verify_fix":
             assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    @pytest.mark.parametrize(
+        ("bad_scope_entry", "expected_detail"),
+        [
+            ("not a scope object", "aggregate scope entry 1: must be an object"),
+            (
+                {
+                    "scope": "",
+                    "working_directory": "libs/bad",
+                    "status": "failed",
+                    "phase_summary": {
+                        "completed": [{"name": "unit", "status": "passed", "duration_seconds": 1.0}],
+                        "passed": ["unit"],
+                        "failed": [],
+                        "running": [],
+                        "never_started": [],
+                        "last_observed": "unit",
+                        "observed_count": 1,
+                        "completed_count": 1,
+                        "total_duration_seconds": 1.0,
+                    },
+                },
+                "aggregate scope entry 1: scope identity is required",
+            ),
+        ],
+    )
+    def test_verify_gate_legacy_scoped_aggregate_rejects_malformed_scope_entries(
+        self,
+        tmp_path: Path,
+        bad_scope_entry: object,
+        expected_detail: str,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        config.verify_command = "(per-project verify_command)"
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=ReviewVerifyResult(
+                command="(per-project verify_command)",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 38, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory="(per-project; see artifact)",
+                failure="verify_command timed out after 600s",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+            aggregate_details={
+                "runnable_count": 2,
+                "scopes": [
+                    {
+                        "scope": "services/foo",
+                        "working_directory": "services/foo",
+                        "status": "failed",
+                        "exit_status": "timed out",
+                        "failure_origin": "timeout",
+                        "command_identity": "./bin/foo-verify",
+                        "phase_summary": {
+                            "completed": [{"name": "unit", "status": "passed", "duration_seconds": 2.0}],
+                            "passed": ["unit"],
+                            "failed": [],
+                            "running": [],
+                            "never_started": ["functional"],
+                            "last_observed": "unit",
+                            "observed_count": 1,
+                            "completed_count": 1,
+                            "total_duration_seconds": 2.0,
+                        },
+                    },
+                    bad_scope_entry,
+                ],
+            },
+        )
+
+        action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
+
+        assert action["type"] == "needs_discussion"
+        assert action["needs_attention_reason"] == PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID
+        assert expected_detail in action["description"]
+        assert "verify_phase_summary" not in action
+        assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
 
     @pytest.mark.parametrize(
         ("project_outputs", "expected_aggregate_status", "expected_action_type", "expected_reason"),
@@ -26908,6 +27009,257 @@ class TestProviderPromptSanitization:
         assert "aggregate scope libs/bar: phase_summary.last_observed must be null" in action["description"]
         assert PARK_REASON_VERIFY_BUDGET_EXCEEDED not in action["description"]
         assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    def test_verify_gate_timeout_with_incomplete_aggregate_does_not_fall_back_to_direct_summary(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 37, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 600s",
+                output="gza-verify phase=start name=unit\n",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        gate = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert gate.metadata is not None
+        metadata = dict(gate.metadata)
+        metadata["phase_summary"] = {
+            "completed": [{"name": "ruff", "status": "passed", "duration_seconds": 1.0}],
+            "passed": ["ruff"],
+            "failed": [],
+            "running": ["unit"],
+            "never_started": ["ty", "mypy", "checks", "functional"],
+            "last_observed": "unit",
+            "observed_count": 2,
+            "completed_count": 1,
+            "total_duration_seconds": 1.0,
+        }
+        metadata["aggregate_details"] = {
+            "runnable_count": 1,
+            "scopes": "not a scopes summary",
+        }
+        store.add_artifact(
+            impl.id,
+            kind=gate.kind,
+            label=gate.label,
+            path=gate.path,
+            content_type=gate.content_type,
+            byte_size=gate.byte_size,
+            sha256=gate.sha256,
+            created_at=gate.created_at,
+            producer=gate.producer,
+            command=gate.command,
+            status=gate.status,
+            exit_status=gate.exit_status,
+            head_sha=gate.head_sha,
+            metadata=metadata,
+            artifact_id=gate.id,
+        )
+
+        action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
+
+        assert action["type"] == "needs_discussion"
+        assert action["needs_attention_reason"] == PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID
+        assert "missing phase results" in action["description"]
+        assert PARK_REASON_VERIFY_BUDGET_EXCEEDED not in action["description"]
+        assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    def test_verify_gate_timeout_with_non_object_aggregate_does_not_fall_back_to_direct_summary(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 37, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 600s",
+                output="gza-verify phase=start name=unit\n",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        gate = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert gate.metadata is not None
+        metadata = dict(gate.metadata)
+        metadata["phase_summary"] = {
+            "completed": [
+                {"name": "ruff", "status": "passed", "duration_seconds": 1.0},
+                {"name": "ty", "status": "passed", "duration_seconds": 1.0},
+                {"name": "mypy", "status": "passed", "duration_seconds": 1.0},
+                {"name": "checks", "status": "passed", "duration_seconds": 1.0},
+                {"name": "unit", "status": "passed", "duration_seconds": 1.0},
+            ],
+            "passed": ["ruff", "ty", "mypy", "checks", "unit"],
+            "failed": [],
+            "running": [],
+            "never_started": ["functional"],
+            "last_observed": "unit",
+            "observed_count": 5,
+            "completed_count": 5,
+            "total_duration_seconds": 5.0,
+        }
+        metadata["aggregate_details"] = ["not", "an", "object"]
+        store.add_artifact(
+            impl.id,
+            kind=gate.kind,
+            label=gate.label,
+            path=gate.path,
+            content_type=gate.content_type,
+            byte_size=gate.byte_size,
+            sha256=gate.sha256,
+            created_at=gate.created_at,
+            producer=gate.producer,
+            command=gate.command,
+            status=gate.status,
+            exit_status=gate.exit_status,
+            head_sha=gate.head_sha,
+            metadata=metadata,
+            artifact_id=gate.id,
+        )
+
+        validation = validate_verify_phase_evidence_from_metadata(metadata)
+        assert validation.state == PHASE_EVIDENCE_INDETERMINATE
+        assert validation.reason == "malformed aggregate_details: must be an object"
+
+        action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
+
+        assert action["type"] == "needs_discussion"
+        assert action["needs_attention_reason"] == PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID
+        assert "malformed aggregate_details: must be an object" in action["description"]
+        assert PARK_REASON_VERIFY_BUDGET_EXCEEDED not in action["description"]
+        assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    @pytest.mark.parametrize(
+        ("aggregate_details", "expected_action_type", "expected_reason"),
+        [
+            (
+                {
+                    "phase_results": [{"name": "unit", "status": "passed", "duration_seconds": 3.25}],
+                    "started_phase_names": [],
+                    "completed_phase_names": ["unit"],
+                    "failed_phase_names": [],
+                    "expected_phase_names": ["unit"],
+                    "not_started_phase_names": [],
+                },
+                "needs_discussion",
+                PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID,
+            ),
+            (
+                {
+                    "phase_results": [{"name": "unit", "status": "failed", "duration_seconds": 3.25}],
+                    "started_phase_names": ["unit"],
+                    "completed_phase_names": ["unit"],
+                    "failed_phase_names": ["unit"],
+                    "expected_phase_names": ["unit"],
+                    "not_started_phase_names": [],
+                },
+                "create_verify_fix",
+                None,
+            ),
+        ],
+    )
+    def test_verify_gate_timeout_reconciles_direct_summary_with_current_aggregate_phase_results(
+        self,
+        tmp_path: Path,
+        aggregate_details: dict[str, object],
+        expected_action_type: str,
+        expected_reason: str | None,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 37, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 600s",
+                output="gza-verify phase=start name=unit\n",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        gate = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert gate.metadata is not None
+        metadata = dict(gate.metadata)
+        metadata["phase_summary"] = {
+            "completed": [{"name": "ruff", "status": "passed", "duration_seconds": 1.0}],
+            "passed": ["ruff"],
+            "failed": [],
+            "running": ["unit"],
+            "never_started": ["ty", "mypy", "checks", "functional"],
+            "last_observed": "unit",
+            "observed_count": 2,
+            "completed_count": 1,
+            "total_duration_seconds": 1.0,
+        }
+        metadata["aggregate_details"] = aggregate_details
+        store.add_artifact(
+            impl.id,
+            kind=gate.kind,
+            label=gate.label,
+            path=gate.path,
+            content_type=gate.content_type,
+            byte_size=gate.byte_size,
+            sha256=gate.sha256,
+            created_at=gate.created_at,
+            producer=gate.producer,
+            command=gate.command,
+            status=gate.status,
+            exit_status=gate.exit_status,
+            head_sha=gate.head_sha,
+            metadata=metadata,
+            artifact_id=gate.id,
+        )
+
+        action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
+
+        assert action["type"] == expected_action_type, action
+        if expected_reason is not None:
+            assert action["needs_attention_reason"] == expected_reason
+            assert "terminal phase lacks start" in action["description"]
+            assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+        else:
+            assert "needs_attention_reason" not in action
 
     @pytest.mark.parametrize(
         "pre_run_status",
