@@ -2977,8 +2977,17 @@ CREATE TABLE IF NOT EXISTS provider_usage_failures (
 );
 """
 
+# Migration from v69 to v70: branch/status task lookup for scoped landed-evidence
+# recovery and canonical based_on edge lookup for scoped lineage traversal.
+MIGRATION_V69_TO_V70 = """
+CREATE INDEX IF NOT EXISTS idx_tasks_project_branch_status
+    ON tasks(project_id, branch, status);
+CREATE INDEX IF NOT EXISTS idx_tasks_project_based_on
+    ON tasks(project_id, based_on);
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 69
+SCHEMA_VERSION = 70
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -3361,9 +3370,11 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             CREATE INDEX IF NOT EXISTS idx_tasks_project_slug ON tasks(project_id, slug);
             CREATE INDEX IF NOT EXISTS idx_tasks_project_created ON tasks(project_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_tasks_project_group ON tasks(project_id, "group");
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_based_on ON tasks(project_id, based_on);
             CREATE INDEX IF NOT EXISTS idx_tasks_project_depends_on ON tasks(project_id, depends_on);
             CREATE INDEX IF NOT EXISTS idx_tasks_project_merge_status ON tasks(project_id, merge_status);
             CREATE INDEX IF NOT EXISTS idx_tasks_project_type_based_on ON tasks(project_id, task_type, based_on);
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_branch_status ON tasks(project_id, branch, status);
 
             CREATE TABLE task_tags (
                 project_id TEXT NOT NULL,
@@ -3675,6 +3686,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             CREATE INDEX IF NOT EXISTS idx_tasks_project_slug ON tasks(project_id, slug);
             CREATE INDEX IF NOT EXISTS idx_tasks_project_created ON tasks(project_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_tasks_project_group ON tasks(project_id, "group");
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_based_on ON tasks(project_id, based_on);
             CREATE INDEX IF NOT EXISTS idx_tasks_project_depends_on ON tasks(project_id, depends_on);
             CREATE INDEX IF NOT EXISTS idx_tasks_project_merge_status ON tasks(project_id, merge_status);
             CREATE INDEX IF NOT EXISTS idx_tasks_project_type_based_on ON tasks(project_id, task_type, based_on);
@@ -3910,6 +3922,7 @@ _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
         67,
         68,
         69,
+        70,
     }
 )
 
@@ -4256,6 +4269,12 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
             raise RuntimeError(
                 "Auto-migration to v56 incomplete: missing required index idx_watch_recovery_backoffs_due"
             )
+    if target_version >= 70 and not _index_exists(conn, "idx_tasks_project_branch_status"):
+        raise RuntimeError(
+            "Auto-migration to v70 incomplete: missing required index idx_tasks_project_branch_status"
+        )
+    if target_version >= 70 and not _index_exists(conn, "idx_tasks_project_based_on"):
+        raise RuntimeError("Auto-migration to v70 incomplete: missing required index idx_tasks_project_based_on")
     if target_version >= 58:
         if not _table_exists(conn, "parked_task_rearms"):
             raise RuntimeError("Auto-migration to v58 incomplete: missing required table parked_task_rearms")
@@ -5110,8 +5129,10 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status)
 CREATE INDEX IF NOT EXISTS idx_tasks_project_slug ON tasks(project_id, slug);
 CREATE INDEX IF NOT EXISTS idx_tasks_project_created ON tasks(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_project_group ON tasks(project_id, "group");
+CREATE INDEX IF NOT EXISTS idx_tasks_project_based_on ON tasks(project_id, based_on);
 CREATE INDEX IF NOT EXISTS idx_tasks_project_depends_on ON tasks(project_id, depends_on);
 CREATE INDEX IF NOT EXISTS idx_tasks_project_merge_status ON tasks(project_id, merge_status);
+CREATE INDEX IF NOT EXISTS idx_tasks_project_branch_status ON tasks(project_id, branch, status);
 
 CREATE TABLE IF NOT EXISTS task_tags (
     project_id TEXT NOT NULL,
@@ -5191,6 +5212,7 @@ CREATE INDEX IF NOT EXISTS idx_run_steps_project_step_index ON run_steps(project
 CREATE INDEX IF NOT EXISTS idx_run_substeps_project_run_id ON run_substeps(project_id, run_id);
 CREATE INDEX IF NOT EXISTS idx_run_substeps_project_step_id ON run_substeps(project_id, step_id);
 
+CREATE INDEX IF NOT EXISTS idx_tasks_project_based_on ON tasks(project_id, based_on);
 CREATE INDEX IF NOT EXISTS idx_tasks_project_type_based_on ON tasks(project_id, task_type, based_on);
 CREATE TABLE IF NOT EXISTS task_comments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5678,6 +5700,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (67, MIGRATION_V66_TO_V67),
     (68, MIGRATION_V67_TO_V68),
     (69, MIGRATION_V68_TO_V69),
+    (70, MIGRATION_V69_TO_V70),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -5822,6 +5845,7 @@ class SqliteTaskStore:
         self._registry_mutation_validated_identity: _DbFileIdentity | None = None
         self._query_only_table_exists: dict[str, bool] = {}
         self._query_only_columns: dict[str, set[str]] = {}
+        self._query_only_indexes: set[str] = set()
         self._write_pragmas_applied = False
         # Set by _ensure_db when it creates the database from scratch. Such a database
         # has no rows, so the row-level repair passes below cannot find anything to fix.
@@ -6697,6 +6721,10 @@ class SqliteTaskStore:
         self._query_only_columns = {
             table: (_table_columns(conn, table) if self._query_only_table_exists[table] else set()) for table in tables
         }
+        self._query_only_indexes = {
+            str(row["name"])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index' AND name IS NOT NULL")
+        }
 
     def _collect_query_only_warnings(self) -> None:
         """Record warnings for degraded query-only reads on damaged current schemas."""
@@ -6865,6 +6893,12 @@ class SqliteTaskStore:
         if self._open_mode != "query_only":
             return True
         return column in self._query_only_columns.get(table, set())
+
+    def _query_only_has_index(self, index_name: str) -> bool:
+        """Return True when query-only startup proved an index exists."""
+        if self._open_mode != "query_only":
+            return True
+        return index_name in self._query_only_indexes
 
     def _query_only_supports_tags(self) -> bool:
         """Return True when query-only reads can safely use task tag artifacts."""
@@ -9633,6 +9667,11 @@ class SqliteTaskStore:
                 return grouped
         with self._connect() as conn:
             if branch_filter_pairs is not None:
+                branch_status_task_ref = (
+                    "tasks t INDEXED BY idx_tasks_project_branch_status"
+                    if self._query_only_has_index("idx_tasks_project_branch_status")
+                    else "tasks t"
+                )
                 max_pairs_per_chunk = max(1, (_SQL_VARIABLE_CHUNK - 2) // 2)
                 for start in range(0, len(branch_filter_pairs), max_pairs_per_chunk):
                     chunk = branch_filter_pairs[start : start + max_pairs_per_chunk]
@@ -9640,47 +9679,104 @@ class SqliteTaskStore:
                     params: list[object] = []
                     for root_id, branch_key in chunk:
                         params.extend((root_id, branch_key))
-                    rows = conn.execute(
+                    candidate_rows = conn.execute(
                         f"""
-                        WITH RECURSIVE
+                        WITH
                         requested(root_id, branch_key) AS (
                             VALUES {requested_values}
+                        )
+                        SELECT requested.root_id, t.id AS candidate_id
+                        FROM requested
+                        JOIN {branch_status_task_ref}
+                          ON t.project_id = ?
+                         AND t.branch = requested.branch_key
+                         AND t.status IN ('completed', 'unmerged')
+                         AND t.id != requested.root_id
+                        WHERE 1 = 1
+                          AND (
+                            EXISTS (
+                                SELECT 1
+                                FROM merge_unit_tasks mut
+                                JOIN merge_units mu
+                                  ON mu.project_id = mut.project_id
+                                 AND mu.id = mut.merge_unit_id
+                                WHERE mut.project_id = t.project_id
+                                  AND mut.task_id = t.id
+                                  AND {active_merge_unit_where_sql("mu")}
+                                  AND mu.state = 'merged'
+                            )
+                            OR (
+                                t.merge_status = 'merged'
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM merge_unit_tasks mut
+                                    JOIN merge_units mu
+                                      ON mu.project_id = mut.project_id
+                                     AND mu.id = mut.merge_unit_id
+                                    WHERE mut.project_id = t.project_id
+                                      AND mut.task_id = t.id
+                                      AND {inactive_tombstone_merge_unit_where_sql("mu")}
+                                )
+                            )
+                          )
+                        """,
+                        (*params, self._project_id),
+                    ).fetchall()
+                    candidate_pairs = tuple(
+                        dict.fromkeys((str(row["root_id"]), str(row["candidate_id"])) for row in candidate_rows)
+                    )
+                    if not candidate_pairs:
+                        continue
+
+                    max_candidates_per_chunk = max(1, (_SQL_VARIABLE_CHUNK - 3) // 2)
+                    for candidate_start in range(0, len(candidate_pairs), max_candidates_per_chunk):
+                        candidate_chunk = candidate_pairs[candidate_start : candidate_start + max_candidates_per_chunk]
+                        candidate_values = ",".join("(?, ?)" for _ in candidate_chunk)
+                        candidate_params: list[object] = []
+                        for root_id, candidate_id in candidate_chunk:
+                            candidate_params.extend((root_id, candidate_id))
+                        rows = conn.execute(
+                            f"""
+                        WITH RECURSIVE
+                        candidates(root_id, candidate_id) AS (
+                            VALUES {candidate_values}
                         ),
-                        requested_roots(root_id) AS (
-                            SELECT DISTINCT root_id
-                            FROM requested
-                        ),
-                        lineage(root_id, task_id) AS (
-                            SELECT root_id, root_id
-                            FROM requested_roots
+                        ancestry(root_id, candidate_id, ancestor_id) AS (
+                            SELECT root_id, candidate_id, candidate_id
+                            FROM candidates
                             UNION
-                            SELECT lineage.root_id, child.id
-                            FROM lineage
-                            JOIN requested
-                              ON requested.root_id = lineage.root_id
-                            JOIN tasks child
-                              ON child.project_id = ?
-                             AND (
-                               child.based_on = lineage.task_id
-                               OR child.depends_on = lineage.task_id
-                             )
-                             AND child.task_type != 'internal'
-                             AND (
-                               child.branch = requested.branch_key
-                               OR child.recovery_origin IS NOT NULL
-                             )
+                            SELECT ancestry.root_id, ancestry.candidate_id, parent.id
+                            FROM ancestry
+                            CROSS JOIN tasks current
+                              ON current.project_id = ?
+                             AND current.id = ancestry.ancestor_id
+                            JOIN tasks parent
+                              ON parent.project_id = current.project_id
+                             AND parent.id = current.based_on
+                            WHERE ancestry.ancestor_id != ancestry.root_id
+                            UNION
+                            SELECT ancestry.root_id, ancestry.candidate_id, parent.id
+                            FROM ancestry
+                            CROSS JOIN tasks current
+                              ON current.project_id = ?
+                             AND current.id = ancestry.ancestor_id
+                            JOIN tasks parent
+                              ON parent.project_id = current.project_id
+                             AND parent.id = current.depends_on
+                            WHERE ancestry.ancestor_id != ancestry.root_id
+                        ),
+                        reachable_candidates(root_id, candidate_id) AS (
+                            SELECT DISTINCT root_id, candidate_id
+                            FROM ancestry
+                            WHERE ancestor_id = root_id
                         )
                         SELECT
-                            lineage.root_id AS lineage_root_id,
+                            reachable_candidates.root_id AS lineage_root_id,
                             t.*
-                        FROM lineage
-                        JOIN requested
-                          ON requested.root_id = lineage.root_id
+                        FROM reachable_candidates
                         JOIN tasks t
                           ON t.project_id = ?
-                         AND t.id = lineage.task_id
-                         AND t.id != lineage.root_id
-                         AND t.branch = requested.branch_key
+                         AND t.id = reachable_candidates.candidate_id
                         WHERE 1 = 1
                           AND t.status IN ('completed', 'unmerged')
                           AND (
@@ -9708,14 +9804,14 @@ class SqliteTaskStore:
                                       AND {inactive_tombstone_merge_unit_where_sql("mu")}
                                 )
                             )
-                          )
+                        )
                         ORDER BY lineage_root_id ASC, t.created_at ASC, t.id ASC
                         """,
-                        (*params, self._project_id, self._project_id),
-                    ).fetchall()
-                    tasks = self._rows_to_tasks(conn, rows)
-                    for row, task in zip(rows, tasks, strict=True):
-                        grouped.setdefault(str(row["lineage_root_id"]), []).append(task)
+                            (*candidate_params, self._project_id, self._project_id, self._project_id),
+                        ).fetchall()
+                        tasks = self._rows_to_tasks(conn, rows)
+                        for row, task in zip(rows, tasks, strict=True):
+                            grouped.setdefault(str(row["lineage_root_id"]), []).append(task)
                 return grouped
 
             max_roots_per_chunk = max(1, (_SQL_VARIABLE_CHUNK - 1) // 3)

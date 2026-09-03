@@ -16259,6 +16259,183 @@ class TestExecutionProjectResolver:
         assert history[0].auto_implement is None
         assert any("tasks.auto_implement" in warning for warning in query_store.startup_warnings())
 
+    def _seed_same_branch_landed_lineage(self, store: SqliteTaskStore) -> tuple[str, str, str]:
+        failed = store.add("Failed lineage seed", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.branch = "feature/query-only-landed-lineage"
+        failed.completed_at = datetime(2026, 8, 27, 8, 0, tzinfo=UTC)
+        store.update(failed)
+
+        landed = store.add("Landed lineage descendant", task_type="implement", based_on=failed.id)
+        assert landed.id is not None
+        landed.status = "completed"
+        landed.branch = failed.branch
+        landed.has_commits = True
+        landed.merge_status = "merged"
+        landed.completed_at = datetime(2026, 8, 27, 9, 0, tzinfo=UTC)
+        store.update(landed)
+
+        return failed.id, landed.id, failed.branch
+
+    def _seed_unrelated_landed_lineage_population(self, store: SqliteTaskStore, *, count: int) -> None:
+        completed_at = datetime(2026, 8, 28, 8, 0, tzinfo=UTC).isoformat()
+        template = store.add("Unrelated landed lineage template", task_type="implement")
+        assert template.id is not None
+        template.status = "completed"
+        template.branch = "feature/unrelated-landed-lineage-template"
+        template.has_commits = True
+        template.merge_status = "merged"
+        template.completed_at = datetime(2026, 8, 28, 8, 0, tzinfo=UTC)
+        store.update(template)
+
+        with sqlite3.connect(store.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                (store.project_id, template.id),
+            ).fetchone()
+            assert row is not None
+            columns = tuple(row.keys())
+            quoted_columns = ", ".join(f'"{column}"' for column in columns)
+            placeholders = ", ".join("?" for _ in columns)
+            rows = []
+            for index in range(count):
+                values = dict(row)
+                values.update(
+                    {
+                        "id": f"gza-{900000 + index}",
+                        "prompt": f"Unrelated landed lineage {index}",
+                        "branch": f"feature/unrelated-landed-lineage-{index}",
+                        "based_on": None,
+                        "depends_on": None,
+                        "created_at": completed_at,
+                        "updated_at": completed_at,
+                        "completed_at": completed_at,
+                    }
+                )
+                rows.append(tuple(values[column] for column in columns))
+            conn.executemany(
+                f"INSERT INTO tasks ({quoted_columns}) VALUES ({placeholders})",
+                rows,
+            )
+            conn.commit()
+
+    def test_query_only_pre_v70_landed_lineage_reads_without_branch_status_index(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        failed_id, landed_id, branch = self._seed_same_branch_landed_lineage(store)
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP INDEX IF EXISTS idx_tasks_project_branch_status")
+            conn.execute("DROP INDEX IF EXISTS idx_tasks_project_based_on")
+            conn.execute("UPDATE schema_version SET version = 68")
+            conn.commit()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            grouped = query_store.list_landed_lineage_tasks_for_roots(
+                [failed_id],
+                branch_keys_by_root_id={failed_id: [branch]},
+            )
+        finally:
+            db_path.chmod(0o644)
+
+        assert {root_id: [task.id for task in tasks] for root_id, tasks in grouped.items()} == {
+            failed_id: [landed_id],
+        }
+
+    def test_query_only_current_missing_branch_status_index_landed_lineage_degrades_safely(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        failed_id, landed_id, branch = self._seed_same_branch_landed_lineage(store)
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP INDEX IF EXISTS idx_tasks_project_branch_status")
+            conn.commit()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            grouped = query_store.list_landed_lineage_tasks_for_roots(
+                [failed_id],
+                branch_keys_by_root_id={failed_id: [branch]},
+            )
+        finally:
+            db_path.chmod(0o644)
+
+        assert {root_id: [task.id for task in tasks] for root_id, tasks in grouped.items()} == {
+            failed_id: [landed_id],
+        }
+
+    def test_query_only_current_landed_lineage_keeps_indexed_query_work_bounded_when_available(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        baseline_db_path = tmp_path / "baseline.db"
+        baseline_store = SqliteTaskStore(baseline_db_path, prefix="gza")
+        baseline_failed_id, baseline_landed_id, baseline_branch = self._seed_same_branch_landed_lineage(baseline_store)
+
+        expanded_db_path = tmp_path / "expanded.db"
+        expanded_store = SqliteTaskStore(expanded_db_path, prefix="gza")
+        expanded_failed_id, expanded_landed_id, expanded_branch = self._seed_same_branch_landed_lineage(expanded_store)
+        self._seed_unrelated_landed_lineage_population(expanded_store, count=3000)
+
+        def measure_query_only_lookup(
+            db_path: Path,
+            failed_id: str,
+            branch: str,
+        ) -> tuple[dict[str, list[Task]], int]:
+            progress_calls = 0
+
+            def count_progress() -> int:
+                nonlocal progress_calls
+                progress_calls += 1
+                return 0
+
+            db_path.chmod(0o444)
+            try:
+                query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+                with query_store.read_session():
+                    conn = query_store._read_session_conn  # noqa: SLF001 - measure sqlite work for this read.
+                    assert conn is not None
+                    conn.set_progress_handler(count_progress, 100)
+                    try:
+                        grouped = query_store.list_landed_lineage_tasks_for_roots(
+                            [failed_id],
+                            branch_keys_by_root_id={failed_id: [branch]},
+                        )
+                    finally:
+                        conn.set_progress_handler(None, 0)
+            finally:
+                db_path.chmod(0o644)
+            return grouped, progress_calls
+
+        baseline_grouped, baseline_work = measure_query_only_lookup(
+            baseline_db_path,
+            baseline_failed_id,
+            baseline_branch,
+        )
+        expanded_grouped, expanded_work = measure_query_only_lookup(
+            expanded_db_path,
+            expanded_failed_id,
+            expanded_branch,
+        )
+
+        assert {root_id: [task.id for task in tasks] for root_id, tasks in baseline_grouped.items()} == {
+            baseline_failed_id: [baseline_landed_id],
+        }
+        assert {root_id: [task.id for task in tasks] for root_id, tasks in expanded_grouped.items()} == {
+            expanded_failed_id: [expanded_landed_id],
+        }
+        assert expanded_work <= baseline_work + 100
+
     def test_query_only_open_current_db_missing_create_pr_fails_closed(
         self, tmp_path: Path
     ) -> None:

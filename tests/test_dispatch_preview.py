@@ -59,6 +59,41 @@ def _bulk_insert_completed_history(
     return task_ids
 
 
+def _bulk_insert_failed_connector_history(
+    store,
+    *,
+    count: int,
+    start: int,
+) -> tuple[str, ...]:
+    now = datetime(2026, 4, 4, 8, 0, tzinfo=UTC).isoformat()
+    task_ids = tuple(f"gza-{start + idx}" for idx in range(count))
+    with store._connect() as conn:  # noqa: SLF001 - fast large-store fixture setup
+        conn.executemany(
+            """
+            INSERT INTO tasks (
+                project_id, id, prompt, status, task_type, based_on, depends_on,
+                branch, failure_reason, created_at, updated_at, completed_at
+            )
+            VALUES (?, ?, ?, 'failed', 'implement', ?, ?, ?, 'INFRASTRUCTURE_ERROR', ?, ?, ?)
+            """,
+            [
+                (
+                    store._project_id,  # noqa: SLF001
+                    task_id,
+                    f"Unrelated failed connector-bearing task {idx}",
+                    f"gza-unrelated-parent-{idx}",
+                    f"gza-unrelated-dependency-{idx}",
+                    f"feature/unrelated-connector-{idx}",
+                    now,
+                    now,
+                    now,
+                )
+                for idx, task_id in enumerate(task_ids)
+            ],
+        )
+    return task_ids
+
+
 def _bulk_insert_completed_implement_siblings_with_distinct_slices(
     store,
     *,
@@ -652,6 +687,27 @@ def test_recovery_preview_scoped_seed_ignores_large_non_recovery_descendant_hist
         task_type="internal",
     )
 
+    with patch(
+        "gza.recovery_engine._load_merge_context",
+        return_value=recovery_engine._MergeContext(git=None, default_branch="main"),
+    ):
+        full_preview = build_dispatch_preview(
+            store,
+            tags=None,
+            any_tag=False,
+            max_recovery_attempts=1,
+            selection_mode="recovery_only",
+            include_pending=False,
+        )
+        tagged_full_preview = build_dispatch_preview(
+            store,
+            tags=("alpha",),
+            any_tag=False,
+            max_recovery_attempts=1,
+            selection_mode="recovery_only",
+            include_pending=False,
+        )
+
     def fail_get_all():
         raise AssertionError("scoped recovery preview must not fall back to get_all()")
 
@@ -685,6 +741,14 @@ def test_recovery_preview_scoped_seed_ignores_large_non_recovery_descendant_hist
             include_pending=False,
         )
 
+    assert [(entry.owner_task.id, entry.task.id, entry.action) for entry in scoped_preview.recovery_entries] == [
+        (entry.owner_task.id, entry.task.id, entry.action) for entry in full_preview.recovery_entries
+    ]
+    assert [
+        (entry.owner_task.id, entry.task.id, entry.action) for entry in tagged_scoped_preview.recovery_entries
+    ] == [
+        (entry.owner_task.id, entry.task.id, entry.action) for entry in tagged_full_preview.recovery_entries
+    ]
     assert _recovery_entry_keys(scoped_preview) == [(failed.id, failed.id, "retry")]
     assert _recovery_entry_keys(tagged_scoped_preview) == [(failed.id, failed.id, "retry")]
     assert [entry.task.id for entry in scoped_preview.recovery_entries] == [failed.id]
@@ -1312,16 +1376,18 @@ def test_recovery_preview_scoped_landed_evidence_matches_full_for_transitive_man
 
 
 @pytest.mark.parametrize(
-    ("intermediate_branch", "case_id"),
+    ("intermediate_branch", "intermediate_task_type", "case_id"),
     (
-        (None, "branchless"),
-        ("feature/different-intermediate", "different-branch"),
+        (None, "implement", "branchless"),
+        ("feature/different-intermediate", "implement", "different-branch"),
+        ("feature/internal-intermediate", "internal", "internal"),
     ),
 )
-def test_recovery_preview_scoped_landed_evidence_reaches_through_nonmatching_intermediate_branch(
+def test_recovery_preview_scoped_landed_evidence_reaches_through_unlanded_connector(
     tmp_path: Path,
     monkeypatch,
     intermediate_branch: str | None,
+    intermediate_task_type: str,
     case_id: str,
 ) -> None:
     setup_config(tmp_path)
@@ -1338,10 +1404,9 @@ def test_recovery_preview_scoped_landed_evidence_reaches_through_nonmatching_int
     store.update(failed)
 
     intermediate = store.add(
-        f"Manual {case_id} intermediate",
-        task_type="implement",
+        f"Ordinary {case_id} connector",
+        task_type=intermediate_task_type,
         based_on=failed.id,
-        recovery_origin="manual",
     )
     assert intermediate.id is not None
     intermediate.status = "completed"
@@ -1353,7 +1418,6 @@ def test_recovery_preview_scoped_landed_evidence_reaches_through_nonmatching_int
         f"Merged same-branch grandchild behind {case_id} intermediate",
         task_type="implement",
         based_on=intermediate.id,
-        recovery_origin="manual",
     )
     assert landed.id is not None
     landed.status = "completed"
@@ -1392,6 +1456,91 @@ def test_recovery_preview_scoped_landed_evidence_reaches_through_nonmatching_int
     assert landed.id in hydrated_ids
     assert intermediate.id not in hydrated_ids
     assert len(set(hydrated_ids)) < 50
+
+
+def test_scoped_landed_lineage_query_work_ignores_unrelated_connectors(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    store._default_merge_target_cache = "main"  # noqa: SLF001 - avoid real git in unit test
+    store._project_root = None  # noqa: SLF001 - avoid real git fallback in unit test
+
+    failed = store.add("Failed root with landed descendant", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.branch = "feature/bounded-query-work"
+    failed.completed_at = datetime(2026, 6, 28, 8, 0, tzinfo=UTC)
+    store.update(failed)
+
+    intermediate = store.add("Branchless connector", task_type="internal", based_on=failed.id)
+    assert intermediate.id is not None
+    intermediate.status = "completed"
+    intermediate.branch = None
+    intermediate.completed_at = datetime(2026, 6, 28, 9, 0, tzinfo=UTC)
+    store.update(intermediate)
+
+    landed = store.add("Merged same-branch grandchild", task_type="implement", depends_on=intermediate.id)
+    assert landed.id is not None
+    landed.status = "completed"
+    landed.branch = failed.branch
+    landed.has_commits = True
+    landed.completed_at = datetime(2026, 6, 28, 10, 0, tzinfo=UTC)
+    store.update(landed)
+    unit = store.create_merge_unit(
+        source_branch=landed.branch,
+        target_branch="main",
+        owner_task_id=landed.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(landed.id, unit.id, "owner")
+
+    def fail_get_all():
+        raise AssertionError("scoped landed-evidence lookup must not fall back to get_all()")
+
+    hydrated_ids: list[str] = []
+    original_row_to_task = store._row_to_task  # noqa: SLF001
+
+    def counted_row_to_task(row, *args, **kwargs):
+        hydrated_ids.append(str(row["id"]))
+        return original_row_to_task(row, *args, **kwargs)
+
+    def measured_lookup() -> tuple[dict[str, list[object]], int]:
+        progress_calls = 0
+
+        def count_progress() -> int:
+            nonlocal progress_calls
+            progress_calls += 1
+            return 0
+
+        with store.read_session():
+            conn = store._read_session_conn  # noqa: SLF001
+            assert conn is not None
+            conn.set_progress_handler(count_progress, 100)
+            try:
+                result = store.list_landed_lineage_tasks_for_roots(
+                    (failed.id,),
+                    branch_keys_by_root_id={failed.id: (failed.branch,)},
+                )
+            finally:
+                conn.set_progress_handler(None, 0)
+        return result, progress_calls
+
+    monkeypatch.setattr(store, "get_all", fail_get_all)
+    monkeypatch.setattr(store, "_row_to_task", counted_row_to_task)  # noqa: SLF001
+
+    baseline_result, baseline_work = measured_lookup()
+    _bulk_insert_failed_connector_history(store, count=5000, start=395000)
+    expanded_result, expanded_work = measured_lookup()
+
+    assert [task.id for task in baseline_result[failed.id]] == [landed.id]
+    assert [task.id for task in expanded_result[failed.id]] == [landed.id]
+    assert landed.id in hydrated_ids
+    assert intermediate.id not in hydrated_ids
+    assert len(set(hydrated_ids)) == 1
+    assert expanded_work <= baseline_work + 250
 
 
 @pytest.mark.parametrize("tombstone_state", ("dropped", "superseded"))
