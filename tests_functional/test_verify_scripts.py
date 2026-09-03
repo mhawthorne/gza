@@ -199,6 +199,45 @@ def test_full_verify_defaults_to_fixed_ci_parity_xdist_worker_count_on_high_core
 
 
 @pytest.mark.timeout(30, method="signal")
+def test_full_verify_clamps_xdist_worker_count_to_a_single_core_machine(tmp_path: Path) -> None:
+    fixture_root = _setup_verify_script_fixture(tmp_path)
+    tool_log = fixture_root / "venv-tools.log"
+
+    venv_bin = fixture_root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    _write_fake_venv_python(venv_bin / "python", tool_log)
+    _write_fake_passthrough_tool(fixture_root / "bin" / "test-unit", tool_log, "test-unit")
+    for tool_name in ("ruff", "ty", "mypy", "pytest"):
+        _write_fake_passthrough_tool(venv_bin / tool_name, tool_log, tool_name)
+
+    fake_bin = fixture_root / "fake-bin"
+    fake_bin.mkdir()
+    _write_fake_getconf(fake_bin / "getconf", cpu_count=1)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = subprocess.run(
+        ["bash", "bin/tests"],
+        cwd=fixture_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=4,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "cores=1 xdist_workers=1" in result.stdout
+    tool_invocations = tool_log.read_text(encoding="utf-8")
+    assert "test-unit --summary -- tests/ -n 1 --dist load --durations=25 -o faulthandler_timeout=60" in tool_invocations
+    assert (
+        f"{venv_bin / 'python'} -m gza.test_functional_rerun --summary -- tests_functional/ "
+        "-n 1 --dist loadscope --durations=25 -o faulthandler_timeout=60"
+        in tool_invocations
+    )
+
+
+@pytest.mark.timeout(30, method="signal")
 def test_full_verify_uses_project_venv_for_test_latency_when_available(tmp_path: Path) -> None:
     fixture_root = _setup_verify_script_fixture(tmp_path)
     tool_log = fixture_root / "venv-tools.log"
