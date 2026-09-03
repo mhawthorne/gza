@@ -55,7 +55,7 @@ TS=$(date +%Y%m%d-%H%M%S)                                               # reuse 
 Then fetch all three surfaces **as parallel Bash tool calls in a single message** — they are independent and read-only, so concurrent runs are safe. Parallel calls do **not** share shell state, so inline the literal `${TS}` value into each command (do not re-derive it) and redirect each to its **own** file (the outputs have different shapes — two are JSON, one is text):
 
 ```bash
-uv run gza incomplete --json --last 0 > .gza/system-triage/${TS}-incomplete.json                          # needs-attention rows (next_action_reason)
+uv run gza incomplete --json --last 0 > .gza/system-triage/${TS}-incomplete.json                          # envelope: summary + rows with next_action_reason
 uv run gza history --status failed --json --days 1 --date-field effective > .gza/system-triage/${TS}-history.json   # recent failed leaves (failure_reason)
 uv run gza next --all > .gza/system-triage/${TS}-next.txt                                                  # recovery + pending lanes, blocked rows (text; no --json)
 ```
@@ -66,7 +66,7 @@ Default to **recent** failures (last 24h) — do not dredge an all-time backlog 
 
 ### Step 2: Bucket stuck rows by failure class
 
-Anchor classes on the **reason strings the system already emits** — `next_action_reason` from `incomplete`, `failure_reason` from `history`. The authoritative taxonomy lives in `specs/behavior/systemic-fix-triage.md`; the working set:
+Anchor classes on the **reason strings the system already emits** — `next_action_reason` from `incomplete` envelope `rows`, `failure_reason` from `history`. The authoritative taxonomy lives in `specs/behavior/systemic-fix-triage.md`; the working set:
 
 | Class | Signal | Default leverage tier |
 |---|---|---|

@@ -32,7 +32,7 @@ from gza.cli import (
 from gza.cli._common import clear_task_queue_position_scoped, set_task_queue_position_scoped
 from gza.config import Config
 from gza.console import truncate
-from gza.db import Task
+from gza.db import MERGE_SOURCE_MAX_CYCLES_DEFERRED, SqliteTaskStore, Task
 from gza.dispatch_preview import DispatchPreview, build_dispatch_preview
 from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerRow
@@ -52,6 +52,50 @@ from .conftest import (
     setup_config,
     setup_db_with_tasks,
 )
+
+
+def _incomplete_json_payload(stdout: str) -> dict[str, object]:
+    payload = json.loads(stdout)
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _incomplete_json_rows(stdout: str) -> list[dict[str, object]]:
+    rows = _incomplete_json_payload(stdout)["rows"]
+    assert isinstance(rows, list)
+    return rows
+
+
+def _incomplete_deferred_summary(stdout: str) -> int:
+    summary = _incomplete_json_payload(stdout)["summary"]
+    assert isinstance(summary, dict)
+    value = summary["deferred_blockers_outstanding"]
+    assert isinstance(value, int)
+    return value
+
+
+def _seed_max_cycles_deferred_blocker(
+    store: SqliteTaskStore,
+    *,
+    source_tags: tuple[str, ...] = (),
+    blocker_tags: tuple[str, ...] = ("deferred-review-blocker",),
+) -> Task:
+    source = store.add("Merged max-cycle source", task_type="implement", tags=source_tags)
+    store.mark_completed(source, has_commits=True, branch=f"feature/max-cycle-source-{len(store.get_all())}")
+    assert source.id is not None
+    source_unit = store.resolve_merge_unit_for_task(source.id)
+    assert source_unit is not None
+    store.set_merge_unit_state(source_unit.id, "merged", merge_source=MERGE_SOURCE_MAX_CYCLES_DEFERRED)
+
+    blocker = store.add(
+        "Deferred review blocker",
+        task_type="implement",
+        based_on=source.id,
+        depends_on=source.id,
+        tags=blocker_tags,
+    )
+    assert blocker.id is not None
+    return blocker
 
 
 @pytest.fixture(autouse=True)
@@ -18214,11 +18258,21 @@ class TestIncompleteCommand:
 
     @staticmethod
     def _one_line_row_id(output: str) -> str:
-        return next(line.split(":", 1)[0] for line in output.splitlines() if line.strip())
+        return next(
+            line.split(":", 1)[0]
+            for line in output.splitlines()
+            if line.strip() and not line.startswith("Deferred blockers outstanding:")
+        )
 
     @staticmethod
     def _tree_root_id(output: str) -> str:
-        first_line = next(line for line in output.splitlines() if line.strip() and not set(line.strip()) == {"-"})
+        first_line = next(
+            line
+            for line in output.splitlines()
+            if line.strip()
+            and not set(line.strip()) == {"-"}
+            and not line.startswith("Deferred blockers outstanding:")
+        )
         return first_line.split()[1]
 
     @staticmethod
@@ -18560,7 +18614,8 @@ class TestIncompleteCommand:
 
         captured = capsys.readouterr()
         assert result == 0
-        assert captured.out.strip() == task.id
+        assert "Deferred blockers outstanding: 0" in captured.out
+        assert task.id in captured.out.splitlines()
 
     def test_incomplete_json_fields_override_limits_projection(
         self,
@@ -18579,7 +18634,7 @@ class TestIncompleteCommand:
 
         captured = capsys.readouterr()
         assert result == 0
-        assert json.loads(captured.out) == [{"id": task.id, "status": "failed"}]
+        assert _incomplete_json_rows(captured.out) == [{"id": task.id, "status": "failed"}]
 
     def test_incomplete_unknown_fields_list_valid_choices(
         self,
@@ -18610,7 +18665,8 @@ class TestIncompleteCommand:
         result = invoke_gza("incomplete", "--fields", "id", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert result.stdout.strip() == task.id
+        assert "Deferred blockers outstanding: 0" in result.stdout
+        assert task.id in result.stdout.splitlines()
         assert result.stderr == ""
 
     def test_incomplete_cli_text_multi_field_uses_blocks(self, tmp_path: Path):
@@ -18641,7 +18697,7 @@ class TestIncompleteCommand:
         result = invoke_gza("incomplete", "--json", "--fields", "id,status", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert json.loads(result.stdout) == [{"id": task.id, "status": "failed"}]
+        assert _incomplete_json_rows(result.stdout) == [{"id": task.id, "status": "failed"}]
         assert result.stderr == ""
 
     def test_incomplete_cli_json_fields_can_project_trigger_source(self, tmp_path: Path):
@@ -18663,8 +18719,91 @@ class TestIncompleteCommand:
         )
 
         assert result.returncode == 0
-        assert json.loads(result.stdout) == [{"id": task.id, "trigger_source": "watch"}]
+        assert _incomplete_json_rows(result.stdout) == [{"id": task.id, "trigger_source": "watch"}]
         assert result.stderr == ""
+
+    def test_incomplete_text_includes_deferred_blocker_count_with_no_rows(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        _seed_max_cycles_deferred_blocker(store)
+
+        result = invoke_gza("incomplete", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Deferred blockers outstanding: 1" in result.stdout
+        assert "No unresolved task lineages" in result.stdout
+        assert "Deferred review blocker" not in result.stdout
+        assert result.stderr == ""
+
+    def test_incomplete_json_includes_deferred_blocker_summary_with_no_rows(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        _seed_max_cycles_deferred_blocker(store)
+
+        result = invoke_gza("incomplete", "--json", "--last", "0", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert _incomplete_deferred_summary(result.stdout) == 1
+        assert _incomplete_json_rows(result.stdout) == []
+        assert result.stderr == ""
+
+    def test_incomplete_deferred_blocker_count_uses_positive_tag_scope(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        _seed_max_cycles_deferred_blocker(
+            store,
+            blocker_tags=("deferred-review-blocker", "release", "backend"),
+        )
+        _seed_max_cycles_deferred_blocker(
+            store,
+            blocker_tags=("deferred-review-blocker", "frontend"),
+        )
+
+        any_tag_result = invoke_gza(
+            "incomplete",
+            "--json",
+            "--tag",
+            "release",
+            "--tag",
+            "frontend",
+            "--last",
+            "0",
+            "--project",
+            str(tmp_path),
+        )
+        all_tags_result = invoke_gza(
+            "incomplete",
+            "--json",
+            "--tag",
+            "release",
+            "--tag",
+            "backend",
+            "--all-tags",
+            "--last",
+            "0",
+            "--project",
+            str(tmp_path),
+        )
+        missing_all_result = invoke_gza(
+            "incomplete",
+            "--json",
+            "--tag",
+            "release",
+            "--tag",
+            "frontend",
+            "--all-tags",
+            "--last",
+            "0",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert any_tag_result.returncode == 0
+        assert all_tags_result.returncode == 0
+        assert missing_all_result.returncode == 0
+        assert _incomplete_deferred_summary(any_tag_result.stdout) == 2
+        assert _incomplete_deferred_summary(all_tags_result.stdout) == 1
+        assert _incomplete_deferred_summary(missing_all_result.stdout) == 0
 
     def test_incomplete_tag_filters_text_and_json_match_owner_scope(self, tmp_path: Path) -> None:
         tasks = self._setup_incomplete_tag_filter_fixture(tmp_path)
@@ -18689,7 +18828,7 @@ class TestIncompleteCommand:
         assert tasks["beta"].id not in text_result.stdout
 
         assert json_result.returncode == 0
-        json_rows = {(row["id"], tuple(row["tags"])) for row in json.loads(json_result.stdout)}
+        json_rows = {(row["id"], tuple(row["tags"])) for row in _incomplete_json_rows(json_result.stdout)}
         assert json_rows == {
             (tasks["alpha"].id, ("alpha",)),
             (tasks["both"].id, ("alpha", "beta")),
@@ -18730,14 +18869,14 @@ class TestIncompleteCommand:
         )
 
         assert any_tag_result.returncode == 0
-        assert {row["id"] for row in json.loads(any_tag_result.stdout)} == {
+        assert {row["id"] for row in _incomplete_json_rows(any_tag_result.stdout)} == {
             tasks["alpha"].id,
             tasks["beta"].id,
             tasks["both"].id,
         }
 
         assert all_tags_result.returncode == 0
-        assert json.loads(all_tags_result.stdout) == [{"id": tasks["both"].id}]
+        assert _incomplete_json_rows(all_tags_result.stdout) == [{"id": tasks["both"].id}]
 
     def test_incomplete_untagged_filter_matches_only_untagged_owner_rows(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
@@ -18768,7 +18907,7 @@ class TestIncompleteCommand:
         )
 
         assert result.returncode == 0
-        assert json.loads(result.stdout) == [{"id": untagged.id, "tags": []}]
+        assert _incomplete_json_rows(result.stdout) == [{"id": untagged.id, "tags": []}]
 
     def test_incomplete_json_untagged_keeps_untagged_owner_with_tagged_failed_descendant(
         self,
@@ -18783,7 +18922,7 @@ class TestIncompleteCommand:
         captured = capsys.readouterr()
 
         assert result == 0
-        assert json.loads(captured.out) == [
+        assert _incomplete_json_rows(captured.out) == [
             {
                 "id": owner.id,
                 "tags": [],
@@ -18804,7 +18943,7 @@ class TestIncompleteCommand:
         captured = capsys.readouterr()
 
         assert result == 0
-        assert json.loads(captured.out) == [
+        assert _incomplete_json_rows(captured.out) == [
             {
                 "id": owner.id,
                 "tags": [],
@@ -18861,7 +19000,7 @@ class TestIncompleteCommand:
         )
 
         assert result.returncode == 0
-        assert json.loads(result.stdout) == []
+        assert _incomplete_json_rows(result.stdout) == []
         assert result.stderr == ""
         assert impl.tags == ("alpha",)
 
@@ -18905,7 +19044,7 @@ class TestIncompleteCommand:
         )
 
         assert result.returncode == 0
-        assert json.loads(result.stdout) == []
+        assert _incomplete_json_rows(result.stdout) == []
         assert result.stderr == ""
 
     def test_incomplete_without_tag_filters_preserves_unfiltered_owner_rows(self, tmp_path: Path) -> None:
@@ -18923,7 +19062,7 @@ class TestIncompleteCommand:
         )
 
         assert result.returncode == 0
-        assert {row["id"] for row in json.loads(result.stdout)} == {
+        assert {row["id"] for row in _incomplete_json_rows(result.stdout)} == {
             tasks["alpha"].id,
             tasks["beta"].id,
             tasks["both"].id,
@@ -19012,11 +19151,11 @@ class TestIncompleteCommand:
             }
         ]
         assert any_tag_result.returncode == 0
-        assert json.loads(any_tag_result.stdout) == expected
+        assert _incomplete_json_rows(any_tag_result.stdout) == expected
         assert any_tag_result.stderr == ""
 
         assert all_tags_result.returncode == 0
-        assert json.loads(all_tags_result.stdout) == expected
+        assert _incomplete_json_rows(all_tags_result.stdout) == expected
         assert all_tags_result.stderr == ""
 
     def test_incomplete_json_tag_filter_drops_row_when_rerooted_owner_falls_out_of_scope(
@@ -19054,7 +19193,7 @@ class TestIncompleteCommand:
         captured = capsys.readouterr()
 
         assert result == 0
-        assert json.loads(captured.out) == []
+        assert _incomplete_json_rows(captured.out) == []
         assert failed.id != completed_retry.id
 
     def test_incomplete_json_tag_filter_keeps_rerooted_owner_when_final_owner_matches_all_tags(
@@ -19093,7 +19232,7 @@ class TestIncompleteCommand:
         captured = capsys.readouterr()
 
         assert result == 0
-        assert json.loads(captured.out) == [
+        assert _incomplete_json_rows(captured.out) == [
             {
                 "id": completed_retry.id,
                 "tags": ["alpha", "beta"],
@@ -19130,7 +19269,7 @@ class TestIncompleteCommand:
         result = invoke_gza("incomplete", "--json", "--last", "0", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert json.loads(result.stdout) == []
+        assert _incomplete_json_rows(result.stdout) == []
         assert result.stderr == ""
 
     def test_incomplete_normalization_keeps_merged_owner_with_live_unresolved_descendant(
@@ -19176,7 +19315,7 @@ class TestIncompleteCommand:
 
         captured = capsys.readouterr()
         assert result == 0
-        assert json.loads(captured.out) == [
+        assert _incomplete_json_rows(captured.out) == [
             {
                 "id": followup.id,
                 "unresolved_ids": [followup.id],
@@ -19264,7 +19403,8 @@ class TestIncompleteCommand:
         captured = capsys.readouterr()
         assert result == 0
         assert phases == ["cache-enter", "run", "normalize", "cache-exit"]
-        assert captured.out.strip() == "No unresolved task lineages"
+        assert "Deferred blockers outstanding: 0" in captured.out
+        assert "No unresolved task lineages" in captured.out
 
     def test_incomplete_cli_json_uses_real_next_action_when_git_context_is_available(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -19285,7 +19425,7 @@ class TestIncompleteCommand:
             )
 
         assert result.returncode == 0
-        assert json.loads(result.stdout) == [
+        assert _incomplete_json_rows(result.stdout) == [
             {
                 "id": plan.id,
                 "next_action": "create_plan_review",
@@ -19332,7 +19472,7 @@ class TestIncompleteCommand:
             )
 
         assert result.returncode == 0
-        assert json.loads(result.stdout) == [
+        assert _incomplete_json_rows(result.stdout) == [
             {
                 "id": failed.id,
                 "next_action": "needs_rebase",
@@ -19391,7 +19531,7 @@ class TestIncompleteCommand:
 
         captured = capsys.readouterr()
         assert result == 0
-        assert {row["id"] for row in json.loads(captured.out)} == {
+        assert {row["id"] for row in _incomplete_json_rows(captured.out)} == {
             release_only.id,
             release_ops.id,
             ops_only.id,
@@ -19445,7 +19585,7 @@ class TestIncompleteCommand:
 
         captured = capsys.readouterr()
         assert result == 0
-        assert json.loads(captured.out) == [{"id": both.id}]
+        assert _incomplete_json_rows(captured.out) == [{"id": both.id}]
         assert [entry.task.id for entry in preview.recovery_entries] == [both.id]
 
     def test_incomplete_tag_scope_respects_configured_max_resume_attempts_in_recovery_preview(
@@ -19491,7 +19631,7 @@ class TestIncompleteCommand:
 
         captured = capsys.readouterr()
         assert result == 0
-        assert json.loads(captured.out) == [
+        assert _incomplete_json_rows(captured.out) == [
             {
                 "id": failed.id,
                 "next_action": "skip",
@@ -19531,7 +19671,7 @@ class TestIncompleteCommand:
 
         captured = capsys.readouterr()
         assert result == 0
-        payload = json.loads(captured.out)
+        payload = _incomplete_json_rows(captured.out)
         assert [entry.task.id for entry in preview.recovery_entries] == [failed_review.id]
         assert payload == [
             {
@@ -19549,7 +19689,8 @@ class TestIncompleteCommand:
 
         captured = capsys.readouterr()
         assert result == 0
-        assert captured.out.splitlines()[0].startswith(f"{failed_review.id}: Resume failed task (MAX_TURNS)")
+        assert "Deferred blockers outstanding: 0" in captured.out
+        assert f"{failed_review.id}: Resume failed task (MAX_TURNS)" in captured.out
         assert plan.id not in self._one_line_row_id(captured.out)
 
         args = self._incomplete_args(tmp_path, fields=None, tree=True)
@@ -19560,8 +19701,9 @@ class TestIncompleteCommand:
         captured = capsys.readouterr()
         assert result == 0
         tree_text = captured.out
-        assert tree_text.splitlines()[0].startswith("failed")
-        assert failed_review.id in tree_text.splitlines()[0]
+        assert "Deferred blockers outstanding: 0" in tree_text
+        assert any(line.startswith("failed") for line in tree_text.splitlines())
+        assert failed_review.id in tree_text
         assert self._tree_root_id(tree_text) == failed_review.id
         assert plan.id not in tree_text
 
@@ -19592,7 +19734,8 @@ class TestIncompleteCommand:
         captured = capsys.readouterr()
         assert result == 0
         lines = captured.out.splitlines()
-        assert lines[0].startswith(f"{failed_review.id}: Resume failed task (MAX_TURNS)")
+        assert lines[0] == "Deferred blockers outstanding: 0"
+        assert any(line.startswith(f"{failed_review.id}: Resume failed task (MAX_TURNS)") for line in lines)
         assert plan.id not in self._one_line_row_id(captured.out)
         assert "Blocked dependents:" in captured.out
         blocked_output = " ".join(captured.out.split())
@@ -19649,7 +19792,7 @@ class TestIncompleteCommand:
         assert self._ids_present_in_output(queue_result.stdout, *candidate_tasks) == expected_ids
         assert self._watch_recovery_report_ids(watch_result.stdout, *candidate_tasks) == expected_ids
         assert self._advance_recovery_subset_ids(advance_result.stdout, *candidate_tasks) == expected_ids
-        assert json.loads(incomplete_result.stdout) == [
+        assert _incomplete_json_rows(incomplete_result.stdout) == [
             {
                 "id": failed_review.id,
                 "next_action_owner_id": failed_review.id,
@@ -19748,7 +19891,7 @@ class TestIncompleteCommand:
         assert self._ids_present_in_output(queue_result.stdout, *candidate_tasks) == expected_ids
         assert self._watch_recovery_report_ids(watch_result.stdout, *candidate_tasks) == expected_ids
         assert self._ids_present_in_output(advance_result.stdout, *candidate_tasks) == expected_ids
-        assert {row["id"] for row in json.loads(incomplete_result.stdout)} == expected_ids
+        assert {row["id"] for row in _incomplete_json_rows(incomplete_result.stdout)} == expected_ids
 
     def test_recovery_ids_match_queue_watch_advance_and_incomplete_for_all_tag_scope(
         self,
@@ -19838,7 +19981,7 @@ class TestIncompleteCommand:
         assert self._ids_present_in_output(queue_result.stdout, *candidate_tasks) == expected_ids
         assert self._watch_recovery_report_ids(watch_result.stdout, *candidate_tasks) == expected_ids
         assert self._ids_present_in_output(advance_result.stdout, *candidate_tasks) == expected_ids
-        assert json.loads(incomplete_result.stdout) == [{"id": both.id}]
+        assert _incomplete_json_rows(incomplete_result.stdout) == [{"id": both.id}]
 
     def test_incomplete_keeps_failed_owner_visible_until_completed_recovery_code_is_merged(
         self,
@@ -20207,7 +20350,7 @@ class TestIncompleteCommand:
             )
 
         assert result.returncode == 0
-        assert json.loads(result.stdout) == [
+        assert _incomplete_json_rows(result.stdout) == [
             {
                 "id": plan.id,
                 "next_action": "awaiting_human",
@@ -20238,7 +20381,7 @@ class TestIncompleteCommand:
             )
 
         assert result.returncode == 0
-        assert json.loads(result.stdout) == [
+        assert _incomplete_json_rows(result.stdout) == [
             {
                 "id": explore.id,
                 "next_action": "needs_discussion",
@@ -20327,12 +20470,13 @@ class TestIncompleteCommand:
 
         assert result.returncode == 0
         lines = [line for line in result.stdout.splitlines() if line.strip()]
-        assert len(lines) == 1
-        assert truncate(first_line, 100) in lines[0]
-        assert "Full prompt body that should not render" not in lines[0]
-        assert root.prompt not in lines[0]
-        assert "| context:" not in lines[0]
-        assert "| unresolved:" not in lines[0]
+        row_lines = [line for line in lines if not line.startswith("Deferred blockers outstanding:")]
+        assert len(row_lines) == 1
+        assert truncate(first_line, 100) in row_lines[0]
+        assert "Full prompt body that should not render" not in row_lines[0]
+        assert root.prompt not in row_lines[0]
+        assert "| context:" not in row_lines[0]
+        assert "| unresolved:" not in row_lines[0]
         assert result.stderr == ""
 
     def test_incomplete_roots_plan_impl_review_improve_lineage_at_impl_in_both_views(
@@ -20784,11 +20928,21 @@ class TestLineageOwnerParity:
 
     @staticmethod
     def _one_line_row_id(output: str) -> str:
-        return next(line.split(":", 1)[0] for line in output.splitlines() if line.strip())
+        return next(
+            line.split(":", 1)[0]
+            for line in output.splitlines()
+            if line.strip() and not line.startswith("Deferred blockers outstanding:")
+        )
 
     @staticmethod
     def _tree_root_id(output: str) -> str:
-        first_line = next(line for line in output.splitlines() if line.strip() and not set(line.strip()) == {"-"})
+        first_line = next(
+            line
+            for line in output.splitlines()
+            if line.strip()
+            and not set(line.strip()) == {"-"}
+            and not line.startswith("Deferred blockers outstanding:")
+        )
         return first_line.split()[1]
 
     @staticmethod
@@ -21127,7 +21281,7 @@ class TestLineageOwnerParity:
             )
         incomplete_captured = capsys.readouterr()
         assert incomplete_result == 0
-        assert json.loads(incomplete_captured.out) == [{"id": impl.id}]
+        assert _incomplete_json_rows(incomplete_captured.out) == [{"id": impl.id}]
 
         unmerged_result = query_cli.cmd_unmerged(
             self._unmerged_args(tmp_path, fields="id"),

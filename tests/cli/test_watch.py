@@ -1038,6 +1038,29 @@ def _seed_watch_lifecycle_summary_fixture(tmp_path: Path) -> tuple[object, objec
     return store, {plan.id: plan, impl.id: impl}
 
 
+def _seed_watch_deferred_blocker(
+    store: SqliteTaskStore,
+    *,
+    blocker_tags: tuple[str, ...] = ("deferred-review-blocker",),
+) -> Task:
+    source = store.add("Merged max-cycle watch source", task_type="implement")
+    store.mark_completed(source, has_commits=True, branch=f"feature/watch-max-cycle-source-{len(store.get_all())}")
+    assert source.id is not None
+    source_unit = store.resolve_merge_unit_for_task(source.id)
+    assert source_unit is not None
+    store.set_merge_unit_state(source_unit.id, "merged", merge_source=MERGE_SOURCE_MAX_CYCLES_DEFERRED)
+
+    blocker = store.add(
+        "Deferred watch blocker",
+        task_type="implement",
+        based_on=source.id,
+        depends_on=source.id,
+        tags=blocker_tags,
+    )
+    assert blocker.id is not None
+    return blocker
+
+
 def _make_watch_startup_git() -> Git:
     git = _make_watch_git()
     git.branch_exists.return_value = False  # type: ignore[attr-defined]
@@ -11973,6 +11996,74 @@ def test_watch_supervisor_fleet_cycle_runs_all_direct_phases_before_worker_dispa
     assert events.count("analyze:a") == 2
     assert events.count("analyze:b") == 1
     assert [event for event in events if event.startswith("dispatch:")] == ["dispatch:a", "dispatch:b"]
+
+
+def test_watch_supervisor_fleet_cycle_emits_one_deferred_blocker_count_per_runtime(
+    tmp_path: Path,
+) -> None:
+    with patch(
+        "gza.git.subprocess.run",
+        return_value=subprocess.CompletedProcess(["git"], 1, "", ""),
+    ):
+        runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+        runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+        _seed_watch_deferred_blocker(runtime_a.store)
+        _seed_watch_deferred_blocker(runtime_b.store)
+        construction = WatchSupervisorRuntimeConstruction(runtimes=(runtime_a, runtime_b))
+        selection = WatchSupervisorSelection(
+            projects=(
+                WatchSupervisorProjectSelector(
+                    key="a", ref=str(runtime_a.config.project_dir), path=runtime_a.config.project_dir
+                ),
+                WatchSupervisorProjectSelector(
+                    key="b", ref=str(runtime_b.config.project_dir), path=runtime_b.config.project_dir
+                ),
+            )
+        )
+
+        with (
+            patch("gza.cli.watch.construct_watch_project_runtimes", return_value=construction),
+            patch("gza.cli._common.reconcile_in_progress_tasks"),
+            patch("gza.cli._common.prune_terminal_dead_workers"),
+            patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+            patch(
+                "gza.cli.watch.check_git_health",
+                return_value=SimpleNamespace(dispatch_halted=False, state=SimpleNamespace(alert_message=None)),
+            ),
+            patch.object(
+                WatchProjectRuntime,
+                "analyze_cycle",
+                autospec=True,
+                side_effect=lambda runtime, **_kwargs: _runtime_analysis_with_pending_suppression(runtime),
+            ),
+            patch.object(WatchProjectRuntime, "recovery_dispatch_head", autospec=True, return_value=None),
+            patch.object(WatchProjectRuntime, "pending_dispatch_head", autospec=True, return_value=None),
+            patch("gza.cli.watch._run_watch_main_integration_verify", return_value=SimpleNamespace(merges_halted=False)),
+        ):
+            result, _lease_set = run_watch_supervisor_fleet_cycle(
+                anchor_store=runtime_a.store,
+                selection=selection,
+                quiet=True,
+                owner_token=None,
+                existing_lease_set=None,
+                batch=2,
+                recovery_slots=0,
+                recovery_mode="pending_only",
+                max_recovery_attempts=1,
+                max_iterations=1,
+                dry_run=True,
+                pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+                recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+                emit_summary=False,
+            )
+
+        assert result.work_done is False
+        assert (runtime_a.config.project_dir / ".gza" / "watch.log").read_text().count(
+            "Deferred blockers outstanding: 1"
+        ) == 1
+        assert (runtime_b.config.project_dir / ".gza" / "watch.log").read_text().count(
+            "Deferred blockers outstanding: 1"
+        ) == 1
 
 
 def test_watch_supervisor_fleet_cycle_health_hold_does_not_block_healthy_project(
@@ -56012,6 +56103,291 @@ def test_watch_cycle_quiet_routes_lifecycle_summary_to_watch_log(
 
     assert "Lifecycle actions (2):" in log_path.read_text()
     assert "Lifecycle actions (2):" not in capsys.readouterr().out
+
+
+def test_watch_cycle_emits_deferred_blocker_count_once_per_cycle(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _seed_watch_deferred_blocker(store)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=False)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+    ):
+        for _ in range(2):
+            _run_cycle(
+                config=config,
+                store=store,
+                batch=1,
+                max_iterations=10,
+                dry_run=True,
+                log=log,
+                precomputed_plan=_empty_scoped_watch_plan(),
+                skip_runtime_reconcile=True,
+            )
+
+    stdout = capsys.readouterr().out
+    log_text = log_path.read_text()
+    assert stdout.count("Deferred blockers outstanding: 1") == 2
+    assert log_text.count("Deferred blockers outstanding: 1") == 2
+    assert "ATTENTION Deferred blockers outstanding" not in log_text
+    assert "Needs attention" not in log_text
+
+
+def test_watch_cycle_preview_and_resumed_execution_emit_one_deferred_blocker_count(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _seed_watch_deferred_blocker(store)
+    pending = store.add("Pending accepted after preview", task_type="implement")
+    assert pending.id is not None
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+    ):
+        _preview_result, preview_plan = watch_module._preview_initial_watch_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            log=log,
+            tags=None,
+            any_tag=False,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            show_skipped=False,
+            auto_restart_on_drift=True,
+            installed_package_drift=None,
+            git=_make_watch_git(),
+        )
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            precomputed_plan=preview_plan,
+            begin_cycle=False,
+            end_cycle=True,
+            emit_cycle_header=False,
+            emit_lifecycle_summary=False,
+            skip_runtime_reconcile=True,
+            git=_make_watch_git(),
+        )
+
+    log_text = log_path.read_text()
+    assert log_text.count("Deferred blockers outstanding: 1") == 1
+
+
+def _assert_single_info_deferred_blocker_summary(log_text: str, *, expected_count: int = 1) -> None:
+    summary = f"Deferred blockers outstanding: {expected_count}"
+    summary_lines = [line for line in log_text.splitlines() if summary in line]
+    assert len(summary_lines) == 1
+    assert "INFO" in summary_lines[0]
+    assert "ATTENTION Deferred blockers outstanding" not in log_text
+    assert "Needs attention: Deferred blockers outstanding" not in log_text
+
+
+def test_cmd_watch_accepted_preview_stop_closes_with_scoped_deferred_blocker_count(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _seed_watch_deferred_blocker(store, blocker_tags=("deferred-review-blocker", "release"))
+    _seed_watch_deferred_blocker(store, blocker_tags=("deferred-review-blocker", "other"))
+    pending = store.add("Pending accepted preview then stop", task_type="implement", tags=("release",))
+    assert pending.id is not None
+    args = _watch_args(tmp_path, [], yes=False, quiet=True, tags=["release"])
+
+    signal_handlers: dict[signal.Signals, object] = {}
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def accept_and_stop(_prompt: str) -> str:
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+        return "y"
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=True),
+        patch("gza.cli.watch.sys.stdout.flush"),
+        patch("builtins.input", side_effect=accept_and_stop),
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    _assert_single_info_deferred_blocker_summary((tmp_path / ".gza" / "watch.log").read_text())
+
+
+def test_cmd_watch_accepted_preview_system_hold_closes_with_scoped_deferred_blocker_count(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _seed_watch_deferred_blocker(store, blocker_tags=("deferred-review-blocker", "release"))
+    _seed_watch_deferred_blocker(store, blocker_tags=("deferred-review-blocker", "other"))
+    pending = store.add("Pending accepted preview then system hold", task_type="implement", tags=("release",))
+    assert pending.id is not None
+    args = _watch_args(tmp_path, [], yes=False, quiet=True, tags=["release"])
+
+    signal_handlers: dict[signal.Signals, object] = {}
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def stop_after_hold(_seconds: int, _stop_requested) -> None:
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=True),
+        patch("gza.cli.watch.sys.stdout.flush"),
+        patch("builtins.input", return_value="y"),
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._system_can_run_tasks", side_effect=(True, False)),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=stop_after_hold),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    _assert_single_info_deferred_blocker_summary(log_text)
+    assert "System unavailable: Docker daemon unreachable" in log_text
+
+
+def test_cmd_watch_accepted_preview_git_health_hold_closes_with_scoped_deferred_blocker_count(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _seed_watch_deferred_blocker(store, blocker_tags=("deferred-review-blocker", "release"))
+    _seed_watch_deferred_blocker(store, blocker_tags=("deferred-review-blocker", "other"))
+    pending = store.add("Pending accepted preview then git hold", task_type="implement", tags=("release",))
+    assert pending.id is not None
+    args = _watch_args(tmp_path, [], yes=False, quiet=True, tags=["release"])
+
+    signal_handlers: dict[signal.Signals, object] = {}
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def stop_after_hold(_seconds: int, _stop_requested) -> None:
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=True),
+        patch("gza.cli.watch.sys.stdout.flush"),
+        patch("builtins.input", return_value="y"),
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._system_can_run_tasks", return_value=True),
+        patch("gza.cli.watch._emit_git_health_hold", side_effect=(False, True)),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=stop_after_hold),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    _assert_single_info_deferred_blocker_summary((tmp_path / ".gza" / "watch.log").read_text())
+
+
+def test_cmd_watch_aborted_initial_preview_closes_with_deferred_blocker_count(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _seed_watch_deferred_blocker(store)
+    pending = store.add("Pending preview then abort", task_type="implement")
+    assert pending.id is not None
+    args = _watch_args(tmp_path, [], yes=False, quiet=True)
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=True),
+        patch("gza.cli.watch.sys.stdout.flush"),
+        patch("builtins.input", return_value="n"),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert rc == 0
+    assert log_text.count("Deferred blockers outstanding: 1") == 1
+    assert "Aborted." not in log_text
+
+
+def test_watch_cycle_deferred_blocker_count_uses_positive_tag_scope(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _seed_watch_deferred_blocker(store, blocker_tags=("deferred-review-blocker", "release", "backend"))
+    _seed_watch_deferred_blocker(store, blocker_tags=("deferred-review-blocker", "frontend"))
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+            tags=("release", "backend"),
+            any_tag=False,
+            precomputed_plan=_empty_scoped_watch_plan(),
+            skip_runtime_reconcile=True,
+        )
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+            tags=("release", "frontend"),
+            any_tag=False,
+            precomputed_plan=_empty_scoped_watch_plan(),
+            skip_runtime_reconcile=True,
+        )
+
+    log_text = log_path.read_text()
+    assert log_text.count("Deferred blockers outstanding: 1") == 1
+    assert log_text.count("Deferred blockers outstanding: 0") == 1
 
 
 def test_watch_cycle_executes_direct_lifecycle_actions_before_worker_consuming_actions(

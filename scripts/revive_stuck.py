@@ -25,9 +25,10 @@ Usage:
     scripts/revive_stuck.py --tag system          # only revive tasks tagged `system`
     scripts/revive_stuck.py --tag a --tag b       # match-ANY (repeatable or comma-separated)
 
-Tag filtering is a short-term client-side narrowing of ``gza incomplete --json`` on the
-lineage-owner tags; it will be replaced when ``gza incomplete`` accepts ``--tag`` natively
-(gza-6466), matching the ``watch`` / ``queue`` argument convention.
+Tag filtering is a client-side narrowing of the ``gza incomplete --json`` envelope's
+``rows`` field on lineage-owner tags. The envelope also includes ``summary`` metadata
+such as ``deferred_blockers_outstanding``; that debt is operator-visible but is not a
+lineage row for this reviver to act on.
 """
 
 from __future__ import annotations
@@ -121,6 +122,21 @@ def _row_matches_tags(row: dict, tag_filters: set[str] | None) -> bool:
     return not owner_tags.isdisjoint(tag_filters)
 
 
+def _incomplete_rows_from_json(out: str) -> list[dict]:
+    payload = json.loads(out)
+    if not isinstance(payload, dict):
+        raise ValueError("expected gza incomplete --json to return an object envelope")
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError("expected gza incomplete --json envelope to contain a rows list")
+    if not all(isinstance(row, dict) for row in rows):
+        raise ValueError("expected every gza incomplete --json row to be an object")
+    summary = payload.get("summary", {})
+    if not isinstance(summary, dict):
+        raise ValueError("expected gza incomplete --json summary to be an object")
+    return rows
+
+
 def _classified_rows(
     project: Path, tag_filters: set[str] | None
 ) -> tuple[list[tuple[str, list[str] | None, str, str]], int]:
@@ -133,8 +149,9 @@ def _classified_rows(
     if rc != 0:
         return [], 0
     try:
-        rows = json.loads(out)
-    except json.JSONDecodeError:
+        rows = _incomplete_rows_from_json(out)
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(f"Warning: could not parse gza incomplete --json output: {exc}", file=sys.stderr)
         return [], 0
     result: list[tuple[str, list[str] | None, str, str]] = []
     total = 0

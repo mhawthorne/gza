@@ -163,6 +163,7 @@ from ..task_query import (
     TaskQueryService,
     TaskRow,
     collect_scoped_tag_scope_gaps,
+    count_outstanding_deferred_review_blockers,
     normalize_tag_filters,
     task_matches_tag_filters,
 )
@@ -6041,6 +6042,17 @@ def _watch_log_line_with_message_prefix(line: str, prefix: str) -> str:
     return "\n".join(prefixed_lines)
 
 
+def _emit_deferred_blocker_debt_summary(
+    log: _WatchLog,
+    store: SqliteTaskStore,
+    *,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+) -> None:
+    outstanding = count_outstanding_deferred_review_blockers(store, tags=tags, any_tag=any_tag)
+    log.emit("INFO", f"Deferred blockers outstanding: {outstanding}")
+
+
 def _rotate_watch_log_if_non_empty(path: Path) -> None:
     while True:
         try:
@@ -10543,6 +10555,12 @@ def run_watch_supervisor_fleet_cycle(
                 quiet=quiet,
             )
         for runtime in runtimes:
+            _emit_deferred_blocker_debt_summary(
+                runtime.log,
+                runtime.store,
+                tags=runtime.tags,
+                any_tag=runtime.any_tag,
+            )
             _emit_cycle_attention_summary(runtime.log)
             runtime.log.end_cycle()
         return result, construction.lease_set
@@ -16058,6 +16076,8 @@ def _run_cycle(
                 git=latest_main_verify_git,
                 target_branch=target_branch,
             )
+            if end_cycle:
+                _emit_deferred_blocker_debt_summary(log, store, tags=tags, any_tag=any_tag)
             _emit_cycle_attention_summary(log)
             if end_cycle:
                 log.end_cycle()
@@ -17753,6 +17773,8 @@ def _run_cycle(
             git=latest_main_verify_git,
             target_branch=target_branch,
         )
+        if end_cycle:
+            _emit_deferred_blocker_debt_summary(log, store, tags=tags, any_tag=any_tag)
         _emit_cycle_attention_summary(log)
         if end_cycle:
             log.end_cycle()
@@ -18529,6 +18551,20 @@ def cmd_watch(args: argparse.Namespace) -> int:
         def _active_failure_owner_ids() -> frozenset[str]:
             return runtime.active_failure_owner_ids()
 
+        def _close_accepted_preview_cycle() -> None:
+            nonlocal preview_cycle_open, pending_first_cycle_plan
+            if not preview_cycle_open:
+                return
+            _emit_deferred_blocker_debt_summary(
+                runtime.log,
+                runtime.store,
+                tags=runtime.tags,
+                any_tag=runtime.any_tag,
+            )
+            runtime.log.end_cycle()
+            preview_cycle_open = False
+            pending_first_cycle_plan = None
+
         def _current_scoped_selector_recovery_closure_by_owner() -> dict[str, frozenset[str]] | None:
             if scoped_owner_ids is None:
                 return None
@@ -18614,6 +18650,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 effective_scoped_owner_ids = preview_plan.analysis.effective_scoped_owner_ids or scoped_owner_ids
             if preview_result.work_done:
                 if not sys.stdout.isatty():
+                    _emit_deferred_blocker_debt_summary(
+                        runtime.log,
+                        runtime.store,
+                        tags=runtime.tags,
+                        any_tag=runtime.any_tag,
+                    )
                     runtime.log.end_cycle()
                     print(
                         "watch: stdout is not a terminal, so the initial confirmation "
@@ -18629,6 +18671,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 except KeyboardInterrupt:
                     raise
                 if answer not in ("y", "yes"):
+                    _emit_deferred_blocker_debt_summary(
+                        runtime.log,
+                        runtime.store,
+                        tags=runtime.tags,
+                        any_tag=runtime.any_tag,
+                    )
                     runtime.log.end_cycle()
                     print("Aborted.")
                     return 0
@@ -18636,6 +18684,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 preview_cycle_open = True
                 return None
 
+            _emit_deferred_blocker_debt_summary(
+                runtime.log,
+                runtime.store,
+                tags=runtime.tags,
+                any_tag=runtime.any_tag,
+            )
             runtime.log.end_cycle()
             return None
 
@@ -18666,8 +18720,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
         while result_code is None:
             if stop_requested:
-                if preview_cycle_open:
-                    runtime.log.end_cycle()
+                _close_accepted_preview_cycle()
                 break
 
             if watch_session_recorded:
@@ -18675,10 +18728,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 worker_heartbeat()
 
             if not _system_can_run_tasks(runtime.config, runtime_context=runtime.runtime_context):
-                if preview_cycle_open:
-                    runtime.log.end_cycle()
-                    preview_cycle_open = False
-                    pending_first_cycle_plan = None
+                _close_accepted_preview_cycle()
                 if scoped_owner_ids is not None:
                     scoped_activity = _reported_scoped_watch_activity(
                         log=runtime.log,
@@ -18752,9 +18802,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 runtime_context=runtime.runtime_context,
             ):
                 if preview_cycle_open:
-                    runtime.log.end_cycle()
-                    preview_cycle_open = False
-                    pending_first_cycle_plan = None
+                    _close_accepted_preview_cycle()
                     needs_initial_preview = not skip_confirm
                 if dry_run:
                     result_code = 0

@@ -41,9 +41,9 @@ For no-ID sweeps, start with AskUserQuestion and offer:
 
 If the caller's intent is clearly recent (for example "what just failed?", "triage the latest watch output", "check today's attention rows"), proceed with `Last 24 hours` without asking a follow-up.
 
-Then gather the structured rows up front so later steps only spend tokens on in-window rows:
+Then gather the structured rows up front so later steps only spend tokens on in-window rows. `gza incomplete --json` returns an object envelope with `summary` and `rows`; consumers must validate and iterate `rows`, not the envelope object itself. The `summary.deferred_blockers_outstanding` value is debt metadata for operators and is not a lineage row.
 
-- **With ID:** run `uv run gza incomplete --json --last 0` and filter to the merge-unit owner row that contains the requested task (check both `id` and `member_ids`). If no row matches, fall back to `uv run gza show <id>` and report the lineage state directly.
+- **With ID:** run `uv run gza incomplete --json --last 0`, parse the object envelope, and filter the `rows` list to the merge-unit owner row that contains the requested task (check both `id` and `member_ids`). If no row matches, fall back to `uv run gza show <id>` and report the lineage state directly.
 - **Without ID, recent sweep:** prefer the built-in server-side date filter:
 
 ```bash
@@ -56,7 +56,7 @@ uv run gza incomplete --json --days 1 --date-field effective --last 0
   - `Last 7 days` → `uv run gza incomplete --json --days 7 --date-field effective --last 0`
   - `All time` → `uv run gza incomplete --json --last 0`
 
-The JSON rows include:
+Each JSON row in `rows` includes:
 - `id` — the merge-unit owner ID (this is the row that surfaces)
 - `next_action` — discrete type (see Step 2)
 - `next_action_reason` — short reason string (see Step 2)

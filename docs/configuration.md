@@ -1485,7 +1485,7 @@ gza incomplete [options]
 | `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
 | `--any-tag` | With repeated `--tag` values, match any requested tag explicitly (default) |
 | `--untagged` | Match only unresolved rows whose owner has no tags; cannot be combined with tag selector flags |
-| `--json` | Output JSON rows from the unified query API |
+| `--json` | Output a JSON envelope with `summary` metadata and unified query `rows` |
 
 Use `gza incomplete` for unresolved lineage triage. Use the more specific command surfaces when you want one domain only:
 

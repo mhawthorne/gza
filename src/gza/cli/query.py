@@ -130,6 +130,7 @@ from ..task_query import (
     TaskQueryService as _TaskQueryService,
     TaskRow as _TaskRow,
     apply_projection_values as _apply_query_projection_values,
+    count_outstanding_deferred_review_blockers,
     normalize_tag_filters,
     parse_csv as _parse_csv,
     projection_fields as _projection_fields,
@@ -1762,10 +1763,19 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
                 target_branch=target_branch,
                 **normalize_kwargs,
             )
+    deferred_blockers_outstanding = count_outstanding_deferred_review_blockers(
+        store,
+        tags=normalized_tag_filters,
+        any_tag=any_tag,
+    )
     if getattr(args, "json", False):
-        _render_projection_result(result, use_json=True)
+        _render_incomplete_json_result(
+            result,
+            deferred_blockers_outstanding=deferred_blockers_outstanding,
+        )
         return 0
 
+    console.print(f"Deferred blockers outstanding: {deferred_blockers_outstanding}")
     if not result.rows:
         if blocked_by_dropped_only:
             console.print("No pending tasks blocked by dropped dependencies")
@@ -2623,6 +2633,25 @@ def _render_projection_result(result: _TaskQueryResult, *, use_json: bool) -> No
         print(rendered)
     else:
         console.print(rendered)
+
+
+def _render_incomplete_json_result(
+    result: _TaskQueryResult,
+    *,
+    deferred_blockers_outstanding: int,
+) -> None:
+    """Render incomplete JSON with command-level summary metadata."""
+    print(
+        json.dumps(
+            {
+                "summary": {
+                    "deferred_blockers_outstanding": deferred_blockers_outstanding,
+                },
+                "rows": result.to_json(),
+            },
+            indent=2,
+        )
+    )
 
 
 def _enrich_unmerged_result(

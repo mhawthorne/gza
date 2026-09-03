@@ -506,7 +506,7 @@ def main() -> int:
     incomplete_parser.add_argument(
         "--json",
         action="store_true",
-        help="Output JSON rows from the unified query API",
+        help="Output a JSON envelope with summary metadata and unified query rows",
     )
     incomplete_parser.add_argument(
         "--verbose",
