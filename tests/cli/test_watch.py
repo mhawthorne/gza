@@ -125,6 +125,7 @@ from gza.cli.watch import (
     _maybe_repair_target_already_merged_skip,
     _maybe_skip_watch_no_progress_for_transient_terminal,
     _observe_selected_watch_no_progress_without_dispatch,
+    _compute_cycle_task_accounting,
     _OwnerFailureBackoffState,
     _query_owner_rows_with_context,
     _record_failure_backoff_updates,
@@ -20851,6 +20852,82 @@ def test_watch_cycle_logs_tag_scoped_pending_count_in_wake_line(tmp_path: Path) 
         )
 
     assert "WAKE      checking... (0 running, pending=2 runnable, blocked=1, 1 slots)" in log_path.read_text()
+
+
+def test_watch_cycle_logs_cycle_accounting_line(tmp_path: Path) -> None:
+    """Each cycle should emit a disjoint accounting of in-scope non-terminal tasks."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    store.add("Release runnable", task_type="plan", group="release-1")
+    release_blocker = store.add("Release blocker", task_type="plan", group="release-1")
+    assert release_blocker.id is not None
+    store.add("Release blocked", task_type="plan", group="release-1", depends_on=release_blocker.id)
+    store.add("Backlog runnable", task_type="plan", group="backlog")
+    done = store.add("Release done", task_type="plan", group="release-1")
+    done.status = "completed"
+    done.completed_at = datetime.now(UTC)
+    store.update(done)
+    dropped = store.add("Release dropped", task_type="plan", group="release-1")
+    dropped.status = "dropped"
+    dropped.completed_at = datetime.now(UTC)
+    store.update(dropped)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("release-1",),
+        )
+
+    assert (
+        "INFO      cycle accounting: running=0 pending=2 blocked=1 parked=0 recovery=0 other=0"
+        in log_path.read_text()
+    )
+
+
+def test_compute_cycle_task_accounting_classifies_failed_tasks(tmp_path: Path) -> None:
+    """Failed tasks split into recovery (auto lane) and parked (manual skip)."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    parked_task = store.add("Manual failure", task_type="implement")
+    parked_task.status = "failed"
+    parked_task.failure_reason = "TEST_FAILURE"
+    parked_task.completed_at = datetime.now(UTC)
+    store.update(parked_task)
+
+    recovery_task = store.add("Retryable failure", task_type="implement")
+    recovery_task.status = "failed"
+    recovery_task.failure_reason = "PROVIDER_UNAVAILABLE"
+    recovery_task.completed_at = datetime.now(UTC)
+    store.update(recovery_task)
+
+    analysis = SimpleNamespace(watch_read_context=RecoveryReadContext())
+    accounting = _compute_cycle_task_accounting(
+        store=store,
+        analysis=analysis,
+        tags=None,
+        any_tag=True,
+        max_recovery_attempts=3,
+    )
+
+    assert accounting.parked == 1
+    assert accounting.recovery == 1
+    assert accounting.other == 0
+    assert accounting.total == 2
 
 
 def test_watch_cycle_logs_tag_scope_with_all_mode(tmp_path: Path) -> None:

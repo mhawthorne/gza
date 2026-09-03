@@ -68,7 +68,44 @@ def test_parse_log_infers_zero_attention_from_silent_cycles(tmp_path: Path) -> N
 
     points, _merges = module.parse_log(str(log), datetime(2026, 7, 8))
 
-    assert [p.attention for p in points] == [None, 2, 2, 0, 0]
+    assert [p.parked for p in points] == [None, 2, 2, 0, 0]
+
+
+def test_parse_log_accounting_line_overrides_all_series(tmp_path: Path) -> None:
+    """A cycle accounting line is the source of truth for all six series."""
+    module = _load_module()
+    log = tmp_path / "watch.log"
+    log.write_text(
+        "\n".join(
+            [
+                # Legacy cycle: WAKE counts + attention -> parked; recovery/other None.
+                "10:00:00 WAKE      checking... (1 running, pending=2 runnable, blocked=3, 4 slots)",
+                "10:00:05 INFO      Needs attention (4 tasks):",
+                "                     gza-1 ...",
+                # Accounting cycle: all six series come from the accounting line,
+                # not the (deliberately different) WAKE counts.
+                "10:01:00 WAKE      checking... (9 running, pending=9 runnable, blocked=9, 0 slots)",
+                "10:01:05 INFO      cycle accounting: running=1 pending=2 blocked=3 parked=4 recovery=5 other=6",
+                # Accounting cycle with zero parked: parked is 0, not carried forward.
+                "10:02:00 WAKE      checking... (0 running, pending=0 runnable, blocked=0, 4 slots)",
+                "10:02:05 INFO      cycle accounting: running=0 pending=1 blocked=0 parked=0 recovery=1 other=0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    points, _merges = module.parse_log(str(log), datetime(2026, 7, 8))
+
+    assert len(points) == 3
+    legacy, acct, acct_zero = points
+    assert (legacy.running, legacy.pending, legacy.blocked) == (1, 2, 3)
+    assert legacy.parked == 4
+    assert legacy.recovery is None
+    assert legacy.other is None
+    assert (acct.running, acct.pending, acct.blocked) == (1, 2, 3)
+    assert (acct.parked, acct.recovery, acct.other) == (4, 5, 6)
+    assert (acct_zero.parked, acct_zero.recovery, acct_zero.other) == (0, 1, 0)
 
 
 def test_parse_watch_logs_all_spans_archives_and_live_chronologically(
@@ -200,7 +237,7 @@ def test_parse_watch_logs_attention_does_not_cross_file_boundary(tmp_path: Path)
 
     points, _merges = module.parse_watch_logs(log_dir / "watch.log", datetime(2026, 8, 25))
 
-    assert [p.attention for p in points] == [2, None]
+    assert [p.parked for p in points] == [2, None]
 
 
 def test_parse_watch_logs_default_hours_does_not_parse_old_archive_when_live_has_newest(
