@@ -15046,7 +15046,9 @@ def test_watch_cycle_manual_failed_recovery_emits_one_steady_attention_per_cycle
     assert text.count("1 task still need attention (unchanged)") == 1
     assert stdout.count("Needs attention (1 task):") == 1
     assert stdout.count("1 task still need attention (unchanged)") == 1
-    assert text.count(f"{failed_leaf.id} implement") == 2
+    # The message now appears once (via the one-time ATTENTION line); the
+    # roundup is counts-only and no longer repeats it.
+    assert text.count(f"{failed_leaf.id} implement") == 1
 
 
 def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tmp_path: Path) -> None:
@@ -37093,13 +37095,13 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
     )
     assert log_text.count("ATTENTION") == 1
     assert log_text.count("Needs attention (1 task):") == 1
-    assert log_text.count(expected_attention) == 2
+    # The message now appears once (via the one-time ATTENTION line); the
+    # roundup is counts-only and no longer repeats it.
+    assert log_text.count(expected_attention) == 1
     assert "red for" not in log_text
     assert expected_attention in log_text
     assert "human intervention required" in log_text
-    assert (
-        "Needs attention (1 task):\n  main verify RED at `feedfacecafe` - merges halted; phase `functional` failing\n"
-    ) not in log_text
+    assert "main verify RED at `feedfacecafe` - merges halted; phase `functional` failing" not in log_text
     alert_git = MagicMock(spec=Git)
     alert_git.default_branch.return_value = "main"
     alert_git.branch_exists.return_value = True
@@ -37934,10 +37936,13 @@ def test_watch_cycle_emits_attention_for_main_verify_launch_issue_without_freezi
     log_text = log_path.read_text()
     assert sum(1 for line in log_text.splitlines() if " ATTENTION " in line) == 1
     assert log_text.count("Needs attention (1 task):") == 1
-    summary_tail = log_text.split("Needs attention (1 task):", maxsplit=1)[1]
-    assert summary_tail.count("could not launch `ruff`") == 1
-    assert "fix the environment, not the code" in summary_tail
-    assert "verify_command environment error" not in summary_tail
+    # The roundup is counts-only now; the message itself lives on the one-time
+    # ATTENTION line, captured in the log's current attention state.
+    messages = log.visible_attention_messages()
+    assert len(messages) == 1
+    assert messages[0].count("could not launch `ruff`") == 1
+    assert "fix the environment, not the code" in messages[0]
+    assert "verify_command environment error" not in messages[0]
     assert "main verify RED" not in log_text
     assert "merges halted" not in log_text
 
@@ -38319,14 +38324,18 @@ def test_watch_cycle_replaces_buffered_main_verify_red_with_exhausted_after_reme
         )
 
     assert merge_calls == [remediation_task.id]
-    log_text = log_path.read_text()
-    summary_tail = log_text.split("INFO      Needs attention (1 task):", maxsplit=1)[1]
-    summary_block = summary_tail.splitlines()[1]
-    assert "main verify remediation exhausted for phase:functional after 2/2 attempts" in summary_block
-    assert "human intervention required" in summary_block
-    assert "main verify RED at `feedfacecafe`" not in summary_block
-    assert "feedfacecafe" not in summary_block
-    assert "merges halted" not in summary_block
+    assert "INFO      Needs attention (1 task):" in log_path.read_text()
+    # The roundup is counts-only now; the currently-active message lives on
+    # the log's current attention state (the one-time ATTENTION line).
+    messages = log.visible_attention_messages()
+    assert any(
+        "main verify remediation exhausted for phase:functional after 2/2 attempts" in message
+        for message in messages
+    )
+    assert any("human intervention required" in message for message in messages)
+    assert any("main verify RED at `feedfacecafe`" not in message for message in messages)
+    assert any("feedfacecafe" not in message for message in messages)
+    assert any("merges halted" not in message for message in messages)
 
 
 def test_watch_cycle_keeps_current_main_verify_red_attention_when_head_unchanged(
@@ -56879,12 +56888,14 @@ def test_watch_cycle_surfaces_guarded_pending_skip_as_attention_then_roundup_onl
     assert text.count("Needs attention (1 task):") == 1
     assert text.count("1 task still need attention (unchanged)") == 1
     assert "Summary:" not in text
+    # The message now appears once (via the one-time ATTENTION line); the
+    # roundup is counts-only and no longer repeats it.
     assert (
         text.count(
             f'{pending_review.id} review "Pending review" reason=guarded-pending-skip '
             f"{exec_result.message}; will not run automatically"
         )
-        == 2
+        == 1
     )
     assert stdout.count("Needs attention (1 task):") == 1
     assert stdout.count("1 task still need attention (unchanged)") == 1
@@ -58082,10 +58093,12 @@ def test_watch_log_suppresses_unchanged_attention_inline_across_cycles_but_keeps
     assert len(attention_lines) == 2
     assert attention_lines[0].startswith("18:08:47 ATTENTION")
     assert attention_lines[1].startswith("18:18:47 ATTENTION")
-    assert text.count("INFO      Needs attention (1 task):") == 2
+    assert text.count("INFO      Needs attention (1 task): task-1=1") == 2
     assert text.count("INFO      1 task still need attention (unchanged)") == 1
-    assert text.count("  gza-1 review needs manual attention") == 1
-    assert text.count("  gza-1 review still needs manual attention") == 1
+    # The roundup is counts-only now; each distinct message still appears once,
+    # via its one-time (unindented) ATTENTION line.
+    assert text.count("gza-1 review needs manual attention") == 1
+    assert text.count("gza-1 review still needs manual attention") == 1
 
 
 def test_main_verify_attention_summary_keeps_red_line_when_head_is_unchanged(tmp_path: Path) -> None:
@@ -58176,11 +58189,15 @@ def test_main_verify_attention_summary_replaces_matching_emission_when_render_he
     )
     _emit_cycle_attention_summary(log)
 
-    text = log_path.read_text() if log_path.exists() else ""
-    summary_text = text.split("INFO      ", maxsplit=1)[1] if "INFO      " in text else ""
-    assert "main verify red evidence unproven at current HEAD; current HEAD identity unavailable" in summary_text
-    assert "main verify RED at `feedfacecafe` - merges halted" not in summary_text
-    assert "phase `unit` failing" not in summary_text
+    # The roundup is counts-only now; the message lives on the one-time
+    # ATTENTION line, captured in the log's current attention state.
+    messages = log.visible_attention_messages()
+    assert any(
+        "main verify red evidence unproven at current HEAD; current HEAD identity unavailable" in message
+        for message in messages
+    )
+    assert any("main verify RED at `feedfacecafe` - merges halted" not in message for message in messages)
+    assert any("phase `unit` failing" not in message for message in messages)
 
 
 def test_main_verify_attention_summary_replaces_unproven_emission_when_render_head_matches(
@@ -58210,10 +58227,14 @@ def test_main_verify_attention_summary_replaces_unproven_emission_when_render_he
     )
     _emit_cycle_attention_summary(log)
 
-    text = log_path.read_text()
-    summary_text = text.split("INFO      ", maxsplit=1)[1] if "INFO      " in text else ""
-    assert "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing (red for 8m)" in summary_text
-    assert "main verify red evidence unproven" not in summary_text
+    # The roundup is counts-only now; the message lives on the one-time
+    # ATTENTION line, captured in the log's current attention state.
+    messages = log.visible_attention_messages()
+    assert any(
+        "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing (red for 8m)" in message
+        for message in messages
+    )
+    assert any("main verify red evidence unproven" not in message for message in messages)
 
 
 def test_main_verify_attention_summary_uses_real_target_ref_for_isolated_checkout(
@@ -58379,10 +58400,12 @@ def test_main_verify_attention_summary_ignores_ambiguous_short_target_ref(
     )
     _emit_cycle_attention_summary(log)
 
-    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
-    assert expected in summary_text
-    assert "feedfacecafe" not in summary_text
-    assert "merges halted" not in summary_text
+    # The roundup is counts-only now; the message lives on the one-time
+    # ATTENTION line, captured in the log's current attention state.
+    messages = log.visible_attention_messages()
+    assert any(expected in message for message in messages)
+    assert any("feedfacecafe" not in message for message in messages)
+    assert any("merges halted" not in message for message in messages)
     assert call("main") not in git.rev_parse_if_exists.call_args_list
 
 
@@ -58472,13 +58495,15 @@ def test_main_verify_attention_summary_fails_closed_for_malformed_unclassified_s
     )
     _emit_cycle_attention_summary(log)
 
-    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
-    assert expected in summary_text
-    assert "feedfacecafe" not in summary_text
-    assert "main verify RED" not in summary_text
-    assert "RED" not in summary_text
-    assert "merges halted" not in summary_text
-    assert "human intervention required" not in summary_text
+    # The roundup is counts-only now; the message lives on the one-time
+    # ATTENTION line, captured in the log's current attention state.
+    messages = log.visible_attention_messages()
+    assert any(expected in message for message in messages)
+    assert any("feedfacecafe" not in message for message in messages)
+    assert any("main verify RED" not in message for message in messages)
+    assert any("RED" not in message for message in messages)
+    assert any("merges halted" not in message for message in messages)
+    assert any("human intervention required" not in message for message in messages)
 
 
 def test_main_verify_attention_summary_keeps_missing_evidence_attention_visible(tmp_path: Path) -> None:
@@ -58507,12 +58532,16 @@ def test_main_verify_attention_summary_keeps_missing_evidence_attention_visible(
     )
     _emit_cycle_attention_summary(log)
 
-    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
-    assert "Needs attention (1 task):" in summary_text
-    assert "main verify evidence unknown for current HEAD; verify status unavailable" in summary_text
-    assert "feedfacecafe" not in summary_text
-    assert "RED" not in summary_text
-    assert "merges halted" not in summary_text
+    # The roundup is counts-only now; the message lives on the one-time
+    # ATTENTION line, captured in the log's current attention state.
+    messages = log.visible_attention_messages()
+    assert "Needs attention (1 task):" in log_path.read_text()
+    assert any(
+        "main verify evidence unknown for current HEAD; verify status unavailable" in message for message in messages
+    )
+    assert any("feedfacecafe" not in message for message in messages)
+    assert any("RED" not in message for message in messages)
+    assert any("merges halted" not in message for message in messages)
 
 
 def test_main_verify_attention_summary_renders_current_unknown_status_as_unknown_evidence(
@@ -58543,13 +58572,15 @@ def test_main_verify_attention_summary_renders_current_unknown_status_as_unknown
     )
     _emit_cycle_attention_summary(log)
 
-    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
-    assert "main verify evidence unknown for current HEAD; unrecognized verify status `mystery`" in summary_text
-    assert "feedfacecafe" not in summary_text
-    assert "main verify RED" not in summary_text
-    assert "RED" not in summary_text
-    assert "merges halted" not in summary_text
-    assert "red for" not in summary_text
+    # The roundup is counts-only now; the message lives on the one-time
+    # ATTENTION line, captured in the log's current attention state.
+    messages = log.visible_attention_messages()
+    assert any("main verify evidence unknown for current HEAD; unrecognized verify status `mystery`" in message for message in messages)
+    assert any("feedfacecafe" not in message for message in messages)
+    assert any("main verify RED" not in message for message in messages)
+    assert any("RED" not in message for message in messages)
+    assert any("merges halted" not in message for message in messages)
+    assert any("red for" not in message for message in messages)
 
 
 @pytest.mark.parametrize(
@@ -58671,13 +58702,15 @@ def test_main_verify_attention_summary_surfaces_launch_failure_without_alert_mes
     )
     _emit_cycle_attention_summary(log)
 
-    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
-    assert "main verify misconfigured - verify command launch failed; fix the environment, not the code" in summary_text
-    assert "feedfacecafe" not in summary_text
-    assert "RED" not in summary_text
-    assert "merges halted" not in summary_text
-    assert "red for" not in summary_text
-    assert "remediation exhausted" not in summary_text
+    # The roundup is counts-only now; the message lives on the one-time
+    # ATTENTION line, captured in the log's current attention state.
+    messages = log.visible_attention_messages()
+    assert any("main verify misconfigured - verify command launch failed; fix the environment, not the code" in message for message in messages)
+    assert any("feedfacecafe" not in message for message in messages)
+    assert any("RED" not in message for message in messages)
+    assert any("merges halted" not in message for message in messages)
+    assert any("red for" not in message for message in messages)
+    assert any("remediation exhausted" not in message for message in messages)
 
 
 @pytest.mark.parametrize("live_main_sha", ["cafebabecafe", None])
@@ -58710,11 +58743,13 @@ def test_main_verify_attention_summary_sanitizes_launch_failure_with_legacy_red_
     )
     _emit_cycle_attention_summary(log)
 
-    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
-    assert "main verify misconfigured - verify command launch failed; fix the environment, not the code" in summary_text
-    assert "feedfacecafe" not in summary_text
-    assert "main verify RED" not in summary_text
-    assert "merges halted" not in summary_text
+    # The roundup is counts-only now; the message lives on the one-time
+    # ATTENTION line, captured in the log's current attention state.
+    messages = log.visible_attention_messages()
+    assert any("main verify misconfigured - verify command launch failed; fix the environment, not the code" in message for message in messages)
+    assert any("feedfacecafe" not in message for message in messages)
+    assert any("main verify RED" not in message for message in messages)
+    assert any("merges halted" not in message for message in messages)
 
 
 @pytest.mark.parametrize(
@@ -58772,13 +58807,15 @@ def test_main_verify_attention_summary_prefers_structured_special_status_over_le
     )
     _emit_cycle_attention_summary(log)
 
-    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
-    assert expected in summary_text
-    assert "human intervention" not in summary_text
+    # The roundup is counts-only now; the message lives on the one-time
+    # ATTENTION line, captured in the log's current attention state.
+    messages = log.visible_attention_messages()
+    assert any(expected in message for message in messages)
+    assert any("human intervention" not in message for message in messages)
     if verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS:
-        assert "feedfacecafe" not in summary_text
-        assert "main verify RED" not in summary_text
-        assert "merges halted" not in summary_text
+        assert any("feedfacecafe" not in message for message in messages)
+        assert any("main verify RED" not in message for message in messages)
+        assert any("merges halted" not in message for message in messages)
 
 
 @pytest.mark.parametrize("verify_status", ["mystery", 7, ""])
@@ -58816,16 +58853,20 @@ def test_main_verify_attention_summary_rejects_legacy_exhaustion_for_unknown_inv
     )
     _emit_cycle_attention_summary(log)
 
-    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
-    assert "main verify evidence unknown for current HEAD" in summary_text
-    assert (
-        "unrecognized verify status `mystery`" if verify_status == "mystery" else "invalid verify status evidence"
-    ) in summary_text
-    assert "feedfacecafe" not in summary_text
-    assert "RED" not in summary_text
-    assert "merges halted" not in summary_text
-    assert "red for" not in summary_text
-    assert "remediation exhausted" not in summary_text
+    # The roundup is counts-only now; the message lives on the one-time
+    # ATTENTION line, captured in the log's current attention state.
+    messages = log.visible_attention_messages()
+    assert any("main verify evidence unknown for current HEAD" in message for message in messages)
+    assert any(
+        ("unrecognized verify status `mystery`" if verify_status == "mystery" else "invalid verify status evidence")
+        in message
+        for message in messages
+    )
+    assert any("feedfacecafe" not in message for message in messages)
+    assert any("RED" not in message for message in messages)
+    assert any("merges halted" not in message for message in messages)
+    assert any("red for" not in message for message in messages)
+    assert any("remediation exhausted" not in message for message in messages)
 
 
 @pytest.mark.parametrize(
@@ -58864,10 +58905,12 @@ def test_main_verify_attention_summary_weakens_stale_freshness_unavailable_claim
     )
     _emit_cycle_attention_summary(log)
 
-    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
-    assert expected in summary_text
-    assert "feedfacecafe" not in summary_text
-    assert "merges halted" not in summary_text
+    # The roundup is counts-only now; the message lives on the one-time
+    # ATTENTION line, captured in the log's current attention state.
+    messages = log.visible_attention_messages()
+    assert any(expected in message for message in messages)
+    assert any("feedfacecafe" not in message for message in messages)
+    assert any("merges halted" not in message for message in messages)
 
 
 def test_main_verify_attention_summary_keeps_freshness_halt_when_head_matches(tmp_path: Path) -> None:
@@ -58895,10 +58938,12 @@ def test_main_verify_attention_summary_keeps_freshness_halt_when_head_matches(tm
     )
     _emit_cycle_attention_summary(log)
 
-    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
-    assert "main verify freshness unproven at `feedfacecafe` - merges halted" in summary_text
-    assert "exact tree fingerprint unavailable" in summary_text
-    assert "red for" not in summary_text
+    # The roundup is counts-only now; the message lives on the one-time
+    # ATTENTION line, captured in the log's current attention state.
+    messages = log.visible_attention_messages()
+    assert any("main verify freshness unproven at `feedfacecafe` - merges halted" in message for message in messages)
+    assert any("exact tree fingerprint unavailable" in message for message in messages)
+    assert any("red for" not in message for message in messages)
 
 
 @pytest.mark.parametrize(
@@ -58947,14 +58992,17 @@ def test_main_verify_attention_summary_limits_exhausted_duration_to_current_prov
     )
     _emit_cycle_attention_summary(log)
 
-    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
-    assert (
-        "main verify remediation exhausted for phase:unit after 2/2 attempts; human intervention required"
-    ) in summary_text
-    assert ("red for 8m" in summary_text) is expected_has_duration
+    # The roundup is counts-only now; the message lives on the one-time
+    # ATTENTION line, captured in the log's current attention state.
+    messages = log.visible_attention_messages()
+    assert any(
+        "main verify remediation exhausted for phase:unit after 2/2 attempts; human intervention required" in message
+        for message in messages
+    )
+    assert any("red for 8m" in message for message in messages) is expected_has_duration
     if target_head != "feedfacecafe":
-        assert "feedfacecafe" not in summary_text
-        assert "merges halted" not in summary_text
+        assert any("feedfacecafe" not in message for message in messages)
+        assert any("merges halted" not in message for message in messages)
 
 
 @pytest.mark.parametrize(
@@ -59019,12 +59067,16 @@ def test_main_verify_missing_alert_exhaustion_finalizes_as_proof_free_human_atte
     )
     _emit_cycle_attention_summary(log)
 
-    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
-    assert (
+    # The roundup is counts-only now; the message lives on the one-time
+    # ATTENTION line, captured in the log's current attention state.
+    messages = log.visible_attention_messages()
+    assert any(
         "main verify remediation exhausted for phase:functional after 2/2 attempts; human intervention required"
-    ) in summary_text
-    assert "feedfacecafe" not in summary_text
-    assert "merges halted" not in summary_text
+        in message
+        for message in messages
+    )
+    assert any("feedfacecafe" not in message for message in messages)
+    assert any("merges halted" not in message for message in messages)
     assert git.rev_parse_if_exists.call_args_list == [call("refs/heads/main")]
 
 

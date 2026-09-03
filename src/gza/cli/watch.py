@@ -5955,6 +5955,10 @@ class _WatchLog:
         with self._lock:
             return tuple(self._visible_attention_this_cycle.values())
 
+    def visible_attention_items(self) -> tuple[tuple[str, str], ...]:
+        with self._lock:
+            return tuple(self._visible_attention_this_cycle.items())
+
     def note_merge_logged(self, merge_key: str) -> None:
         with self._lock:
             self._merge_logged_this_cycle.add(merge_key)
@@ -13579,18 +13583,34 @@ def _collect_unhandled_failures(
     return failures
 
 
+def _attention_category(attention_key: str) -> str:
+    """The grouping bucket for an attention key: the segment before its first ':'."""
+    return attention_key.split(":", 1)[0]
+
+
 def _emit_cycle_attention_summary(log: _WatchLog) -> None:
-    messages = log.visible_attention_messages()
-    if not messages:
+    """Log a per-cycle roundup of attention counts, grouped by category.
+
+    This is a repeating summary, not the place to act on individual tasks — use
+    ``gza incomplete --tag <tag>`` to list and copy the actual task IDs. Keeping
+    the roundup to counts (rather than one line per task, repeated every cycle)
+    keeps the log legible; the one-time ATTENTION line emitted when a task first
+    needs attention still carries the full per-task message.
+    """
+    items = log.visible_attention_items()
+    if not items:
         return
     if log._sticky_attention_this_cycle == log._sticky_attention_prev_cycle:  # noqa: SLF001 - watch-local sticky state
-        plural = "s" if len(messages) != 1 else ""
-        log.emit("INFO", f"{len(messages)} task{plural} still need attention (unchanged)")
+        plural = "s" if len(items) != 1 else ""
+        log.emit("INFO", f"{len(items)} task{plural} still need attention (unchanged)")
         return
-    plural = "s" if len(messages) != 1 else ""
-    lines = [f"{NEEDS_ATTENTION_LABEL} ({len(messages)} task{plural}):"]
-    lines.extend(f"  {message}" for message in messages)
-    log.emit("INFO", "\n".join(lines))
+    counts: dict[str, int] = {}
+    for attention_key, _message in items:
+        category = _attention_category(attention_key)
+        counts[category] = counts.get(category, 0) + 1
+    plural = "s" if len(items) != 1 else ""
+    breakdown = ", ".join(f"{category}={count}" for category, count in sorted(counts.items()))
+    log.emit("INFO", f"{NEEDS_ATTENTION_LABEL} ({len(items)} task{plural}): {breakdown}")
 
 
 def _process_expected_start_boundary(
