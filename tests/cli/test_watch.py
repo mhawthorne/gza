@@ -10522,6 +10522,48 @@ def _add_failed_resume_row(runtime: WatchProjectRuntime, prompt: str) -> DbTask:
     return task
 
 
+def _recovery_decision(
+    task: DbTask,
+    *,
+    action: str = "retry",
+    reason_code: str = "test_recovery",
+    launch_mode: Literal["iterate", "worker", "none"] = "worker",
+    recovery_task_id: str | None = None,
+    reuse_existing: bool = False,
+) -> FailedRecoveryDecision:
+    assert task.id is not None
+    return FailedRecoveryDecision(
+        task_id=task.id,
+        action=action,
+        reason_code=reason_code,
+        reason_text=reason_code,
+        launch_mode=launch_mode,
+        attempt_index=1,
+        attempt_limit=1,
+        recovery_task_id=recovery_task_id,
+        reuse_existing=reuse_existing,
+    )
+
+
+def _recovery_entry(
+    task: DbTask,
+    *,
+    owner_task: DbTask | None = None,
+    action_type: str = "retry",
+    decision: FailedRecoveryDecision | None = None,
+    worker_consuming: bool = True,
+) -> DispatchPreviewEntry:
+    return DispatchPreviewEntry(
+        lane="recovery",
+        task=task,
+        owner_task=owner_task or task,
+        runnable=True,
+        worker_consuming=worker_consuming,
+        decision=decision or _recovery_decision(task, action=action_type),
+        advance_action={"type": action_type, "description": f"{action_type} recovery"},
+    )
+
+
 def test_watch_supervisor_dispatch_lanes_reserve_recovery_from_one_global_budget(
     tmp_path: Path,
 ) -> None:
@@ -11006,6 +11048,656 @@ def test_watch_supervisor_recovery_lane_reuses_slot_after_not_dispatchable_head(
     assert budget.occupancy.slots == 0
 
 
+def test_supervisor_launch_budget_dispatches_recovery_candidate_with_runtime_config(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    failed = _add_failed_resume_row(runtime, "A failed task resumes through fleet recovery")
+    candidate = runtime.recovery_dispatch_head(max_recovery_attempts=1, recovery_mode="recovery_only")
+    assert candidate is not None
+    assert candidate.task.id == failed.id
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=1)
+    seen_configs: list[Config] = []
+    settled_task_ids: list[str] = []
+
+    def settle_spy(*, pending_starts: list[object], store: SqliteTaskStore, **_kwargs: object) -> list[object]:
+        [entry] = pending_starts
+        task_id = getattr(entry, "task_id", None)
+        assert isinstance(task_id, str)
+        settled_task_ids.append(task_id)
+        _register_live_worker_for_task(runtime.config, task_id, worker_id=f"w-{task_id}")
+        return _live_settle_results(pending_starts, store=store)
+
+    with (
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_spy),
+        patch("gza.cli.watch.launch_permit", wraps=launch_permit) as launch_spy,
+    ):
+        result = budget.dispatch_recovery_candidate(runtime, candidate, max_iterations=3)
+
+    seen_configs = [call.args[0] for call in launch_spy.call_args_list]
+    assert seen_configs == [runtime.config]
+    assert result.status == "live"
+    assert result.slot_consuming is True
+    assert result.dispatch_budget_consuming is True
+    assert budget.reservations == ()
+    assert budget.occupancy.slots == 0
+    assert len(settled_task_ids) == 1
+    recovered = runtime.store.get(settled_task_ids[0])
+    assert recovered is not None
+    assert recovered.based_on == failed.id
+
+
+@pytest.mark.parametrize("later_child_proof", ["running", "terminal"])
+def test_supervisor_launch_budget_retargets_live_recovery_reservation_to_child_when_refresh_degrades(
+    tmp_path: Path,
+    later_child_proof: str,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    failed = _add_failed_resume_row(runtime_a, "A failed parent must not settle child reservation")
+    child = runtime_a.store.add("A live recovery child", task_type="implement", based_on=failed.id)
+    pending_b = runtime_b.store.add("B must wait for child proof", task_type="plan")
+    assert failed.id is not None
+    assert child.id is not None
+    assert pending_b.id is not None
+    recovery_candidate = _runtime_candidate(runtime_a, failed, lane="recovery")
+    pending_candidate = _runtime_candidate(runtime_b, pending_b, lane="pending")
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+
+    def dispatch_live_child(
+        candidate: ProjectDispatchCandidate,
+        **_kwargs: object,
+    ) -> ProjectDispatchResult:
+        assert candidate.task.id == failed.id
+        return ProjectDispatchResult(
+            runtime_key=runtime_a.key,
+            candidate=candidate,
+            status="live",
+            slot_consuming=True,
+            work_done=True,
+            dispatch_budget_consuming=True,
+            task=child,
+            launched_task_id=child.id,
+        )
+
+    with (
+        patch.object(runtime_a, "dispatch_recovery_candidate", side_effect=dispatch_live_child),
+        patch.object(runtime_a, "reconcile_runtime_state", side_effect=sqlite3.OperationalError("database is locked")),
+    ):
+        result = budget.dispatch_recovery_candidate(runtime_a, recovery_candidate, max_iterations=1)
+
+    assert result.status == "live"
+    assert [(reservation.runtime_key, reservation.task_id) for reservation in budget.reservations] == [
+        ("a", child.id)
+    ]
+    assert budget.occupancy.provisional_reservations == 1
+    assert budget.dispatch_pending_candidate(runtime_b, pending_candidate, max_iterations=1).status == (
+        "global_capacity_blocked"
+    )
+
+    if later_child_proof == "running":
+        _mark_runtime_task_live(runtime_a, child.id)
+    else:
+        child_after = runtime_a.store.get(child.id)
+        assert child_after is not None
+        child_after.status = "failed"
+        child_after.completed_at = datetime.now(UTC)
+        runtime_a.store.update(child_after)
+
+    budget.disabled_runtime_keys.clear()
+    budget.refresh_occupancy()
+
+    assert budget.reservations == ()
+    if later_child_proof == "running":
+        assert budget.dispatch_pending_candidate(runtime_b, pending_candidate, max_iterations=1).status == (
+            "global_capacity_blocked"
+        )
+    else:
+        assert budget.reserve(pending_candidate) is not None
+
+
+@pytest.mark.parametrize("action_type", ["resume", "retry"])
+@pytest.mark.parametrize("later_child_proof", ["starting", "running", "terminal"])
+def test_supervisor_launch_budget_retains_resume_retry_child_after_operational_settlement_failure(
+    tmp_path: Path,
+    action_type: str,
+    later_child_proof: str,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / f"project-a-{action_type}", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / f"project-b-{action_type}", project_name="b")
+    failed = _add_failed_resume_row(runtime_a, f"A failed parent launches {action_type} child")
+    pending_b = runtime_b.store.add("B stays blocked until recovery child is reconciled", task_type="plan")
+    assert failed.id is not None
+    assert pending_b.id is not None
+    decision = _recovery_decision(failed, action=action_type, launch_mode="worker")
+    entry = _recovery_entry(failed, action_type=action_type, decision=decision)
+    recovery_candidate = _runtime_candidate(runtime_a, failed, lane="recovery")
+    pending_candidate = _runtime_candidate(runtime_b, pending_b, lane="pending")
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+    settled_child_ids: list[str] = []
+
+    def settle_raises(*, pending_starts: list[object], **_kwargs: object) -> list[object]:
+        [settle_entry] = pending_starts
+        child_id = getattr(settle_entry, "task_id")
+        assert isinstance(child_id, str)
+        settled_child_ids.append(child_id)
+        raise sqlite3.OperationalError("settlement store is locked")
+
+    with (
+        patch("gza.cli.watch.build_dispatch_preview", return_value=DispatchPreview(entries=(entry,))),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_raises),
+        patch.object(runtime_a, "reconcile_runtime_state", side_effect=sqlite3.OperationalError("reconcile locked")),
+    ):
+        with pytest.raises(sqlite3.OperationalError, match="settlement store is locked"):
+            budget.dispatch_recovery_candidate(runtime_a, recovery_candidate, max_iterations=1)
+
+    assert len(settled_child_ids) == 1
+    [child_id] = settled_child_ids
+    child = runtime_a.store.get(child_id)
+    assert child is not None
+    assert child.based_on == failed.id
+    assert [(reservation.runtime_key, reservation.task_id) for reservation in budget.reservations] == [
+        (runtime_a.key, child_id)
+    ]
+    assert budget.occupancy.provisional_reservations == 1
+    assert budget.dispatch_pending_candidate(runtime_b, pending_candidate, max_iterations=1).status == (
+        "global_capacity_blocked"
+    )
+
+    if later_child_proof == "terminal":
+        child.status = "failed"
+        child.completed_at = datetime.now(UTC)
+        runtime_a.store.update(child)
+    elif later_child_proof == "running":
+        _mark_runtime_task_live(runtime_a, child_id)
+    else:
+        _register_live_worker_for_task(runtime_a.config, child_id, worker_id=f"w-starting-{child_id}")
+
+    budget.disabled_runtime_keys.clear()
+    budget.refresh_occupancy()
+
+    assert budget.reservations == ()
+    if later_child_proof == "terminal":
+        assert budget.reserve(pending_candidate) is not None
+    else:
+        assert budget.dispatch_pending_candidate(runtime_b, pending_candidate, max_iterations=1).status == (
+            "global_capacity_blocked"
+        )
+
+
+@pytest.mark.parametrize("later_child_proof", ["starting", "running", "terminal"])
+def test_supervisor_launch_budget_retains_shared_executor_child_after_operational_settlement_failure(
+    tmp_path: Path,
+    later_child_proof: str,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a-shared-executor", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b-shared-executor", project_name="b")
+    failed = _add_failed_resume_row(runtime_a, "A failed parent launches shared-executor child")
+    child = runtime_a.store.add("A shared-executor child", task_type="review", based_on=failed.id)
+    pending_b = runtime_b.store.add("B stays blocked behind shared-executor child", task_type="plan")
+    assert failed.id is not None
+    assert child.id is not None
+    assert pending_b.id is not None
+    decision = _recovery_decision(failed, action="retry", reason_code="create-review", launch_mode="worker")
+    entry = _recovery_entry(failed, action_type="create_review", decision=decision)
+    recovery_candidate = _runtime_candidate(runtime_a, failed, lane="recovery")
+    pending_candidate = _runtime_candidate(runtime_b, pending_b, lane="pending")
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+    settled_child_ids: list[str] = []
+
+    def execute_child(*, task: DbTask, action: dict[str, object], context: object) -> AdvanceActionExecutionResult:
+        assert task.id == failed.id
+        assert action["type"] == "create_review"
+        assert context.store is runtime_a.store
+        return AdvanceActionExecutionResult(
+            action_type="create_review",
+            status="success",
+            execution_phase="worker_launch",
+            message="started review",
+            success_message="started review",
+            worker_consuming=True,
+            attempted_spawn=True,
+            worker_started=True,
+            work_done=True,
+            handled_task_id=child.id,
+            created_task=child,
+            worker_label="review",
+        )
+
+    def settle_raises(*, pending_starts: list[object], **_kwargs: object) -> list[object]:
+        [settle_entry] = pending_starts
+        child_id = getattr(settle_entry, "task_id")
+        assert isinstance(child_id, str)
+        settled_child_ids.append(child_id)
+        raise sqlite3.OperationalError("shared executor settlement locked")
+
+    with (
+        patch("gza.cli.watch.build_dispatch_preview", return_value=DispatchPreview(entries=(entry,))),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.execute_advance_action", side_effect=execute_child),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_raises),
+        patch.object(runtime_a, "reconcile_runtime_state", side_effect=sqlite3.OperationalError("reconcile locked")),
+    ):
+        with pytest.raises(sqlite3.OperationalError, match="shared executor settlement locked"):
+            budget.dispatch_recovery_candidate(runtime_a, recovery_candidate, max_iterations=1)
+
+    assert settled_child_ids == [child.id]
+    assert [(reservation.runtime_key, reservation.task_id) for reservation in budget.reservations] == [
+        (runtime_a.key, child.id)
+    ]
+    assert budget.occupancy.provisional_reservations == 1
+    assert budget.dispatch_pending_candidate(runtime_b, pending_candidate, max_iterations=1).status == (
+        "global_capacity_blocked"
+    )
+
+    if later_child_proof == "terminal":
+        child.status = "failed"
+        child.completed_at = datetime.now(UTC)
+        runtime_a.store.update(child)
+    elif later_child_proof == "running":
+        _mark_runtime_task_live(runtime_a, child.id)
+    else:
+        _register_live_worker_for_task(runtime_a.config, child.id, worker_id=f"w-starting-{child.id}")
+
+    budget.disabled_runtime_keys.clear()
+    budget.refresh_occupancy()
+
+    assert budget.reservations == ()
+    if later_child_proof == "terminal":
+        assert budget.reserve(pending_candidate) is not None
+    else:
+        assert budget.dispatch_pending_candidate(runtime_b, pending_candidate, max_iterations=1).status == (
+            "global_capacity_blocked"
+        )
+
+
+@pytest.mark.parametrize(
+    ("settle_status", "expected_status"),
+    [
+        (watch_module._DispatchSettleStatus.TERMINAL_BEFORE_RUNNING, "terminal_before_running"),
+        (watch_module._DispatchSettleStatus.NO_LIVE_PROOF, "no_live_proof"),
+    ],
+)
+def test_supervisor_launch_budget_releases_recovery_reservation_without_live_proof(
+    tmp_path: Path,
+    settle_status: object,
+    expected_status: str,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    failed = _add_failed_resume_row(runtime_a, "A recovery settles without live proof")
+    pending_b = runtime_b.store.add("B pending reuses recovery slot", task_type="plan")
+    assert pending_b.id is not None
+    recovery_candidate = runtime_a.recovery_dispatch_head(max_recovery_attempts=1, recovery_mode="recovery_only")
+    pending_candidate = runtime_b.pending_dispatch_head(max_recovery_attempts=1)
+    assert recovery_candidate is not None
+    assert pending_candidate is not None
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+
+    def settle_spy(*, pending_starts: list[object], store: SqliteTaskStore, **_kwargs: object) -> list[object]:
+        [entry] = pending_starts
+        if store is runtime_a.store:
+            return [
+                watch_module._WatchDispatchSettleResult(
+                    entry=entry,
+                    status=settle_status,
+                    reason=f"task {failed.id} did not occupy a live slot",
+                    task=store.get(getattr(entry, "task_id")),
+                )
+            ]
+        _register_live_worker_for_task(runtime_b.config, pending_b.id, worker_id=f"w-{pending_b.id}")
+        return _live_settle_results(pending_starts, store=store)
+
+    with (
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_spy),
+    ):
+        recovery_result = budget.dispatch_recovery_candidate(runtime_a, recovery_candidate, max_iterations=1)
+        pending_result = budget.dispatch_pending_candidate(runtime_b, pending_candidate, max_iterations=1)
+
+    assert recovery_result.status == expected_status
+    assert recovery_result.slot_consuming is False
+    assert pending_result.status == "live"
+    assert budget.reservations == ()
+    assert budget.occupancy.slots == 0
+
+
+@pytest.mark.parametrize("settle_status", [watch_module._DispatchSettleStatus.LIVE, watch_module._DispatchSettleStatus.NO_LIVE_PROOF])
+def test_watch_project_runtime_recovery_dispatch_routes_needs_rebase_through_shared_executor(
+    tmp_path: Path,
+    settle_status: object,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    failed = _add_failed_resume_row(runtime_a, "A failed implementation needs rebase")
+    failed.branch = "feature/rebase-me"
+    runtime_a.store.update(failed)
+    pending_b = runtime_b.store.add("B pending after non-live rebase", task_type="plan")
+    assert failed.id is not None
+    assert pending_b.id is not None
+    decision = _recovery_decision(failed, action="retry", reason_code="recovery-preflight-rebase")
+    entry = _recovery_entry(failed, action_type="needs_rebase", decision=decision)
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+    seen_contexts: list[object] = []
+    settled_rebase_ids: list[str] = []
+
+    def preview_for_rebase(*_args: object, **_kwargs: object) -> DispatchPreview:
+        return DispatchPreview(entries=(entry,))
+
+    def settle_spy(*, pending_starts: list[object], store: SqliteTaskStore, **_kwargs: object) -> list[object]:
+        [settle_entry] = pending_starts
+        task_id = getattr(settle_entry, "task_id")
+        assert isinstance(task_id, str)
+        settled_rebase_ids.append(task_id)
+        if settle_status is watch_module._DispatchSettleStatus.LIVE:
+            _register_live_worker_for_task(runtime_a.config, task_id, worker_id=f"w-{task_id}")
+        return [
+            watch_module._WatchDispatchSettleResult(
+                entry=settle_entry,
+                status=settle_status,
+                reason=f"task {task_id} settlement for rebase",
+                task=store.get(task_id),
+            )
+        ]
+
+    def execute_spy(*, task: DbTask, action: dict[str, object], context: object) -> AdvanceActionExecutionResult:
+        seen_contexts.append(context)
+        return real_execute_advance_action(task=task, action=action, context=context)
+
+    with (
+        patch("gza.cli.watch.build_dispatch_preview", side_effect=preview_for_rebase),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch(
+            "gza.cli.watch._resolve_and_persist_post_merge_rebase_state",
+            return_value=SimpleNamespace(already_merged=False),
+        ),
+        patch("gza.cli.watch.execute_advance_action", side_effect=execute_spy),
+        patch("gza.cli.advance_executor.launch_permit", wraps=launch_permit) as launch_spy,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_spy),
+    ):
+        recovery_candidate = runtime_a.recovery_dispatch_head(max_recovery_attempts=1, recovery_mode="recovery_only")
+        assert recovery_candidate is not None
+        recovery_result = budget.dispatch_recovery_candidate(runtime_a, recovery_candidate, max_iterations=1)
+
+    assert seen_contexts
+    context = seen_contexts[0]
+    assert context.store is runtime_a.store
+    assert context.config is runtime_a.config
+    assert context.git is runtime_a.git
+    assert context.runtime_context is runtime_a.runtime_context
+    assert [call.args[:2] for call in launch_spy.call_args_list] == [(runtime_a.config, runtime_a.store)]
+    assert len(settled_rebase_ids) == 1
+    rebase_task = runtime_a.store.get(settled_rebase_ids[0])
+    assert rebase_task is not None
+    assert rebase_task.based_on == failed.id
+    if settle_status is watch_module._DispatchSettleStatus.LIVE:
+        assert recovery_result.status == "live"
+        assert budget.reserve(_runtime_candidate(runtime_b, pending_b, lane="pending")) is None
+    else:
+        assert recovery_result.status == "no_live_proof"
+        assert budget.reserve(_runtime_candidate(runtime_b, pending_b, lane="pending")) is not None
+
+
+@pytest.mark.parametrize("action_type", ["create_review", "run_improve"])
+def test_watch_project_runtime_recovery_dispatch_routes_review_improve_family_through_shared_executor(
+    tmp_path: Path,
+    action_type: str,
+) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / f"project-{action_type}", project_name="a")
+    failed = _add_failed_resume_row(runtime, f"Failed recovery action {action_type}")
+    child = runtime.store.add(f"Recovery child for {action_type}", task_type="review")
+    assert failed.id is not None
+    assert child.id is not None
+    decision = _recovery_decision(failed, action="retry", reason_code=f"{action_type}-reason")
+    entry = _recovery_entry(failed, action_type=action_type, decision=decision)
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=1)
+    seen_contexts: list[object] = []
+
+    def execute_spy(*, task: DbTask, action: dict[str, object], context: object) -> AdvanceActionExecutionResult:
+        assert task.id == failed.id
+        assert action["type"] == action_type
+        seen_contexts.append(context)
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="success",
+            execution_phase="worker_launch",
+            message=f"started {action_type}",
+            success_message=f"started {action_type}",
+            worker_consuming=True,
+            attempted_spawn=True,
+            worker_started=True,
+            work_done=True,
+            handled_task_id=child.id,
+            created_task=child,
+            worker_label="iterate",
+        )
+
+    def settle_spy(*, pending_starts: list[object], store: SqliteTaskStore, **_kwargs: object) -> list[object]:
+        [settle_entry] = pending_starts
+        _register_live_worker_for_task(runtime.config, child.id, worker_id=f"w-{child.id}")
+        return [
+            watch_module._WatchDispatchSettleResult(
+                entry=settle_entry,
+                status=watch_module._DispatchSettleStatus.LIVE,
+                reason=f"task {child.id} reached running state",
+                task=store.get(child.id),
+            )
+        ]
+
+    with (
+        patch("gza.cli.watch.build_dispatch_preview", return_value=DispatchPreview(entries=(entry,))),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.execute_advance_action", side_effect=execute_spy),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_spy),
+    ):
+        candidate = runtime.recovery_dispatch_head(max_recovery_attempts=1, recovery_mode="recovery_only")
+        assert candidate is not None
+        result = budget.dispatch_recovery_candidate(runtime, candidate, max_iterations=1)
+
+    assert result.status == "live"
+    assert result.launched_task_id == child.id
+    assert seen_contexts[0].store is runtime.store
+    assert seen_contexts[0].config is runtime.config
+    assert seen_contexts[0].git is runtime.git
+    assert seen_contexts[0].runtime_context is runtime.runtime_context
+
+
+def test_watch_project_runtime_recovery_dispatch_rejects_stale_head_before_permit(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    stale = _add_failed_resume_row(runtime, "Stale recovery head")
+    current = _add_failed_resume_row(runtime, "Current recovery head")
+    assert stale.id is not None
+    assert current.id is not None
+    stale_candidate = _runtime_candidate(runtime, stale, lane="recovery")
+    current_entry = _recovery_entry(current, action_type="retry")
+
+    with (
+        patch("gza.cli.watch.build_dispatch_preview", return_value=DispatchPreview(entries=(current_entry,))),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", side_effect=AssertionError("no-progress mutated")),
+        patch("gza.cli.watch.launch_permit", side_effect=AssertionError("permit acquired")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("worker spawned")),
+    ):
+        result = runtime.dispatch_recovery_candidate(stale_candidate, max_iterations=1)
+
+    assert result.status == "not_dispatchable"
+    assert result.slot_consuming is False
+    assert result.dispatch_budget_consuming is False
+    assert "current eligible recovery dispatch head" in str(result.detail)
+
+
+@pytest.mark.parametrize("gate", ["backoff", "no_progress"])
+def test_watch_supervisor_recovery_preflight_rejects_parked_head_and_reuses_slot_until_gate_clears(
+    tmp_path: Path,
+    gate: str,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / f"project-a-{gate}", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / f"project-b-{gate}", project_name="b")
+    failed_a = _add_failed_resume_row(runtime_a, f"A gated recovery {gate}")
+    failed_b = _add_failed_resume_row(runtime_b, f"B recovery uses rejected slot {gate}")
+    assert failed_a.id is not None
+    assert failed_b.id is not None
+    decision_a = _recovery_decision(failed_a, action="retry", reason_code=f"{gate}-retry")
+    action_a = {"type": "retry", "description": f"{gate} retry"}
+    entry_a = _recovery_entry(failed_a, action_type="retry", decision=decision_a)
+    entry_a = replace(entry_a, advance_action=action_a)
+    entry_b = _recovery_entry(failed_b, action_type="retry")
+    candidate_a = ProjectDispatchCandidate(
+        runtime_key=runtime_a.key,
+        task=failed_a,
+        lane="recovery",
+        runtime_identity=runtime_a.runtime_identity,
+        selection_mode="recovery_only",
+        max_recovery_attempts=1,
+        preview_entry=entry_a,
+        owner_task=failed_a,
+    )
+    candidate_b = ProjectDispatchCandidate(
+        runtime_key=runtime_b.key,
+        task=failed_b,
+        lane="recovery",
+        runtime_identity=runtime_b.runtime_identity,
+        selection_mode="recovery_only",
+        max_recovery_attempts=1,
+        preview_entry=entry_b,
+        owner_task=failed_b,
+    )
+    progress_candidate = build_watch_progress_candidate(
+        runtime_a.store,
+        subject_task=failed_a,
+        action=action_a,
+        action_task=failed_a,
+        failed_task=failed_a,
+    )
+    if gate == "backoff":
+        runtime_a.store.upsert_watch_recovery_backoff(
+            WatchRecoveryBackoff(
+                subject_kind=progress_candidate.subject_kind,
+                subject_id=progress_candidate.subject_id,
+                action_type=progress_candidate.action_type,
+                action_reason=progress_candidate.action_reason,
+                subject_task_id=progress_candidate.subject_task_id,
+                last_failure_task_id=failed_a.id,
+                last_failure_reason="PROVIDER_UNAVAILABLE",
+                last_failure_fingerprint="transient:retry:PROVIDER_UNAVAILABLE",
+                streak=1,
+                next_retry_at=datetime.now(UTC) + timedelta(minutes=10),
+                updated_at=datetime.now(UTC),
+            )
+        )
+    else:
+        runtime_a.store.upsert_watch_progress_observation(
+            WatchProgressObservation(
+                subject_kind=progress_candidate.subject_kind,
+                subject_id=progress_candidate.subject_id,
+                action_type=progress_candidate.action_type,
+                action_reason=progress_candidate.action_reason,
+                subject_task_id=progress_candidate.subject_task_id,
+                action_task_id=progress_candidate.action_task_id,
+                action_task_status=progress_candidate.action_task_status,
+                action_task_started_at=progress_candidate.action_task_started_at,
+                action_task_running_pid=progress_candidate.action_task_running_pid,
+                failed_task_id=progress_candidate.failed_task_id,
+                recovery_task_id=progress_candidate.recovery_task_id,
+                merge_unit_id=progress_candidate.merge_unit_id,
+                merge_unit_state=progress_candidate.merge_unit_state,
+                merge_unit_head_sha=progress_candidate.merge_unit_head_sha,
+                evidence_fingerprint=progress_candidate.evidence_fingerprint,
+                streak=2,
+                parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+                observed_at=datetime.now(UTC),
+            )
+        )
+
+    dispatched: list[tuple[str, str]] = []
+
+    def recovery_head(runtime: WatchProjectRuntime) -> ProjectDispatchCandidate | None:
+        return candidate_a if runtime.key == "a" else candidate_b
+
+    def settle_live(*, pending_starts: list[object], store: SqliteTaskStore, **_kwargs: object) -> list[object]:
+        [settle_entry] = pending_starts
+        task_id = getattr(settle_entry, "task_id")
+        assert isinstance(task_id, str)
+        owner_runtime = runtime_a if store is runtime_a.store else runtime_b
+        _register_live_worker_for_task(owner_runtime.config, task_id, worker_id=f"w-{owner_runtime.key}-{task_id}")
+        return _live_settle_results(pending_starts, store=store)
+
+    with (
+        patch.object(
+            runtime_a,
+            "recovery_dispatch_head",
+            side_effect=lambda **_kwargs: recovery_head(runtime_a),
+        ),
+        patch.object(
+            runtime_b,
+            "recovery_dispatch_head",
+            side_effect=lambda **_kwargs: recovery_head(runtime_b),
+        ),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_live),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+    ):
+        first_results = dispatch_watch_supervisor_lane_incrementally(
+            [runtime_a, runtime_b],
+            lane="recovery",
+            limit=1,
+            recovery_mode="recovery_only",
+            max_recovery_attempts=1,
+            strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            launch_budget=SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1),
+        )
+
+    dispatched.extend((result.runtime_key, result.status) for result in first_results)
+    assert dispatched == [("a", "not_dispatchable"), ("b", "live")]
+
+    if gate == "backoff":
+        runtime_a.store.upsert_watch_recovery_backoff(
+            WatchRecoveryBackoff(
+                subject_kind=progress_candidate.subject_kind,
+                subject_id=progress_candidate.subject_id,
+                action_type=progress_candidate.action_type,
+                action_reason=progress_candidate.action_reason,
+                subject_task_id=progress_candidate.subject_task_id,
+                last_failure_task_id=failed_a.id,
+                last_failure_reason="PROVIDER_UNAVAILABLE",
+                last_failure_fingerprint="transient:retry:PROVIDER_UNAVAILABLE",
+                streak=1,
+                next_retry_at=datetime.now(UTC) - timedelta(seconds=1),
+                updated_at=datetime.now(UTC),
+            )
+        )
+    else:
+        clear_watch_progress_subject(runtime_a.store, subject_task=failed_a)
+    runtime_a.begin_dispatch_pass()
+
+    with (
+        patch.object(runtime_a, "recovery_dispatch_head", return_value=candidate_a),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_live),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+    ):
+        second_results = dispatch_watch_supervisor_lane_incrementally(
+            [runtime_a],
+            lane="recovery",
+            limit=1,
+            recovery_mode="recovery_only",
+            max_recovery_attempts=1,
+            strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
+            launch_budget=SupervisorLaunchBudget([runtime_a], supervisor_batch=1),
+        )
+
+    assert [(result.runtime_key, result.status) for result in second_results] == [("a", "live")]
+
+
 @pytest.mark.parametrize("claim_kind", ["running", "starting"])
 def test_watch_supervisor_fleet_cycle_preserves_pre_direct_claim_when_budget_refresh_disables_runtime(
     tmp_path: Path,
@@ -11256,11 +11948,12 @@ def test_watch_supervisor_deferred_recovery_head_withholds_pending_capacity(
     recovery_mode: Any,
 ) -> None:
     runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
-    recovery = _runtime_candidate(
-        runtime, runtime.store.add("Deferred recovery", task_type="implement"), lane="recovery"
-    )
+    failed = _add_failed_resume_row(runtime, "Recovery dry-run withholds pending capacity")
+    recovery = runtime.recovery_dispatch_head(max_recovery_attempts=1, recovery_mode="recovery_only")
+    assert recovery is not None
+    assert recovery.task.id == failed.id
     pending = _runtime_candidate(runtime, runtime.store.add("Pending must wait", task_type="plan"), lane="pending")
-    budget = SupervisorLaunchBudget([runtime], supervisor_batch=1)
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=1, dry_run=True)
     pending_dispatches: list[str] = []
 
     with (
@@ -11275,7 +11968,6 @@ def test_watch_supervisor_deferred_recovery_head_withholds_pending_capacity(
             recovery_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
             pending_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
             launch_budget=budget,
-            dispatch_recovery_candidate=watch_module._watch_supervisor_recovery_dispatch_not_enabled,
             dispatch_pending_candidate=lambda selected_runtime, candidate, _budget: (
                 pending_dispatches.append(str(candidate.task.id))
                 or ProjectDispatchResult(
@@ -11318,7 +12010,6 @@ def test_watch_supervisor_donates_recovery_capacity_when_no_recovery_head_exists
             recovery_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
             pending_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
             launch_budget=budget,
-            dispatch_recovery_candidate=watch_module._watch_supervisor_recovery_dispatch_not_enabled,
             dispatch_pending_candidate=lambda selected_runtime, candidate, _budget: ProjectDispatchResult(
                 runtime_key=selected_runtime.key,
                 candidate=candidate,
@@ -48338,6 +49029,293 @@ def test_supervisor_launch_budget_releases_local_cap_rejection_so_another_projec
     assert budget.reservations == ()
     assert budget.occupancy.slots == 0
     assert permit_b.released is True
+
+
+@pytest.mark.parametrize("recovery_action_type", ["resume", "retry"])
+def test_supervisor_recovery_spawn_failure_suppresses_child_and_reuses_slot_for_other_project(
+    tmp_path: Path,
+    recovery_action_type: str,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    failed = runtime_a.store.add(f"Failed {recovery_action_type} parent", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.completed_at = datetime.now(UTC)
+    failed.failure_reason = "PROVIDER_ERROR"
+    failed.branch = f"feature/{recovery_action_type}-parent"
+    runtime_a.store.update(failed)
+    recovery_child = runtime_a.store.add(
+        failed.prompt,
+        task_type="implement",
+        based_on=failed.id,
+        recovery_origin=recovery_action_type,
+    )
+    other_pending = runtime_b.store.add("Other project pending uses released slot", task_type="plan")
+    assert recovery_child.id is not None
+    assert other_pending.id is not None
+    decision = _recovery_decision(
+        failed,
+        action=recovery_action_type,
+        recovery_task_id=recovery_child.id,
+        reuse_existing=True,
+    )
+    recovery_entry = _recovery_entry(
+        failed,
+        action_type=recovery_action_type,
+        decision=decision,
+    )
+    child_pending_entry = DispatchPreviewEntry(
+        lane="pending",
+        task=recovery_child,
+        owner_task=recovery_child,
+        runnable=True,
+        worker_consuming=True,
+    )
+    other_pending_entry = DispatchPreviewEntry(
+        lane="pending",
+        task=other_pending,
+        owner_task=other_pending,
+        runnable=True,
+        worker_consuming=True,
+    )
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+    launched_task_ids: list[str] = []
+
+    def build_preview(store: SqliteTaskStore, *_args: object, **kwargs: object) -> DispatchPreview:
+        include_recovery = kwargs.get("include_recovery", True)
+        include_pending = kwargs.get("include_pending", True)
+        entries: list[DispatchPreviewEntry] = []
+        if store is runtime_a.store:
+            if include_recovery:
+                entries.append(recovery_entry)
+            if include_pending:
+                entries.append(child_pending_entry)
+        elif store is runtime_b.store and include_pending:
+            entries.append(other_pending_entry)
+        return DispatchPreview(entries=tuple(entries))
+
+    def spawn_resume_worker(
+        _args: argparse.Namespace,
+        _config: Config,
+        new_task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        launched_task_ids.append(new_task_id)
+        return 1
+
+    def spawn_worker(
+        _args: argparse.Namespace,
+        config: Config,
+        *,
+        task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        launched_task_ids.append(task_id)
+        return 1 if config is runtime_a.config else 0
+
+    def settle_spy(*, pending_starts: list[object], store: SqliteTaskStore, **_kwargs: object) -> list[object]:
+        assert store is runtime_b.store
+        _register_live_worker_for_task(runtime_b.config, other_pending.id)
+        return _live_settle_results(pending_starts, store=store)
+
+    with (
+        patch("gza.cli.watch.build_dispatch_preview", side_effect=build_preview),
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.launch_permit", side_effect=lambda *_args, **_kwargs: _RuntimeDispatchPermit()),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _config, task, **_kwargs: task),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=spawn_resume_worker),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=spawn_worker),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_spy),
+    ):
+        result = dispatch_watch_supervisor_lanes_incrementally(
+            [runtime_a, runtime_b],
+            recovery_slots_config=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=watch_module.create_watch_dispatch_strategy(
+                "round-robin",
+                project_order=("a", "b"),
+                weights={},
+            ),
+            pending_strategy=watch_module.create_watch_dispatch_strategy(
+                "round-robin",
+                project_order=("a", "b"),
+                weights={},
+            ),
+            launch_budget=budget,
+            max_iterations=1,
+        )
+
+    assert [item.status for item in result.recovery_results] == ["launch_blocked"]
+    assert result.recovery_results[0].launched_task_id == recovery_child.id
+    assert result.recovery_results[0].task is not None
+    assert result.recovery_results[0].task.id == recovery_child.id
+    assert [item.status for item in result.pending_results] == ["live"]
+    assert result.pending_results[0].task is not None
+    assert result.pending_results[0].task.id == other_pending.id
+    assert launched_task_ids == [recovery_child.id, other_pending.id]
+    assert budget.reservations == ()
+    assert budget.occupancy.slots == 0
+    assert recovery_child.id in runtime_a._attempted_dispatch_task_ids
+    assert failed.id in runtime_a._attempted_dispatch_task_ids
+    assert runtime_a.pending_dispatch_head(max_recovery_attempts=1) is None
+
+    runtime_a.begin_dispatch_pass()
+    next_pass_head = runtime_a.pending_dispatch_head(max_recovery_attempts=1)
+    assert next_pass_head is not None
+    assert next_pass_head.task.id == recovery_child.id
+
+
+def test_supervisor_shared_recovery_spawn_error_suppresses_child_and_reuses_slot_for_other_project(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    failed = runtime_a.store.add("Failed parent needing rebase recovery", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.completed_at = datetime.now(UTC)
+    failed.failure_reason = "PROVIDER_ERROR"
+    failed.branch = "feature/shared-recovery-parent"
+    runtime_a.store.update(failed)
+    recovery_child = runtime_a.store.add(
+        "Recovery rebase child",
+        task_type="rebase",
+        based_on=failed.id,
+        recovery_origin="needs_rebase",
+    )
+    other_pending = runtime_b.store.add("Other project pending after shared recovery error", task_type="plan")
+    assert recovery_child.id is not None
+    assert other_pending.id is not None
+    decision = _recovery_decision(
+        failed,
+        action="reconcile",
+        reason_code="recovery_preflight_rebase",
+        launch_mode="worker",
+    )
+    recovery_entry = _recovery_entry(
+        failed,
+        action_type="needs_rebase",
+        decision=decision,
+    )
+    child_pending_entry = DispatchPreviewEntry(
+        lane="pending",
+        task=recovery_child,
+        owner_task=recovery_child,
+        runnable=True,
+        worker_consuming=True,
+    )
+    other_pending_entry = DispatchPreviewEntry(
+        lane="pending",
+        task=other_pending,
+        owner_task=other_pending,
+        runnable=True,
+        worker_consuming=True,
+    )
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+    worker_spawns: list[str] = []
+
+    def build_preview(store: SqliteTaskStore, *_args: object, **kwargs: object) -> DispatchPreview:
+        include_recovery = kwargs.get("include_recovery", True)
+        include_pending = kwargs.get("include_pending", True)
+        entries: list[DispatchPreviewEntry] = []
+        if store is runtime_a.store:
+            if include_recovery:
+                entries.append(recovery_entry)
+            if include_pending:
+                entries.append(child_pending_entry)
+        elif store is runtime_b.store and include_pending:
+            entries.append(other_pending_entry)
+        return DispatchPreview(entries=tuple(entries))
+
+    def execute_shared_recovery(
+        *,
+        task: DbTask,
+        action: dict[str, object],
+        context: object,
+    ) -> AdvanceActionExecutionResult:
+        del context
+        assert task.id == failed.id
+        assert action["type"] == "needs_rebase"
+        return AdvanceActionExecutionResult(
+            action_type="needs_rebase",
+            status="error",
+            execution_phase="worker_launch",
+            message=f"Failed to start rebase worker for task {recovery_child.id}",
+            error_message=f"Failed to start rebase worker for task {recovery_child.id}",
+            worker_consuming=True,
+            attempted_spawn=True,
+            worker_started=False,
+            work_done=False,
+            handled_task_id=recovery_child.id,
+            created_task=recovery_child,
+            worker_label="rebase",
+        )
+
+    def spawn_worker(
+        _args: argparse.Namespace,
+        config: Config,
+        *,
+        task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        assert config is runtime_b.config
+        worker_spawns.append(task_id)
+        return 0
+
+    def settle_spy(*, pending_starts: list[object], store: SqliteTaskStore, **_kwargs: object) -> list[object]:
+        assert store is runtime_b.store
+        _register_live_worker_for_task(runtime_b.config, other_pending.id)
+        return _live_settle_results(pending_starts, store=store)
+
+    with (
+        patch("gza.cli.watch.build_dispatch_preview", side_effect=build_preview),
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.execute_advance_action", side_effect=execute_shared_recovery),
+        patch("gza.cli.watch.launch_permit", side_effect=lambda *_args, **_kwargs: _RuntimeDispatchPermit()),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=spawn_worker),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_spy),
+    ):
+        result = dispatch_watch_supervisor_lanes_incrementally(
+            [runtime_a, runtime_b],
+            recovery_slots_config=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=watch_module.create_watch_dispatch_strategy(
+                "round-robin",
+                project_order=("a", "b"),
+                weights={},
+            ),
+            pending_strategy=watch_module.create_watch_dispatch_strategy(
+                "round-robin",
+                project_order=("a", "b"),
+                weights={},
+            ),
+            launch_budget=budget,
+            max_iterations=1,
+        )
+
+    assert [item.status for item in result.recovery_results] == ["launch_blocked"]
+    assert result.recovery_results[0].launched_task_id == recovery_child.id
+    assert result.recovery_results[0].task is not None
+    assert result.recovery_results[0].task.id == recovery_child.id
+    assert [item.status for item in result.pending_results] == ["live"]
+    assert result.pending_results[0].task is not None
+    assert result.pending_results[0].task.id == other_pending.id
+    assert worker_spawns == [other_pending.id]
+    assert budget.reservations == ()
+    assert budget.occupancy.slots == 0
+    assert recovery_child.id in runtime_a._attempted_dispatch_task_ids
+    assert failed.id in runtime_a._attempted_dispatch_task_ids
+    assert runtime_a.pending_dispatch_head(max_recovery_attempts=1) is None
+
+    runtime_a.begin_dispatch_pass()
+    next_pass_head = runtime_a.pending_dispatch_head(max_recovery_attempts=1)
+    assert next_pass_head is not None
+    assert next_pass_head.task.id == recovery_child.id
 
 
 def test_supervisor_dispatch_refresh_disables_failing_runtime_without_losing_successful_result(

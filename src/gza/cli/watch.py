@@ -9263,6 +9263,7 @@ class ProjectDispatchResult:
     dispatch_budget_consuming: bool = False
     detail: str | None = None
     task: DbTask | None = None
+    launched_task_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -9383,6 +9384,8 @@ class SupervisorLaunchReservation:
     runtime_key: str
     task_id: str
     lane: Literal["recovery", "pending", "lifecycle"]
+    release_pending_after_settle: bool = True
+    original_task_id: str | None = None
 
 
 @dataclass
@@ -9398,6 +9401,7 @@ class SupervisorLaunchBudget:
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _reservations: dict[str, SupervisorLaunchReservation] = field(default_factory=dict, init=False, repr=False)
     _settled_reservation_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _unresolved_exception_reservation_ids: set[str] = field(default_factory=set, init=False, repr=False)
     _virtual_dispatch_starts: int = field(default=0, init=False, repr=False)
     _virtual_dispatch_starts_by_runtime_key: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _occupancy: AggregateWatchOccupancy | None = field(default=None, init=False, repr=False)
@@ -9436,8 +9440,10 @@ class SupervisorLaunchBudget:
     def refresh_occupancy(self) -> AggregateWatchOccupancy:
         with self._lock:
             snapshots: list[ProjectRuntimeReconcileResult] = []
+            stale_runtime_keys: set[str] = set()
             for runtime in self.runtimes:
                 if runtime.key in self.disabled_runtime_keys:
+                    stale_runtime_keys.add(runtime.key)
                     previous = self._last_reconcile_by_runtime_key.get(runtime.key)
                     if previous is not None:
                         snapshots.append(previous)
@@ -9446,6 +9452,7 @@ class SupervisorLaunchBudget:
                     snapshot = runtime.reconcile_runtime_state(dry_run=self.dry_run)
                 except _WATCH_PROJECT_OPERATIONAL_EXCEPTIONS as exc:
                     self.disable_runtime(runtime, phase="reconcile", exc=exc)
+                    stale_runtime_keys.add(runtime.key)
                     previous = self._last_reconcile_by_runtime_key.get(runtime.key)
                     if previous is not None:
                         snapshots.append(previous)
@@ -9464,7 +9471,10 @@ class SupervisorLaunchBudget:
                 supervisor_batch=self.supervisor_batch,
                 limit_by_runtime_key=limit_by_runtime_key,
             )
-            self._release_reconciled_reservations_locked(self._occupancy)
+            self._release_reconciled_reservations_locked(
+                self._occupancy,
+                stale_runtime_keys=stale_runtime_keys,
+            )
             self.refresh_count += 1
             return self._occupancy_with_reservations(self._occupancy)
 
@@ -9494,6 +9504,7 @@ class SupervisorLaunchBudget:
                 runtime_key=candidate.runtime_key,
                 task_id=str(candidate.task.id),
                 lane=candidate.lane,
+                original_task_id=str(candidate.task.id),
             )
             self._reservations[reservation.reservation_id] = reservation
             return reservation
@@ -9501,6 +9512,49 @@ class SupervisorLaunchBudget:
     def release(self, reservation: SupervisorLaunchReservation) -> None:
         with self._lock:
             self._pop_reservation_locked(reservation.reservation_id)
+
+    @staticmethod
+    def _launched_task_id_for_result(result: ProjectDispatchResult) -> str | None:
+        if result.launched_task_id:
+            return result.launched_task_id
+        if result.task is not None and result.task.id is not None:
+            return str(result.task.id)
+        return None
+
+    def _retarget_reservation_locked(
+        self,
+        reservation: SupervisorLaunchReservation,
+        *,
+        launched_task_id: str | None,
+        release_pending_after_settle: bool,
+    ) -> SupervisorLaunchReservation:
+        task_id = launched_task_id or reservation.task_id
+        original_task_id = reservation.original_task_id or reservation.task_id
+        if (
+            task_id == reservation.task_id
+            and release_pending_after_settle == reservation.release_pending_after_settle
+            and original_task_id == reservation.original_task_id
+        ):
+            return reservation
+        retargeted = replace(
+            reservation,
+            task_id=task_id,
+            release_pending_after_settle=release_pending_after_settle,
+            original_task_id=original_task_id,
+        )
+        self._reservations[reservation.reservation_id] = retargeted
+        return retargeted
+
+    def _mark_dispatch_exception_locked(
+        self,
+        reservation: SupervisorLaunchReservation,
+        dispatch_exc: BaseException,
+    ) -> SupervisorLaunchReservation:
+        if isinstance(dispatch_exc, _WATCH_PROJECT_OPERATIONAL_EXCEPTIONS):
+            self._unresolved_exception_reservation_ids.add(reservation.reservation_id)
+            return reservation
+        self._settled_reservation_ids.add(reservation.reservation_id)
+        return reservation
 
     def dispatch_pending_candidate(
         self,
@@ -9538,7 +9592,7 @@ class SupervisorLaunchBudget:
                     step1_handled_child_task_ids=step1_handled_child_task_ids,
                 )
             except Exception as dispatch_exc:
-                self._settled_reservation_ids.add(reservation.reservation_id)
+                reservation = self._mark_dispatch_exception_locked(reservation, dispatch_exc)
                 try:
                     self.refresh_occupancy()
                 except Exception as refresh_exc:
@@ -9547,6 +9601,73 @@ class SupervisorLaunchBudget:
                         f"{reservation.reservation_id}: {refresh_exc}"
                     )
                 raise
+            reservation = self._retarget_reservation_locked(
+                reservation,
+                launched_task_id=self._launched_task_id_for_result(result),
+                release_pending_after_settle=not result.slot_consuming,
+            )
+            self._settled_reservation_ids.add(reservation.reservation_id)
+            self.refresh_occupancy()
+            if not result.slot_consuming:
+                self.release(reservation)
+            return result
+
+    def dispatch_recovery_candidate(
+        self,
+        runtime: "WatchProjectRuntime",
+        candidate: ProjectDispatchCandidate,
+        *,
+        max_iterations: int,
+        dry_run: bool = False,
+        quiet: bool = False,
+        analysis: ProjectCycleAnalysis | None = None,
+    ) -> ProjectDispatchResult:
+        """Reserve one global slot, run runtime-local recovery dispatch, then settle."""
+        with self._lock:
+            reservation = self.reserve(candidate)
+            if reservation is None:
+                return ProjectDispatchResult(
+                    runtime_key=runtime.key,
+                    candidate=candidate,
+                    status="global_capacity_blocked",
+                    slot_consuming=False,
+                    work_done=False,
+                    detail="supervisor launch budget has no available slots",
+                    task=candidate.task,
+                )
+            try:
+                def retarget_launch_reservation(launched_task_id: str) -> None:
+                    nonlocal reservation
+                    assert reservation is not None
+                    reservation = self._retarget_reservation_locked(
+                        reservation,
+                        launched_task_id=launched_task_id,
+                        release_pending_after_settle=reservation.release_pending_after_settle,
+                    )
+
+                result = runtime.dispatch_recovery_candidate(
+                    candidate,
+                    max_iterations=max_iterations,
+                    dry_run=dry_run,
+                    quiet=quiet,
+                    analysis=analysis,
+                    launch_reservation_retarget=retarget_launch_reservation,
+                )
+            except Exception as dispatch_exc:
+                reservation = self._mark_dispatch_exception_locked(reservation, dispatch_exc)
+                try:
+                    self.refresh_occupancy()
+                except Exception as refresh_exc:
+                    dispatch_exc.add_note(
+                        f"supervisor occupancy refresh failed while reconciling reservation "
+                        f"{reservation.reservation_id}: {refresh_exc}"
+                    )
+                raise
+            reservation = self._retarget_reservation_locked(
+                reservation,
+                launched_task_id=self._launched_task_id_for_result(result),
+                release_pending_after_settle=not result.slot_consuming,
+            )
             self._settled_reservation_ids.add(reservation.reservation_id)
             self.refresh_occupancy()
             if not result.slot_consuming:
@@ -9583,13 +9704,21 @@ class SupervisorLaunchBudget:
             reservation_ids=tuple(reservation.reservation_id for reservation in reservations),
         )
 
-    def _release_reconciled_reservations_locked(self, occupancy: AggregateWatchOccupancy) -> None:
+    def _release_reconciled_reservations_locked(
+        self,
+        occupancy: AggregateWatchOccupancy,
+        *,
+        stale_runtime_keys: AbstractSet[str] = frozenset(),
+    ) -> None:
         if not self._reservations:
             return
         local_by_runtime_key = occupancy.local_by_runtime_key
         runtime_by_key = self.runtime_by_key
         reconciled_reservation_ids: list[str] = []
         for reservation_id, reservation in self._reservations.items():
+            unresolved_exception = reservation_id in self._unresolved_exception_reservation_ids
+            if unresolved_exception and reservation.runtime_key in stale_runtime_keys:
+                continue
             local = local_by_runtime_key.get(reservation.runtime_key)
             if local is None:
                 continue
@@ -9600,13 +9729,26 @@ class SupervisorLaunchBudget:
                 continue
             runtime = runtime_by_key.get(reservation.runtime_key)
             task = runtime.store.get(reservation.task_id) if runtime is not None else None
-            if task is not None and task.status not in {"pending", "in_progress"}:
+            retargeted_to_child = (
+                reservation.original_task_id is not None and reservation.task_id != reservation.original_task_id
+            )
+            if (
+                task is not None
+                and task.status not in {"pending", "in_progress"}
+                and (not unresolved_exception or retargeted_to_child)
+            ):
                 reconciled_reservation_ids.append(reservation_id)
                 continue
-            if reservation_id in self._settled_reservation_ids and task is not None and task.status == "pending":
+            if (
+                reservation_id in self._settled_reservation_ids
+                and not unresolved_exception
+                and reservation.release_pending_after_settle
+                and task is not None
+                and task.status == "pending"
+            ):
                 reconciled_reservation_ids.append(reservation_id)
                 continue
-            if reservation_id in self._settled_reservation_ids and task is None:
+            if reservation_id in self._settled_reservation_ids and not unresolved_exception and task is None:
                 reconciled_reservation_ids.append(reservation_id)
         for reservation_id in reconciled_reservation_ids:
             self._pop_reservation_locked(reservation_id)
@@ -9614,6 +9756,7 @@ class SupervisorLaunchBudget:
     def _pop_reservation_locked(self, reservation_id: str) -> None:
         self._reservations.pop(reservation_id, None)
         self._settled_reservation_ids.discard(reservation_id)
+        self._unresolved_exception_reservation_ids.discard(reservation_id)
 
 
 def dispatch_watch_supervisor_pending_candidates(
@@ -9717,8 +9860,14 @@ def dispatch_watch_supervisor_lane_incrementally(
         candidate: ProjectDispatchCandidate,
         budget: SupervisorLaunchBudget,
     ) -> ProjectDispatchResult:
-        if lane != "pending":
-            raise ValueError("recovery lane dispatch requires an explicit dispatch_candidate callback")
+        if lane == "recovery":
+            return budget.dispatch_recovery_candidate(
+                runtime,
+                candidate,
+                max_iterations=max_iterations,
+                dry_run=budget.dry_run,
+                analysis=analyses.get(runtime.key),
+            )
         return budget.dispatch_pending_candidate(
             runtime,
             candidate,
@@ -10088,25 +10237,6 @@ def _emit_watch_supervisor_strategy_startup_warning(
         )
 
 
-def _watch_supervisor_recovery_dispatch_not_enabled(
-    runtime: "WatchProjectRuntime",
-    candidate: ProjectDispatchCandidate,
-    launch_budget: SupervisorLaunchBudget,
-) -> ProjectDispatchResult:
-    if candidate.task.id is not None:
-        runtime._exclude_pending_dispatch_candidate_for_pass(str(candidate.task.id))
-    return ProjectDispatchResult(
-        runtime_key=runtime.key,
-        candidate=candidate,
-        status="not_dispatchable",
-        slot_consuming=False,
-        work_done=False,
-        dispatch_budget_consuming=True,
-        detail="worker-consuming recovery dispatch is not enabled in the fleet supervisor yet",
-        task=candidate.task,
-    )
-
-
 def watch_supervisor_fleet_cycle_is_idle(result: WatchSupervisorFleetCycleResult) -> bool:
     """Return true only when the complete fleet result has no active or runnable work."""
     occupancy = result.occupancy
@@ -10421,7 +10551,6 @@ def run_watch_supervisor_fleet_cycle(
                 pending_strategy=pending_strategy,
                 launch_budget=launch_budget,
                 max_iterations=max_iterations,
-                dispatch_recovery_candidate=_watch_supervisor_recovery_dispatch_not_enabled,
                 analyses=analyses,
                 operational_disabled_callback=disabled.append,
             )
@@ -10949,6 +11078,18 @@ def _preflight_pending_dispatch_candidate(
     return _PendingDispatchPreflightResult(task=refreshed_task, dispatchable=True)
 
 
+@dataclass(frozen=True)
+class _RecoveryDispatchPreflightResult:
+    task: DbTask | None
+    dispatchable: bool
+    detail: str | None = None
+    current_candidate: ProjectDispatchCandidate | None = None
+    decision: FailedRecoveryDecision | None = None
+    recovery_action: dict[str, Any] | None = None
+    owner_task: DbTask | None = None
+    action_task: DbTask | None = None
+
+
 @dataclass
 class WatchProjectRuntime:
     """Mutable state for one project's watch execution."""
@@ -11335,9 +11476,173 @@ class WatchProjectRuntime:
             None,
         )
 
+    def _current_recovery_dispatch_head_for_validation(
+        self,
+        *,
+        recovery_mode: DispatchSelectionMode,
+        max_recovery_attempts: int,
+    ) -> ProjectDispatchCandidate | None:
+        return self.recovery_dispatch_head(
+            max_recovery_attempts=max_recovery_attempts,
+            recovery_mode=recovery_mode,
+            analysis=None,
+            excluded_owner_ids=self.active_failure_owner_ids(),
+        )
+
     def _exclude_pending_dispatch_candidate_for_pass(self, task_id: str | None) -> None:
         if task_id is not None:
             self._attempted_dispatch_task_ids.add(str(task_id))
+
+    def _exclude_recovery_dispatch_tasks_for_pass(
+        self,
+        *,
+        failed_task_id: str | None,
+        recovered_task_id: str | None = None,
+    ) -> None:
+        self._exclude_pending_dispatch_candidate_for_pass(failed_task_id)
+        self._exclude_pending_dispatch_candidate_for_pass(recovered_task_id)
+
+    def _preflight_recovery_dispatch_candidate(
+        self,
+        candidate: ProjectDispatchCandidate,
+        *,
+        max_recovery_attempts: int,
+        dry_run: bool,
+    ) -> _RecoveryDispatchPreflightResult:
+        if not self._candidate_belongs_to_runtime(candidate) or candidate.lane != "recovery" or candidate.task.id is None:
+            return _RecoveryDispatchPreflightResult(
+                task=candidate.task,
+                dispatchable=False,
+                detail="candidate does not belong to this runtime recovery lane",
+            )
+        failed = self.store.get(str(candidate.task.id))
+        if failed is None:
+            return _RecoveryDispatchPreflightResult(
+                task=candidate.task,
+                dispatchable=False,
+                detail=f"task {candidate.task.id} is not present in runtime store",
+            )
+        if failed.status != "failed":
+            self._exclude_pending_dispatch_candidate_for_pass(str(failed.id))
+            return _RecoveryDispatchPreflightResult(
+                task=failed,
+                dispatchable=False,
+                detail=f"task is {failed.status}, not failed",
+            )
+        current_head = self._current_recovery_dispatch_head_for_validation(
+            recovery_mode=candidate.selection_mode,
+            max_recovery_attempts=max_recovery_attempts,
+        )
+        if current_head is None or current_head.task.id != failed.id:
+            detail = (
+                f"task {failed.id} is not the current eligible recovery dispatch head"
+                if current_head is not None
+                else f"task {failed.id} is no longer eligible for recovery dispatch"
+            )
+            return _RecoveryDispatchPreflightResult(
+                task=failed,
+                dispatchable=False,
+                detail=detail,
+                current_candidate=current_head,
+            )
+
+        entry = current_head.preview_entry or candidate.preview_entry
+        decision = entry.decision if entry is not None and entry.decision is not None else None
+        if decision is None:
+            decision = decide_failed_task_recovery(
+                self.store,
+                failed,
+                max_recovery_attempts=max_recovery_attempts,
+            )
+        if should_hide_failed_recovery_decision(decision):
+            self._exclude_pending_dispatch_candidate_for_pass(str(failed.id))
+            return _RecoveryDispatchPreflightResult(
+                task=failed,
+                dispatchable=False,
+                detail=f"recovery decision {decision.reason_code} is hidden",
+                current_candidate=current_head,
+                decision=decision,
+            )
+        recovery_action = (
+            entry.advance_action
+            if entry is not None and entry.advance_action is not None
+            else {"type": decision.action, "description": decision.reason_code}
+        )
+        owner_task = current_head.owner_task or (entry.owner_task if entry is not None else None) or failed
+        action_task = failed
+
+        if not dry_run:
+            if _maybe_emit_active_watch_recovery_backoff(
+                store=self.store,
+                log=self.log,
+                subject_task=failed,
+                action=recovery_action,
+            ):
+                self._exclude_pending_dispatch_candidate_for_pass(str(failed.id))
+                return _RecoveryDispatchPreflightResult(
+                    task=failed,
+                    dispatchable=False,
+                    detail="active recovery backoff",
+                    current_candidate=current_head,
+                    decision=decision,
+                    recovery_action=recovery_action,
+                    owner_task=owner_task,
+                    action_task=action_task,
+                )
+            no_progress_attention = _maybe_park_watch_no_progress(
+                config=self.config,
+                store=self.store,
+                subject_task=failed,
+                action=recovery_action,
+                action_task=action_task,
+                failed_task=failed,
+                no_progress_cycles=self.config.watch.no_progress_cycles,
+            )
+            if _watch_no_progress_result_deferred_for_transient_backoff(no_progress_attention):
+                _maybe_emit_active_watch_recovery_backoff(
+                    store=self.store,
+                    log=self.log,
+                    subject_task=failed,
+                    action=recovery_action,
+                )
+                self._exclude_pending_dispatch_candidate_for_pass(str(failed.id))
+                return _RecoveryDispatchPreflightResult(
+                    task=failed,
+                    dispatchable=False,
+                    detail="transient recovery backoff",
+                    current_candidate=current_head,
+                    decision=decision,
+                    recovery_action=recovery_action,
+                    owner_task=owner_task,
+                    action_task=action_task,
+                )
+            if no_progress_attention is not None:
+                recovery_action_type = str(recovery_action.get("type", decision.action))
+                self.log.emit_attention(
+                    attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
+                    message=_watch_needs_attention_message(failed, no_progress_attention),
+                )
+                self._exclude_pending_dispatch_candidate_for_pass(str(failed.id))
+                return _RecoveryDispatchPreflightResult(
+                    task=failed,
+                    dispatchable=False,
+                    detail=str(no_progress_attention.get("needs_attention_reason", "watch-no-progress")),
+                    current_candidate=current_head,
+                    decision=decision,
+                    recovery_action=recovery_action,
+                    owner_task=owner_task,
+                    action_task=action_task,
+                )
+
+        return _RecoveryDispatchPreflightResult(
+            task=failed,
+            dispatchable=True,
+            current_candidate=current_head,
+            decision=decision,
+            recovery_action=recovery_action,
+            owner_task=owner_task,
+            action_task=action_task,
+        )
 
     def run_direct_phase(
         self,
@@ -11519,6 +11824,886 @@ class WatchProjectRuntime:
             config=self.config,
             store=self.store,
             pending_starts=pending_starts,
+        )
+
+    def _build_recovery_advance_executor_context(
+        self,
+        *,
+        max_iterations: int,
+        max_recovery_attempts: int,
+        dry_run: bool,
+        quiet: bool,
+        target_branch: str,
+    ) -> AdvanceActionExecutionContext:
+        worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
+
+        def spawn_worker(task_obj: DbTask, task_kind: str) -> int:
+            assert task_obj.id is not None
+            task_id = str(task_obj.id)
+            return _spawn_worker_with_failure_log(
+                quiet=quiet,
+                log=self.log,
+                failure_message=f"{task_id} {task_kind}: worker spawn failed",
+                dedupe_key=f"spawn-worker-failed:{task_id}",
+                spawn_fn=lambda: _spawn_background_worker(
+                    worker_args,
+                    self.config,
+                    task_id=task_id,
+                    quiet=quiet,
+                    prepared_task=task_obj,
+                    startup_quiet=True,
+                    runtime_context=self.runtime_context,
+                ),
+            )
+
+        def spawn_resume_worker(task_obj: DbTask, task_kind: str) -> int:
+            assert task_obj.id is not None
+            task_id = str(task_obj.id)
+            return _spawn_worker_with_failure_log(
+                quiet=quiet,
+                log=self.log,
+                failure_message=f"{task_id} {task_kind}: resume worker spawn failed",
+                dedupe_key=f"spawn-resume-failed:{task_id}",
+                spawn_fn=lambda: _spawn_background_resume_worker(
+                    worker_args,
+                    self.config,
+                    new_task_id=task_id,
+                    quiet=quiet,
+                    prepared_task=task_obj,
+                    startup_quiet=True,
+                    runtime_context=self.runtime_context,
+                ),
+            )
+
+        def spawn_iterate(task_obj: DbTask, task_kind: str) -> int:
+            iterate_args = argparse.Namespace(
+                max_iterations=max_iterations,
+                no_docker=False,
+                resume=False,
+                retry=False,
+                auto_iterate=True,
+            )
+            return _spawn_worker_with_failure_log(
+                quiet=quiet,
+                log=self.log,
+                failure_message=f"{task_obj.id} {task_kind}: iterate worker spawn failed",
+                dedupe_key=f"spawn-iterate-failed:{task_obj.id}",
+                spawn_fn=lambda: _spawn_background_iterate(
+                    iterate_args,
+                    self.config,
+                    task_obj,
+                    startup_quiet=True,
+                    runtime_context=self.runtime_context,
+                ),
+            )
+
+        def create_rebase_from_task(parent_task: DbTask) -> DbTask:
+            assert parent_task.id is not None
+            assert parent_task.branch is not None
+            return _create_rebase_task(
+                self.store,
+                parent_task.id,
+                parent_task.branch,
+                target_branch,
+                config=self.config,
+                trigger_source="watch",
+            )
+
+        def create_targeted_rebase_from_task(parent_task: DbTask, rebase_target: str) -> DbTask:
+            assert parent_task.id is not None
+            assert parent_task.branch is not None
+            return _create_rebase_task(
+                self.store,
+                parent_task.id,
+                parent_task.branch,
+                rebase_target,
+                config=self.config,
+                trigger_source="watch",
+            )
+
+        def create_implement_from_task(parent_task: DbTask) -> DbTask:
+            return _create_implementation_task_from_source(
+                self.store,
+                parent_task,
+                config=self.config,
+                prompt=_unimplemented_implement_prompt(parent_task),
+                trigger_source="watch",
+            )
+
+        return AdvanceActionExecutionContext(
+            store=self.store,
+            trigger_source="watch",
+            dry_run=dry_run,
+            max_resume_attempts=max_recovery_attempts,
+            use_iterate_for_create_implement=True,
+            use_iterate_for_needs_rebase=False,
+            can_spawn_worker=lambda _kind: True,
+            no_worker_capacity_message=lambda worker_label: f"SKIP: no watch worker slots available for {worker_label}",
+            prepare_task_for_background_start=lambda task, rollback_on_failure: _prepare_task_for_immediate_execution(
+                self.config,
+                task,
+                rollback_on_failure=rollback_on_failure,
+                store=self.store,
+                runtime_context=self.runtime_context,
+            ),
+            prepare_create_review=lambda task: _prepare_create_review_action(
+                self.store,
+                task,
+                config=self.config,
+                trigger_source="watch",
+            ),
+            create_resume_task=lambda task: _create_resume_task(
+                self.store,
+                task,
+                config=self.config,
+                trigger_source="watch",
+            ),
+            create_retry_task=lambda task: _create_retry_task(
+                self.store,
+                task,
+                config=self.config,
+                trigger_source="watch",
+            ),
+            create_rebase_task=create_rebase_from_task,
+            create_implement_task=create_implement_from_task,
+            create_plan_review_task=lambda task: _create_plan_review_task(
+                self.store,
+                task,
+                config=self.config,
+                trigger_source="watch",
+            ),
+            create_plan_improve_task=lambda task, review_task: _create_plan_improve_task(
+                self.store,
+                task,
+                review_task,
+                config=self.config,
+                trigger_source="watch",
+            ),
+            create_review_adjudication_task=lambda impl_task, review_task, finding, dispute_metadata: (
+                _create_review_adjudication_task(
+                    self.store,
+                    impl_task,
+                    review_task,
+                    finding,
+                    config=self.config,
+                    dispute_metadata=dispute_metadata,
+                    trigger_source="watch",
+                )
+            ),
+            materialize_plan_slices=lambda plan_task, review_task, manifest: _materialize_plan_review_slices(
+                self.config,
+                self.store,
+                plan_task,
+                review_task,
+                manifest,
+                trigger_source="plan-review",
+                require_review_before_merge=self.config.require_review_before_merge,
+            ),
+            repair_plan_slice_materialization=lambda plan_task, review_task, manifest, partial_task_ids, repair_trigger_source: (
+                _repair_plan_review_slice_materialization(
+                    self.config,
+                    self.store,
+                    plan_task,
+                    review_task,
+                    manifest,
+                    partial_task_ids=partial_task_ids,
+                    trigger_source=repair_trigger_source,
+                    require_review_before_merge=self.config.require_review_before_merge,
+                )
+            ),
+            create_targeted_rebase_task=create_targeted_rebase_from_task,
+            spawn_worker=spawn_worker,
+            spawn_resume_worker=spawn_resume_worker,
+            spawn_iterate_worker=spawn_iterate,
+            is_rebase_target_already_merged=lambda task: (
+                _resolve_and_persist_post_merge_rebase_state(
+                    self.store,
+                    self.git,
+                    task,
+                    target_branch,
+                    config=self.config,
+                    merge_source=_resolve_current_merge_source(self.git, task.branch) if task.branch else None,
+                ).already_merged
+            ),
+            config=self.config,
+            git=self.git,
+            spawn_iterate_recovery=lambda task_obj, mode, prepared_task: _spawn_worker_with_failure_log(
+                quiet=quiet,
+                log=self.log,
+                failure_message=f"{task_obj.id} {mode}: iterate worker spawn failed",
+                dedupe_key=f"spawn-iterate-failed:{task_obj.id}:{mode}",
+                spawn_fn=lambda: _spawn_background_iterate(
+                    argparse.Namespace(
+                        max_iterations=max_iterations,
+                        no_docker=False,
+                        resume=False,
+                        retry=False,
+                        auto_iterate=True,
+                    ),
+                    self.config,
+                    prepared_task,
+                    prepared_task_id=str(prepared_task.id),
+                    prepared_resume=mode == "resume",
+                    prepared_phase="preloop",
+                    startup_quiet=True,
+                    runtime_context=self.runtime_context,
+                ),
+            ),
+            prefer_iterate_for_action=lambda task, action: _watch_iterate_impl_target(
+                store=self.store,
+                git=self.git,
+                task=task,
+                action=action,
+                running_task_ids=set(_collect_live_running_state(self.config, self.store)[1]),
+                target_branch=target_branch,
+                max_recovery_attempts=max_recovery_attempts,
+            ),
+            reconcile_diverged_branch=lambda task: _reconcile_diverged_branch_with_origin(
+                self.config,
+                self.git,
+                task,
+                target_branch=target_branch,
+            ),
+            runtime_context=self.runtime_context,
+        )
+
+    def _dispatch_recovery_advance_action(
+        self,
+        *,
+        candidate: ProjectDispatchCandidate,
+        failed: DbTask,
+        decision: FailedRecoveryDecision,
+        recovery_action: dict[str, Any],
+        owner_task: DbTask,
+        action_task: DbTask,
+        max_iterations: int,
+        max_recovery_attempts: int,
+        dry_run: bool,
+        quiet: bool,
+        analysis: ProjectCycleAnalysis | None,
+        launch_reservation_retarget: Callable[[str], None] | None = None,
+    ) -> ProjectDispatchResult:
+        recovery_action_type = str(recovery_action.get("type", decision.action))
+        if dry_run:
+            self.log.emit(
+                "RECOVR",
+                (
+                    f"{failed.id} {recovery_action_type} [owner={owner_task.id}] "
+                    f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit}) "
+                    "[dry-run]"
+                ),
+            )
+            self._exclude_pending_dispatch_candidate_for_pass(str(failed.id))
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="dry_run",
+                slot_consuming=False,
+                work_done=True,
+                dispatch_budget_consuming=True,
+                task=failed,
+            )
+
+        target_branch = (
+            analysis.analysis.target_branch
+            if analysis is not None and analysis.analysis.target_branch is not None
+            else self.git.default_branch()
+        )
+        executor_context = self._build_recovery_advance_executor_context(
+            max_iterations=max_iterations,
+            max_recovery_attempts=max_recovery_attempts,
+            dry_run=False,
+            quiet=quiet,
+            target_branch=target_branch,
+        )
+        exec_result = execute_advance_action(task=failed, action=recovery_action, context=executor_context)
+        handled_task_id = exec_result.handled_task_id
+        recovered_result_task = exec_result.created_task
+        if handled_task_id is not None:
+            recovered_result_task = recovered_result_task or self.store.get(str(handled_task_id))
+            if exec_result.worker_consuming and launch_reservation_retarget is not None:
+                launch_reservation_retarget(str(handled_task_id))
+        if exec_result.status == "skip":
+            attention = resolve_execution_needs_attention(failed, exec_result)
+            if attention is not None:
+                self.log.emit_attention(
+                    attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}",
+                    message=_watch_needs_attention_message(attention.task, attention.action),
+                )
+            else:
+                no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
+                    store=self.store,
+                    subject_task=failed,
+                    action=recovery_action,
+                    action_task=action_task,
+                    failed_task=failed,
+                    no_progress_cycles=self.config.watch.no_progress_cycles,
+                )
+                if no_progress_attention is not None:
+                    self.log.emit_attention(
+                        attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
+                        message=_watch_needs_attention_message(failed, no_progress_attention),
+                    )
+                else:
+                    self.log.emit(
+                        "SKIP",
+                        f"{failed.id}: {exec_result.message}",
+                        dedupe_key=f"recovery-{recovery_action_type}-skip:{failed.id}:{exec_result.message}",
+                    )
+            self._exclude_recovery_dispatch_tasks_for_pass(
+                failed_task_id=str(failed.id),
+                recovered_task_id=handled_task_id,
+            )
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status=(
+                    "local_capacity_blocked"
+                    if _watch_worker_capacity_skip(recovery_action_type, exec_result.message, exec_result)
+                    else "launch_blocked"
+                ),
+                slot_consuming=False,
+                work_done=False,
+                detail=exec_result.message,
+                task=recovered_result_task or failed,
+                launched_task_id=handled_task_id,
+            )
+        if exec_result.status in {"error", "unsupported"}:
+            self.log.emit_attention(
+                attention_key=f"planned-recovery-dispatch-invariant:fleet:{failed.id}:{recovery_action_type}",
+                message=(
+                    f"{failed.id}: planned recovery action {recovery_action_type} failed closed "
+                    f"before dispatch settlement ({exec_result.message or exec_result.error_message})"
+                ),
+            )
+            self._exclude_recovery_dispatch_tasks_for_pass(
+                failed_task_id=str(failed.id),
+                recovered_task_id=handled_task_id,
+            )
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="not_dispatchable" if exec_result.status == "unsupported" else "launch_blocked",
+                slot_consuming=False,
+                work_done=False,
+                detail=exec_result.message or exec_result.error_message,
+                task=recovered_result_task or failed,
+                launched_task_id=handled_task_id,
+            )
+        if not _watch_execution_requires_dispatch_confirmation(exec_result):
+            self._exclude_recovery_dispatch_tasks_for_pass(
+                failed_task_id=str(failed.id),
+                recovered_task_id=handled_task_id,
+            )
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="dry_run" if exec_result.status == "dry_run" else "not_dispatchable",
+                slot_consuming=False,
+                work_done=exec_result.work_done,
+                dispatch_budget_consuming=exec_result.worker_consuming and exec_result.work_done,
+                detail=exec_result.success_message or exec_result.message,
+                task=recovered_result_task or failed,
+                launched_task_id=handled_task_id,
+            )
+
+        recovered_task_id = str(exec_result.handled_task_id)
+        if launch_reservation_retarget is not None:
+            launch_reservation_retarget(recovered_task_id)
+        recovered_task = exec_result.created_task or self.store.get(recovered_task_id)
+        self._exclude_recovery_dispatch_tasks_for_pass(
+            failed_task_id=str(failed.id),
+            recovered_task_id=recovered_task_id,
+        )
+        recovery_annotation = _format_expected_start_annotation(
+            _ExpectedStart(
+                recovery_action=recovery_action_type,
+                parent_failed_id=str(failed.id),
+                launch_mode="worker",
+            )
+        )
+        deferred = _DeferredWatchDispatchStart(
+            settle=_PendingWatchDispatchSettle(
+                task_id=recovered_task_id,
+                task_before=_snapshot_watch_dispatch_task(recovered_task),
+                start_label=f"{failed.id} -> {recovered_task_id}",
+                dedupe_key=f"recovery-undispatched:{recovery_action_type}:{failed.id}:{recovered_task_id}",
+            ),
+            subject_task=failed,
+            action=recovery_action,
+            action_task_before=action_task,
+            failed_task=failed,
+            owner_task_id=owner_task.id,
+            action_type=recovery_action_type,
+            start_message=(
+                _format_start_line(recovered_task, recovery_annotation=recovery_annotation)
+                if recovered_task is not None
+                else f"{recovered_task_id} [{recovery_action_type} of {failed.id}]"
+            ),
+            reserve_recovery_slot=True,
+        )
+        [settle_result] = self.settle_dispatch_starts([deferred.settle])
+        started, no_progress_attention = _emit_deferred_watch_dispatch_outcome(
+            config=self.config,
+            store=self.store,
+            log=self.log,
+            deferred=deferred,
+            settle_result=settle_result,
+        )
+        if no_progress_attention is not None:
+            self.log.emit_attention(
+                attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
+                message=_watch_needs_attention_message(failed, no_progress_attention),
+            )
+        self._exclude_recovery_dispatch_tasks_for_pass(
+            failed_task_id=str(failed.id),
+            recovered_task_id=recovered_task_id,
+        )
+        if started:
+            self._confirmed_started_task_ids.add(recovered_task_id)
+            self.expected_starts[recovered_task_id] = _ExpectedStart(
+                recovery_action=recovery_action_type,
+                parent_failed_id=str(failed.id),
+                launch_mode="worker",
+            )
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="live",
+                slot_consuming=True,
+                work_done=True,
+                dispatch_budget_consuming=True,
+                detail=settle_result.reason,
+                task=settle_result.task or recovered_task,
+                launched_task_id=recovered_task_id,
+            )
+        if settle_result.status is _DispatchSettleStatus.TERMINAL_BEFORE_RUNNING:
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="terminal_before_running",
+                slot_consuming=False,
+                work_done=False,
+                detail=settle_result.reason,
+                task=settle_result.task,
+                launched_task_id=recovered_task_id,
+            )
+        return ProjectDispatchResult(
+            runtime_key=self.key,
+            candidate=candidate,
+            status="no_live_proof",
+            slot_consuming=False,
+            work_done=False,
+            detail=settle_result.reason,
+            task=settle_result.task,
+            launched_task_id=recovered_task_id,
+        )
+
+    def dispatch_recovery_candidate(
+        self,
+        candidate: ProjectDispatchCandidate,
+        *,
+        max_iterations: int,
+        dry_run: bool = False,
+        quiet: bool = False,
+        analysis: ProjectCycleAnalysis | None = None,
+        launch_reservation_retarget: Callable[[str], None] | None = None,
+    ) -> ProjectDispatchResult:
+        """Dispatch one worker-consuming recovery candidate through runtime-owned machinery."""
+        if analysis is not None:
+            self._validate_analysis(analysis)
+        effective_max_recovery_attempts = (
+            candidate.max_recovery_attempts
+            if candidate.max_recovery_attempts is not None
+            else self.config.max_resume_attempts
+        )
+        preflight = self._preflight_recovery_dispatch_candidate(
+            candidate,
+            max_recovery_attempts=effective_max_recovery_attempts,
+            dry_run=dry_run,
+        )
+        if not preflight.dispatchable:
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="not_dispatchable",
+                slot_consuming=False,
+                work_done=False,
+                detail=preflight.detail,
+                task=preflight.task,
+            )
+
+        failed = preflight.task
+        decision = preflight.decision
+        recovery_action = preflight.recovery_action
+        assert failed is not None
+        assert failed.id is not None
+        assert decision is not None
+        assert recovery_action is not None
+        owner_task = preflight.owner_task or failed
+        action_task = preflight.action_task or failed
+        assert owner_task is not None
+        assert action_task is not None
+        recovery_action_type = str(recovery_action.get("type", decision.action))
+        if recovery_action_type not in {"resume", "retry"}:
+            return self._dispatch_recovery_advance_action(
+                candidate=candidate,
+                failed=failed,
+                decision=decision,
+                recovery_action=recovery_action,
+                owner_task=owner_task,
+                action_task=action_task,
+                max_iterations=max_iterations,
+                max_recovery_attempts=effective_max_recovery_attempts,
+                dry_run=dry_run,
+                quiet=quiet,
+                analysis=analysis,
+                launch_reservation_retarget=launch_reservation_retarget,
+            )
+
+        if dry_run:
+            destination = decision.recovery_task_id or "(new task)"
+            owner_id = owner_task.id if owner_task.id is not None else failed.id
+            self.log.emit(
+                "RECOVR",
+                (
+                    f"{failed.id} {recovery_action_type} via {decision.launch_mode} -> {destination} "
+                    f"[owner={owner_id}] "
+                    f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit}) "
+                    "[dry-run]"
+                ),
+            )
+            self._exclude_pending_dispatch_candidate_for_pass(str(failed.id))
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="dry_run",
+                slot_consuming=False,
+                work_done=True,
+                dispatch_budget_consuming=True,
+                task=failed,
+            )
+
+        try:
+            permit = launch_permit(self.config, self.store)
+        except MaxConcurrentTasksError as exc:
+            self.log.emit(
+                "SKIP",
+                f"{failed.id}: {exc}",
+                dedupe_key=f"watch-max-concurrent:{recovery_action_type}:{failed.id}",
+            )
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="local_capacity_blocked",
+                slot_consuming=False,
+                work_done=False,
+                detail=str(exc),
+                task=failed,
+            )
+
+        owned_launch_permit: LaunchPermit | None = permit
+        reserved_launch_permit_task_id: str | None = None
+        recovered_task: DbTask | None = None
+        recovered_task_before: _WatchDispatchTaskSnapshot | None = None
+        recovered_task_id: str | None = None
+        rc = 1
+        try:
+            if decision.reuse_existing:
+                assert decision.recovery_task_id is not None
+                recovered_task_id = decision.recovery_task_id
+                recovered_task = self.store.get(recovered_task_id)
+                if recovered_task is None:
+                    permit.release()
+                    owned_launch_permit = None
+                    self._exclude_pending_dispatch_candidate_for_pass(str(failed.id))
+                    return ProjectDispatchResult(
+                        runtime_key=self.key,
+                        candidate=candidate,
+                        status="launch_blocked",
+                        slot_consuming=False,
+                        work_done=False,
+                        detail=f"recovery task {recovered_task_id} is missing",
+                        task=failed,
+                    )
+                if launch_reservation_retarget is not None:
+                    launch_reservation_retarget(recovered_task_id)
+                self._exclude_recovery_dispatch_tasks_for_pass(
+                    failed_task_id=str(failed.id),
+                    recovered_task_id=recovered_task_id,
+                )
+            else:
+                try:
+                    if recovery_action_type == "resume":
+                        recovered_task = _create_resume_task(
+                            self.store,
+                            failed,
+                            config=self.config,
+                            trigger_source="watch",
+                        )
+                    else:
+                        recovered_task = _create_retry_task(
+                            self.store,
+                            failed,
+                            config=self.config,
+                            trigger_source="watch",
+                            automatic_recovery=True,
+                        )
+                except DuplicateActiveChildError as exc:
+                    permit.release()
+                    owned_launch_permit = None
+                    detail = format_duplicate_active_child_message(
+                        exc,
+                        parent_task_id=str(failed.id),
+                        task=failed,
+                    )
+                    self.log.emit(
+                        "SKIP",
+                        f"{failed.id}: {detail}",
+                        dedupe_key=(
+                            f"recovery-{recovery_action_type}-duplicate:{failed.id}:{exc.active_child.id}"
+                        ),
+                    )
+                    self._exclude_recovery_dispatch_tasks_for_pass(
+                        failed_task_id=str(failed.id),
+                        recovered_task_id=exc.active_child.id,
+                    )
+                    return ProjectDispatchResult(
+                        runtime_key=self.key,
+                        candidate=candidate,
+                        status="launch_blocked",
+                        slot_consuming=False,
+                        work_done=False,
+                        detail=detail,
+                        task=exc.active_child,
+                        launched_task_id=exc.active_child.id,
+                    )
+                except ConfigError as exc:
+                    permit.release()
+                    owned_launch_permit = None
+                    detail = str(exc)
+                    self.log.emit(
+                        "SKIP",
+                        f"{failed.id}: {detail}",
+                        dedupe_key=f"recovery-{recovery_action_type}-config:{failed.id}",
+                    )
+                    self._exclude_pending_dispatch_candidate_for_pass(str(failed.id))
+                    return ProjectDispatchResult(
+                        runtime_key=self.key,
+                        candidate=candidate,
+                        status="launch_blocked",
+                        slot_consuming=False,
+                        work_done=False,
+                        detail=detail,
+                        task=failed,
+                    )
+                assert recovered_task.id is not None
+                recovered_task_id = str(recovered_task.id)
+                if launch_reservation_retarget is not None:
+                    launch_reservation_retarget(recovered_task_id)
+                self._exclude_recovery_dispatch_tasks_for_pass(
+                    failed_task_id=str(failed.id),
+                    recovered_task_id=recovered_task_id,
+                )
+
+            prepared_recovered_task = _prepare_task_for_immediate_execution(
+                self.config,
+                recovered_task,
+                rollback_on_failure=not decision.reuse_existing,
+                store=self.store,
+                runtime_context=self.runtime_context,
+            )
+            if prepared_recovered_task is None:
+                permit.release()
+                owned_launch_permit = None
+                self._exclude_recovery_dispatch_tasks_for_pass(
+                    failed_task_id=str(failed.id),
+                    recovered_task_id=recovered_task_id,
+                )
+                return ProjectDispatchResult(
+                    runtime_key=self.key,
+                    candidate=candidate,
+                    status="launch_blocked",
+                    slot_consuming=False,
+                    work_done=True,
+                    detail=f"failed to prepare {recovery_action_type} task {recovered_task_id}",
+                    task=recovered_task,
+                    launched_task_id=recovered_task_id,
+                )
+            recovered_task = prepared_recovered_task
+            recovered_task_id = str(prepared_recovered_task.id)
+            if launch_reservation_retarget is not None:
+                launch_reservation_retarget(recovered_task_id)
+            reserved_launch_permit_task_id = recovered_task_id
+            reserve_task_launch_permit(recovered_task_id, permit)
+            owned_launch_permit = None
+            recovered_task_before = _snapshot_watch_dispatch_task(prepared_recovered_task)
+
+            if recovery_action_type == "resume" and decision.launch_mode == "worker":
+                rc = _spawn_worker_with_failure_log(
+                    quiet=quiet,
+                    log=self.log,
+                    failure_message=f"{failed.id} -> {recovered_task_id}: resume worker spawn failed",
+                    dedupe_key=f"spawn-resume-failed:{failed.id}:{recovered_task_id}",
+                    spawn_fn=lambda: _spawn_background_resume_worker(
+                        argparse.Namespace(no_docker=False, max_turns=None),
+                        self.config,
+                        recovered_task_id,
+                        quiet=quiet,
+                        prepared_task=prepared_recovered_task,
+                        startup_quiet=True,
+                        runtime_context=self.runtime_context,
+                    ),
+                )
+            elif recovery_action_type == "retry" and decision.launch_mode == "worker":
+                rc = _spawn_worker_with_failure_log(
+                    quiet=quiet,
+                    log=self.log,
+                    failure_message=f"{failed.id} -> {recovered_task_id}: worker spawn failed",
+                    dedupe_key=f"spawn-worker-failed:{failed.id}:{recovered_task_id}",
+                    spawn_fn=lambda: _spawn_background_worker(
+                        argparse.Namespace(no_docker=False, max_turns=None, resume=False),
+                        self.config,
+                        task_id=recovered_task_id,
+                        quiet=quiet,
+                        prepared_task=prepared_recovered_task,
+                        startup_quiet=True,
+                        runtime_context=self.runtime_context,
+                    ),
+                )
+            else:
+                rc = _spawn_worker_with_failure_log(
+                    quiet=quiet,
+                    log=self.log,
+                    failure_message=f"{failed.id} -> {recovered_task_id}: iterate worker spawn failed",
+                    dedupe_key=f"spawn-iterate-failed:{failed.id}:{recovered_task_id}",
+                    spawn_fn=lambda: _spawn_background_iterate(
+                        argparse.Namespace(
+                            max_iterations=max_iterations,
+                            no_docker=False,
+                            resume=False,
+                            retry=False,
+                            auto_iterate=True,
+                        ),
+                        self.config,
+                        prepared_recovered_task,
+                        prepared_task_id=recovered_task_id,
+                        prepared_resume=recovery_action_type == "resume",
+                        prepared_phase="preloop",
+                        startup_quiet=True,
+                        runtime_context=self.runtime_context,
+                    ),
+                )
+        finally:
+            if reserved_launch_permit_task_id is not None:
+                release_task_launch_permit(reserved_launch_permit_task_id)
+            if owned_launch_permit is not None:
+                owned_launch_permit.release()
+
+        if rc != 0:
+            detail = (
+                f"{failed.id} -> {recovered_task_id}: worker spawn failed"
+                if decision.launch_mode == "worker"
+                else f"{failed.id} -> {recovered_task_id}: iterate worker spawn failed"
+            )
+            self._exclude_recovery_dispatch_tasks_for_pass(
+                failed_task_id=str(failed.id),
+                recovered_task_id=recovered_task_id,
+            )
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="launch_blocked",
+                slot_consuming=False,
+                work_done=False,
+                detail=detail,
+                task=recovered_task,
+                launched_task_id=recovered_task_id,
+            )
+
+        assert recovered_task is not None
+        assert recovered_task_id is not None
+        recovery_annotation = _format_expected_start_annotation(
+            _ExpectedStart(
+                recovery_action=recovery_action_type,
+                parent_failed_id=str(failed.id),
+                launch_mode=decision.launch_mode,
+            )
+        )
+        deferred = _DeferredWatchDispatchStart(
+            settle=_PendingWatchDispatchSettle(
+                task_id=recovered_task_id,
+                task_before=recovered_task_before,
+                start_label=f"{failed.id} -> {recovered_task_id}",
+                dedupe_key=f"recovery-undispatched:{recovery_action_type}:{failed.id}:{recovered_task_id}",
+            ),
+            subject_task=failed,
+            action=recovery_action,
+            action_task_before=failed,
+            failed_task=failed,
+            owner_task_id=owner_task.id,
+            action_type=recovery_action_type,
+            start_message=_format_start_line(
+                recovered_task,
+                recovery_annotation=recovery_annotation,
+            ),
+            reserve_recovery_slot=True,
+        )
+        [settle_result] = self.settle_dispatch_starts([deferred.settle])
+        started, no_progress_attention = _emit_deferred_watch_dispatch_outcome(
+            config=self.config,
+            store=self.store,
+            log=self.log,
+            deferred=deferred,
+            settle_result=settle_result,
+        )
+        if no_progress_attention is not None:
+            self.log.emit_attention(
+                attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
+                message=_watch_needs_attention_message(failed, no_progress_attention),
+            )
+        self._exclude_recovery_dispatch_tasks_for_pass(
+            failed_task_id=str(failed.id),
+            recovered_task_id=recovered_task_id,
+        )
+        if started:
+            self._confirmed_started_task_ids.add(recovered_task_id)
+            self.expected_starts[recovered_task_id] = _ExpectedStart(
+                recovery_action=recovery_action_type,
+                parent_failed_id=str(failed.id),
+                launch_mode=decision.launch_mode,
+            )
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="live",
+                slot_consuming=True,
+                work_done=True,
+                dispatch_budget_consuming=True,
+                detail=settle_result.reason,
+                task=settle_result.task,
+                launched_task_id=recovered_task_id,
+            )
+        if settle_result.status is _DispatchSettleStatus.TERMINAL_BEFORE_RUNNING:
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="terminal_before_running",
+                slot_consuming=False,
+                work_done=False,
+                detail=settle_result.reason,
+                task=settle_result.task,
+                launched_task_id=recovered_task_id,
+            )
+        return ProjectDispatchResult(
+            runtime_key=self.key,
+            candidate=candidate,
+            status="no_live_proof",
+            slot_consuming=False,
+            work_done=False,
+            detail=settle_result.reason,
+            task=settle_result.task,
+            launched_task_id=recovered_task_id,
         )
 
     def dispatch_pending_candidate(
