@@ -13706,9 +13706,13 @@ class SqliteTaskStore:
         if not self.supports_merge_units():
             return 0
         repaired = 0
-        for unit in self.list_active_merge_units(states=("unmerged",)):
+        units = self.list_active_merge_units(states=("unmerged",))
+        # Load every unit's members in one chunked pass: this repair runs from the store
+        # constructor, so a per-unit query here is a per-command cost on large projects.
+        members_by_unit_id = self.list_tasks_for_merge_units(unit.id for unit in units)
+        for unit in units:
             implement_members = [
-                task for task in self.list_tasks_for_merge_unit(unit.id) if task.task_type == "implement"
+                task for task in members_by_unit_id.get(unit.id, ()) if task.task_type == "implement"
             ]
             if len(implement_members) < 2:
                 continue
