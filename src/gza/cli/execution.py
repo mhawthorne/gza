@@ -4733,6 +4733,37 @@ def _determine_selected_iterate_action_for_args(
     return action
 
 
+class _RetryableChildProbeError(RuntimeError):
+    """Raised when a completed-owner retry probe cannot resolve lifecycle state."""
+
+
+def _probe_completed_task_retry_action(
+    config: Any,
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    max_resume_attempts: int,
+    force: bool,
+) -> dict[str, Any]:
+    try:
+        retry_probe_git = Git(config.project_dir)
+        retry_probe_target_branch = retry_probe_git.current_branch()
+        return _determine_selected_iterate_action_for_args(
+            _build_iterate_engine_config(
+                config,
+                max_resume_attempts=max_resume_attempts,
+            ),
+            store,
+            retry_probe_git,
+            task,
+            retry_probe_target_branch,
+            max_resume_attempts=max_resume_attempts,
+            force=force,
+        )
+    except Exception as exc:
+        raise _RetryableChildProbeError(f"{type(exc).__name__}: {exc}") from exc
+
+
 def _iterate_action_description(action: dict[str, Any]) -> str:
     """Return a user-facing description for an iterate action."""
     description = action.get("description")
@@ -4966,6 +4997,30 @@ def _cmd_iterate_impl(
             use_retry = False
         else:
             flag = "--resume" if use_resume else "--retry"
+            if use_retry and impl_task.status == "completed":
+                try:
+                    retry_probe_action = _probe_completed_task_retry_action(
+                        config,
+                        store,
+                        impl_task,
+                        max_resume_attempts=effective_max_resume_attempts,
+                        force=force,
+                    )
+                except _RetryableChildProbeError as exc:
+                    return phase1_error(
+                        args,
+                        f"{flag} was given for completed task {impl_task.id}, but the retryable failed task "
+                        f"could not be determined: {exc}",
+                    )
+                if isinstance(retry_probe_action, dict) and retry_probe_action.get("type") == "retry":
+                    failed_child = retry_probe_action.get("failed_task")
+                    if isinstance(failed_child, DbTask) and failed_child.id is not None:
+                        return phase1_error(
+                            args,
+                            f"{flag} was given for completed task {impl_task.id}, but the retryable failed task is "
+                            f"{failed_child.id} ({failed_child.task_type}). Run iterate without {flag} to let "
+                            "lifecycle dispatch that retry, or retry that task directly.",
+                        )
             return phase1_error(
                 args,
                 f"{flag} is only valid for failed tasks (task {impl_task.id} is {impl_task.status}).",
@@ -5536,6 +5591,44 @@ def _cmd_iterate_impl(
                 ),
             )
 
+    def _resolve_iterate_retry_start(
+        selected_action: dict[str, Any],
+        *,
+        fallback_failed_task: DbTask,
+        trigger_source: str,
+        permit: LaunchPermit | None = None,
+    ) -> tuple[DbTask | None, bool, str | None]:
+        failed_task = selected_action.get("failed_task")
+        task_to_retry = failed_task if isinstance(failed_task, DbTask) else fallback_failed_task
+        if task_to_retry.id is None:
+            if isinstance(permit, LaunchPermit):
+                permit.release()
+            return None, False, "selected retry task is missing an id"
+
+        retry_task_id = selected_action.get("recovery_task_id")
+        reuse_existing = bool(selected_action.get("reuse_existing", False))
+        if reuse_existing:
+            if not isinstance(retry_task_id, str):
+                if isinstance(permit, LaunchPermit):
+                    permit.release()
+                return None, False, "selected retry action is missing an existing recovery task id"
+            existing_retry = store.get(retry_task_id)
+            if existing_retry is None:
+                if isinstance(permit, LaunchPermit):
+                    permit.release()
+                return None, False, f"pending retry child {retry_task_id} selected by recovery policy was not found"
+            return existing_retry, False, None
+
+        retry_task, duplicate_message = _create_iterate_recovery_clone(
+            task_to_retry,
+            recovery_action="retry",
+            trigger_source=trigger_source,
+            permit=permit,
+        )
+        if duplicate_message is not None or retry_task is None:
+            return None, True, duplicate_message
+        return retry_task, True, None
+
     def _create_selected_iterate_review_task(
         selected_action: dict[str, Any],
         review_target: DbTask,
@@ -5666,6 +5759,36 @@ def _cmd_iterate_impl(
                             if isinstance(verify_owner_task, DbTask) and verify_owner_task.id is not None
                             else None
                         ),
+                    ),
+                    None,
+                )
+
+            if action_type == "retry":
+                permit = _reserve_iterate_launch()
+                if permit is False:
+                    return None, 1
+                action_task, rollback_on_failure, error_message = _resolve_iterate_retry_start(
+                    initial_action,
+                    fallback_failed_task=iterate_task,
+                    trigger_source="auto-recovery",
+                    permit=permit,
+                )
+                if error_message is not None or action_task is None:
+                    print_phase1_message(args, f"Skipping retry recovery: {error_message}.")
+                    return None, 0
+                prepared_task = _prepare_reserved_iterate_task(
+                    action_task,
+                    permit=permit,
+                    rollback_on_failure=rollback_on_failure,
+                )
+                if prepared_task is None:
+                    return None, 1
+                return (
+                    _PreparedIterateStart(
+                        task=prepared_task,
+                        initial_resume=False,
+                        phase="iteration",
+                        action_type="retry",
                     ),
                     None,
                 )
@@ -7424,6 +7547,57 @@ def _cmd_iterate_impl(
                 action_task = maybe_action_task
             assert action_task.id is not None
             print(f"  Running pending verify_fix {action_task.id}...")
+        elif action_type == "retry":
+            if isinstance(prepared_action_task, DbTask):
+                action_task = prepared_action_task
+            else:
+                permit_candidate = _reserve_iterate_launch()
+                if permit_candidate is False:
+                    final_status = "blocked"
+                    final_stop_reason = "retry_failed"
+                    break
+                permit_for_retry: LaunchPermit | None = permit_candidate
+                created_retry_task, rollback_on_failure, duplicate_message = _resolve_iterate_retry_start(
+                    action,
+                    fallback_failed_task=impl_task,
+                    trigger_source="manual",
+                    permit=permit_for_retry,
+                )
+                if duplicate_message is not None or created_retry_task is None:
+                    print(f"  Error creating retry task: {duplicate_message}")
+                    final_status = "blocked"
+                    final_stop_reason = "retry_failed"
+                    _append_summary_row(
+                        summary_rows,
+                        iteration_index=iteration,
+                        task_type="retry",
+                        task=None,
+                        status="failed",
+                        failure_reason=duplicate_message,
+                    )
+                    break
+                if isinstance(permit_for_retry, LaunchPermit):
+                    prepared_retry_task = _prepare_reserved_iterate_task(
+                        created_retry_task,
+                        permit=permit_for_retry,
+                        rollback_on_failure=rollback_on_failure,
+                    )
+                    if prepared_retry_task is None:
+                        final_status = "blocked"
+                        final_stop_reason = "retry_failed"
+                        _append_summary_row(
+                            summary_rows,
+                            iteration_index=iteration,
+                            task_type="retry",
+                            task=None,
+                            status="failed",
+                        )
+                        break
+                    action_task = prepared_retry_task
+                else:
+                    action_task = created_retry_task
+            assert action_task.id is not None
+            print(f"  Running retry {action_task.id}...")
         elif action_type == "improve":
             if isinstance(prepared_action_task, DbTask):
                 action_task = prepared_action_task

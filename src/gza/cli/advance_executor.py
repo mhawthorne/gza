@@ -3461,7 +3461,9 @@ def execute_advance_action(
         return result
 
     if action_type == "retry":
-        if task.id is None:
+        failed_task = action.get("failed_task")
+        task_to_retry = failed_task if isinstance(failed_task, DbTask) else task
+        if task_to_retry.id is None:
             return AdvanceActionExecutionResult(action_type=action_type, status="skip", message="missing task id")
         if context.dry_run:
             return AdvanceActionExecutionResult(
@@ -3470,9 +3472,10 @@ def execute_advance_action(
                 message=action.get("description", "Retry failed task"),
                 worker_consuming=True,
                 work_done=True,
+                handled_task_id=task_to_retry.id,
             )
 
-        launch_mode = str(action.get("launch_mode") or ("iterate" if task.task_type == "implement" else "worker"))
+        launch_mode = str(action.get("launch_mode") or ("iterate" if task_to_retry.task_type == "implement" else "worker"))
         retry_task_id = action.get("recovery_task_id")
         reuse_existing = bool(action.get("reuse_existing", False))
         permit, blocked = _reserve_background_launch(
@@ -3502,13 +3505,13 @@ def execute_advance_action(
                     message="missing retry task factory",
                 )
             try:
-                retry_task = context.create_retry_task(task)
+                retry_task = context.create_retry_task(task_to_retry)
             except DuplicateActiveChildError as exc:
                 return _skip_duplicate_recovery_creation(
                     action_type=action_type,
                     permit=permit,
                     exc=exc,
-                    task=task,
+                    task=task_to_retry,
                 )
             except ConfigError as exc:
                 return _task_creation_config_error_result(
@@ -3537,7 +3540,7 @@ def execute_advance_action(
                 assert prepare_error is not None
                 return prepare_error
             assert prepared_retry_task.id is not None
-            rc = context.spawn_iterate_recovery(task, "retry", prepared_retry_task)
+            rc = context.spawn_iterate_recovery(task_to_retry, "retry", prepared_retry_task)
             worker_label = "iterate"
             handled_task = prepared_retry_task
         else:
@@ -3553,7 +3556,7 @@ def execute_advance_action(
                 assert prepare_error is not None
                 return prepare_error
             assert prepared_retry_task.id is not None
-            rc = context.spawn_worker(prepared_retry_task, task.task_type or "task")
+            rc = context.spawn_worker(prepared_retry_task, task_to_retry.task_type or "task")
             worker_label = "retry"
             handled_task = prepared_retry_task
         _release_reserved_launch_if_left(handled_task)

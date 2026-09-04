@@ -6598,6 +6598,51 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext, *, phase: str = "pre_revi
                 ),
                 phase=phase,
             )
+        if existing.status == "failed":
+            recovery_decision = decide_failed_task_recovery(
+                ctx.store,
+                existing,
+                max_recovery_attempts=ctx.max_resume_attempts,
+            )
+            if recovery_decision.action == "retry":
+                recovery_action = failed_recovery_decision_to_action(existing, recovery_decision)
+                recovery_action.update(
+                    {
+                        "description": f"Retry failed verify_fix {_task_id(existing)} ({recovery_decision.reason_code})",
+                        "failed_task": existing,
+                        "verify_fix_task": existing,
+                        "verify_epoch": current_epoch,
+                    }
+                )
+                return _with_red_verify_gate_metadata(ctx, recovery_action, phase=phase)
+            if recovery_decision.reason_code == "retry_limit_reached":
+                recovery_detail = (
+                    f"automatic retry attempts exhausted "
+                    f"({recovery_decision.attempt_index}/{recovery_decision.attempt_limit})"
+                )
+            else:
+                recovery_detail = (
+                    f"recovery decision is {recovery_decision.action} "
+                    f"({recovery_decision.reason_code}: {recovery_decision.reason_text})"
+                )
+            return _with_red_verify_gate_metadata(
+                ctx,
+                with_needs_attention(
+                    {
+                        "type": "needs_discussion",
+                        "description": (
+                            f"SKIP: verify_fix task {_task_id(existing)} is failed; "
+                            f"{recovery_detail}; review cannot continue"
+                        ),
+                        "verify_fix_task": existing,
+                        "verify_epoch": current_epoch,
+                        "recovery_decision": recovery_decision,
+                    },
+                    reason=PARK_REASON_VERIFY_FAILED_NEEDS_FIX,
+                    subject_task_id=existing.id or owner_task.id,
+                ),
+                phase=phase,
+            )
         return _with_red_verify_gate_metadata(
             ctx,
             with_needs_attention(

@@ -468,9 +468,14 @@ epoch.
   known not-started phase names when available. This classification MUST happen before
   looking up or acting on any existing same-epoch `verify_fix`; existing task rows are
   left untouched.
-- If a same-epoch `verify_fix` is already `pending` and the current evidence is not a
-  budget-only timeout, lifecycle MUST `run_verify_fix`. If it is already `in_progress`,
-  lifecycle MUST `wait_verify_fix`.
+- If the current evidence is not a budget-only timeout and a same-epoch `verify_fix`
+  is already `pending`, lifecycle MUST `run_verify_fix`; if it is already
+  `in_progress`, lifecycle MUST `wait_verify_fix`.
+- If a same-epoch `verify_fix` is `failed`, lifecycle MUST apply the shared failed-task
+  recovery policy to that `verify_fix` before parking the implementation owner. A retry
+  decision with remaining attempts MUST dispatch/reuse the verify-fix retry; only
+  non-retry decisions or exhausted retry attempts may park with `verify-failed-needs-fix`,
+  and the park message MUST distinguish those cases.
 - If one same-epoch `verify_fix` attempt completed without source changes and the current
   red verify evidence is structurally classified as timeout-origin, lifecycle MUST rerun
   verification for the exact same head once before treating that `verify_fix` as

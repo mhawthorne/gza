@@ -203,3 +203,4 @@ def test_main_honors_disable_switch(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert exit_code == 0
     assert run_unit_phase.call_args.kwargs["rerun_enabled"] is False
+

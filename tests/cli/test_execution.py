@@ -12960,6 +12960,8 @@ class TestIterateCommand:
             patch("gza.cli.Git", return_value=mock_git),
             patch("gza.cli.execution.Git", return_value=mock_git),
             patch("gza.db.Git", return_value=mock_git, create=True),
+            patch("gza.git.Git.branch_exists", return_value=True),
+            patch("gza.git.Git.rev_parse_if_exists", side_effect=lambda _self, ref: "failed-child-head" if ref == impl.branch else None),
         ):
             result = cmd_iterate(args)
         output = capsys.readouterr().out
@@ -19257,6 +19259,333 @@ class TestIterateCommand:
         assert result.returncode != 0
         output = result.stdout + (result.stderr or "")
         assert "failed" in output.lower()
+
+    def test_retry_flag_on_owner_blocked_by_failed_verify_fix_names_retryable_child(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        impl.branch = "feature/iterate-retry-failed-verify-fix-child"
+        store.update(impl)
+        config, verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
+            store,
+            tmp_path,
+            impl,
+            head_sha="failed-child-head",
+        )
+        verify_fix.status = "failed"
+        verify_fix.completed_at = None
+        verify_fix.failure_reason = "INFRASTRUCTURE_ERROR"
+        verify_fix.branch = impl.branch
+        verify_fix.merge_status = "unmerged"
+        store.update(verify_fix)
+        config.max_resume_attempts = 2
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=True,
+            background=False,
+            force=False,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: "failed-child-head" if ref == impl.branch else None
+
+        with (
+            patch("gza.cli.Config.load", return_value=config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.recovery_engine.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
+            patch("gza.git.Git.branch_exists", return_value=True),
+            patch("gza.git.Git.rev_parse_if_exists", side_effect=lambda ref: "failed-child-head" if ref == impl.branch else None),
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result != 0
+        assert str(verify_fix.id) in output
+        assert "retryable failed task" in output
+        assert f"task {impl.id} is completed" not in output
+
+    def test_retry_flag_on_owner_surfaces_retryable_child_probe_failure(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        impl.branch = "feature/iterate-retry-probe-failure"
+        store.update(impl)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=True,
+            background=False,
+            force=False,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution._determine_selected_iterate_action_for_args",
+                side_effect=RuntimeError("selected action unavailable"),
+            ),
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result != 0
+        assert "retryable failed task could not be determined" in output
+        assert "RuntimeError: selected action unavailable" in output
+        assert f"--retry is only valid for failed tasks (task {impl.id} is completed)" not in output
+
+    def test_iterate_foreground_retries_failed_verify_fix_child_not_completed_owner(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        assert impl.id is not None
+        impl.branch = "feature/iterate-runtime-retry-failed-verify-fix"
+        store.update(impl)
+        config, verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
+            store,
+            tmp_path,
+            impl,
+            head_sha="failed-child-head",
+        )
+        assert verify_fix.id is not None
+        verify_fix.status = "failed"
+        verify_fix.completed_at = datetime.now(UTC)
+        verify_fix.failure_reason = "INFRASTRUCTURE_ERROR"
+        verify_fix.branch = impl.branch
+        verify_fix.merge_status = "unmerged"
+        store.update(verify_fix)
+        config.max_resume_attempts = 2
+        config.max_concurrent = None
+        config.require_review_before_merge = False
+
+        retry_action = {
+            "type": "retry",
+            "description": f"Retry failed verify_fix {verify_fix.id}",
+            "failed_task": verify_fix,
+            "launch_mode": "worker",
+        }
+        merge_action = {
+            "type": "merge",
+            "description": "ready to merge after retry",
+        }
+        run_task_ids: list[str] = []
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            assert task.task_type == "verify_fix"
+            assert task.based_on == verify_fix.id
+            assert task.based_on != impl.id
+            assert task.recovery_origin == "retry"
+            run_task_ids.append(task.id)
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            task.has_commits = True
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
+        mock_git.ref_exists.return_value = False
+        mock_git.is_merged.return_value = False
+        mock_git.rev_parse_if_exists.side_effect = (
+            lambda ref: "failed-child-head"
+            if ref == impl.branch
+            else "base-head"
+            if ref in {"main", "origin/main"}
+            else None
+        )
+
+        with (
+            patch("gza.cli.Config.load", return_value=config),
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.cli.execution.determine_next_action", return_value=retry_action),
+            patch(
+                "gza.cli.execution._determine_selected_iterate_action_for_args",
+                side_effect=[retry_action, merge_action],
+            ),
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground),
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        retry_children = [
+            task
+            for task in store.get_all()
+            if task.task_type == "verify_fix"
+            and task.based_on == verify_fix.id
+            and task.recovery_origin == "retry"
+        ]
+        owner_retry_children = [
+            task
+            for task in store.get_all()
+            if task.based_on == impl.id and task.recovery_origin == "retry"
+        ]
+        assert result == 0
+        assert len(retry_children) == 1
+        assert run_task_ids == [retry_children[0].id]
+        assert owner_retry_children == []
+        assert "Running retry" in output
+        assert "unsupported_action:retry" not in output
+
+    def test_iterate_background_prepares_failed_verify_fix_retry_child_not_owner(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        assert impl.id is not None
+        impl.branch = "feature/iterate-background-retry-failed-verify-fix"
+        store.update(impl)
+        config, verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
+            store,
+            tmp_path,
+            impl,
+            head_sha="failed-child-head",
+        )
+        assert verify_fix.id is not None
+        verify_fix.status = "failed"
+        verify_fix.completed_at = datetime.now(UTC)
+        verify_fix.failure_reason = "INFRASTRUCTURE_ERROR"
+        verify_fix.branch = impl.branch
+        verify_fix.merge_status = "unmerged"
+        store.update(verify_fix)
+        config.max_resume_attempts = 2
+        config.max_concurrent = None
+        config.require_review_before_merge = False
+
+        retry_action = {
+            "type": "retry",
+            "description": f"Retry failed verify_fix {verify_fix.id}",
+            "failed_task": verify_fix,
+            "launch_mode": "worker",
+        }
+        spawned: list[SimpleNamespace] = []
+
+        def fake_spawn_background_iterate(args, config, task, **kwargs):
+            spawned.append(SimpleNamespace(args=args, config=config, task=task, kwargs=kwargs))
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=True,
+            force=False,
+            worker_id=None,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
+        mock_git.ref_exists.return_value = False
+        mock_git.is_merged.return_value = False
+        mock_git.rev_parse_if_exists.side_effect = (
+            lambda ref: "failed-child-head"
+            if ref == impl.branch
+            else "base-head"
+            if ref in {"main", "origin/main"}
+            else None
+        )
+
+        with (
+            patch("gza.cli.Config.load", return_value=config),
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution._determine_selected_iterate_action_for_args",
+                return_value=retry_action,
+            ),
+            patch("gza.cli.execution._spawn_background_iterate", side_effect=fake_spawn_background_iterate),
+        ):
+            result = cmd_iterate(args)
+
+        _ = capsys.readouterr()
+        retry_children = [
+            task
+            for task in store.get_all()
+            if task.task_type == "verify_fix"
+            and task.based_on == verify_fix.id
+            and task.recovery_origin == "retry"
+        ]
+        owner_retry_children = [
+            task
+            for task in store.get_all()
+            if task.based_on == impl.id and task.recovery_origin == "retry"
+        ]
+        assert result == 0
+        assert len(spawned) == 1
+        assert len(retry_children) == 1
+        prepared_retry = retry_children[0]
+        assert spawned[0].task.id == impl.id
+        assert spawned[0].kwargs["prepared_task_id"] == prepared_retry.id
+        assert spawned[0].kwargs["prepared_action_type"] == "retry"
+        assert spawned[0].kwargs["prepared_phase"] == "iteration"
+        assert spawned[0].kwargs["prepared_resume"] is False
+        assert prepared_retry.based_on == verify_fix.id
+        assert prepared_retry.based_on != impl.id
+        assert owner_retry_children == []
 
     def test_resume_and_retry_mutually_exclusive(self, tmp_path: Path):
         """--resume and --retry cannot be used together."""

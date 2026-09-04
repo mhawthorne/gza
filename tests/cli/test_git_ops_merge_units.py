@@ -59,6 +59,9 @@ class _MergeGit:
     def branch_exists(self, branch: str) -> bool:
         return True
 
+    def local_branch_names(self) -> tuple[str, ...]:
+        return ("main",)
+
     def ref_exists(self, ref: str) -> bool:
         return False
 
@@ -286,7 +289,11 @@ def _assert_verify_family_merge_refused(
     ]
     for flags in flag_sets:
         git = fake_git_factory() if fake_git_factory is not None else _MergeGit(tmp_path)
-        with patch("gza.cli.git_ops.Git", lambda project_dir, git=git: git):
+        with (
+            patch("gza.cli.git_ops.Git", lambda project_dir, git=git: git),
+            patch("gza.cli.execution.Git", lambda project_dir, git=git: git),
+            patch("gza.recovery_engine.Git", lambda project_dir, git=git: git),
+        ):
             result = invoke_gza(
                 "merge",
                 str(impl.id),

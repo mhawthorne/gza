@@ -329,6 +329,66 @@ def test_run_review_rejects_selected_head_mismatch(tmp_path: Path) -> None:
     assert reloaded_review.review_verify_head_sha == "stale-head"
 
 
+def test_retry_action_with_failed_task_retries_selected_child_not_owner(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Implement feature", task_type="implement")
+    assert owner.id is not None
+    _mark_completed(owner, branch="feature/retry-owner")
+    owner.has_commits = True
+    store.update(owner)
+    verify_fix = store.add(
+        "Verify fix failed",
+        task_type="verify_fix",
+        based_on=owner.id,
+        same_branch=True,
+        branch=owner.branch,
+    )
+    assert verify_fix.id is not None
+    verify_fix.status = "failed"
+    verify_fix.failure_reason = "INFRASTRUCTURE_ERROR"
+    store.update(verify_fix)
+
+    retry_inputs: list[str] = []
+    spawned: list[tuple[str, str]] = []
+
+    def create_retry_task(task: DbTask) -> DbTask:
+        assert task.id is not None
+        retry_inputs.append(task.id)
+        retry = store.add(
+            task.prompt,
+            task_type=task.task_type,
+            based_on=task.id,
+            same_branch=task.same_branch,
+            branch=task.branch,
+            recovery_origin="retry",
+        )
+        assert retry.id is not None
+        return retry
+
+    context = _base_executor_context(
+        store=store,
+        config=config,
+        create_retry_task=create_retry_task,
+        spawn_worker=lambda task, kind: spawned.append((task.id or "", kind)) or 0,
+    )
+    action = {
+        "type": "retry",
+        "description": "Retry failed verify_fix",
+        "failed_task": verify_fix,
+        "launch_mode": "worker",
+    }
+
+    with patch("gza.git.Git.branch_exists", return_value=False):
+        result = execute_advance_action(task=owner, action=action, context=context)
+
+    assert result.status == "success"
+    assert retry_inputs == [verify_fix.id]
+    assert spawned == [(result.handled_task_id or "", "verify_fix")]
+
+
 @pytest.mark.parametrize(
     ("action_type", "context_overrides", "action_extra", "patch_target"),
     [
