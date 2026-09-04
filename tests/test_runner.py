@@ -4962,6 +4962,46 @@ class TestReviewContextFromChain:
         assert "Fix flaky tests" not in context
         assert "Reduced retry loops" not in context
 
+    def test_review_context_reports_prior_blocker_citations(self, tmp_path: Path):
+        """A re-review must see which code an earlier round blocked on, to scope criterion (3)."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement citations", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review1 = store.add(prompt="Review 1", task_type="review", depends_on=impl_task.id)
+        review1.status = "completed"
+        review1.output_content = (
+            "## Summary\n- Reviewed\n\n"
+            "## Blockers\n\n### B1\n"
+            "Evidence: The retry path swallows the error.\n"
+            "Open-state citation: `src/gza/runner.py:120-140`\n"
+            "Impact: Silent failure.\n"
+            "Required fix: Surface the error.\n"
+            "Required tests: Cover the swallowed path.\n\n"
+            "## Follow-Ups\nNone.\n\n"
+            "Verdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review1)
+
+        improve1 = store.add(
+            prompt="Improve 1",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review1.id,
+        )
+        improve1.status = "completed"
+        store.update(improve1)
+
+        review2 = store.add(prompt="Review 2", task_type="review", depends_on=impl_task.id)
+
+        context = _build_context_from_chain(review2, store, tmp_path, git=None)
+
+        assert "## Improve Lineage Context" in context
+        assert "blocked on: src/gza/runner.py" in context
+
     def test_review_context_bounds_improve_lineage_and_reports_omitted(self, tmp_path: Path):
         """Review context includes only recent iteration rows and reports omitted count."""
         db_path = tmp_path / "test.db"

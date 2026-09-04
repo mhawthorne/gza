@@ -169,6 +169,7 @@ from .review_tasks import (
     resolve_verify_fix_task_identity,
 )
 from .review_verdict import (
+    ParsedReviewReport,
     ReviewFinding,
     classify_review_blocker_finding,
     compute_review_score,
@@ -2823,6 +2824,7 @@ DIFF_SMALL_THRESHOLD = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
 DIFF_MEDIUM_THRESHOLD = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
 REVIEW_CONTEXT_FILE_LIMIT = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
 REVIEW_IMPROVE_LINEAGE_LIMIT = 5
+REVIEW_IMPROVE_LINEAGE_CITATION_LIMIT = 6
 REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
 REVIEW_VERIFY_OUTPUT_MAX_CHARS = 4000
 AUTONOMOUS_VERIFY_TIMEOUT_SECONDS = DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS
@@ -7596,8 +7598,31 @@ def _build_review_improve_lineage_context(review_task: Task, impl_task: Task, st
             f"verdict={verdict or 'unknown'} score={score} -> "
             f"improve {improve.id or '?'} status={improve.status or 'unknown'} completed={completed}"
         )
+        prior_blocker_citations = _review_blocker_citations(review_report)
+        if prior_blocker_citations:
+            lines.append(f"  blocked on: {', '.join(prior_blocker_citations)}")
 
     return "\n".join(lines)
+
+
+def _review_blocker_citations(report: ParsedReviewReport | None) -> list[str]:
+    """Return the source paths a prior review's BLOCKERs cited, most specific first.
+
+    A re-review needs to know which code an earlier round already blocked on so it can
+    tell a still-open blocker from a newly discovered defect in untouched code.
+    """
+    if report is None:
+        return []
+    citations: list[str] = []
+    for finding in report.findings:
+        if finding.severity != "BLOCKER":
+            continue
+        raw = finding.open_state_citation or ""
+        for candidate in re.findall(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9_]+(?::\d+(?:-\d+)?)?", raw):
+            path = candidate.split(":", 1)[0]
+            if path not in citations:
+                citations.append(path)
+    return citations[:REVIEW_IMPROVE_LINEAGE_CITATION_LIMIT]
 
 
 def _parse_changed_files_from_numstat(numstat_output: str) -> list[str]:
