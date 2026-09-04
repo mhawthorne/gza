@@ -102,8 +102,7 @@ If changes were stashed in Step 1, run `git -C "$GZA_WORKTREE_ROOT" stash pop` t
 
 Rebase is a prerequisite step, not a merge decision point — the project's full `verify_command` gate already runs downstream (at merge time / by the watch runner), so do not re-run it here. Re-running the full suite in every rebase duplicates that gate and wastes significant wall-clock time for no additional safety.
 
-- Before targeted verification, read `verify_command` directly from `gza.yaml`; if `uv run gza config` is available, use it only as optional confirmation, and do not treat `gza config` failure as an error when `gza.yaml` was readable.
-- After the rebase is fully complete, after any stashed changes have been restored, run targeted tests covering only the files touched by conflict resolution or the rebase itself. Use `inner_verify_command` when configured, otherwise use the project `verify_command` to identify the relevant test command(s).
+- After the rebase is fully complete and any stashed changes have been restored, run targeted tests covering only the files touched by conflict resolution or the rebase itself. Use `inner_verify_command` when configured, otherwise run the relevant test file(s)/module(s) directly.
 - Fix any failures you surface in your own context and do not declare success until targeted verification passes.
 - Do not run the full `verify_command` as part of this skill. If you believe a full-suite run is warranted, say so in your summary rather than running it yourself.
 

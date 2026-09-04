@@ -4,15 +4,9 @@ import ast
 from datetime import UTC, datetime
 from pathlib import Path
 
-import gza.colors as _colors
 from gza.console import truncate
 from gza.db import SqliteTaskStore
 from gza.task_query import LineageRow, PresentationSpec, TaskQuery, TaskQueryResult
-
-
-def _colored_id(task_id: str) -> str:
-    task_id_color = _colors.TASK_COLORS.task_id
-    return f"[{task_id_color}]{task_id}[/{task_id_color}]"
 
 
 def _store(tmp_path: Path) -> SqliteTaskStore:
@@ -55,7 +49,7 @@ def test_one_line_uses_headline_prompt_and_drops_context(tmp_path: Path) -> None
     rendered = result.render()
 
     assert rendered == (
-        f"{_colored_id(owner.id)}: Retry failed task (PREREQUISITE_UNMERGED) — {truncate(first_line, 100)}"
+        f"{owner.id}: Retry failed task (PREREQUISITE_UNMERGED) — {truncate(first_line, 100)}"
     )
     assert "Full prompt body that should not render" not in rendered
     assert root.prompt not in rendered
@@ -102,7 +96,7 @@ def test_one_line_omits_unresolved_task_list(tmp_path: Path) -> None:
 
     rendered = result.render()
 
-    assert rendered == f"{_colored_id(owner.id)}: Needs attention — Owner prompt"
+    assert rendered == f"{owner.id}: Needs attention — Owner prompt"
     assert failed.prompt not in rendered
     assert dropped.prompt not in rendered
     assert completed.prompt not in rendered
@@ -128,7 +122,7 @@ def test_one_line_renders_merge_reason(tmp_path: Path) -> None:
     )
 
     rendered = result.render()
-    assert rendered == f"{_colored_id(owner.id)}: Merge branch into main — Owner prompt"
+    assert rendered == f"{owner.id}: Merge branch into main — Owner prompt"
 
 
 def test_task_presenters_has_no_unused_import_bindings() -> None:

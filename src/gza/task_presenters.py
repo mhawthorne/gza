@@ -128,8 +128,6 @@ def _render_one_line(result: TaskQueryResult) -> str:
             owner = lineage_row.owner_task
             values = lineage_row.values
             owner_id = str(values.get("id", owner.id or "unknown"))
-            task_id_color = _colors.TASK_COLORS.task_id
-            colored_owner_id = f"[{task_id_color}]{owner_id}[/{task_id_color}]"
             owner_prompt = _headline_prompt(str(values.get("prompt", owner.prompt)))
             reason = lineage_row.values.get("next_action_reason")
 
@@ -141,22 +139,20 @@ def _render_one_line(result: TaskQueryResult) -> str:
                     )
                     if reason == parked_prereq_reason:
                         reason = "SKIP: legacy prereq parked"
-                prefix = f"{colored_owner_id}: {reason} — "
+                prefix = f"{owner_id}: {reason} — "
                 lines.append(f"{prefix}{owner_prompt}")
                 continue
 
             unresolved_count = len(lineage_row.unresolved_tasks)
             lines.append(
-                f"{colored_owner_id}: unresolved lineage ({unresolved_count} task{'s' if unresolved_count != 1 else ''})"
+                f"{owner_id}: unresolved lineage ({unresolved_count} task{'s' if unresolved_count != 1 else ''})"
                 f" — {owner_prompt}"
             )
             continue
 
         task_row: TaskRow = row
         task = task_row.task
-        task_id_color = _colors.TASK_COLORS.task_id
-        colored_task_id = f"[{task_id_color}]{task.id or 'unknown'}[/{task_id_color}]"
-        lines.append(f"{colored_task_id}: {task.status}")
+        lines.append(f"{task.id or 'unknown'}: {task.status}")
 
     return "\n".join(lines)
 
