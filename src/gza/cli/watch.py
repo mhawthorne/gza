@@ -516,6 +516,7 @@ def _main_verify_remediation_prompt(
             "Required outcome:",
             "- restore a stable green local main integration verify result for this failure signature",
             "- add targeted regression coverage for the failing phase or flake mode",
+            "- touch only the files needed to fix this failure signature; do not include unrelated refactors, cleanups, or other changes in the diff",
             "",
             "While iterating, run only the targeted test(s) for the failing phase (e.g. a single file or -k selection), not the full suite.",
             "Do not run the full project verify command yourself — the runner re-verifies automatically after you finish.",
