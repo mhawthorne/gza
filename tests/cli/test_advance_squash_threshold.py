@@ -68,6 +68,7 @@ def _mock_git(*, current_branch: str = "main", can_merge: bool = True, commit_co
     git.branch_exists.return_value = True
     git.ref_exists.return_value = False
     git.can_merge.return_value = can_merge
+    git.count_commits_behind.return_value = 0
     git.count_commits_ahead.return_value = commit_count
     git.count_commits_ahead_checked.return_value = commit_count
     return git

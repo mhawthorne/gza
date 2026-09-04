@@ -16512,6 +16512,7 @@ class TestExtractedRunInnerHelpers:
 
         lifecycle_git = Mock()
         lifecycle_git.can_merge.return_value = True
+        lifecycle_git.count_commits_behind.return_value = 0
         lifecycle_git.is_merged.return_value = False
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
@@ -17337,6 +17338,7 @@ class TestExtractedRunInnerHelpers:
 
         lifecycle_git = Mock()
         lifecycle_git.can_merge.return_value = True
+        lifecycle_git.count_commits_behind.return_value = 0
         lifecycle_git.is_merged.return_value = False
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
@@ -26046,6 +26048,7 @@ class TestProviderPromptSanitization:
 
         lifecycle_git = Mock()
         lifecycle_git.can_merge.return_value = True
+        lifecycle_git.count_commits_behind.return_value = 0
         lifecycle_git.is_merged.return_value = False
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
@@ -26172,6 +26175,7 @@ class TestProviderPromptSanitization:
 
         lifecycle_git = Mock()
         lifecycle_git.can_merge.return_value = True
+        lifecycle_git.count_commits_behind.return_value = 0
         lifecycle_git.is_merged.return_value = False
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
@@ -26272,6 +26276,7 @@ class TestProviderPromptSanitization:
 
         lifecycle_git = Mock()
         lifecycle_git.can_merge.return_value = True
+        lifecycle_git.count_commits_behind.return_value = 0
         lifecycle_git.is_merged.return_value = False
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
@@ -26293,6 +26298,7 @@ class TestProviderPromptSanitization:
     def _lifecycle_git_for_head(self, branch: str) -> Mock:
         lifecycle_git = Mock()
         lifecycle_git.can_merge.return_value = True
+        lifecycle_git.count_commits_behind.return_value = 0
         lifecycle_git.is_merged.return_value = False
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
@@ -27570,6 +27576,7 @@ class TestProviderPromptSanitization:
 
         lifecycle_git = Mock()
         lifecycle_git.can_merge.return_value = True
+        lifecycle_git.count_commits_behind.return_value = 0
         lifecycle_git.is_merged.return_value = False
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
@@ -27944,6 +27951,7 @@ class TestProviderPromptSanitization:
 
         lifecycle_git = Mock()
         lifecycle_git.can_merge.return_value = True
+        lifecycle_git.count_commits_behind.return_value = 0
         lifecycle_git.is_merged.return_value = False
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False

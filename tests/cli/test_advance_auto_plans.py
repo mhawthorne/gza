@@ -61,6 +61,7 @@ def _mock_git(*, current_branch: str = "main", can_merge: bool = True) -> Mock:
     git.branch_exists.return_value = True
     git.ref_exists.return_value = False
     git.can_merge.return_value = can_merge
+    git.count_commits_behind.return_value = 0
     return git
 
 
@@ -2139,6 +2140,7 @@ def test_advance_dry_run_uses_post_rebase_review_after_later_completed_rebase(
     git = Mock()
     git.current_branch.return_value = "main"
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
     git.branch_exists.side_effect = lambda branch: branch == impl.branch
     git.ref_exists.return_value = False
     git.resolve_merge_source_ref.side_effect = lambda branch: branch if branch == impl.branch else None
@@ -2338,7 +2340,7 @@ def test_advance_explicit_impl_conflict_plan_skips_orphan_rebase_branch_for_non_
     assert rc == 0
     assert "Would advance 1 task(s):" in captured.out
     assert str(impl.id) in captured.out
-    assert "Run verify gate before review" in captured.out
+    assert "Rebase before verify_gate" in captured.out
     assert str(orphan.id) not in captured.out
 
 

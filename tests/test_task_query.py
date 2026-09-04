@@ -2429,7 +2429,7 @@ def test_lifecycle_complete_excludes_pending_review_attached_to_merged_unit(tmp_
     assert "pending review" not in prompts
 
 
-def test_incomplete_projection_uses_review_flow_for_mergeable_behind_branch(tmp_path: Path) -> None:
+def test_incomplete_projection_uses_rebase_flow_for_mergeable_behind_branch(tmp_path: Path) -> None:
     from tests.cli.conftest import make_store, setup_config
 
     setup_config(tmp_path)
@@ -2478,11 +2478,11 @@ def test_incomplete_projection_uses_review_flow_for_mergeable_behind_branch(tmp_
 
     assert len(result.rows) == 1
     row = result.rows[0]
-    assert row.values["next_action"] == "run_review"
-    assert "stale" not in str(row.values["next_action_reason"]).lower()
+    assert row.values["next_action"] == "needs_rebase"
+    assert row.values["next_action_reason"] == "Rebase before run_review"
 
 
-def test_incomplete_projection_uses_merge_flow_for_approved_behind_branch(tmp_path: Path) -> None:
+def test_incomplete_projection_uses_rebase_flow_for_approved_behind_branch(tmp_path: Path) -> None:
     from tests.cli.conftest import make_store, setup_config
 
     setup_config(tmp_path)
@@ -2540,8 +2540,8 @@ def test_incomplete_projection_uses_merge_flow_for_approved_behind_branch(tmp_pa
 
     assert len(result.rows) == 1
     row = result.rows[0]
-    assert row.values["next_action"] == "merge"
-    assert "stale" not in str(row.values["next_action_reason"]).lower()
+    assert row.values["next_action"] == "needs_rebase"
+    assert row.values["next_action_reason"] == "Rebase before merge"
 
 
 def test_merge_chain_unmerged_matches_legacy_unmerged_status(tmp_path: Path) -> None:

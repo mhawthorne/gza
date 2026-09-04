@@ -202,6 +202,10 @@ def _mock_unmerged_git() -> Git:
             del branch, target
             return 1
 
+        def count_commits_behind(self, source_ref: str, target_ref: str) -> int:
+            del source_ref, target_ref
+            return 0
+
         def get_diff_numstat(self, revision_range: str) -> str:
             del revision_range
             return ""
@@ -9314,7 +9318,7 @@ class TestShowCommand:
         assert exit_code == 0
         assert "Lifecycle: recovered, needs attention" in plain
 
-    def test_show_mergeable_behind_branch_uses_review_lifecycle(
+    def test_show_mergeable_behind_branch_uses_rebase_lifecycle(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         from gza.cli.query import cmd_show
@@ -9387,7 +9391,7 @@ class TestShowCommand:
 
         output = capsys.readouterr().out
         assert exit_code == 0
-        assert "Lifecycle: review pending" in output
+        assert "Lifecycle: needs rebase" in output
 
     def test_show_lifecycle_labels_capped_merge_and_defer(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
@@ -21457,7 +21461,7 @@ class TestLineageOwnerParity:
         assert result == 0
         one_line_output = captured.out
         assert self._one_line_row_id(one_line_output) == impl.id
-        assert "Create closing review (code changed since the last review)" in one_line_output
+        assert "Rebase before create_review" in one_line_output
         assert f"{dropped_one.id} (dropped)" not in one_line_output
         assert f"{dropped_two.id} (dropped)" not in one_line_output
 

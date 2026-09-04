@@ -173,6 +173,23 @@ def _make_verify_context(*, config: Config, store: Any, git: Git) -> AdvanceActi
     )
 
 
+def _print_manual_verify_rebase_required(action: dict[str, Any], *, task_id: str) -> None:
+    parent_id = action.get("rebase_parent_task_id")
+    parent_branch = action.get("rebase_parent_branch")
+    target = action.get("target_branch")
+    parent_text = f" task {parent_id}" if isinstance(parent_id, str) and parent_id else ""
+    branch_text = f" on branch '{parent_branch}'" if isinstance(parent_branch, str) and parent_branch else ""
+    target_text = f" before retrying verify against '{target}'" if isinstance(target, str) and target else ""
+    print(
+        "Error: Verify gate cannot run until the merge unit is rebased. "
+        f"Create or run the required rebase for{parent_text}{branch_text}{target_text}."
+    )
+    if action.get("description"):
+        print(str(action["description"]))
+    elif not parent_text:
+        print(f"Requested task: {task_id}")
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     """Rerun or inspect a task merge unit's lifecycle verify gate."""
     config = Config.load(args.project_dir)
@@ -298,6 +315,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
             member_tasks=resolved_members,
             selected_for_merge=True,
         )
+    if action.get("type") == "needs_rebase":
+        _print_manual_verify_rebase_required(action, task_id=task_id)
+        return 1
     previous_artifact_ids = _verify_artifact_ids(store, verify_owner_task) if args.force else set()
     result = execute_advance_action(
         task=execution_task,

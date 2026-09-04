@@ -3630,15 +3630,32 @@ def execute_advance_action(
         return result
 
     if action_type == "needs_rebase":
-        if task.id is None or not task.branch:
+        rebase_parent_task = task
+        rebase_parent_task_id = action.get("rebase_parent_task_id")
+        if isinstance(rebase_parent_task_id, str) and rebase_parent_task_id:
+            resolved_parent_task = context.store.get(rebase_parent_task_id)
+            if resolved_parent_task is None:
+                return AdvanceActionExecutionResult(
+                    action_type=action_type,
+                    status="error",
+                    message=f"Cannot rebase: parent task {rebase_parent_task_id} is missing",
+                )
+            if not resolved_parent_task.branch:
+                return AdvanceActionExecutionResult(
+                    action_type=action_type,
+                    status="error",
+                    message=f"Cannot rebase: parent task {rebase_parent_task_id} has no branch",
+                )
+            rebase_parent_task = resolved_parent_task
+        if rebase_parent_task.id is None or not rebase_parent_task.branch:
             return AdvanceActionExecutionResult(
                 action_type=action_type,
                 status="error",
-                message=f"Cannot rebase: task {task.id} has no branch",
+                message=f"Cannot rebase: task {rebase_parent_task.id} has no branch",
             )
         if (
             context.is_rebase_target_already_merged is not None
-            and context.is_rebase_target_already_merged(task)
+            and context.is_rebase_target_already_merged(rebase_parent_task)
         ):
             return AdvanceActionExecutionResult(
                 action_type=action_type,
@@ -3663,25 +3680,6 @@ def execute_advance_action(
         )
         if blocked is not None:
             return blocked
-        rebase_parent_task = task
-        rebase_parent_task_id = action.get("rebase_parent_task_id")
-        if isinstance(rebase_parent_task_id, str) and rebase_parent_task_id:
-            resolved_parent_task = context.store.get(rebase_parent_task_id)
-            if resolved_parent_task is None:
-                return AdvanceActionExecutionResult(
-                    action_type=action_type,
-                    status="error",
-                    message=f"Cannot rebase: recovery preflight parent task {rebase_parent_task_id} is missing",
-                )
-            if not resolved_parent_task.branch:
-                return AdvanceActionExecutionResult(
-                    action_type=action_type,
-                    status="error",
-                    message=(
-                        f"Cannot rebase: recovery preflight parent task {rebase_parent_task_id} has no branch"
-                    ),
-                )
-            rebase_parent_task = resolved_parent_task
         try:
             rebase_task = context.create_rebase_task(rebase_parent_task)
         except DuplicateActiveChildError as exc:

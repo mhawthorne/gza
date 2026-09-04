@@ -72,6 +72,10 @@ class _MergeGit:
     def can_merge(self, branch: str, into: str | None = None) -> bool:
         return True
 
+    def count_commits_behind(self, source_ref: str, target_ref: str) -> int:
+        del source_ref, target_ref
+        return 0
+
     def get_diff_numstat(self, revision_range: str) -> str:
         return "1\t0\tfeature.txt\n"
 

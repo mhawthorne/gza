@@ -29,6 +29,7 @@ def _iterate_git_runtime():
     mock_git.resolve_merge_source_ref.return_value = None
     mock_git.is_merged.return_value = False
     mock_git.can_merge.return_value = True
+    mock_git.count_commits_behind.return_value = 0
     return patch("gza.cli.Git", return_value=mock_git)
 
 

@@ -605,6 +605,7 @@ def test_query_lineage_owner_rows_tag_filter_keeps_merge_unit_representative(tmp
     git = MagicMock()
     git.branch_exists.return_value = True
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
     git.rev_parse_if_exists.side_effect = lambda ref: (
         "same-head" if ref == "feature/tag-filtered-merge-unit" else "target-sha" if ref == "main" else None
     )
@@ -897,6 +898,7 @@ def test_query_lineage_owner_rows_without_tag_filter_keeps_merge_unit_representa
     git = MagicMock()
     git.branch_exists.return_value = True
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
     git.rev_parse_if_exists.side_effect = lambda ref: (
         "same-head" if ref == "feature/tag-filtered-merge-unit" else "target-sha" if ref == "main" else None
     )
@@ -1099,6 +1101,7 @@ def test_query_lineage_owner_rows_task_id_filter_keeps_skipped_same_branch_manua
     git = MagicMock()
     git.branch_exists.return_value = True
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     unfiltered_rows = query_lineage_owner_rows(
         store,
@@ -1379,6 +1382,7 @@ def test_query_lineage_owner_rows_completed_explore_without_followup_needs_atten
     git = MagicMock()
     git.branch_exists.return_value = True
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     rows = query_lineage_owner_rows(
         store,
@@ -1429,6 +1433,7 @@ def test_query_lineage_owner_rows_surfaces_strict_scope_violation_paths(tmp_path
     git = MagicMock()
     git.branch_exists.return_value = True
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
     git.get_diff_name_status.return_value = "M\tservices/foo/app.py\nM\tdre/web/src/app.tsx\n"
 
     rows = query_lineage_owner_rows(
@@ -1473,6 +1478,7 @@ def test_query_lineage_owner_rows_keeps_completed_explore_with_only_dropped_plan
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     rows = query_lineage_owner_rows(
         store,
@@ -1600,6 +1606,7 @@ def test_query_lineage_owner_rows_promotes_completed_plan_descendant_over_explor
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     rows = query_lineage_owner_rows(
         store,
@@ -1635,6 +1642,7 @@ def test_query_lineage_owner_rows_surfaces_held_completed_plan_as_awaiting_human
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     rows = query_lineage_owner_rows(
         store,
@@ -1686,6 +1694,7 @@ def test_query_lineage_owner_rows_uses_completed_revised_plan_as_action_frontier
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     rows = query_lineage_owner_rows(
         store,
@@ -1726,6 +1735,7 @@ def test_query_lineage_owner_rows_completed_empty_prereq_is_not_awaiting_human(t
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     rows = query_lineage_owner_rows(
         store,
@@ -1796,6 +1806,7 @@ def test_query_lineage_owner_rows_failed_empty_prereq_surfaces_release_valve_by_
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     rows = query_lineage_owner_rows(
         store,
@@ -1896,6 +1907,7 @@ def test_query_lineage_owner_rows_failed_empty_prereq_policy_toggle_suppresses_r
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     rows = query_lineage_owner_rows(
         store,
@@ -1928,6 +1940,7 @@ def test_query_lineage_owner_rows_surfaces_manual_review_creation_attention(tmp_
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     rows = query_lineage_owner_rows(
         store,
@@ -2003,6 +2016,7 @@ def test_query_lineage_owner_rows_prefers_impl_branch_over_orphan_rebase_owner(t
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
     git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = lambda ref: (
         "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
@@ -2058,6 +2072,7 @@ def test_query_lineage_owner_rows_marks_orphan_only_impl_lineage_for_manual_reso
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     rows = query_lineage_owner_rows(
         store,
@@ -2139,7 +2154,8 @@ def test_query_lineage_owner_rows_excludes_orphan_rebase_descendant_from_actiona
     assert row.lifecycle_action_task is not None
     assert row.lifecycle_action_task.id == impl.id
     assert row.next_action is not None
-    assert row.next_action["type"] == "create_review"
+    assert row.next_action["type"] == "needs_rebase"
+    assert row.next_action["reason"] == "pre-dispatch-rebase"
     unresolved_ids = {task.id for task in row.unresolved_tasks if task.id is not None}
     assert orphan.id not in unresolved_ids
 
@@ -2183,6 +2199,7 @@ def test_query_lineage_owner_rows_planning_excludes_dropped_descendant_rebase(tm
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
     git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = lambda ref: (
         "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
@@ -2242,6 +2259,7 @@ def test_query_lineage_owner_rows_planning_skips_dropped_owner_lineage(tmp_path:
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     rows = query_lineage_owner_rows(
         store,
@@ -2369,6 +2387,7 @@ def test_query_lineage_owner_rows_repeated_planning_omits_superseded_loser_root_
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     first_rows = query_lineage_owner_rows(
         store,
@@ -2760,6 +2779,7 @@ def test_query_lineage_owner_rows_keeps_legitimate_impl_branch_rebase_descendant
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
     git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = lambda ref: (
         "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
@@ -2814,6 +2834,7 @@ def test_query_lineage_owner_rows_planning_keeps_completed_and_failed_live_tasks
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
     git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = lambda ref: (
         "same-head" if ref == "feature/completed-live" else "base-head" if ref == "main" else None
@@ -2864,6 +2885,7 @@ def test_query_lineage_owner_rows_excludes_completed_empty_implementation(tmp_pa
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     rows = query_lineage_owner_rows(
         store,
@@ -2901,6 +2923,7 @@ def test_query_lineage_owner_rows_failed_timeout_no_review_prefers_resume_over_m
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
     git.resolve_fresh_merge_source.return_value = ("origin/feature/failed-timeout-no-review", None)
 
     rows = query_lineage_owner_rows(
@@ -2924,7 +2947,7 @@ def test_query_lineage_owner_rows_failed_timeout_no_review_prefers_resume_over_m
     assert row.next_action["type"] == "needs_rebase"
 
 
-def test_query_lineage_owner_rows_mergeable_behind_branch_projects_normal_action(tmp_path: Path) -> None:
+def test_query_lineage_owner_rows_mergeable_behind_branch_projects_rebase(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -2945,6 +2968,7 @@ def test_query_lineage_owner_rows_mergeable_behind_branch_projects_normal_action
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
     git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = lambda ref: (
         "same-head" if ref == "feature/stale-lineage" else "base-head" if ref == "main" else None
@@ -2966,11 +2990,12 @@ def test_query_lineage_owner_rows_mergeable_behind_branch_projects_normal_action
     assert row.lifecycle_action_task is not None
     assert row.lifecycle_action_task.id == impl.id
     assert row.next_action is not None
-    assert row.next_action["type"] == "create_review"
+    assert row.next_action["type"] == "needs_rebase"
+    assert row.next_action["reason"] == "pre-dispatch-rebase"
     assert row.lineage_status == "actionable"
 
 
-def test_query_lineage_owner_rows_projects_merge_for_approved_behind_branch(tmp_path: Path) -> None:
+def test_query_lineage_owner_rows_projects_rebase_for_approved_behind_branch(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -3003,6 +3028,7 @@ def test_query_lineage_owner_rows_projects_merge_for_approved_behind_branch(tmp_
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
     git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = lambda ref: (
         "same-head" if ref == "feature/approved-stale-lineage" else "base-head" if ref == "main" else None
@@ -3027,7 +3053,8 @@ def test_query_lineage_owner_rows_projects_merge_for_approved_behind_branch(tmp_
     assert row.lifecycle_action_task is not None
     assert row.lifecycle_action_task.id == impl.id
     assert row.next_action is not None
-    assert row.next_action["type"] == "merge"
+    assert row.next_action["type"] == "needs_rebase"
+    assert row.next_action["reason"] == "pre-dispatch-rebase"
     assert row.lineage_status == "actionable"
 
 
@@ -6162,6 +6189,7 @@ def test_query_lineage_owner_rows_orphan_task_id_scope_classifies_canonical_root
     git = MagicMock()
     git.branch_exists.return_value = True
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     global_rows = query_lineage_owner_rows(
         store,
@@ -6289,6 +6317,7 @@ def test_query_lineage_owner_rows_skipped_task_id_scope_honors_task_type_for_fai
     git = MagicMock()
     git.branch_exists.return_value = True
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     rows = query_lineage_owner_rows(
         store,
@@ -6998,6 +7027,7 @@ def test_query_lineage_owner_rows_keeps_auto_refreshable_stale_review_out_of_att
     git.default_branch.return_value = "main"
     git.current_branch.return_value = "topic"
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
     git.branch_exists.return_value = True
     git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(impl.branch)
     git.rev_parse_if_exists.side_effect = lambda ref: "current-sha" if ref == impl.branch else None
@@ -7073,6 +7103,7 @@ def test_query_lineage_owner_rows_surfaces_cleared_review_probe_failure_attentio
     git.default_branch.return_value = "main"
     git.current_branch.return_value = "topic"
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
     git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(impl.branch)
     git.rev_parse_if_exists.side_effect = GitError("probe blew up")
 

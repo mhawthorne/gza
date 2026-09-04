@@ -9,7 +9,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -38,6 +38,7 @@ from gza.advance_engine import (
     count_completed_review_cycles,
     needs_attention_recommended_next_step,
     pending_merge_finalization_action,
+    plan_manual_verify_gate_action,
     prime_lifecycle_git_facts,
     require_needs_attention_subject,
     resolve_advance_context,
@@ -112,7 +113,7 @@ class _FakeGit:
         merge_source_result: tuple[str | None, str | None] | None = None,
         legacy_merge_source_ref: str | None = None,
         ahead_count: int | None = None,
-        behind_count: int | None = None,
+        behind_count: Any = 0,
         behind_count_error: Exception | None = None,
         name_status_by_range: dict[str, str] | None = None,
         name_status_error_by_range: dict[str, Exception] | None = None,
@@ -468,6 +469,27 @@ def _make_completed_unmerged_impl(
     impl.has_commits = True
     store.update(impl)
     return impl
+
+
+def _make_completed_standalone_explore_merge_candidate(
+    store: SqliteTaskStore,
+    *,
+    branch: str,
+) -> DbTask:
+    explore = store.add("Explore feature", task_type="explore")
+    assert explore.id is not None
+    explore.status = "completed"
+    explore.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    explore.branch = branch
+    explore.merge_status = "unmerged"
+    explore.has_commits = True
+    store.update(explore)
+    store.get_or_create_merge_unit_for_task(explore)
+
+    pending_plan = store.add("Plan follow-up", task_type="plan", based_on=explore.id)
+    pending_plan.status = "pending"
+    store.update(pending_plan)
+    return explore
 
 
 def _add_completed_review(
@@ -1231,7 +1253,7 @@ def test_resolve_context_excludes_resume_state_for_test_failure(tmp_path: Path):
     assert ctx.failure_reason == "TEST_FAILURE"
 
 
-def test_rule_ordering_prefers_conflict_before_review_actions(tmp_path: Path):
+def test_pre_dispatch_rebase_gate_preempts_review_verify_on_conflict(tmp_path: Path):
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     config.verify_command = "./bin/tests"
@@ -1266,9 +1288,11 @@ def test_rule_ordering_prefers_conflict_before_review_actions(tmp_path: Path):
         selected_for_merge=True,
     )
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "verify_gate"
     assert selected_action["type"] == "needs_rebase"
+    assert selected_action["reason"] == "pre-dispatch-rebase"
 
 
 def test_worker_action_taxonomy_covers_batch_accounting_actions() -> None:
@@ -3356,15 +3380,16 @@ def test_rebase_after_review_with_changed_diff_requires_fresh_review(tmp_path: P
         store,
         _FakeGit(
             can_merge=True,
+            behind_count=1,
             existing_branches={task.branch},
             ref_shas={task.branch: "rebased-sha", "main": "target-sha"},
         ),
         task,
         "main",
     )
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
-    assert action["description"] == "Run verify gate before review"
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "verify_gate"
 
 
 def test_rebase_after_review_with_unknown_diff_requires_fresh_review(tmp_path: Path, monkeypatch) -> None:
@@ -3406,15 +3431,16 @@ def test_rebase_after_review_with_unknown_diff_requires_fresh_review(tmp_path: P
         store,
         _FakeGit(
             can_merge=True,
+            behind_count=1,
             existing_branches={task.branch},
             ref_shas={task.branch: "rebased-sha", "main": "target-sha"},
         ),
         task,
         "main",
     )
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
-    assert action["description"] == "Run verify gate before review"
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "verify_gate"
 
 
 def test_stale_review_with_auto_review_disabled_needs_manual_refresh(tmp_path: Path, monkeypatch) -> None:
@@ -9926,6 +9952,7 @@ def test_completed_changed_rebase_under_resumed_implement_invalidates_prior_revi
         store,
         _FakeGit(
             can_merge=True,
+            behind_count=1,
             existing_branches={resumed.branch},
             ref_shas={resumed.branch: "rebased-sha", "main": "target-sha"},
         ),
@@ -9933,9 +9960,9 @@ def test_completed_changed_rebase_under_resumed_implement_invalidates_prior_revi
         "main",
     )
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
-    assert action["description"] == "Run verify gate before review"
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "verify_gate"
 
 
 def test_completed_rebase_with_changed_diff_invalidates_owner_review(tmp_path: Path, monkeypatch) -> None:
@@ -9971,6 +9998,7 @@ def test_completed_rebase_with_changed_diff_invalidates_owner_review(tmp_path: P
         store,
         _FakeGit(
             can_merge=True,
+            behind_count=1,
             existing_branches={impl.branch},
             ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
         ),
@@ -9978,9 +10006,9 @@ def test_completed_rebase_with_changed_diff_invalidates_owner_review(tmp_path: P
         "main",
     )
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
-    assert action["description"] == "Run verify gate before review"
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "verify_gate"
 
 
 def test_changed_rebase_resolution_review_action_uses_persisted_rebase_target_after_target_moves(
@@ -10022,6 +10050,7 @@ def test_changed_rebase_resolution_review_action_uses_persisted_rebase_target_af
         store,
         _FakeGit(
             can_merge=True,
+            behind_count=1,
             existing_branches={impl.branch},
             ref_shas={impl.branch: "rebased-head", "main": "target-now"},
         ),
@@ -10029,9 +10058,9 @@ def test_changed_rebase_resolution_review_action_uses_persisted_rebase_target_af
         "main",
     )
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
-    assert action["description"] == "Run verify gate before review"
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "verify_gate"
 
 
 def test_changed_rebase_with_missing_persisted_provenance_rederives_resolution_review_shas(
@@ -18788,6 +18817,131 @@ def test_failed_recovery_requires_rebase_before_resume_or_retry_when_branch_lack
     assert action["failed_task_id"] == failed.id
 
 
+@pytest.mark.parametrize(
+    ("child_type", "child_kwargs"),
+    [
+        ("review", {"depends_on": "__impl__"}),
+        ("improve", {"based_on": "__impl__", "same_branch": True}),
+        ("fix", {"based_on": "__impl__", "same_branch": True}),
+    ],
+)
+@pytest.mark.parametrize(
+    ("target_is_ancestor", "expected_action_type"),
+    [
+        (False, "needs_rebase"),
+        (True, "resume"),
+    ],
+)
+def test_failed_commitless_same_branch_child_recovery_uses_owner_branch_for_preflight_rebase(
+    tmp_path: Path,
+    child_type: str,
+    child_kwargs: dict[str, object],
+    target_is_ancestor: bool,
+    expected_action_type: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implemented feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = f"feature/commitless-child-{child_type}-{target_is_ancestor}"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    resolved_kwargs = {
+        key: impl.id if value == "__impl__" else value
+        for key, value in child_kwargs.items()
+    }
+    failed_child = store.add(f"Failed {child_type}", task_type=child_type, **resolved_kwargs)
+    assert failed_child.id is not None
+    failed_child.status = "failed"
+    failed_child.failure_reason = "MAX_STEPS"
+    failed_child.session_id = "sess-recovery-child"
+    failed_child.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    failed_child.branch = impl.branch
+    failed_child.has_commits = False
+    store.update(failed_child)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "branch-tip", "main": "target-tip"},
+            ancestor_pairs={("main", impl.branch): target_is_ancestor},
+        ),
+        failed_child,
+        "main",
+    )
+
+    assert action["type"] == expected_action_type
+    if expected_action_type == "needs_rebase":
+        assert action["reason"] == "recovery-preflight-rebase"
+        assert action["deferred_action_type"] == "resume"
+        assert action["failed_task_id"] == failed_child.id
+        assert action["rebase_parent_task_id"] == impl.id
+        assert action["rebase_parent_branch"] == impl.branch
+    else:
+        assert action["decision"].task_id == failed_child.id
+
+
+@pytest.mark.parametrize("descendant_type", ["improve", "rebase"])
+def test_pre_dispatch_rebase_action_from_descendant_identifies_canonical_parent(
+    tmp_path: Path,
+    descendant_type: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = store.add("Implemented feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = f"feature/pre-dispatch-descendant-{descendant_type}"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    descendant = store.add(
+        f"Completed {descendant_type}",
+        task_type=descendant_type,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert descendant.id is not None
+    descendant.status = "completed"
+    descendant.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    descendant.branch = impl.branch
+    descendant.has_commits = True
+    store.update(descendant)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "branch-tip", "main": "target-tip"},
+            ancestor_pairs={("main", impl.branch): False},
+            behind_count=1,
+        ),
+        descendant,
+        "main",
+    )
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["rebase_parent_task_id"] == impl.id
+    assert action["rebase_parent_task_type"] == "implement"
+    assert action["rebase_parent_branch"] == impl.branch
+    assert action["target_branch"] == "main"
+
+
 def test_failed_recovery_waits_for_same_branch_preflight_rebase(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -18968,9 +19122,9 @@ def test_remote_only_merged_tip_no_longer_suppresses_advance(
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
-    assert action["description"] == "Run verify gate before review"
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "verify_gate"
     refreshed = store.get(impl.id)
     assert refreshed is not None
     assert refreshed.merge_status == "unmerged"
@@ -19005,9 +19159,9 @@ def test_remote_only_empty_proof_no_longer_persists_no_work_state(
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
-    assert action["description"] == "Run verify gate before review"
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "verify_gate"
     refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
     assert refreshed_unit is None
 
@@ -20425,7 +20579,7 @@ def test_conflict_needs_rebase_not_emitted_when_target_already_merged(tmp_path: 
     assert action["advance_reason"] == "target-already-merged"
 
 
-def test_conflict_needs_rebase_emitted_without_completed_rebase(tmp_path: Path) -> None:
+def test_pre_dispatch_rebase_gate_emitted_without_completed_rebase(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     impl = store.add("Implement feature", task_type="implement")
@@ -20447,10 +20601,402 @@ def test_conflict_needs_rebase_emitted_without_completed_rebase(tmp_path: Path) 
         selected_for_merge=True,
     )
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "verify_gate"
     assert selected_action["type"] == "needs_rebase"
-    assert selected_action["reason"] == "merge-selection-conflict-rebase"
+    assert selected_action["reason"] == "pre-dispatch-rebase"
+
+
+def test_pre_dispatch_rebase_gate_preempts_clean_stale_create_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/stale-before-review",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    monkeypatch.setattr(
+        advance_engine_module,
+        "resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            behind_count=1,
+            ref_shas={impl.branch: "branch-tip", "main": "target-tip"},
+            ancestor_pairs={("main", impl.branch): False},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "create_review"
+
+
+def test_pre_dispatch_rebase_gate_preempts_clean_stale_merge(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/stale-before-merge",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    monkeypatch.setattr(
+        advance_engine_module,
+        "resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            behind_count=1,
+            ref_shas={impl.branch: "branch-tip", "main": "target-tip"},
+            ancestor_pairs={("main", impl.branch): False},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "merge"
+
+
+def test_pre_dispatch_rebase_gate_rebases_clean_stale_standalone_non_implement_merge(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    task = _make_completed_standalone_explore_merge_candidate(
+        store,
+        branch="feature/stale-standalone-explore",
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            behind_count=1,
+            existing_branches={task.branch},
+            ref_shas={task.branch: "branch-tip", "main": "target-tip"},
+            ancestor_pairs={("main", task.branch): False},
+        ),
+        task,
+        "main",
+    )
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "merge"
+
+
+def test_pre_dispatch_rebase_gate_preserves_current_standalone_non_implement_merge(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    task = _make_completed_standalone_explore_merge_candidate(
+        store,
+        branch="feature/current-standalone-explore",
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            behind_count=0,
+            existing_branches={task.branch},
+            ref_shas={task.branch: "branch-tip", "main": "target-tip"},
+            ancestor_pairs={("main", task.branch): False},
+        ),
+        task,
+        "main",
+    )
+
+    assert action["type"] == "merge"
+
+
+def test_pre_dispatch_rebase_gate_fails_closed_when_standalone_non_implement_behind_probe_unverified(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    task = _make_completed_standalone_explore_merge_candidate(
+        store,
+        branch="feature/unverified-standalone-explore",
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            behind_count=None,
+            existing_branches={task.branch},
+            ref_shas={task.branch: "branch-tip", "main": "target-tip"},
+            ancestor_pairs={("main", task.branch): False},
+        ),
+        task,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "pre-dispatch-target-freshness-unverified"
+    assert action["deferred_action_type"] == "merge"
+    assert action["diagnostic"] == "count_commits_behind returned no result"
+    assert action["subject_task_id"] == task.id
+
+
+def test_pre_dispatch_rebase_gate_rebases_conflicting_standalone_non_implement_merge(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    task = _make_completed_standalone_explore_merge_candidate(
+        store,
+        branch="feature/conflicting-standalone-explore",
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=False,
+            behind_count=0,
+            existing_branches={task.branch},
+            ref_shas={task.branch: "branch-tip", "main": "target-tip"},
+            ancestor_pairs={("main", task.branch): False},
+        ),
+        task,
+        "main",
+    )
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "merge"
+
+
+def test_pre_dispatch_rebase_gate_preempts_verify_only_noop_recovery(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 1
+    monkeypatch.setattr(advance_engine_module, "_latest_review_is_verify_blocked_only", lambda _ctx: True)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/stale-verify-only-noop-recovery",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 10, 0, tzinfo=UTC))
+    review.output_content = _verify_failure_only_review_report()
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head-sha"
+    store.update(review)
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            behind_count=2,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "same-head-sha"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "recover_verify_only_noop_review"
+
+
+def test_current_verify_only_noop_recovery_still_proceeds(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 1
+    monkeypatch.setattr(advance_engine_module, "_latest_review_is_verify_blocked_only", lambda _ctx: True)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/current-verify-only-noop-recovery",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 10, 0, tzinfo=UTC))
+    review.output_content = _verify_failure_only_review_report()
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head-sha"
+    store.update(review)
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            behind_count=0,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "same-head-sha"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "recover_verify_only_noop_review"
+    assert action["latest_noop_improve_task"].task_type == "improve"
+    assert action["current_branch_head_sha"] == "same-head-sha"
+
+
+def test_recovered_green_verify_fix_rebases_before_reprojected_merge(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+    from gza.cli.execution import _determine_recovered_post_green_iterate_action
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/recovered-green-stale-merge",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    monkeypatch.setattr(
+        advance_engine_module,
+        "resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        behind_count=1,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "branch-tip", "main": "target-tip"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    ordinary_action = evaluate_advance_rules(config, store, git, impl, "main")
+    recovered_action = _determine_recovered_post_green_iterate_action(
+        config,
+        store,
+        git,
+        impl,
+        "main",
+        max_resume_attempts=1,
+    )
+
+    assert ordinary_action["type"] == "needs_rebase"
+    assert ordinary_action["deferred_action_type"] == "merge"
+    assert recovered_action["type"] == "needs_rebase"
+    assert recovered_action["reason"] == "pre-dispatch-rebase"
+    assert recovered_action["deferred_action_type"] == "merge"
+
+
+def test_manual_verify_gate_planning_rebases_before_forced_verify(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/manual-verify-stale",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        behind_count=1,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "branch-tip", "main": "target-tip"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    action = plan_manual_verify_gate_action(
+        config,
+        store,
+        git,
+        impl,
+        "main",
+        verify_owner_task=impl,
+        selected_for_merge=True,
+    )
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "verify_gate"
+
+
+def test_pre_dispatch_rebase_gate_does_not_rebase_idle_manual_attention(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.advance_create_reviews = False
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/stale-manual-attention",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            behind_count=1,
+            ref_shas={impl.branch: "branch-tip", "main": "target-tip"},
+            ancestor_pairs={("main", impl.branch): False},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "review-needs-manual-creation"
 
 
 def test_conflict_needs_rebase_suppressed_when_active_rebase_exists(tmp_path: Path) -> None:
@@ -20537,13 +21083,17 @@ def test_rebase_failure_circuit_breaker_resets_after_completed_rebase(tmp_path: 
     _add_completed_rebase(store, impl, when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC))
 
     git = _FakeGit(
-        can_merge=False,
+        can_merge=True,
         existing_refs={"origin/feature/rebase-breaker-reset-rebase"},
         ref_shas={
+            impl.branch: "branch-tip",
             "origin/feature/rebase-breaker-reset-rebase": "branch-tip",
             "main": "target-tip",
         },
-        ancestor_pairs={("main", "origin/feature/rebase-breaker-reset-rebase"): True},
+        ancestor_pairs={
+            ("main", impl.branch): True,
+            ("main", "origin/feature/rebase-breaker-reset-rebase"): True,
+        },
     )
     ctx = resolve_advance_context(config, store, git, impl, "main")
     assert ctx.rebase_failure_streak is None
@@ -20594,9 +21144,11 @@ def test_rebase_failure_circuit_breaker_resets_after_completed_review(
         selected_for_merge=True,
     )
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_merge"
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "verify_gate"
     assert selected_action["type"] == "needs_rebase"
+    assert selected_action["reason"] == "pre-dispatch-rebase"
     assert "needs_attention_reason" not in selected_action
 
 
@@ -20654,16 +21206,20 @@ def test_completed_rebase_that_still_blocks_merge_needs_attention(tmp_path: Path
         can_merge=False,
         existing_refs={"origin/feature/rebase-still-blocked"},
         ref_shas={
+            impl.branch: "branch-tip",
             "origin/feature/rebase-still-blocked": "branch-tip",
             "main": "target-tip",
         },
-        ancestor_pairs={("main", "origin/feature/rebase-still-blocked"): True},
+        ancestor_pairs={
+            ("main", impl.branch): True,
+            ("main", "origin/feature/rebase-still-blocked"): True,
+        },
     )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "rebase-did-not-unblock-merge"
 
 
 def test_stale_completed_rebase_falls_through_to_needs_rebase(tmp_path: Path) -> None:
@@ -23759,7 +24315,7 @@ def test_approved_with_followups_and_newer_unresolved_comment_creates_improve(tm
     assert action["review_task"].id == review.id
 
 
-def test_mergeable_behind_branch_keeps_review_flow(tmp_path: Path) -> None:
+def test_mergeable_behind_branch_rebases_before_review_flow(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
@@ -23780,8 +24336,9 @@ def test_mergeable_behind_branch_keeps_review_flow(tmp_path: Path) -> None:
 
     action = evaluate_advance_rules(config, store, git, task, "main")
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "verify_gate"
     assert classify_advance_action(action) == "actionable"
 
 
@@ -26099,7 +26656,7 @@ def test_non_spec_branch_with_head_probe_warning_bypasses_spec_coherence_gate(tm
     assert action["verify_gate_phase"] == "pre_merge"
 
 
-def test_stale_conflicting_branch_only_emits_needs_rebase_when_selected_for_merge(tmp_path: Path) -> None:
+def test_stale_conflicting_branch_rebases_before_ordinary_dispatch(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
@@ -26127,16 +26684,18 @@ def test_stale_conflicting_branch_only_emits_needs_rebase_when_selected_for_merg
         "main",
         selected_for_merge=True,
     )
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "verify_gate"
     assert selected_action["type"] == "needs_rebase"
+    assert selected_action["reason"] == "pre-dispatch-rebase"
 
 
 def test_failed_rebase_manual_resolution_still_wins_over_clean_mergeable_tip(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
-    impl, failed_rebase = _make_completed_impl_with_failed_rebase(
+    impl, _failed_rebase = _make_completed_impl_with_failed_rebase(
         store,
         branch="feature/failed-rebase-stale",
     )
@@ -26148,9 +26707,89 @@ def test_failed_rebase_manual_resolution_still_wins_over_clean_mergeable_tip(tmp
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
-    assert action["description"] == "Run verify gate before review"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
+    assert action["subject_task_id"] == impl.id
+
+
+def test_rebase_failure_circuit_breaker_wins_over_clean_mergeable_behind_tip(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/clean-behind-rebase-breaker",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    _add_failed_rebase_attempts(store, impl, hours=(10, 11, 12))
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            behind_count=3,
+            existing_branches={impl.branch},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "rebase-failure-circuit-breaker"
+    assert action["subject_task_id"] == impl.id
+    assert action["rebase_failure_streak"]["attempts"] == 3
+
+
+def test_clean_mergeable_behind_rebase_failure_circuit_breaker_resets_after_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/clean-behind-rebase-breaker-reset",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    _add_failed_rebase_attempts(store, impl, hours=(10, 11, 12))
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    monkeypatch.setattr(
+        advance_engine_module,
+        "resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    )
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            behind_count=1,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "reviewed-head", "main": "target-tip"},
+            ancestor_pairs={("main", impl.branch): False},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "merge"
 
 
 def test_non_stale_branch_keeps_existing_review_action(tmp_path: Path) -> None:
@@ -26175,6 +26814,122 @@ def test_non_stale_branch_keeps_existing_review_action(tmp_path: Path) -> None:
     action = evaluate_advance_rules(config, store, git, task, "main")
     assert action["type"] == "verify_gate"
     assert action["verify_gate_phase"] == "pre_review"
+
+
+@pytest.mark.parametrize(
+    ("behind_count", "behind_count_error", "expected_diagnostic"),
+    [
+        (None, None, "count_commits_behind returned no result"),
+        (0, GitError("behind probe failed"), "behind probe failed"),
+        ("two", None, "count_commits_behind returned malformed result 'two'"),
+    ],
+)
+def test_pre_dispatch_rebase_gate_fails_closed_when_behind_probe_unverified(
+    tmp_path: Path,
+    behind_count: Any,
+    behind_count_error: Exception | None,
+    expected_diagnostic: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/behind-probe-unverified"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            behind_count=behind_count,
+            behind_count_error=behind_count_error,
+            existing_branches={task.branch},
+        ),
+        task,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "pre-dispatch-target-freshness-unverified"
+    assert action["deferred_action_type"] == "verify_gate"
+    assert action["diagnostic"] == expected_diagnostic
+    assert action["subject_task_id"] == task.id
+
+
+def test_pre_dispatch_rebase_gate_fails_closed_when_behind_probe_returns_mock(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/behind-probe-mock"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            behind_count=MagicMock(),
+            existing_branches={task.branch},
+        ),
+        task,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "pre-dispatch-target-freshness-unverified"
+    assert action["deferred_action_type"] == "verify_gate"
+    assert "count_commits_behind returned malformed result" in action["diagnostic"]
+    assert "MagicMock" in action["diagnostic"]
+    assert action["subject_task_id"] == task.id
+
+
+def test_pre_dispatch_rebase_gate_uses_distinct_behind_probe_outcomes(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/behind-probe-outcomes"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    current_action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, behind_count=0, existing_branches={task.branch}),
+        task,
+        "main",
+    )
+    stale_action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, behind_count=1, existing_branches={task.branch}),
+        task,
+        "main",
+    )
+
+    assert current_action["type"] == "verify_gate"
+    assert current_action["verify_gate_phase"] == "pre_review"
+    assert stale_action["type"] == "needs_rebase"
+    assert stale_action["reason"] == "pre-dispatch-rebase"
+    assert stale_action["deferred_action_type"] == "verify_gate"
 
 
 @pytest.mark.parametrize("advance_create_reviews", [True, False])
@@ -26219,7 +26974,7 @@ def test_completed_rebase_without_completed_impl_skips_plain_review_creation(
     assert "does not resolve to a completed implementation review target" in action["description"]
 
 
-def test_approved_but_behind_branch_merges_when_clean(tmp_path: Path, monkeypatch) -> None:
+def test_approved_but_behind_branch_rebases_before_pre_merge_gate(tmp_path: Path, monkeypatch) -> None:
     from gza import advance_engine as advance_engine_module
 
     store = _make_store(tmp_path)
@@ -26257,5 +27012,6 @@ def test_approved_but_behind_branch_merges_when_clean(tmp_path: Path, monkeypatc
     )
     action = evaluate_advance_rules(config, store, git, task, "main")
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_merge"
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "pre-dispatch-rebase"
+    assert action["deferred_action_type"] == "verify_gate"

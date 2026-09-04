@@ -1106,6 +1106,7 @@ def _make_preload_recording_git(
     fake_git.is_merged.return_value = False
     fake_git.has_changes.return_value = False
     fake_git.can_merge.return_value = True
+    fake_git.count_commits_behind.return_value = 0
     fake_git.count_commits_ahead.return_value = 1
 
     ref_calls: list[tuple[tuple[str, ...], str]] = []
@@ -1138,6 +1139,7 @@ def _make_read_session_reconciliation_git(tmp_path: Path, branch: str) -> MagicM
     fake_git.is_merged.return_value = False
     fake_git.has_changes.return_value = False
     fake_git.can_merge.return_value = True
+    fake_git.count_commits_behind.return_value = 0
     fake_git.count_commits_ahead.return_value = 1
     fake_git.rev_parse_if_exists.side_effect = (
         lambda ref: "same-sha" if ref in {branch, "HEAD"} else "base-head" if ref == "main" else None
@@ -13741,6 +13743,7 @@ def test_advance_explicit_merge_refuses_when_checkout_does_not_match_canonical_t
     fake_git.is_merged.return_value = False
     fake_git.has_changes.return_value = False
     fake_git.can_merge.return_value = True
+    fake_git.count_commits_behind.return_value = 0
     fake_git.count_commits_ahead.return_value = 1
 
     args = argparse.Namespace(
@@ -13897,6 +13900,7 @@ def test_advance_execution_remote_only_ref_now_requires_manual_resolution_when_l
     fake_git.is_merged.return_value = False
     fake_git.has_changes.return_value = False
     fake_git.can_merge.return_value = True
+    fake_git.count_commits_behind.return_value = 0
     fake_git.count_commits_ahead.return_value = 1
     fake_git.merge.return_value = None
 
@@ -14565,6 +14569,7 @@ def test_cmd_advance_explicit_dropped_owner_fallback_scopes_second_query_to_owne
     fake_git.is_merged.return_value = False
     fake_git.has_changes.return_value = False
     fake_git.can_merge.return_value = True
+    fake_git.count_commits_behind.return_value = 0
     fake_git.count_commits_ahead.return_value = 1
 
     captured_queries: list = []
@@ -15116,6 +15121,7 @@ def test_advance_execution_remote_only_fresh_ref_no_longer_overrides_stale_local
     fake_git.is_merged.return_value = False
     fake_git.has_changes.return_value = False
     fake_git.can_merge.return_value = True
+    fake_git.count_commits_behind.return_value = 0
     fake_git.count_commits_ahead.return_value = 1
     fake_git.merge.return_value = None
 
@@ -15174,6 +15180,7 @@ def test_advance_execution_prefers_local_branch_when_origin_is_stale(
     fake_git.is_merged.return_value = False
     fake_git.has_changes.return_value = False
     fake_git.can_merge.return_value = True
+    fake_git.count_commits_behind.return_value = 0
     fake_git.count_commits_ahead.return_value = 1
     fake_git.merge.return_value = None
 
@@ -15871,6 +15878,7 @@ def test_advance_dry_run_surfaces_diverged_merge_source_for_reconcile(
     fake_git.is_merged.return_value = False
     fake_git.has_changes.return_value = False
     fake_git.can_merge.return_value = True
+    fake_git.count_commits_behind.return_value = 0
 
     with (
         patch("gza.cli.git_ops.Git", return_value=fake_git),
@@ -15921,6 +15929,7 @@ def test_cmd_advance_uses_shared_lifecycle_execution_gate(
     fake_git.default_branch.return_value = "main"
     fake_git.current_branch.return_value = "main"
     fake_git.branch_exists.return_value = True
+    fake_git.count_commits_behind.return_value = 0
 
     gate_calls: list[tuple[str, int]] = []
 

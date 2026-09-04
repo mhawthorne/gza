@@ -269,6 +269,23 @@ DUPLICATE_BLOCKER_REVIEW_CYCLES = 3
 REBASE_FAILURE_CIRCUIT_BREAKER_ATTEMPTS = 3
 
 WORKER_CONSUMING_ACTIONS = WORKER_CONSUMING_ADVANCE_ACTION_TYPES
+_REBASE_BEFORE_DISPATCH_ACTION_TYPES = frozenset(
+    {
+        "create_review",
+        "run_review",
+        "create_review_adjudication",
+        "run_review_adjudication",
+        "improve",
+        "run_improve",
+        "create_verify_fix",
+        "run_verify_fix",
+        "rerun_completed_verify_fix",
+        "recover_verify_only_noop_review",
+        "verify_gate",
+        "merge",
+        "merge_with_followups",
+    }
+)
 MERGEABLE_EXECUTION_STATUSES = frozenset({"completed", "unmerged"})
 VERIFY_BLOCKED_REVIEW_THRESHOLD = 2
 _LOG = logging.getLogger(__name__)
@@ -320,6 +337,18 @@ class BranchHeadResolution:
 
     head_sha: str | None
     warning: str | None = None
+
+
+@dataclass(frozen=True)
+class BehindTargetProbe:
+    """Tri-state target freshness probe for pre-dispatch branch actions."""
+
+    behind_count: int | None
+    diagnostic: str | None = None
+
+    @property
+    def failed(self) -> bool:
+        return self.diagnostic is not None
 
 
 @dataclass(frozen=True)
@@ -3604,50 +3633,213 @@ def _failed_task_resume_or_retry_action(ctx: AdvanceContext) -> dict[str, Any]:
     assert ctx.failed_recovery_decision is not None
     if ctx.failed_recovery_decision.action == "reconcile":
         return failed_recovery_decision_to_action(ctx.task, ctx.failed_recovery_decision)
-    if ctx.task.task_type == "rebase":
-        return failed_recovery_decision_to_action(ctx.task, ctx.failed_recovery_decision)
-    if not ctx.task.branch:
-        return failed_recovery_decision_to_action(ctx.task, ctx.failed_recovery_decision)
-    if not ctx.task.has_commits:
-        return failed_recovery_decision_to_action(ctx.task, ctx.failed_recovery_decision)
+    return failed_recovery_decision_to_action(ctx.task, ctx.failed_recovery_decision)
 
-    rebase_parent_task = _resolve_recovery_preflight_rebase_parent_task(ctx.store, ctx.task)
+
+def _pre_dispatch_rebase_parent_task(ctx: AdvanceContext, action: Mapping[str, Any]) -> DbTask | None:
+    action_type = str(action.get("type", ""))
+    if action_type in {"resume", "retry"} and ctx.failed_recovery_decision is not None:
+        if ctx.task.task_type == "rebase":
+            return None
+        parent_task = _resolve_recovery_preflight_rebase_parent_task(ctx.store, ctx.task)
+        if not parent_task.branch or not parent_task.has_commits:
+            return None
+        return parent_task
+    if action_type not in _REBASE_BEFORE_DISPATCH_ACTION_TYPES:
+        return None
+    owner_task: DbTask | None
+    if _is_implementation_owned_lineage(ctx):
+        owner_task = _verify_gate_owner_task(ctx)
+    else:
+        merge_unit_plan = ctx.store.resolve_merge_unit_plan_for_task(ctx.task, target_branch=ctx.target_branch)
+        owner_task = merge_unit_plan.representative_task if merge_unit_plan is not None else ctx.task
+    if owner_task is None or not owner_task.branch or not owner_task.has_commits:
+        return None
+    return owner_task
+
+
+def _pre_dispatch_freshness_probe_failed_action(
+    ctx: AdvanceContext,
+    action: Mapping[str, Any],
+    *,
+    diagnostic: str,
+) -> dict[str, Any]:
+    action_type = str(action.get("type", ""))
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                f"SKIP: target freshness for branch '{ctx.merge_source_ref}' could not be verified "
+                f"before {action_type}: {diagnostic}"
+            ),
+            "deferred_action_type": action_type,
+            "target_branch": ctx.target_branch,
+            "merge_source_ref": ctx.merge_source_ref,
+            "diagnostic": diagnostic,
+        },
+        reason="pre-dispatch-target-freshness-unverified",
+        subject_task_id=_needs_attention_subject_id(ctx),
+    )
+
+
+def _pre_dispatch_rebase_required(ctx: AdvanceContext, action: Mapping[str, Any]) -> bool | dict[str, Any]:
+    if _branch_contains_target_tip(ctx):
+        return False
+    if str(action.get("type", "")) in {"resume", "retry"} and ctx.failed_recovery_decision is not None:
+        return True
+    if not isinstance(ctx.merge_source_ref, str) or not ctx.merge_source_ref:
+        return False
+    if not ctx.can_merge:
+        return True
+    behind_probe = _merge_source_behind_target_probe(ctx)
+    if behind_probe.failed:
+        assert behind_probe.diagnostic is not None
+        return _pre_dispatch_freshness_probe_failed_action(ctx, action, diagnostic=behind_probe.diagnostic)
+    return behind_probe.behind_count is not None and behind_probe.behind_count > 0
+
+
+def _merge_source_behind_target_probe(ctx: AdvanceContext) -> BehindTargetProbe:
+    merge_source_ref = ctx.merge_source_ref
+    if not isinstance(merge_source_ref, str) or not merge_source_ref:
+        return BehindTargetProbe(behind_count=None, diagnostic="merge source ref is unavailable")
+    count_commits_behind = getattr(ctx.git, "count_commits_behind", None)
+    if not callable(count_commits_behind):
+        count_commits_behind = getattr(ctx.git, "count_commits_behind_checked", None)
+    if not callable(count_commits_behind):
+        return BehindTargetProbe(behind_count=None, diagnostic="git backend lacks count_commits_behind")
+    try:
+        behind_count = count_commits_behind(merge_source_ref, ctx.target_branch)
+    except Exception as exc:
+        return BehindTargetProbe(behind_count=None, diagnostic=str(exc) or exc.__class__.__name__)
+    if behind_count is None:
+        return BehindTargetProbe(behind_count=None, diagnostic="count_commits_behind returned no result")
+    if not isinstance(behind_count, int) or isinstance(behind_count, bool):
+        return BehindTargetProbe(
+            behind_count=None,
+            diagnostic=f"count_commits_behind returned malformed result {behind_count!r}",
+        )
+    if behind_count < 0:
+        return BehindTargetProbe(
+            behind_count=None,
+            diagnostic=f"count_commits_behind returned negative count {behind_count}",
+        )
+    return BehindTargetProbe(behind_count=behind_count)
+
+
+def _pre_dispatch_failed_rebase_policy_action(ctx: AdvanceContext) -> dict[str, Any] | None:
+    if (
+        ctx.rebase_failure_streak is not None
+        and ctx.rebase_failure_streak.attempts >= REBASE_FAILURE_CIRCUIT_BREAKER_ATTEMPTS
+    ):
+        return _rebase_failure_circuit_breaker_action(ctx)
+    if _failed_rebase_still_blocks_advance(ctx):
+        return with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
+            },
+            reason="rebase-failed-needs-manual-resolution",
+            subject_task_id=ctx.task.id,
+        )
+    return None
+
+
+def _rebase_before_dispatch_action(
+    ctx: AdvanceContext,
+    action: Mapping[str, Any],
+    *,
+    rebase_parent_task: DbTask,
+) -> dict[str, Any]:
+    action_type = str(action.get("type", ""))
+    recovery_preflight_metadata: dict[str, Any] | None = None
+    if action_type in {"resume", "retry"} and ctx.failed_recovery_decision is not None:
+        recovery_preflight_metadata = {
+            "deferred_action_type": action_type,
+            "failed_task_id": ctx.task.id,
+            "recovery_task_id": ctx.failed_recovery_decision.recovery_task_id,
+            "rebase_parent_task_id": rebase_parent_task.id,
+            "rebase_parent_task_type": rebase_parent_task.task_type,
+            "rebase_parent_branch": rebase_parent_task.branch,
+            "reason": "recovery-preflight-rebase",
+        }
+
     same_branch_rebases = _get_same_branch_rebase_descendants_for_root(ctx.store, rebase_parent_task)
     active_same_branch_rebase = next(
         (rebase for rebase in same_branch_rebases if rebase.status in {"pending", "in_progress"}),
         None,
     )
-    deferred_action = failed_recovery_decision_to_action(ctx.task, ctx.failed_recovery_decision)
-    recovery_preflight_metadata = {
-        "deferred_action_type": deferred_action["type"],
-        "failed_task_id": ctx.task.id,
-        "recovery_task_id": ctx.failed_recovery_decision.recovery_task_id,
+    if active_same_branch_rebase is not None:
+        skip_action: dict[str, Any] = {
+            "type": "skip",
+            "description": f"SKIP: rebase {_task_id(active_same_branch_rebase)} already in progress",
+            "reason": "recovery-preflight-rebase" if recovery_preflight_metadata is not None else "pre-dispatch-rebase",
+            "active_rebase_task_id": active_same_branch_rebase.id,
+        }
+        if ctx.failed_recovery_decision is not None:
+            skip_action["recovery_task_id"] = ctx.failed_recovery_decision.recovery_task_id
+        if recovery_preflight_metadata is not None:
+            skip_action["recovery_preflight"] = recovery_preflight_metadata
+        return skip_action
+
+    needs_rebase_action: dict[str, Any] = {
+        "type": "needs_rebase",
+        "description": (
+            "Rebase before failed-task recovery"
+            if recovery_preflight_metadata is not None
+            else f"Rebase before {action_type}"
+        ),
+        "reason": "recovery-preflight-rebase" if recovery_preflight_metadata is not None else "pre-dispatch-rebase",
+        "deferred_action_type": action_type,
         "rebase_parent_task_id": rebase_parent_task.id,
         "rebase_parent_task_type": rebase_parent_task.task_type,
         "rebase_parent_branch": rebase_parent_task.branch,
-        "reason": "recovery-preflight-rebase",
+        "target_branch": ctx.target_branch,
     }
-    if active_same_branch_rebase is not None:
-        return {
-            "type": "skip",
-            "description": f"SKIP: rebase {_task_id(active_same_branch_rebase)} already in progress",
-            "recovery_task_id": ctx.failed_recovery_decision.recovery_task_id,
-            "reason": "recovery-preflight-rebase",
-            "active_rebase_task_id": active_same_branch_rebase.id,
-            "recovery_preflight": recovery_preflight_metadata,
-        }
-    if not _branch_contains_target_tip(ctx):
-        return {
-            "type": "needs_rebase",
-            "description": "Rebase before failed-task recovery",
-            "reason": "recovery-preflight-rebase",
-            "deferred_action_type": deferred_action["type"],
-            "failed_task_id": ctx.task.id,
-            "recovery_task_id": ctx.failed_recovery_decision.recovery_task_id,
-            "rebase_parent_task_id": rebase_parent_task.id,
-            "recovery_preflight": recovery_preflight_metadata,
-        }
-    return failed_recovery_decision_to_action(ctx.task, ctx.failed_recovery_decision)
+    if recovery_preflight_metadata is not None:
+        needs_rebase_action.update(
+            {
+                "failed_task_id": ctx.task.id,
+                "recovery_task_id": ctx.failed_recovery_decision.recovery_task_id
+                if ctx.failed_recovery_decision is not None
+                else None,
+                "recovery_preflight": recovery_preflight_metadata,
+            }
+        )
+    return needs_rebase_action
+
+
+def _apply_pre_dispatch_rebase_gate(ctx: AdvanceContext, action: dict[str, Any]) -> dict[str, Any]:
+    rebase_parent_task = _pre_dispatch_rebase_parent_task(ctx, action)
+    if rebase_parent_task is None:
+        return action
+    rebase_required = _pre_dispatch_rebase_required(ctx, action)
+    if isinstance(rebase_required, dict):
+        return rebase_required
+    if not rebase_required:
+        return action
+
+    failed_rebase_policy_action = _pre_dispatch_failed_rebase_policy_action(ctx)
+    if failed_rebase_policy_action is not None:
+        return failed_rebase_policy_action
+
+    return _rebase_before_dispatch_action(ctx, action, rebase_parent_task=rebase_parent_task)
+
+
+def select_advance_action_for_context(
+    ctx: AdvanceContext,
+    *,
+    action_filter: Callable[[AdvanceContext, dict[str, Any]], bool] | None = None,
+) -> dict[str, Any]:
+    """Select the next lifecycle action, then apply shared pre-dispatch policy."""
+    for rule in ADVANCE_RULES:
+        if rule.matches(ctx):
+            action = rule.action(ctx)
+            if action_filter is not None and not action_filter(ctx, action):
+                continue
+            require_needs_attention_subject(action)
+            return _apply_pre_dispatch_rebase_gate(ctx, action)
+
+    return {"type": "skip", "description": "SKIP: no matching rule (unexpected)"}
 
 
 def _resolve_recovery_preflight_rebase_parent_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
@@ -6601,13 +6793,7 @@ def plan_manual_verify_gate_action(
     if reconcile_action.get("type") == "reconcile_verify_gate_evidence":
         return reconcile_action
 
-    for rule in ADVANCE_RULES:
-        if rule.matches(ctx):
-            planned_action = rule.action(ctx)
-            require_needs_attention_subject(planned_action)
-            break
-    else:
-        planned_action = {"type": "skip", "description": "SKIP: no matching rule (unexpected)"}
+    planned_action = select_advance_action_for_context(ctx)
 
     if planned_action.get("type") == "reconcile_verify_gate_evidence":
         return planned_action
@@ -6615,10 +6801,10 @@ def plan_manual_verify_gate_action(
         action = dict(planned_action)
         action["verify_gate_explicit_refresh"] = True
         action["verify_owner_task"] = verify_owner_task
-        return action
+        return _apply_pre_dispatch_rebase_gate(ctx, action)
 
     phase = "pre_merge" if _verify_gate_in_merge_scope(ctx) else "pre_review"
-    return _verify_gate_action(ctx, phase=phase, explicit_refresh=True)
+    return _apply_pre_dispatch_rebase_gate(ctx, _verify_gate_action(ctx, phase=phase, explicit_refresh=True))
 
 
 def _closing_review_requires_automation(ctx: AdvanceContext) -> bool:
@@ -8511,21 +8697,6 @@ ADVANCE_RULES: list[AdvanceRule] = [
         action=_rebase_did_not_unblock_merge_action,
     ),
     AdvanceRule(
-        name="conflict_needs_rebase",
-        matches=lambda ctx: (
-            ctx.selected_for_merge
-            and not ctx.can_merge
-            and not _merge_source_unavailable_requires_manual_resolution(ctx)
-            and ctx.rebase_pending_or_running is None
-            and not _branch_contains_target_tip(ctx)
-        ),
-        action=lambda ctx: {
-            "type": "needs_rebase",
-            "description": "rebase --resolve (conflicts detected)",
-            "reason": "merge-selection-conflict-rebase",
-        },
-    ),
-    AdvanceRule(
         name="already_rebased_but_lineage_incomplete",
         matches=lambda ctx: not ctx.can_merge and _branch_contains_target_tip(ctx) and ctx.task.status != "completed",
         action=_already_rebased_but_lineage_incomplete_action,
@@ -9087,10 +9258,4 @@ def evaluate_advance_rules(
         selected_for_merge=selected_for_merge,
     )
 
-    for rule in ADVANCE_RULES:
-        if rule.matches(context):
-            action = rule.action(context)
-            require_needs_attention_subject(action)
-            return action
-
-    return {"type": "skip", "description": "SKIP: no matching rule (unexpected)"}
+    return select_advance_action_for_context(context)

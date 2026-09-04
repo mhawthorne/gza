@@ -21,7 +21,7 @@ import gza.cli.execution as _execution_module
 from gza import recovery_engine as _recovery_engine_module
 from gza.artifacts import store_command_output_artifact
 from gza.cli import _run_as_worker, _run_foreground, cmd_run_inline, query as query_cli_module
-from gza.cli.execution import _format_iterate_terminal_merge_state_message
+from gza.cli.execution import _format_iterate_terminal_merge_state_message, _resolve_action_rebase_parent_task
 from gza.concurrency import launch_permit
 from gza.config import Config, ConfigError
 from gza.db import DuplicateActiveChildError, SqliteTaskStore, task_id_numeric_key
@@ -153,6 +153,39 @@ def test_format_iterate_terminal_merge_state_message_distinguishes_redundant(tmp
         f"failed implementation {requested.id} was fully recovered by descendant {iterate.id}; "
         "commits are already present on target."
     )
+
+
+def test_resolve_action_rebase_parent_task_uses_canonical_action_parent(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/iterate-action-parent"
+    store.update(impl)
+
+    descendant = store.add(
+        "Completed improve",
+        task_type="improve",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert descendant.id is not None
+    descendant.branch = impl.branch
+    store.update(descendant)
+
+    resolved = _resolve_action_rebase_parent_task(
+        store,
+        {"type": "needs_rebase", "rebase_parent_task_id": impl.id},
+        descendant,
+    )
+
+    assert resolved == impl
+    assert _resolve_action_rebase_parent_task(
+        store,
+        {"type": "needs_rebase", "rebase_parent_task_id": "missing-task"},
+        descendant,
+    ) is None
 
 
 def test_format_iterate_terminal_merge_state_message_hides_recoverable_failed_redundant_task(
@@ -11670,6 +11703,7 @@ class TestIterateCommand:
         mock_git.resolve_merge_source_ref.return_value = None
         mock_git.is_merged.return_value = False
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with patch("gza.cli.Git", return_value=mock_git):
             yield
@@ -11864,6 +11898,7 @@ class TestIterateCommand:
         git.default_branch.return_value = "main"
         git.branch_exists.return_value = True
         git.can_merge.return_value = True
+        git.count_commits_behind.return_value = 0
         git.is_merged.return_value = False
         git.resolve_merge_source_ref.return_value = None
         git.resolve_fresh_merge_source.return_value = (impl.branch, None)
@@ -12026,8 +12061,11 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.ref_exists.return_value = False
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.is_merged.return_value = False
         mock_git.rev_parse_if_exists.side_effect = (
             lambda ref: "same-head"
@@ -12036,6 +12074,7 @@ class TestIterateCommand:
             if ref in {"main", "origin/main"}
             else None
         )
+        mock_git.count_commits_behind.return_value = 0
         mock_git.count_commits_behind_checked.return_value = 0
         mock_git.count_commits_ahead_checked.return_value = 1
         mock_git.get_diff_name_status.return_value = ""
@@ -12152,8 +12191,11 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.ref_exists.return_value = False
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.is_merged.return_value = False
         mock_git.rev_parse_if_exists.side_effect = (
             lambda ref: "same-head"
@@ -12162,6 +12204,7 @@ class TestIterateCommand:
             if ref in {"main", "origin/main"}
             else None
         )
+        mock_git.count_commits_behind.return_value = 0
         mock_git.count_commits_behind_checked.return_value = 0
         mock_git.count_commits_ahead_checked.return_value = 1
         mock_git.get_diff_name_status.return_value = ""
@@ -12570,8 +12613,11 @@ class TestIterateCommand:
         verify_calls: list[object] = []
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.ref_exists.return_value = False
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: head_sha if ref in {impl.branch, "HEAD"} else None
         mock_git.worktree_add_existing.side_effect = (
             lambda path, ref, detach=False: Path(path).mkdir(parents=True, exist_ok=True) or Path(path)
@@ -12906,6 +12952,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -13293,6 +13340,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -13370,7 +13418,9 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else None
 
         action = _determine_selected_iterate_action(
@@ -13452,6 +13502,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref in {impl.branch, "HEAD"} else None
         mock_git.worktree_add_existing.side_effect = lambda path, ref, detach=False: Path(path).mkdir(parents=True, exist_ok=True) or Path(path)
         mock_git.worktree_remove.side_effect = lambda path, force=False: SimpleNamespace(returncode=0)
@@ -13562,6 +13613,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref in {impl.branch, "HEAD"} else None
         mock_git.worktree_add_existing.side_effect = (
             lambda path, ref, detach=False: Path(path).mkdir(parents=True, exist_ok=True) or Path(path)
@@ -14264,6 +14316,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = (
             lambda ref: "same-head" if isinstance(ref, str) and ref.startswith("task-") else "base-head" if ref == "main" else None
         )
@@ -15281,6 +15334,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with patch("gza.cli.Config.load", return_value=mock_config), \
              patch("gza.cli.get_store", return_value=store), \
              patch("gza.cli.Git", return_value=mock_git), \
@@ -15341,6 +15395,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -15433,6 +15488,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -15507,6 +15563,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
 
         with (
@@ -15597,6 +15654,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
 
         with (
@@ -15683,6 +15741,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -15741,6 +15800,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -15789,6 +15849,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -15844,6 +15905,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -15889,6 +15951,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -15952,6 +16015,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -16018,6 +16082,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -16085,6 +16150,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "head-1" if ref == impl.branch else None
 
         with (
@@ -16134,6 +16200,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "parked-head" if ref == impl.branch else None
 
         with (
@@ -17476,6 +17543,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "rearm-head" if ref == impl.branch else None
 
         with (
@@ -18089,6 +18157,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "advance-force-head" if ref == impl.branch else None
         snapshot = ConcurrencySnapshot(
             limit=1,
@@ -18475,6 +18544,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "improved-head" if ref == impl.branch else None
 
         with (
@@ -18552,6 +18622,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -18678,6 +18749,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -18752,6 +18824,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -18840,6 +18913,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -19403,6 +19477,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         def fake_run_foreground(_config, task_id, resume=False, **kwargs):
             task = store.get(task_id)
@@ -19697,6 +19772,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -20046,6 +20122,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = (
             lambda ref: "same-head" if ref == "test-project/20260101-resume-mismatch" else "base-head" if ref == "main" else None
         )
@@ -20111,6 +20188,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         engine_config = _AdvanceEngineConfigAdapter(
             project_dir=tmp_path,
             require_review_before_merge=True,
@@ -20152,6 +20230,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -20196,6 +20275,7 @@ class TestIterateCommand:
         mock_git.resolve_merge_source_ref.return_value = None
         mock_git.is_merged.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -20245,6 +20325,7 @@ class TestIterateCommand:
         mock_git.resolve_merge_source_ref.return_value = f"origin/{impl.branch}"
         mock_git.is_merged.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -20294,6 +20375,7 @@ class TestIterateCommand:
         mock_git.resolve_merge_source_ref.return_value = f"origin/{impl.branch}"
         mock_git.is_merged.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -20349,6 +20431,7 @@ class TestIterateCommand:
         mock_git.ref_exists.return_value = True
         mock_git.is_merged.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -20427,6 +20510,7 @@ class TestIterateCommand:
         mock_git.ref_exists.return_value = True
         mock_git.is_merged.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -20485,6 +20569,7 @@ class TestIterateCommand:
         mock_git.resolve_merge_source_ref.return_value = f"origin/{impl.branch}"
         mock_git.is_merged.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -20534,6 +20619,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -20583,6 +20669,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.resolve_fresh_merge_source.return_value = impl.branch
         mock_git.rev_parse_if_exists.side_effect = lambda ref: {
             impl.branch: "branch-tip-sha",
@@ -20670,6 +20757,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -20766,6 +20854,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -20831,6 +20920,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.resolve_fresh_merge_source.return_value = (failed.branch, None)
         mock_git.rev_parse_if_exists.side_effect = lambda ref: {
             failed.branch: "old-main-sha",
@@ -20910,6 +21000,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         def fake_run_foreground(config, task_id, resume=False, **kwargs):
             task = store.get(task_id)
@@ -20994,6 +21085,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -21064,6 +21156,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         def fake_run_foreground(config, task_id, resume=False, **kwargs):
             task = store.get(task_id)
@@ -21138,6 +21231,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         def fake_run_foreground(config, task_id, resume=False, **kwargs):
             task = store.get(task_id)
@@ -21242,6 +21336,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         with patch("gza.cli.Config.load", return_value=mock_config), \
              patch("gza.cli.get_store", return_value=store), \
              patch("gza.cli.Git", return_value=mock_git), \
@@ -21290,6 +21385,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with patch("gza.cli.Config.load", return_value=mock_config), \
              patch("gza.cli.get_store", return_value=store), \
@@ -21334,6 +21430,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with patch("gza.cli.Config.load", return_value=mock_config), \
              patch("gza.cli.get_store", return_value=store), \
@@ -21383,6 +21480,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -21426,6 +21524,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         engine_config = _AdvanceEngineConfigAdapter(
             project_dir=tmp_path,
             require_review_before_merge=True,
@@ -21544,6 +21643,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -21613,6 +21713,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -21708,6 +21809,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         def fake_run_foreground(_config, task_id, **kwargs):
             task = store.get(task_id)
@@ -21904,6 +22006,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -22312,6 +22415,8 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.resolve_fresh_merge_source.return_value = recovered_impl.branch
         mock_git.rev_parse_if_exists.side_effect = lambda ref: {
             recovered_impl.branch: "branch-tip-sha",
@@ -22895,6 +23000,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         def fake_run_foreground(_config, task_id, **kwargs):
             task = store.get(task_id)
@@ -23014,6 +23120,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -23405,6 +23512,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         def fake_run_foreground(config, task_id, resume=False, **kwargs):
             task = store.get(task_id)
@@ -23562,6 +23670,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         def fake_run_foreground(config, task_id, resume=False, **kwargs):
             task = store.get(task_id)
@@ -23765,6 +23874,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         def fake_run_foreground(config, task_id, resume=False, **kwargs):
             task = store.get(task_id)
@@ -23873,6 +23983,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         actions = [
             {"type": "improve", "description": "Create improve task", "review_task": review},
@@ -24114,6 +24225,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         def fake_run_foreground(config, task_id, resume=False, **kwargs):
             task = store.get(task_id)
@@ -24245,6 +24357,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         self._persist_current_green_verify(store, tmp_path, impl)
         engine_config = _AdvanceEngineConfigAdapter(
@@ -24335,6 +24448,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -24414,6 +24528,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -24517,6 +24632,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -24746,6 +24862,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         engine_config = _AdvanceEngineConfigAdapter(
             project_dir=tmp_path,
             require_review_before_merge=True,
@@ -24911,6 +25028,8 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         def fake_run_foreground(config, task_id, **kwargs):
             del config, kwargs
@@ -25014,6 +25133,7 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with patch("gza.cli.Config.load", return_value=mock_config), \
              patch("gza.cli.get_store", return_value=store), \
@@ -25284,6 +25404,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         decision = FailedRecoveryDecision(
             task_id=failed_improve.id,
             action=recovery_action,
@@ -26635,6 +26756,8 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.ref_exists.return_value = False
         mock_git.resolve_fresh_merge_source.return_value = SimpleNamespace(ref=impl.branch, warning=None)
         mock_git.can_merge.return_value = False
@@ -26691,9 +26814,12 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.ref_exists.return_value = False
         mock_git.resolve_fresh_merge_source.return_value = SimpleNamespace(ref=impl.branch, warning=None)
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.is_merged.return_value = False
         mock_git.rev_parse_if_exists.side_effect = (
             lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
@@ -26766,9 +26892,12 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.ref_exists.return_value = False
         mock_git.resolve_fresh_merge_source.return_value = SimpleNamespace(ref=impl.branch, warning=None)
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.is_merged.return_value = False
         mock_git.rev_parse_if_exists.side_effect = (
             lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
@@ -26836,9 +26965,12 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.ref_exists.return_value = False
         mock_git.resolve_fresh_merge_source.return_value = SimpleNamespace(ref=impl.branch, warning=None)
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.is_merged.return_value = False
         mock_git.rev_parse_if_exists.side_effect = (
             lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
@@ -26925,9 +27057,12 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.ref_exists.return_value = False
         mock_git.resolve_fresh_merge_source.return_value = SimpleNamespace(ref=impl.branch, warning=None)
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.is_merged.return_value = False
         mock_git.rev_parse_if_exists.side_effect = (
             lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
@@ -27003,9 +27138,12 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.ref_exists.return_value = False
         mock_git.resolve_fresh_merge_source.return_value = SimpleNamespace(ref=impl.branch, warning=None)
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.is_merged.return_value = False
         mock_git.rev_parse_if_exists.side_effect = (
             lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
@@ -27075,9 +27213,12 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.ref_exists.return_value = False
         mock_git.resolve_fresh_merge_source.return_value = SimpleNamespace(ref=impl.branch, warning=None)
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
         mock_git.is_merged.return_value = False
         mock_git.rev_parse_if_exists.side_effect = (
             lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
@@ -27238,6 +27379,7 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         engine_config = _AdvanceEngineConfigAdapter(
             project_dir=tmp_path,
@@ -30081,6 +30223,7 @@ class TestForegroundInvocationContextWiring:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -30148,6 +30291,7 @@ class TestForegroundInvocationContextWiring:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with (
             patch("gza.cli.get_store", return_value=store),
@@ -30224,6 +30368,7 @@ class TestForegroundInvocationContextWiring:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         with patch("gza.cli._common._spawn_detached_worker_process", side_effect=fake_spawn):
             rc = _spawn_background_iterate_worker(spawn_args, config, impl, max_iterations=1)
@@ -30287,6 +30432,7 @@ class TestForegroundInvocationContextWiring:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 0
 
         def fake_run(_config, task_id, **kwargs):
             task = store.get(task_id)

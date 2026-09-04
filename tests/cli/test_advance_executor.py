@@ -5755,6 +5755,7 @@ def _build_verify_gate_merge_unit_context(
 def _build_merge_unit_lifecycle_git(owner: DbTask, *, head_sha: str = "head-1") -> MagicMock:
     lifecycle_git = MagicMock()
     lifecycle_git.can_merge.return_value = True
+    lifecycle_git.count_commits_behind.return_value = 0
     lifecycle_git.is_merged.return_value = False
     lifecycle_git.branch_exists.return_value = True
     lifecycle_git.ref_exists.return_value = False
@@ -6745,6 +6746,7 @@ def test_completed_no_source_timeout_verify_fix_rerun_persists_green_then_plans_
 
     lifecycle_git = MagicMock()
     lifecycle_git.can_merge.return_value = True
+    lifecycle_git.count_commits_behind.return_value = 0
     lifecycle_git.is_merged.return_value = False
     lifecycle_git.branch_exists.return_value = True
     lifecycle_git.ref_exists.return_value = False
@@ -6895,6 +6897,7 @@ def test_completed_legacy_timeout_verify_fix_dry_run_does_not_persist_upgrade(tm
 
     lifecycle_git = MagicMock()
     lifecycle_git.can_merge.return_value = True
+    lifecycle_git.count_commits_behind.return_value = 0
     lifecycle_git.is_merged.return_value = False
     lifecycle_git.branch_exists.return_value = True
     lifecycle_git.ref_exists.return_value = False
@@ -7032,6 +7035,7 @@ def test_completed_legacy_timeout_verify_fix_rerun_uses_managed_worktree_not_dir
 
     lifecycle_git = MagicMock()
     lifecycle_git.can_merge.return_value = True
+    lifecycle_git.count_commits_behind.return_value = 0
     lifecycle_git.is_merged.return_value = False
     lifecycle_git.branch_exists.return_value = True
     lifecycle_git.ref_exists.return_value = False
@@ -7188,6 +7192,7 @@ def test_completed_no_source_timeout_verify_fix_rerun_atomic_persistence_failure
 
     lifecycle_git = MagicMock()
     lifecycle_git.can_merge.return_value = True
+    lifecycle_git.count_commits_behind.return_value = 0
     lifecycle_git.is_merged.return_value = False
     lifecycle_git.branch_exists.return_value = True
     lifecycle_git.ref_exists.return_value = False
@@ -7585,6 +7590,7 @@ def test_completed_no_source_timeout_verify_fix_rerun_refusals_do_not_clear_gate
 
     lifecycle_git = MagicMock()
     lifecycle_git.can_merge.return_value = True
+    lifecycle_git.count_commits_behind.return_value = 0
     lifecycle_git.is_merged.return_value = False
     lifecycle_git.branch_exists.return_value = True
     lifecycle_git.ref_exists.return_value = False
@@ -8351,6 +8357,99 @@ def test_needs_rebase_recovery_preflight_uses_explicit_rebase_parent_task(tmp_pa
     assert result.created_task is not None
     assert result.created_task.based_on == impl.id
     assert spawned == [(result.created_task.id, "rebase")]
+
+
+@pytest.mark.parametrize("use_iterate_for_needs_rebase", [False, True])
+def test_needs_rebase_uses_canonical_parent_from_general_pre_dispatch_action(
+    tmp_path: Path,
+    use_iterate_for_needs_rebase: bool,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/pre-dispatch-parent")
+    store.update(impl)
+
+    descendant = store.add(
+        "Completed improve",
+        task_type="improve",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert descendant.id is not None
+    _mark_completed(descendant, branch=impl.branch)
+    store.update(descendant)
+
+    created_from: list[str] = []
+    already_merged_checked: list[str] = []
+    spawned: list[tuple[str | None, str, str | None]] = []
+
+    def _create_rebase(parent: DbTask) -> DbTask:
+        assert parent.id is not None
+        created_from.append(parent.id)
+        return store.add(
+            prompt=f"Rebase {parent.id}",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+
+    def _spawn_iterate(
+        task_obj: DbTask,
+        kind: str,
+        *,
+        prepared_task: DbTask | None = None,
+        prepared_phase: str | None = None,
+        prepared_action_type: str | None = None,
+    ) -> int:
+        spawned.append((task_obj.id, kind, prepared_task.id if prepared_task else None))
+        assert prepared_phase == "iteration"
+        assert prepared_action_type == "needs_rebase"
+        return 0
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=use_iterate_for_needs_rebase,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_retry_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=_create_rebase,
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda task_obj, kind: spawned.append((task_obj.id, kind, None)) or 0,
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=_spawn_iterate,
+        is_rebase_target_already_merged=lambda task_obj: already_merged_checked.append(str(task_obj.id)) or False,
+    )
+
+    result = execute_advance_action(
+        task=descendant,
+        action={
+            "type": "needs_rebase",
+            "reason": "pre-dispatch-rebase",
+            "rebase_parent_task_id": impl.id,
+            "rebase_parent_branch": impl.branch,
+        },
+        context=context,
+    )
+
+    assert result.status == "success"
+    assert created_from == [impl.id]
+    assert already_merged_checked == [impl.id]
+    assert result.created_task is not None
+    assert result.created_task.based_on == impl.id
+    if use_iterate_for_needs_rebase:
+        assert spawned == [(impl.id, "rebase", result.created_task.id)]
+        assert result.worker_label == "iterate"
+    else:
+        assert spawned == [(result.created_task.id, "rebase", None)]
+        assert result.worker_label == "rebase"
 
 
 def test_needs_rebase_iterate_rolls_back_when_prepare_fails(tmp_path: Path) -> None:

@@ -8,7 +8,7 @@ import signal
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ..advance_engine import (
-    ADVANCE_RULES,
     PARK_REASON_VERIFY_FIX_FAILED,
     AdvanceContext,
     ReviewCycleBoundary,
@@ -26,8 +25,8 @@ from ..advance_engine import (
     _resolve_latest_plan_source,
     completed_review_cycle_belongs_to_boundary,
     count_completed_review_cycles,
-    require_needs_attention_subject,
     resolve_advance_context,
+    select_advance_action_for_context,
 )
 from ..concurrency import (
     LaunchPermit,
@@ -849,6 +848,23 @@ def _iterate_rebase_target_already_merged(
         config=config,
         merge_source=_resolve_current_merge_source(git_runtime, task.branch) if task.branch else None,
     ).already_merged
+
+
+def _resolve_action_rebase_parent_task(
+    store: SqliteTaskStore,
+    action: Mapping[str, object],
+    fallback_task: DbTask,
+) -> DbTask | None:
+    rebase_parent_task = fallback_task
+    rebase_parent_task_id = action.get("rebase_parent_task_id")
+    if isinstance(rebase_parent_task_id, str) and rebase_parent_task_id:
+        resolved_parent_task = store.get(rebase_parent_task_id)
+        if resolved_parent_task is None or not resolved_parent_task.branch:
+            return None
+        rebase_parent_task = resolved_parent_task
+    if rebase_parent_task.id is None or not rebase_parent_task.branch:
+        return None
+    return rebase_parent_task
 
 
 def _run_with_registered_worker(
@@ -4502,19 +4518,17 @@ def _determine_recovered_post_green_iterate_action(
             failed_recovery_decision=None,
             failed_recovery_attention_reason=None,
         )
-        for rule in ADVANCE_RULES:
-            if rule.matches(context):
-                shared_action = rule.action(context)
-                if shared_action.get("type") == "verify_gate":
-                    maybe_verify_owner = shared_action.get("verify_owner_task")
-                    verify_owner = maybe_verify_owner if isinstance(maybe_verify_owner, DbTask) else task
-                    verify_owner = _resolve_verify_fix_failed_owner_task(store, verify_owner)
-                    verify_decision = resolve_verify_gate_decision(store, verify_owner, config=config, git=git)
-                    if verify_decision.state == "passed":
-                        continue
-                require_needs_attention_subject(shared_action)
-                return shared_action
-        return {"type": "skip", "description": "SKIP: no matching rule (unexpected)"}
+
+        def _skip_passed_verify_gate(_context: AdvanceContext, shared_action: dict[str, Any]) -> bool:
+            if shared_action.get("type") != "verify_gate":
+                return True
+            maybe_verify_owner = shared_action.get("verify_owner_task")
+            verify_owner = maybe_verify_owner if isinstance(maybe_verify_owner, DbTask) else task
+            verify_owner = _resolve_verify_fix_failed_owner_task(store, verify_owner)
+            verify_decision = resolve_verify_gate_decision(store, verify_owner, config=config, git=git)
+            return verify_decision.state != "passed"
+
+        return select_advance_action_for_context(context, action_filter=_skip_passed_verify_gate)
 
     return dict(
         reproject_selected_merge_action(
@@ -5756,25 +5770,27 @@ def _cmd_iterate_impl(
                 )
 
             if action_type == "needs_rebase":
-                if not iterate_task.branch:
+                rebase_parent_task = _resolve_action_rebase_parent_task(store, initial_action, iterate_task)
+                if rebase_parent_task is None:
                     return None, None
                 if _iterate_rebase_target_already_merged(
                     config=config,
                     store=store,
                     git_runtime=preflight_context.git_runtime,
-                    task=iterate_task,
+                    task=rebase_parent_task,
                     target_branch=preflight_context.target_branch,
                 ):
                     return None, None
-                assert iterate_task.id is not None
                 permit = _reserve_iterate_launch()
                 if permit is False:
                     return None, 1
+                assert rebase_parent_task.id is not None
+                assert rebase_parent_task.branch is not None
                 try:
                     action_task = _create_rebase_task(
                         store,
-                        iterate_task.id,
-                        iterate_task.branch,
+                        rebase_parent_task.id,
+                        rebase_parent_task.branch,
                         preflight_context.target_branch,
                         config=config,
                         trigger_source="auto-recovery",
@@ -7027,8 +7043,9 @@ def _cmd_iterate_impl(
                 action_task = prepared_action_task
                 assert action_task.id is not None
                 print(f"  Running rebase {action_task.id}...")
-            elif not impl_task.branch:
-                print(f"  Cannot rebase {impl_task.id}: no branch")
+            elif (rebase_parent_task := _resolve_action_rebase_parent_task(store, action, impl_task)) is None:
+                parent_id = action.get("rebase_parent_task_id", impl_task.id)
+                print(f"  Cannot rebase {parent_id}: missing parent task or branch")
                 final_status = "blocked"
                 final_stop_reason = "needs_rebase"
                 _append_summary_row(summary_rows, iteration_index=iteration, task_type="rebase", task=None, status="failed")
@@ -7037,7 +7054,7 @@ def _cmd_iterate_impl(
                 config=config,
                 store=store,
                 git_runtime=git_runtime,
-                task=impl_task,
+                task=rebase_parent_task,
                 target_branch=target_branch,
             ):
                 print("  Skipping rebase: target implementation already merged.")
@@ -7049,7 +7066,7 @@ def _cmd_iterate_impl(
                     final_stop_reason = "needs_rebase"
                     break
                 permit_for_rebase: LaunchPermit | None = permit_candidate
-                if impl_task.id is None or impl_task.branch is None:
+                if rebase_parent_task.id is None or rebase_parent_task.branch is None:
                     final_status = "blocked"
                     final_stop_reason = "needs_rebase"
                     _append_summary_row(summary_rows, iteration_index=iteration, task_type="rebase", task=None, status="failed")
@@ -7057,8 +7074,8 @@ def _cmd_iterate_impl(
                 try:
                     created_rebase_task = _create_rebase_task(
                         store,
-                        impl_task.id,
-                        impl_task.branch,
+                        rebase_parent_task.id,
+                        rebase_parent_task.branch,
                         target_branch,
                         config=config,
                         trigger_source="manual",
@@ -7066,7 +7083,10 @@ def _cmd_iterate_impl(
                 except DuplicateActiveChildError as exc:
                     if isinstance(permit_for_rebase, LaunchPermit):
                         permit_for_rebase.release()
-                    print(f"  Skipping rebase: {format_duplicate_rebase_message(exc, parent_task_id=impl_task.id)}.")
+                    print(
+                        f"  Skipping rebase: "
+                        f"{format_duplicate_rebase_message(exc, parent_task_id=rebase_parent_task.id)}."
+                    )
                     continue
                 if isinstance(permit_for_rebase, LaunchPermit):
                     prepared_rebase_task = _prepare_reserved_iterate_task(

@@ -825,6 +825,7 @@ def _make_watch_git() -> Git:
     git.is_ancestor = MagicMock(return_value=True)  # type: ignore[method-assign]
     git.count_commits_ahead = MagicMock(return_value=1)  # type: ignore[method-assign]
     git.count_commits_ahead_checked = MagicMock(return_value=1)  # type: ignore[method-assign]
+    git.count_commits_behind = MagicMock(return_value=0)  # type: ignore[method-assign]
     git.has_non_empty_source_diff_against_target = MagicMock(return_value=True)  # type: ignore[method-assign]
     git.get_diff_name_status = MagicMock(return_value="M\tfeature.txt\n")  # type: ignore[method-assign]
     git.get_diff_stat_parsed = MagicMock(return_value=(1, 1, 0))  # type: ignore[method-assign]
@@ -42624,6 +42625,7 @@ def test_watch_cycle_recovered_completed_closing_review_on_stable_head_does_not_
     git.default_branch.return_value = "main"
     git.branch_exists.return_value = True
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
 
     with (
         patch("gza.advance_engine.get_review_report") as get_review_report,
@@ -46049,6 +46051,7 @@ def test_watch_cycle_create_review_resolution_child_materializes_and_runs_review
     git.default_branch.return_value = "main"
     git.branch_exists.return_value = True
     git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
     git.is_merged.return_value = False
     git.resolve_merge_source_ref.return_value = None
     git.resolve_fresh_merge_source.return_value = (impl.branch, None)

@@ -214,33 +214,46 @@ MUST verify the branch diff stays within the work unit's declared project scope.
 Conflict is decided against the canonical local target (see
 [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 4).
 
-- Ordinary queue-wide lifecycle projection MUST evaluate unresolved work units with
-  `selected_for_merge = false` by default. Under that ordinary projection, a branch that
-  merely conflicts with the current local target MUST NOT emit `needs_rebase` yet. It
-  remains on its review/improve/merge lane until a narrower rebase-owning path below
-  applies.
-- Conflict-driven `needs_rebase` is merge-selection scoped. The engine MUST emit it only
-  when the unit has already been selected for merge in the current cycle, or when the
-  shared failed-task recovery policy requires a recovery-preflight rebase before a
-  `resume`/`retry` can safely proceed.
-- A selected merge candidate that reprojects to `needs_rebase` MUST be selected and
-  reported under that final action's worker-slot and merge-lane gates. A cycle with no
-  worker capacity, halted merges, or an unavailable merge lane MUST NOT preview or start a
-  merge-selection rebase for that candidate.
-- A selected-for-merge branch that cannot merge AND already has a rebase child
+- Ordinary queue-wide lifecycle projection MUST run a single rebase-before-dispatch gate
+  after it has selected the next action for a merge unit and before that action is
+  dispatched. The gate applies to actions against the unit's branch, including review,
+  improve, verify-fix, verify-gate, and merge actions; idle rows and needs-attention rows
+  with no action about to be dispatched MUST NOT be rebased.
+- The pre-dispatch gate emits `needs_rebase` when the local merge source does not already
+  contain the current local target tip and either the source cannot merge or the source is
+  positively known to be behind the target. Recovery-preflight rebase remains lifecycle
+  owned: when failed-task recovery would otherwise `resume` or `retry`, the same gate
+  emits `needs_rebase` unless target-tip containment is already proven.
+- If the source is cleanly mergeable but target freshness cannot be verified because the
+  behind-count probe fails, returns no result, or returns malformed data, lifecycle MUST
+  fail closed with `needs_discussion`
+  (`pre-dispatch-target-freshness-unverified`) instead of dispatching the selected branch
+  action.
+- A merge-unit action that reprojects to `needs_rebase` MUST be reported under that final
+  action's worker-slot gates. A cycle with no worker capacity MUST NOT preview or start a
+  rebase for that candidate.
+- A branch that needs the pre-dispatch rebase and already has a rebase child
   `pending`/`in_progress` → `skip` (see
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 1).
+- A branch that needs the pre-dispatch rebase and has unresolved failed-rebase evidence
+  MUST apply the same failed-rebase and circuit-breaker policy independent of `can_merge`.
+  Three qualifying failed same-branch rebase attempts with no intervening reset proof emit
+  `needs_discussion` (`rebase-failure-circuit-breaker`) before a new rebase can be
+  planned; one unresolved manual/conflict failure emits `needs_discussion`
+  (`rebase-failed-needs-manual-resolution`).
 - Singleton identity and duplicate-capacity behavior are owned by
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 1.
-  For this gate, an active rebase for the selected source branch MUST make the
-  selected-for-merge row `skip` without consuming worker capacity.
-- A selected-for-merge branch that cannot merge, has no rebase child, does not already
-  contain the local target tip, and still has a resolvable local merge source →
-  create a `rebase` task (`needs_rebase`). The action's machine-readable reason slug
-  MUST distinguish this merge-lane path from the recovery-preflight path;
-  `merge-selection-conflict-rebase` is the canonical slug.
-- If a selected-for-merge branch lacks any resolvable local merge source while persisted
-  merge state is still non-terminal, lifecycle MUST fail closed with `needs_discussion`
+  For this gate, an active rebase for the source branch MUST make the row `skip` without
+  consuming worker capacity.
+- A branch that needs the pre-dispatch rebase, has no active rebase child, and still has a
+  resolvable local merge source → create a `rebase` task (`needs_rebase`). The action's
+  machine-readable reason slug MUST distinguish this general dispatch path from the
+  recovery-preflight path; `pre-dispatch-rebase` is the canonical slug. Every
+  `needs_rebase` action emitted by this gate MUST identify the canonical rebase parent
+  task id and source branch that the gate evaluated, and executors MUST create or dedupe
+  the rebase under that canonical parent rather than the evaluated descendant row.
+- If a branch lacks any resolvable local merge source while persisted merge state is still
+  non-terminal, lifecycle MUST fail closed with `needs_discussion`
   (`merge-source-needs-manual-resolution`) instead of planning or continuing rebase
   automation from a remote-only/deleted source ref.
 - A recovery-preflight rebase MUST remain lifecycle-owned around recovery policy. When
@@ -282,11 +295,13 @@ Conflict is decided against the canonical local target (see
   `needs_discussion` (reason `rebase-did-not-unblock-merge`). This park rule applies
   only when the completed rebase already includes the current target tip, so a fresh
   same-target rebase is already proved futile. A selected merge candidate with only a
-  stale completed rebase and no current-target-tip containment remains eligible for
-  `merge-selection-conflict-rebase` above. The engine MUST NOT re-queue an identical
-  rebase (see [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 2).
+  stale completed rebase and no current-target-tip containment remains eligible for the
+  shared `pre-dispatch-rebase` gate before its next branch action. The engine MUST NOT
+  re-queue an identical rebase (see
+  [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 2).
 - Repeated rebase failures reach the **circuit-breaker bound** with no intervening success,
-  review, or code change → `needs_discussion` (reason `rebase-failure-circuit-breaker`).
+  review, review-clear proof, or code change → `needs_discussion` (reason
+  `rebase-failure-circuit-breaker`).
 - Branch already contains the target tip but the lineage is still unresolved →
   `needs_discussion` (surface the real blocker rather than spawn a guaranteed-no-op
   rebase).
@@ -1355,6 +1370,7 @@ is a spec change. The accompanying human message is free text.
 | `project-scope-unverified` | needs_discussion | §3 diff could not be inspected (fail closed) |
 | `merge-source-needs-manual-resolution` † | HumanParked | §4 host-side merge-source divergence needs manual resolution |
 | `reconcile-needs-manual-resolution` † | HumanParked | §4 execution-time reconcile outcome needs manual resolution |
+| `pre-dispatch-target-freshness-unverified` | needs_discussion | §4 behind-count probe could not prove a cleanly mergeable branch is current |
 | `rebase-failed-needs-manual-resolution` | HumanParked | §4 manual/conflict rebase failed, no landing proof after shared recovery classification |
 | `rebase-did-not-unblock-merge` | HumanParked | §4 rebase completed, still conflicts |
 | `rebase-failure-circuit-breaker` | HumanParked | §4 repeated rebase failures, no progress |

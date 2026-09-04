@@ -372,6 +372,39 @@ def test_verify_current_green_is_noop_without_force(tmp_path, capsys):
     assert "already passed for the current epoch" in output
 
 
+def test_verify_stale_branch_needs_rebase_exits_without_running_verify(tmp_path, capsys):
+    config = _setup_verify_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_unmerged_task(store)
+    git = _fake_git(tmp_path)
+    git.resolve_fresh_merge_source_ref = MagicMock(return_value=task.branch)
+    git.resolve_fresh_merge_source = MagicMock(
+        return_value=SimpleNamespace(ref=task.branch, warning=None)
+    )
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: {
+            task.branch: "branch-tip",
+            "main": "target-tip",
+        }.get(ref)
+    )
+    git.is_ancestor = MagicMock(return_value=False)
+    git.count_commits_behind = MagicMock(return_value=1)
+
+    with (
+        patch("gza.cli.verify.Git", return_value=git),
+        patch("gza.cli.verify.execute_advance_action") as execute_action,
+    ):
+        rc = cmd_verify(_args(tmp_path, task.id, force=True))
+
+    assert rc == 1
+    execute_action.assert_not_called()
+    output = capsys.readouterr().out
+    assert "Verify gate cannot run until the merge unit is rebased" in output
+    assert f"task {task.id}" in output
+    assert task.branch in output
+    assert "main" in output
+
+
 def test_verify_merge_unit_newer_contributor_red_rerun_can_clear_block(tmp_path, capsys):
     config = _setup_verify_config(tmp_path)
     store = make_store(tmp_path)
