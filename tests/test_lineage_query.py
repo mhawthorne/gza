@@ -7,6 +7,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
@@ -664,15 +665,139 @@ def test_query_lineage_owner_rows_tag_filter_excludes_owner_when_only_member_mat
     member.failure_reason = "TEST_FAILURE"
     store.update(member)
 
-    rows = query_lineage_owner_rows(
-        store,
-        LineageOwnerQuery(limit=None, tags=("alpha",), include_skipped=True, max_recovery_attempts=1),
-        config=config,
-        git=MagicMock(),
-        target_branch="main",
-    )
+    git = MagicMock()
+    with (
+        patch("gza.lineage_query.prime_advance_planning_refs") as preload,
+        patch("gza.cli.advance_engine.determine_next_action") as determine,
+    ):
+        rows = query_lineage_owner_rows(
+            store,
+            LineageOwnerQuery(limit=None, tags=("alpha",), include_skipped=True, max_recovery_attempts=1),
+            config=config,
+            git=git,
+            target_branch="main",
+        )
 
     assert not rows
+    preload.assert_called_once_with(
+        git,
+        branch_names=ANY,
+        target_branch="main",
+        warning_logger=ANY,
+    )
+    assert tuple(preload.call_args.kwargs["branch_names"]) == ()
+    determine.assert_not_called()
+
+
+def _add_unmerged_tag_pruning_owner(
+    store: SqliteTaskStore,
+    *,
+    prompt: str,
+    tags: tuple[str, ...],
+    branch: str,
+    when: datetime,
+) -> DbTask:
+    owner = store.add(prompt, task_type="implement", tags=tags)
+    assert owner.id is not None
+    _set_completed(owner, when=when, branch=branch, has_commits=True)
+    owner.merge_status = "unmerged"
+    store.update(owner)
+    unit = store.create_merge_unit(
+        source_branch=branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    return owner
+
+
+@pytest.mark.parametrize(
+    ("query_kwargs", "expected_prompts"),
+    [
+        ({"tags": ("alpha", "gamma"), "any_tag": True}, {"Alpha owner", "Alpha beta owner"}),
+        ({"tags": ("alpha", "beta"), "any_tag": False}, {"Alpha beta owner"}),
+        ({"exclude_tags": ("beta",)}, {"Alpha owner", "Untagged owner"}),
+        ({"untagged_only": True}, {"Untagged owner"}),
+    ],
+)
+def test_query_lineage_owner_rows_tag_pruning_preserves_visible_rows_and_skips_resolution(
+    tmp_path: Path,
+    query_kwargs: dict[str, Any],
+    expected_prompts: set[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owners = [
+        _add_unmerged_tag_pruning_owner(
+            store,
+            prompt="Alpha owner",
+            tags=("alpha",),
+            branch="feature/tag-prune-alpha",
+            when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+        ),
+        _add_unmerged_tag_pruning_owner(
+            store,
+            prompt="Alpha beta owner",
+            tags=("alpha", "beta"),
+            branch="feature/tag-prune-alpha-beta",
+            when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+        ),
+        _add_unmerged_tag_pruning_owner(
+            store,
+            prompt="Beta owner",
+            tags=("beta",),
+            branch="feature/tag-prune-beta",
+            when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC),
+        ),
+        _add_unmerged_tag_pruning_owner(
+            store,
+            prompt="Untagged owner",
+            tags=(),
+            branch="feature/tag-prune-untagged",
+            when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        ),
+    ]
+    expected_owner_ids = {owner.id for owner in owners if owner.prompt in expected_prompts}
+    expected_branches = {owner.branch for owner in owners if owner.prompt in expected_prompts}
+
+    git = MagicMock()
+    seen_planning_task_ids: list[str] = []
+
+    def _determine_next_action(_config, _store, _git, planning_task, *_args, **_kwargs):
+        assert planning_task.id is not None
+        seen_planning_task_ids.append(planning_task.id)
+        return {"type": "merge", "description": "merge candidate"}
+
+    with (
+        patch("gza.lineage_query.prime_advance_planning_refs") as preload,
+        patch("gza.cli.advance_engine.determine_next_action", side_effect=_determine_next_action) as determine,
+    ):
+        rows = query_lineage_owner_rows(
+            store,
+            LineageOwnerQuery(
+                limit=None,
+                include_skipped=True,
+                max_recovery_attempts=1,
+                **query_kwargs,
+            ),
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert {row.owner_task.id for row in rows} == expected_owner_ids
+    assert set(seen_planning_task_ids) == expected_owner_ids
+    assert determine.call_count == len(expected_owner_ids)
+    preload.assert_called_once_with(
+        git,
+        branch_names=ANY,
+        target_branch="main",
+        warning_logger=ANY,
+    )
+    assert set(preload.call_args.kwargs["branch_names"]) == expected_branches
 
 
 def test_collect_stale_unmerged_sweep_candidates_selects_only_old_unlinked_units(tmp_path: Path) -> None:

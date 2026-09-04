@@ -338,6 +338,29 @@ def _owner_matches_tag_filters(owner: DbTask, query: LineageOwnerQuery, *, tag_m
     return True
 
 
+def _candidate_owner_can_match_tag_filters(
+    owner: DbTask,
+    owner_members: Sequence[DbTask],
+    query: LineageOwnerQuery,
+    *,
+    tag_matcher: Any,
+    merge_units_by_task_id: Mapping[str, MergeUnit],
+) -> bool:
+    if query.tags is None and query.exclude_tags is None and not query.untagged_only:
+        return True
+    if _owner_matches_tag_filters(owner, query, tag_matcher=tag_matcher):
+        return True
+    if not _owner_has_terminal_resolution_for_incomplete_display(owner, merge_units_by_task_id=merge_units_by_task_id):
+        return False
+    return any(
+        task.id is not None
+        and task.id != owner.id
+        and task.status == "failed"
+        and _owner_matches_tag_filters(task, query, tag_matcher=tag_matcher)
+        for task in owner_members
+    )
+
+
 def _effective_merge_state(task: DbTask, *, merge_unit: MergeUnit | None) -> str | None:
     if merge_unit is not None:
         return effective_no_work_merge_state(task, merge_unit.state)
@@ -1418,6 +1441,7 @@ def collect_stale_unmerged_sweep_candidates(
         LineageOwnerQuery(limit=None, exclude_dropped_from_planning=True),
         owner_ids_filter=None,
         task_ids_filter=None,
+        tag_matcher=lambda *, task_tags, tag_filters, any_tag=True: True,
     ):
         merge_units_by_member = {
             task.id: indexes.merge_units_by_task_id[task.id]
@@ -1492,6 +1516,7 @@ def _candidate_owner_rows(
     *,
     owner_ids_filter: set[str] | None,
     task_ids_filter: set[str] | None,
+    tag_matcher: Any,
 ) -> tuple[tuple[str, DbTask, tuple[DbTask, ...], DbTask, bool, bool], ...]:
     candidates: list[tuple[str, DbTask, tuple[DbTask, ...], DbTask, bool, bool]] = []
     for owner_id, owner_members in indexes.members_by_owner_id.items():
@@ -1502,6 +1527,14 @@ def _candidate_owner_rows(
             owner,
             merge_units_by_task_id=indexes.merge_units_by_task_id,
             historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
+        ):
+            continue
+        if not _candidate_owner_can_match_tag_filters(
+            owner,
+            owner_members,
+            query,
+            tag_matcher=tag_matcher,
+            merge_units_by_task_id=indexes.merge_units_by_task_id,
         ):
             continue
         member_matches_task_filter = False
@@ -1691,10 +1724,12 @@ def _build_tag_recovery_scope(
     *,
     tag_matcher,
 ) -> frozenset[str] | None:
-    if query.tags is None and query.exclude_tags is None:
+    if query.tags is None and query.exclude_tags is None and not query.untagged_only:
         return None
 
     def _matches_tag_scope(task: DbTask) -> bool:
+        if query.untagged_only and task.tags:
+            return False
         if query.tags is not None and not tag_matcher(
             task_tags=task.tags, tag_filters=query.tags, any_tag=query.any_tag
         ):
@@ -1864,6 +1899,7 @@ def _query_lineage_owner_rows_with_context(
             query,
             owner_ids_filter=owner_ids_filter,
             task_ids_filter=task_ids_filter,
+            tag_matcher=task_matches_tag_filters,
         )
         drop_excluded_task_ids = frozenset(
             task.id
@@ -1914,6 +1950,8 @@ def _query_lineage_owner_rows_with_context(
             drop_excluded_task_ids: frozenset[str],
             recovery_merge_context: Any,
         ) -> None:
+            if not _owner_matches_tag_filters(failed_leaf, query, tag_matcher=task_matches_tag_filters):
+                return
             max_recovery_attempts = query.max_recovery_attempts if query.max_recovery_attempts is not None else 1
             decision = decide_failed_task_recovery(
                 store,
