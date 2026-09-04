@@ -3,6 +3,7 @@
 import argparse
 import atexit
 import importlib.metadata
+import logging
 import stat
 import sys
 import time
@@ -287,8 +288,20 @@ def _install_profile_exit_summary() -> None:
     atexit.register(_emit_profile_exit_summary)
 
 
+def _install_profile_progress_logging() -> None:
+    """Surface in-flight progress on stderr when GZA_PROFILE=1 so long-running
+    lineage/dispatch queries don't look hung with no incremental output."""
+    if not metrics_enabled():
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("[%(relativeCreated)dms] %(message)s"))
+    logging.getLogger("gza").addHandler(handler)
+    logging.getLogger("gza").setLevel(logging.INFO)
+
+
 def main() -> int:
     _install_profile_exit_summary()
+    _install_profile_progress_logging()
 
     parser = GzaArgumentParser(
         description="Gza - AI agent task runner",

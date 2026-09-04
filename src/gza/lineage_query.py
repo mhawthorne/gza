@@ -2010,14 +2010,22 @@ def _query_lineage_owner_rows_with_context(
                 )
             )
 
-        for (
+        candidate_owner_row_count = len(candidate_owner_rows)
+        for candidate_index, (
             owner_id,
             owner,
             owner_members,
             root,
             owner_matches_owner_filter,
             selected_via_skipped_member,
-        ) in candidate_owner_rows:
+        ) in enumerate(candidate_owner_rows, start=1):
+            if _LOG.isEnabledFor(logging.INFO):
+                _LOG.info(
+                    "lineage owner row %d/%d: resolving next action for %s",
+                    candidate_index,
+                    candidate_owner_row_count,
+                    owner_id,
+                )
             merge_units_by_member = {
                 task.id: indexes.merge_units_by_task_id[task.id]
                 for task in owner_members
