@@ -2212,7 +2212,107 @@ gza watch --watch-config ops/watch.yaml --watch-project core=/work/gza
 
 Keyed CLI tags, all-tags mode, weights, and strategy override the selected manifest values for matching project names. When the final resolved selection contains exactly one project, explicit unkeyed `--tag` values and `--all-tags` override any manifest or keyed tag policy for that one project, and drift re-exec preserves that explicit unkeyed scope. When the selection contains more than one project, unkeyed `--tag`, unkeyed `--all-tags`, and positional task IDs are rejected because their project ownership is ambiguous.
 
-Multi-project watch resolves the selected runtime set, acquires watch-supervisor leases for every currently healthy resolved project in selector order, revalidates disabled projects at poll boundaries, and runs one fleet cycle across the enabled set. Each fleet cycle reconciles and analyzes enabled projects, runs all project-local direct lifecycle work in selector order before any worker start, re-plans projects invalidated by direct work, and then dispatches pending worker candidates through the aggregate supervisor batch. Worker-consuming recovery dispatch remains narrower than the schema for now: recovery heads are analyzed and preserve the lane barrier, but fleet recovery worker starts are deferred until the full dispatch integration lands. Invalid or held projects are reported with their selector, typed reason, and available project/root identity; healthy projects continue to advance. The registry-ID policy is currently asymmetric: a registry `project_id` selector can resolve and activate as part of a true multi-project fleet selection, but a selection containing only one registry-ID selector is projected onto the legacy single-project path and still exits with a registry-ID limitation message. For one-project watch, use `NAME=PATH` or the legacy `--project PATH` executable form.
+Multi-project watch resolves the selected runtime set, acquires watch-supervisor leases for every currently healthy resolved project in selector order, revalidates disabled projects at poll boundaries, and runs one fleet cycle across the enabled set. Each fleet cycle reconciles and analyzes enabled projects, runs all project-local direct lifecycle work in selector order before any worker start, re-plans projects invalidated by direct work, and then dispatches worker candidates through the aggregate supervisor batch. Worker-consuming recovery uses the supervisor-global recovery lane first, capped by `watch.recovery_slots` or the selected recovery mode. When pending pickup is enabled, any remaining aggregate slots are then available to pending dispatch, including unused recovery allocation in the same cycle. `--recovery-only` disables pending dispatch even if recovery leaves aggregate capacity unused. Invalid or held projects are reported with their selector, typed reason, and available project/root identity; healthy projects continue to advance. The registry-ID policy is currently asymmetric: a registry `project_id` selector can resolve and activate as part of a true multi-project fleet selection, but a selection containing only one registry-ID selector is projected onto the legacy single-project path and still exits with a registry-ID limitation message. For one-project watch, use `NAME=PATH` or the legacy `--project PATH` executable form.
+
+#### Multi-project rollout and repair
+
+The first rollout path should use explicit project paths, not registry IDs. Explicit
+paths load each selected project's own `gza.yaml` and DB path directly, so the
+supervisor does not depend on preexisting registry rows being canonical:
+
+```bash
+uv run gza watch \
+  --project /work/gza \
+  --watch-project core=/work/gza \
+  --watch-project server=/work/gza/server \
+  --watch-tag core=v0.6 \
+  --strategy round-robin \
+  --batch 4
+```
+
+Use the legacy one-runtime command as the rollback and compatibility path:
+
+```bash
+uv run gza watch --project /work/gza --tag v0.6
+uv run gza watch --project /work/gza/server
+```
+
+For repeated operation, move the explicit paths into a supervisor manifest and keep
+the same keyed selectors:
+
+```yaml
+version: 1
+batch: 4
+poll: 30
+strategy: round-robin
+aggregate_state_dir: .gza/fleet
+projects:
+  - name: core
+    path: /work/gza
+    project_id: gza
+    tags: [v0.6]
+    tag_mode: any
+  - name: server
+    path: /work/gza/server
+    project_id: gzaserver
+```
+
+Then run:
+
+```bash
+uv run gza watch --project /work/gza --watch-config ops/watch.yaml
+```
+
+After explicit-path supervision is verified, registry-ID selectors may be used as a
+convenience only after `projects diagnose` reports the selected rows as executable.
+Repair rows intentionally instead of relying on automatic migrations or local-row
+special cases:
+
+```bash
+uv run gza projects diagnose --project ANCHOR_PATH
+uv run gza projects register --project ANCHOR_PATH --path PROJECT_PATH --project-id PROJECT_ID --replace
+```
+
+Deactivate only a non-current row that your own `projects diagnose` output identifies
+as invalid, using that row's project ID:
+
+```bash
+uv run gza projects deactivate DEAD_PROJECT_ID --project ANCHOR_PATH
+```
+
+Do not add migrations that hard-code local aliases; use `projects register --replace`
+for the canonical project and `projects deactivate` for invalid non-current rows.
+
+`--batch` in multi-project watch is the supervisor's aggregate watch budget. It is
+shared across the selected projects and is spent after aggregate live, starting, and
+unsettled slot claims are counted. Each project's explicit `max_concurrent` still
+limits that project's running work through the existing local launch permit. Starting
+workers are shown separately and consume the aggregate supervisor budget, but local
+`available` is computed from active running work. This is not the future
+machine-global hard ceiling across unrelated DBs and every command; manual launches
+and other commands still interact with each project's local cap, while a true
+all-command machine ceiling would require a separate machine-global registry or permit.
+
+Strategy choice controls only cross-project arbitration between each project's current
+local head. `round-robin` is the default and carries a persistent cursor so scarce
+slots rotate across eligible projects over time. `weighted-round-robin` gives positive
+weights proportional turns without using zero as a disable switch. `project-priority`
+always drains the first eligible project before later projects; a continuously runnable
+earlier project can indefinitely starve every later project.
+
+Watch-supervisor lease conflicts are exclusive ownership signals. At startup, a lease
+conflict for any otherwise healthy selected project aborts the requested healthy set
+and releases leases already acquired, so stop the other watch process or wait for the
+dead-PID steal rule to recover a stale owner. Projects with invalid config, missing
+paths, DB-path mismatch, project-ID mismatch, Docker holds, Git-health holds, or
+red-main merge holds are reported with their selector and reason. Ordinary local-cap
+exhaustion appears in the selector-qualified aggregate state line as `available=0`
+when that project's active running work reaches its local limit. Starting workers
+appear in the same line as `starting=N`; they consume aggregate supervisor capacity
+while they settle, but they are not subtracted from the displayed local `available`
+count. Healthy projects continue where the state allows; disabled projects are
+retried at later poll boundaries and do not keep `max_idle` artificially active unless
+they still have known live, starting, or unsettled work.
 
 `watch.no_progress_cycles` sets the restart-safe no-progress backstop threshold for `gza watch`. When watch selects the same unchanged worker-launch or recovery action for the same merge unit or lineage across that many cycles without durable progress, it parks the subject with `watch-no-progress-backstop` instead of respawning the no-op forever. Direct verify-evidence reconciliation counts as durable progress when it updates the canonical owner's verify state, even if the recredited evidence is non-green and the next lifecycle action remains remedial. Parks are cleared automatically once that exact executed-action basis no longer holds, including never-started pending launches and stale resolved merge-unit residue.
 
