@@ -1788,12 +1788,16 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
         )
         return 0
 
-    console.print(f"Deferred blockers outstanding: {deferred_blockers_outstanding}")
     if not result.rows:
         if blocked_by_dropped_only:
             console.print("No pending tasks blocked by dropped dependencies")
         else:
             console.print("No unresolved task lineages")
+        if deferred_blockers_outstanding:
+            console.print(
+                f"Deferred blockers outstanding: {deferred_blockers_outstanding} "
+                "(unrelated to the above; hit max review cycles)"
+            )
         return 0
 
     if projection_fields is not None:
@@ -1840,6 +1844,13 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
         for task, readiness in blocked_dependents:
             assert task.id is not None
             console.print(_blocked_dependent_detail(store, task, readiness))
+
+    if deferred_blockers_outstanding:
+        console.print()
+        console.print(
+            f"Deferred blockers outstanding: {deferred_blockers_outstanding} "
+            "(unrelated to the rows above; hit max review cycles)"
+        )
 
     if getattr(args, "verbose", False):
         c = TASK_COLORS
@@ -1933,17 +1944,20 @@ def _blocked_dependent_detail(
     task: DbTask,
     readiness: DependencyReadiness,
 ) -> str:
+    c = TASK_COLORS
+    colored_task_id = f"[{c['task_id']}]{task.id}[/{c['task_id']}]"
     operator_label = blocked_dependency_label(store, task, readiness=readiness)
     if operator_label is not None:
-        return f"  {task.id} pending {task.task_type} {operator_label}"
+        return f"{colored_task_id} pending {task.task_type} {operator_label}"
+    blocking_task_id = readiness.blocking_task_id or task.depends_on or "unknown"
     detail = (
-        f"  {task.id} pending {task.task_type} blocked by "
+        f"{colored_task_id} pending {task.task_type} blocked by "
         f"{readiness.blocking_merge_state or 'unmerged'} dependency "
-        f"{readiness.blocking_task_id or task.depends_on or 'unknown'}"
+        f"[{c['task_id']}]{blocking_task_id}[/{c['task_id']}]"
     )
     owner_id = readiness.blocking_merge_unit_owner_task_id
     if owner_id and owner_id != readiness.blocking_task_id:
-        detail += f" (merge unit owned by {owner_id}"
+        detail += f" (merge unit owned by [{c['task_id']}]{owner_id}[/{c['task_id']}]"
         if readiness.blocking_source_branch:
             detail += f", branch {readiness.blocking_source_branch}"
         detail += ")"

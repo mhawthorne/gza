@@ -3,9 +3,14 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
+from gza.colors import TASK_COLORS
 from gza.console import truncate
 from gza.db import SqliteTaskStore
 from gza.task_query import LineageRow, PresentationSpec, TaskQuery, TaskQueryResult
+
+
+def _colored_id(task_id: str) -> str:
+    return f"[{TASK_COLORS.task_id}]{task_id}[/{TASK_COLORS.task_id}]"
 
 
 def _store(tmp_path: Path) -> SqliteTaskStore:
@@ -48,7 +53,7 @@ def test_one_line_uses_headline_prompt_and_drops_context(tmp_path: Path) -> None
     rendered = result.render()
 
     assert rendered == (
-        f"{owner.id}: Retry failed task (PREREQUISITE_UNMERGED) — {truncate(first_line, 100)}"
+        f"{_colored_id(owner.id)}: Retry failed task (PREREQUISITE_UNMERGED) — {truncate(first_line, 100)}"
     )
     assert "Full prompt body that should not render" not in rendered
     assert root.prompt not in rendered
@@ -56,7 +61,7 @@ def test_one_line_uses_headline_prompt_and_drops_context(tmp_path: Path) -> None
     assert "| unresolved:" not in rendered
 
 
-def test_one_line_summarizes_multiple_unresolved_tasks_by_id_and_reason(tmp_path: Path) -> None:
+def test_one_line_omits_unresolved_task_list(tmp_path: Path) -> None:
     store = _store(tmp_path)
     owner = store.add("Owner prompt", task_type="implement")
 
@@ -95,13 +100,11 @@ def test_one_line_summarizes_multiple_unresolved_tasks_by_id_and_reason(tmp_path
 
     rendered = result.render()
 
-    assert rendered == (
-        f"{owner.id}: Needs attention — Owner prompt"
-        f" | unresolved: {failed.id} (TIMEOUT); {dropped.id} (dropped); {completed.id} (FOLLOW_UP)"
-    )
+    assert rendered == f"{_colored_id(owner.id)}: Needs attention — Owner prompt"
     assert failed.prompt not in rendered
     assert dropped.prompt not in rendered
     assert completed.prompt not in rendered
+    assert "unresolved:" not in rendered
 
 
 def test_one_line_renders_merge_reason(tmp_path: Path) -> None:
@@ -123,4 +126,4 @@ def test_one_line_renders_merge_reason(tmp_path: Path) -> None:
     )
 
     rendered = result.render()
-    assert rendered == f"{owner.id}: Merge branch into main — Owner prompt"
+    assert rendered == f"{_colored_id(owner.id)}: Merge branch into main — Owner prompt"
