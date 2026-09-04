@@ -3,6 +3,7 @@
 import argparse
 import atexit
 import importlib.metadata
+import logging
 import stat
 import sys
 import time
@@ -287,8 +288,20 @@ def _install_profile_exit_summary() -> None:
     atexit.register(_emit_profile_exit_summary)
 
 
+def _install_profile_progress_logging() -> None:
+    """Surface in-flight progress on stderr when GZA_PROFILE=1 so long-running
+    lineage/dispatch queries don't look hung with no incremental output."""
+    if not metrics_enabled():
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("[%(relativeCreated)dms] %(message)s"))
+    logging.getLogger("gza").addHandler(handler)
+    logging.getLogger("gza").setLevel(logging.INFO)
+
+
 def main() -> int:
     _install_profile_exit_summary()
+    _install_profile_progress_logging()
 
     parser = GzaArgumentParser(
         description="Gza - AI agent task runner",
@@ -523,6 +536,16 @@ def main() -> int:
         action="store_true",
         dest="blocked_by_dropped",
         help="Show pending tasks blocked by dropped dependencies instead of unresolved lineages",
+    )
+    incomplete_parser.add_argument(
+        "--needs-attention",
+        action="store_true",
+        dest="needs_attention",
+        help=(
+            "Show only rows the lifecycle planner has classified as needs_attention "
+            "(max cycles reached, red verify after a completed fix, or other manual-"
+            "intervention states) - excludes rows the engine is still actively driving"
+        ),
     )
     incomplete_parser.add_argument(
         "--last",
