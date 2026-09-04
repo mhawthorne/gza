@@ -16285,6 +16285,145 @@ class TestIterateCommand:
         decision = resolve_verify_gate_decision(store, impl, config=config, git=mock_git)
         assert decision.state == "passed"
 
+    def test_iterate_force_verify_fix_failed_stale_owner_routes_needs_rebase_without_verify(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        impl.branch = "feature/iterate-force-stale-verify-fix-failed"
+        store.update(impl)
+        config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
+            store,
+            tmp_path,
+            impl,
+            head_sha="stale-force-head",
+        )
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 1
+        mock_git.is_ancestor.return_value = False
+        mock_git.resolve_merge_source_ref.return_value = None
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: {
+            impl.branch: "stale-force-head",
+            "main": "target-head",
+        }.get(ref)
+
+        with (
+            patch("gza.cli.Config.load", return_value=config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
+            patch(
+                "gza.cli.advance_executor._run_lifecycle_verify",
+                side_effect=AssertionError("stale force verify-fix park must route to rebase before verify"),
+            ),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert "[dry-run] First next action: needs_rebase - Rebase before verify_gate" in output
+
+    def test_iterate_force_verify_fix_failed_stale_owner_runs_rebase_without_verify(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        impl.branch = "feature/iterate-force-stale-verify-fix-failed-live"
+        store.update(impl)
+        config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
+            store,
+            tmp_path,
+            impl,
+            head_sha="stale-force-live-head",
+        )
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 1
+        mock_git.is_ancestor.return_value = False
+        mock_git.resolve_merge_source_ref.return_value = None
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: {
+            impl.branch: "stale-force-live-head",
+            "main": "target-head",
+        }.get(ref)
+        run_task_ids: list[str] = []
+
+        def fake_run_iterate_task_with_recovery(
+            *, args, config, store, task_to_run, max_resume_attempts, **kwargs
+        ):
+            del args, config, store, max_resume_attempts, kwargs
+            task = task_to_run
+            assert task.task_type == "rebase"
+            assert task.id is not None
+            run_task_ids.append(task.id)
+            task.status = "failed"
+            task.completed_at = datetime.now(UTC)
+            return impl, 1, None
+
+        with (
+            patch("gza.cli.Config.load", return_value=config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
+            patch(
+                "gza.cli.execution._run_iterate_task_with_recovery",
+                side_effect=fake_run_iterate_task_with_recovery,
+            ),
+            patch("gza.cli.advance_executor._run_lifecycle_verify") as lifecycle_verify,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+        rebase_tasks = [store.get(task_id) for task_id in run_task_ids]
+
+        assert result == 3
+        assert [task.task_type for task in rebase_tasks if task is not None] == ["rebase"]
+        assert len(rebase_tasks) == 1
+        assert rebase_tasks[0] is not None
+        assert rebase_tasks[0].based_on == impl.id
+        assert "Next action: needs_rebase" in output
+        assert f"Created rebase task {rebase_tasks[0].id}" in output
+        lifecycle_verify.assert_not_called()
+
     def test_iterate_force_recovered_merge_unit_verifies_and_attaches_gate_to_live_owner(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -17235,6 +17374,157 @@ class TestIterateCommand:
         assert impl_decision.state == "failed"
         assert foreign_decision.state == "failed"
         assert f"prepared verify owner {foreign.id} is not the canonical verify owner {impl.id}" in output
+
+    def test_iterate_prepared_verify_gate_stale_owner_routes_needs_rebase_without_verify(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        impl.branch = "feature/prepared-stale-verify-gate"
+        store.update(impl)
+        config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
+            store,
+            tmp_path,
+            impl,
+            head_sha="prepared-stale-head",
+        )
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=True,
+            prepared_task_id=impl.id,
+            prepared_resume=False,
+            prepared_phase="iteration",
+            prepared_action_type="verify_gate",
+            prepared_verify_owner_task_id=impl.id,
+            prepared_review_task_id=None,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 1
+        mock_git.is_ancestor.return_value = False
+        mock_git.resolve_merge_source_ref.return_value = None
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: {
+            impl.branch: "prepared-stale-head",
+            "main": "target-head",
+        }.get(ref)
+
+        with (
+            patch("gza.cli.Config.load", return_value=config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
+            patch(
+                "gza.cli.advance_executor._run_lifecycle_verify",
+                side_effect=AssertionError("prepared stale verify_gate must route to rebase before verify"),
+            ),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert "[dry-run] First next action: needs_rebase - Rebase before verify_gate" in output
+
+    def test_iterate_prepared_verify_gate_stale_owner_runs_rebase_without_verify(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        impl.branch = "feature/prepared-stale-verify-gate-live"
+        store.update(impl)
+        config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
+            store,
+            tmp_path,
+            impl,
+            head_sha="prepared-stale-live-head",
+        )
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=True,
+            prepared_task_id=impl.id,
+            prepared_resume=False,
+            prepared_phase="iteration",
+            prepared_action_type="verify_gate",
+            prepared_verify_owner_task_id=impl.id,
+            prepared_review_task_id=None,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
+        mock_git.count_commits_behind.return_value = 1
+        mock_git.is_ancestor.return_value = False
+        mock_git.resolve_merge_source_ref.return_value = None
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: {
+            impl.branch: "prepared-stale-live-head",
+            "main": "target-head",
+        }.get(ref)
+        run_task_ids: list[str] = []
+
+        def fake_run_iterate_task_with_recovery(
+            *, args, config, store, task_to_run, max_resume_attempts, **kwargs
+        ):
+            del args, config, store, max_resume_attempts, kwargs
+            task = task_to_run
+            assert task.task_type == "rebase"
+            assert task.id is not None
+            run_task_ids.append(task.id)
+            task.status = "failed"
+            task.completed_at = datetime.now(UTC)
+            return impl, 1, None
+
+        with (
+            patch("gza.cli.Config.load", return_value=config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
+            patch(
+                "gza.cli.execution._run_iterate_task_with_recovery",
+                side_effect=fake_run_iterate_task_with_recovery,
+            ),
+            patch("gza.cli.advance_executor._run_lifecycle_verify") as lifecycle_verify,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+        rebase_tasks = [store.get(task_id) for task_id in run_task_ids]
+
+        assert result == 3
+        assert [task.task_type for task in rebase_tasks if task is not None] == ["rebase"]
+        assert len(rebase_tasks) == 1
+        assert rebase_tasks[0] is not None
+        assert rebase_tasks[0].based_on == impl.id
+        assert "Next action: needs_rebase" in output
+        assert f"Created rebase task {rebase_tasks[0].id}" in output
+        lifecycle_verify.assert_not_called()
 
     def test_iterate_background_force_prepared_recovered_lineage_preserves_verify_owner(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -24836,6 +25126,289 @@ class TestIterateCommand:
             for review in store.get_reviews_for_task(impl.id)
             if review.id != pending_ordinary.id
         ] == [_old_review.id]
+
+    def test_max_iterations_forced_closing_honors_gated_needs_rebase_without_review(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza import advance_engine as advance_engine_module
+        from gza.cli.execution import cmd_iterate
+        from gza.review_verdict import ParsedReviewReport
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl, old_review, _rebase, git = self._make_post_rebase_resolution_review_fixture(tmp_path, store)
+        assert impl.id is not None
+        first_cycle_review = store.add("First cycle review", task_type="review")
+        assert first_cycle_review.id is not None
+        monkeypatch.setattr(
+            advance_engine_module,
+            "get_review_report",
+            lambda _project_dir, _review: ParsedReviewReport(
+                verdict="APPROVED",
+                findings=(),
+                format_version="legacy",
+            ),
+        )
+        executed_review_ids: list[str] = []
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            assert task.task_type == "review"
+            executed_review_ids.append(task.id)
+            task.status = "completed"
+            task.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        gated_action = {
+            "type": "needs_rebase",
+            "description": "Rebase before create_review",
+            "reason": "pre-dispatch-rebase",
+            "deferred_action_type": "create_review",
+            "rebase_parent_task_id": impl.id,
+            "rebase_parent_task_type": impl.task_type,
+            "rebase_parent_branch": impl.branch,
+            "target_branch": "main",
+        }
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+            auto_iterate=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Git", return_value=git),
+            patch(
+                "gza.cli.execution._determine_selected_iterate_action_for_args",
+                return_value={
+                    "type": "run_review",
+                    "description": f"Run review {first_cycle_review.id}",
+                    "review_task": first_cycle_review,
+                },
+            ),
+            patch("gza.cli.execution._determine_selected_iterate_action", return_value=gated_action),
+            patch("gza.cli.execution._create_review_task") as create_review,
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+        ):
+            rc = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert rc == 3
+        assert executed_review_ids == [first_cycle_review.id]
+        create_review.assert_not_called()
+        assert [review.id for review in store.get_reviews_for_task(impl.id)] == [old_review.id]
+        assert "Closing review deferred: rebase required before review." in output
+        assert "needs_rebase" in output
+
+    def test_max_iterations_forced_closing_gates_max_cycle_fallback_create_review_needs_rebase(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza import advance_engine as advance_engine_module
+        from gza.cli.execution import cmd_iterate
+        from gza.review_verdict import ParsedReviewReport
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl, old_review, _rebase, git = self._make_post_rebase_resolution_review_fixture(tmp_path, store)
+        assert impl.id is not None
+        git.count_commits_behind.return_value = 1
+        first_cycle_review = store.add("First cycle review", task_type="review")
+        assert first_cycle_review.id is not None
+        monkeypatch.setattr(
+            advance_engine_module,
+            "get_review_report",
+            lambda _project_dir, _review: ParsedReviewReport(
+                verdict="APPROVED",
+                findings=(),
+                format_version="legacy",
+            ),
+        )
+        executed_review_ids: list[str] = []
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            executed_review_ids.append(task.id)
+            task.status = "completed"
+            task.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+            auto_iterate=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Git", return_value=git),
+            patch(
+                "gza.cli.execution._determine_selected_iterate_action_for_args",
+                return_value={
+                    "type": "run_review",
+                    "description": f"Run review {first_cycle_review.id}",
+                    "review_task": first_cycle_review,
+                },
+            ),
+            patch(
+                "gza.cli.execution._determine_selected_iterate_action",
+                return_value={
+                    "type": "max_cycles_reached",
+                    "description": "Reached max review cycles",
+                },
+            ),
+            patch(
+                "gza.cli.execution.resolve_closing_review_action",
+                return_value={
+                    "type": "create_review",
+                    "description": "Create closing review (code changed since the last review)",
+                },
+            ),
+            patch("gza.cli.execution._create_review_task") as create_review,
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+        ):
+            rc = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert rc == 3
+        assert executed_review_ids == [first_cycle_review.id]
+        create_review.assert_not_called()
+        assert [review.id for review in store.get_reviews_for_task(impl.id)] == [old_review.id]
+        assert "Closing review deferred: rebase required before review." in output
+        assert "needs_rebase" in output
+
+    def test_max_iterations_forced_closing_gates_max_cycle_fallback_run_review_freshness_probe_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza import advance_engine as advance_engine_module
+        from gza.cli.execution import cmd_iterate
+        from gza.review_verdict import ParsedReviewReport
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl, old_review, _rebase, git = self._make_post_rebase_resolution_review_fixture(tmp_path, store)
+        assert impl.id is not None
+        git.count_commits_behind.return_value = None
+        pending_closing_review = store.add(
+            "Pending closing review",
+            task_type="review",
+            depends_on=impl.id,
+            based_on=impl.id,
+        )
+        assert pending_closing_review.id is not None
+        pending_closing_review.status = "pending"
+        pending_closing_review.created_at = datetime(2026, 8, 22, tzinfo=UTC)
+        store.update(pending_closing_review)
+        first_cycle_review = store.add("First cycle review", task_type="review")
+        assert first_cycle_review.id is not None
+        monkeypatch.setattr(
+            advance_engine_module,
+            "get_review_report",
+            lambda _project_dir, _review: ParsedReviewReport(
+                verdict="APPROVED",
+                findings=(),
+                format_version="legacy",
+            ),
+        )
+        executed_review_ids: list[str] = []
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            executed_review_ids.append(task.id)
+            task.status = "completed"
+            task.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+            auto_iterate=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Git", return_value=git),
+            patch(
+                "gza.cli.execution._determine_selected_iterate_action_for_args",
+                return_value={
+                    "type": "run_review",
+                    "description": f"Run review {first_cycle_review.id}",
+                    "review_task": first_cycle_review,
+                },
+            ),
+            patch(
+                "gza.cli.execution._determine_selected_iterate_action",
+                return_value={
+                    "type": "max_cycles_reached",
+                    "description": "Reached max review cycles",
+                },
+            ),
+            patch(
+                "gza.cli.execution.resolve_closing_review_action",
+                return_value={
+                    "type": "run_review",
+                    "description": f"Run pending closing review {pending_closing_review.id}",
+                    "review_task": pending_closing_review,
+                },
+            ),
+            patch("gza.cli.execution._create_review_task") as create_review,
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+        ):
+            rc = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert rc == 3
+        assert executed_review_ids == [first_cycle_review.id]
+        create_review.assert_not_called()
+        assert pending_closing_review.status == "pending"
+        assert [review.id for review in store.get_reviews_for_task(impl.id)] == [
+            old_review.id,
+            pending_closing_review.id,
+        ]
+        assert "pre-dispatch-target-freshness-unverified" in output
+        assert f"closing review {pending_closing_review.id}" not in output
 
     def test_changes_requested_with_retry_eligible_failed_improve_retries_instead_of_blocking(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

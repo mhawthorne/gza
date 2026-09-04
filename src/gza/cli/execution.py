@@ -19,6 +19,7 @@ from ..advance_engine import (
     PARK_REASON_VERIFY_FIX_FAILED,
     AdvanceContext,
     ReviewCycleBoundary,
+    _apply_pre_dispatch_rebase_gate,
     _pre_review_verify_fix_action,
     _resolve_and_persist_post_merge_rebase_state,
     _resolve_current_merge_source,
@@ -4638,6 +4639,30 @@ def _force_recovered_verify_fix_failed_gate_action(
     }
 
 
+def _gate_synthesized_iterate_action(
+    config: Any,
+    store: SqliteTaskStore,
+    git: Any,
+    task: DbTask,
+    target_branch: str,
+    action: dict[str, Any],
+    *,
+    max_resume_attempts: int,
+    selected_for_merge: bool,
+) -> dict[str, Any]:
+    """Apply shared pre-dispatch rebase policy to iterate actions built outside the selector."""
+    context = resolve_advance_context(
+        config,
+        store,
+        git,
+        task,
+        target_branch,
+        max_resume_attempts=max_resume_attempts,
+        selected_for_merge=selected_for_merge,
+    )
+    return _apply_pre_dispatch_rebase_gate(context, action)
+
+
 def _determine_selected_iterate_action_for_args(
     config: Any,
     store: SqliteTaskStore,
@@ -4686,7 +4711,7 @@ def _determine_selected_iterate_action_for_args(
                         max_resume_attempts=max_resume_attempts,
                     )
         forced = _force_verify_fix_failed_action(action, task=task, store=store)
-        return _force_recovered_verify_fix_failed_gate_action(
+        forced = _force_recovered_verify_fix_failed_gate_action(
             config,
             store,
             git,
@@ -4694,6 +4719,16 @@ def _determine_selected_iterate_action_for_args(
             target_branch,
             task=task,
             max_resume_attempts=max_resume_attempts,
+        )
+        return _gate_synthesized_iterate_action(
+            config,
+            store,
+            git,
+            task,
+            target_branch,
+            forced,
+            max_resume_attempts=max_resume_attempts,
+            selected_for_merge=True,
         )
     return action
 
@@ -6313,6 +6348,16 @@ def _cmd_iterate_impl(
                 task=impl_task,
                 store=store,
             )
+            initial_action = _gate_synthesized_iterate_action(
+                engine_config,
+                store,
+                git_runtime,
+                impl_task,
+                target_branch,
+                initial_action,
+                max_resume_attempts=max_resume_attempts,
+                selected_for_merge=True,
+            )
     else:
         initial_action = determine_next_action(
             engine_config,
@@ -6332,6 +6377,16 @@ def _cmd_iterate_impl(
                 target_branch,
                 task=impl_task,
                 max_resume_attempts=max_resume_attempts,
+            )
+            initial_action = _gate_synthesized_iterate_action(
+                engine_config,
+                store,
+                git_runtime,
+                impl_task,
+                target_branch,
+                initial_action,
+                max_resume_attempts=max_resume_attempts,
+                selected_for_merge=False,
             )
     initial_action_type = initial_action["type"]
     initial_action_description = initial_action.get("description")
@@ -6512,13 +6567,44 @@ def _cmd_iterate_impl(
         )
         if current_action.get("type") in {"merge", "merge_with_followups"}:
             return False
-        selected_action = (
-            current_action
-            if current_action.get("type") in {"create_review", "run_review", "wait_review"}
-            else closing_action
-        )
+        if current_action.get("type") not in {
+            "create_review",
+            "run_review",
+            "wait_review",
+            "max_cycles_reached",
+        }:
+            final_status = "blocked"
+            final_stop_reason = str(current_action.get("type") or "blocked")
+            if classify_advance_action(current_action) == "needs_attention":
+                final_attention_action = current_action
+                final_attention_task = resolve_subject_task(store, current_action, fallback_task=current_impl_task)
+            if current_action.get("type") == "needs_rebase":
+                print("\nClosing review deferred: rebase required before review.")
+            return True
+        selected_action = current_action
+        if current_action.get("type") == "max_cycles_reached":
+            selected_action = _gate_synthesized_iterate_action(
+                engine_config,
+                store,
+                git_runtime,
+                current_impl_task,
+                target_branch,
+                closing_action,
+                max_resume_attempts=max_resume_attempts,
+                selected_for_merge=True,
+            )
 
         action_type = selected_action["type"]
+        if action_type not in {"create_review", "run_review", "wait_review"}:
+            final_status = "blocked"
+            final_stop_reason = str(action_type or "blocked")
+            if classify_advance_action(selected_action) == "needs_attention":
+                final_attention_action = selected_action
+                final_attention_task = resolve_subject_task(store, selected_action, fallback_task=current_impl_task)
+            if action_type == "needs_rebase":
+                print("\nClosing review deferred: rebase required before review.")
+            return True
+
         if action_type == "wait_review":
             review_task = selected_action.get("review_task")
             print("\nClosing review already in progress before termination.")
@@ -6747,6 +6833,16 @@ def _cmd_iterate_impl(
                     prepared_parked_action,
                     task=impl_task,
                     store=store,
+                )
+                action = _gate_synthesized_iterate_action(
+                    engine_config,
+                    store,
+                    git_runtime,
+                    impl_task,
+                    target_branch,
+                    action,
+                    max_resume_attempts=max_resume_attempts,
+                    selected_for_merge=True,
                 )
             prepared_iteration_start = None
         else:
