@@ -18624,10 +18624,13 @@ def _run_cycle(
             ),
         )
 
-    def _recompute_pending_dispatch() -> tuple[list[DbTask], int, bool, tuple[DispatchPreviewEntry, ...]]:
+    def _recompute_pending_dispatch(
+        *,
+        selection_mode_override: DispatchSelectionMode | None = None,
+    ) -> tuple[list[DbTask], int, bool, tuple[DispatchPreviewEntry, ...]]:
         if scoped_owner_ids is not None:
             return [], 0, False, ()
-        pending_selection_mode = _watch_supervisor_pending_selection_mode(recovery_mode)
+        pending_selection_mode = selection_mode_override or _watch_supervisor_pending_selection_mode(recovery_mode)
         pending_preview = build_dispatch_preview(
             store,
             config=config,
@@ -18677,6 +18680,12 @@ def _run_cycle(
         elif scoped_owner_ids is None and recovery_mode != "recovery_only":
             pending_tasks, pending_slots, pending_dispatch_failed_closed, pending_entries_for_preflight = (
                 _recompute_pending_dispatch()
+            )
+        elif scoped_owner_ids is None and recovery_mode == "recovery_only":
+            # Explicitly queue-positioned pending work (e.g. main-verify remediation) must still
+            # run under recovery_only so unrelated recovery-lane congestion can't starve it.
+            pending_tasks, pending_slots, pending_dispatch_failed_closed, pending_entries_for_preflight = (
+                _recompute_pending_dispatch(selection_mode_override="recovery_only")
             )
         else:
             pending_entries_for_preflight = ()

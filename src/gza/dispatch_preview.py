@@ -145,7 +145,7 @@ def build_dispatch_preview(
             max_recovery_attempts=max_recovery_attempts,
         )
 
-    if include_pending and selection_mode != "recovery_only":
+    if include_pending:
         effective_quiet_seconds = (
             int(getattr(config, "quiet_period_seconds", 0) or 0)
             if quiet_seconds is None and config is not None
@@ -189,7 +189,10 @@ def plan_watch_dispatch_entries(
             slots,
             sum(1 for entry in runnable_entries if entry.lane == "recovery" and entry.worker_consuming),
         )
-        pending_slots = 0
+        pending_slots = min(
+            max(0, slots - recovery_worker_slots),
+            sum(1 for entry in runnable_entries if entry.lane == "pending"),
+        )
     elif selection_mode == "pending_only":
         recovery_worker_slots = 0
         pending_slots = min(
@@ -399,7 +402,9 @@ def _build_pending_preview_entries(
     quiet_seconds: int = 0,
 ) -> tuple[DispatchPreviewEntry, ...]:
     pending_tasks = list(get_runnable_pending_tasks(store, tags=tags, any_tag=any_tag, quiet_seconds=quiet_seconds))
-    if selection_mode == "recovery_first_explicit":
+    if selection_mode in {"recovery_first_explicit", "recovery_only"}:
+        # recovery_only still admits explicitly queue-positioned pending tasks (e.g. main-verify
+        # remediation) so a red main can't be starved by unrelated recovery-lane congestion.
         pending_tasks = [task for task in pending_tasks if task.queue_position is not None]
     if pending_limit is not None:
         pending_tasks = pending_tasks[:pending_limit]
