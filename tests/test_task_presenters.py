@@ -4,15 +4,15 @@ import ast
 from datetime import UTC, datetime
 from pathlib import Path
 
-from gza import task_presenters
+import gza.colors as _colors
 from gza.console import truncate
 from gza.db import SqliteTaskStore
 from gza.task_query import LineageRow, PresentationSpec, TaskQuery, TaskQueryResult
 
 
 def _colored_id(task_id: str) -> str:
-    color = task_presenters.TASK_COLORS.task_id
-    return f"[{color}]{task_id}[/{color}]"
+    task_id_color = _colors.TASK_COLORS.task_id
+    return f"[{task_id_color}]{task_id}[/{task_id_color}]"
 
 
 def _store(tmp_path: Path) -> SqliteTaskStore:

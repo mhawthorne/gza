@@ -3734,6 +3734,7 @@ class TestReviewContextFromChain:
     def test_cross_project_verify_persists_child_full_suite_runtime_for_next_preflight(
         self,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
         duration_seconds: float,
         expected_second_run_failure: bool,
     ) -> None:
@@ -3825,7 +3826,8 @@ class TestReviewContextFromChain:
             timeout_grace_seconds=5.0,
         )
 
-        child_config = Config.load(worktree_child_dir)
+        monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient-should-not-own-child-observation.db"))
+        child_config = Config.load_execution(worktree_child_dir)
         child_store = SqliteTaskStore.from_config(child_config)
         child_holder = child_store.list_project_artifacts(kind=VERIFY_GATE_ARTIFACT_KIND)[0]
         assert child_holder.metadata is not None

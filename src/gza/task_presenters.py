@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import Literal
 
 import gza.colors as _colors
-from gza.colors import TASK_COLORS
 from gza.console import shorten_prompt, truncate
 from gza.lineage_grouping import format_lineage_summary
 from gza.query import TaskLineageNode
@@ -129,7 +128,8 @@ def _render_one_line(result: TaskQueryResult) -> str:
             owner = lineage_row.owner_task
             values = lineage_row.values
             owner_id = str(values.get("id", owner.id or "unknown"))
-            colored_owner_id = f"[{TASK_COLORS.task_id}]{owner_id}[/{TASK_COLORS.task_id}]"
+            task_id_color = _colors.TASK_COLORS.task_id
+            colored_owner_id = f"[{task_id_color}]{owner_id}[/{task_id_color}]"
             owner_prompt = _headline_prompt(str(values.get("prompt", owner.prompt)))
             reason = lineage_row.values.get("next_action_reason")
 
@@ -154,7 +154,8 @@ def _render_one_line(result: TaskQueryResult) -> str:
 
         task_row: TaskRow = row
         task = task_row.task
-        colored_task_id = f"[{TASK_COLORS.task_id}]{task.id or 'unknown'}[/{TASK_COLORS.task_id}]"
+        task_id_color = _colors.TASK_COLORS.task_id
+        colored_task_id = f"[{task_id_color}]{task.id or 'unknown'}[/{task_id_color}]"
         lines.append(f"{colored_task_id}: {task.status}")
 
     return "\n".join(lines)
