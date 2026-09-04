@@ -11951,6 +11951,7 @@ def _run_inner(
                 branch=branch_name,
                 target_ref=rebase_target,
                 checkout_name=task.slug,
+                default_branch=default_branch,
             )
             isolated_checkout = isolated_checkout_cm.__enter__()
         except (GitError, OSError, RuntimeError) as exc:

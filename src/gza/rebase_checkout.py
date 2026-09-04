@@ -70,12 +70,21 @@ def _assert_canonical_worktree_admin_metadata_healthy(source_git: Git, *, phase:
     )
 
 
-def _build_import_refspecs(source_git: Git, *, branch: str, target_ref: str) -> tuple[str, ...]:
+def _build_import_refspecs(
+    source_git: Git, *, branch: str, target_ref: str, default_branch: str | None = None
+) -> tuple[str, ...]:
     refspecs: list[str] = [
         f"+refs/heads/{branch}:refs/heads/{branch}",
     ]
     if re.fullmatch(r"[0-9a-fA-F]{40}", target_ref):
         refspecs.append(f"+{target_ref}:refs/gza/rebase-target/{target_ref[:12]}")
+        # The task prompt refers to the mutable default branch by name (e.g.
+        # "onto the local branch 'main'") even when execution is pinned to an
+        # immutable SHA snapshot of it for race-safety. Import that branch ref
+        # too so the branch name the prompt names is never missing from the
+        # provider's restricted repo view (gza-10227).
+        if default_branch and default_branch != branch:
+            refspecs.append(f"+refs/heads/{default_branch}:refs/heads/{default_branch}")
         return tuple(dict.fromkeys(refspecs))
 
     if target_ref != branch:
@@ -139,6 +148,7 @@ def create_isolated_rebase_checkout(
     branch: str,
     target_ref: str,
     checkout_name: str,
+    default_branch: str | None = None,
 ) -> IsolatedRebaseCheckout:
     """Create a standalone checkout with a private `.git/` directory.
 
@@ -163,7 +173,9 @@ def create_isolated_rebase_checkout(
         _copy_git_identity(source_git=source_git, checkout_git=checkout_git)
 
         source_repo = source_git.toplevel()
-        imported_refs = _build_import_refspecs(source_git, branch=branch, target_ref=target_ref)
+        imported_refs = _build_import_refspecs(
+            source_git, branch=branch, target_ref=target_ref, default_branch=default_branch
+        )
         provider_target_ref = stable_rebase_target_ref(target_ref)
         checkout_git._run(
             "fetch",
@@ -249,6 +261,7 @@ def isolated_rebase_checkout(
     branch: str,
     target_ref: str,
     checkout_name: str,
+    default_branch: str | None = None,
 ) -> Iterator[IsolatedRebaseCheckout]:
     """Yield a private rebase checkout and clean it up afterwards."""
     checkout = create_isolated_rebase_checkout(
@@ -257,6 +270,7 @@ def isolated_rebase_checkout(
         branch=branch,
         target_ref=target_ref,
         checkout_name=checkout_name,
+        default_branch=default_branch,
     )
     try:
         yield checkout
