@@ -888,6 +888,7 @@ def _current_gate_identity(
             config,
             store,
             verify_command=verify_command,
+            quiet=True,
         )
     return MainIntegrationVerifyGateIdentity(
         gate_enabled=True,

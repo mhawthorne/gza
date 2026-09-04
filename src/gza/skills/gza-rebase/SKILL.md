@@ -98,14 +98,13 @@ After all conflicts are resolved:
 
 If changes were stashed in Step 1, run `git -C "$GZA_WORKTREE_ROOT" stash pop` to restore them before final verification. If stash pop introduces conflicts, resolve them before proceeding and do not report success until the current checkout is clean enough to verify.
 
-### Step 7: Final verification
+### Step 7: Targeted verification
 
-Before declaring success, read `verify_command` directly from `gza.yaml` as the project `verify_command`. Also note `inner_verify_command` if present. If `uv run gza config` is available in this environment, you may use it as an optional confirmation or to inspect merged config, but do not treat `gza config` failure as an error when `gza.yaml` was readable.
+Rebase is a prerequisite step, not a merge decision point — the project's full `verify_command` gate already runs downstream (at merge time / by the watch runner), so do not re-run it here. Re-running the full suite in every rebase duplicates that gate and wastes significant wall-clock time for no additional safety.
 
-- If you need quick feedback while fixing verification fallout, use `inner_verify_command` when configured, or otherwise use targeted tests for the files you touched.
-- Run the configured full `verify_command` from the project root or worktree root after the rebase is fully complete, after any stashed changes have been restored, and after the last planned code change.
-- Fix any failures you surface in your own context and do not declare success until the full verification passes.
-- If `gza.yaml` has no `verify_command`, stop and report that it must be set before this skill can complete successfully.
+- After the rebase is fully complete and any stashed changes have been restored, run targeted tests covering only the files touched by conflict resolution or the rebase itself. Use `inner_verify_command` when configured, otherwise run the relevant test file(s)/module(s) directly.
+- Fix any failures you surface in your own context and do not declare success until targeted verification passes.
+- Do not run the full `verify_command` as part of this skill. If you believe a full-suite run is warranted, say so in your summary rather than running it yourself.
 
 ### Step 8: Final summary
 

@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Literal
 
 import gza.colors as _colors
+from gza.colors import TASK_COLORS
 from gza.console import shorten_prompt, truncate
 from gza.db import Task as DbTask
 from gza.lineage_grouping import format_lineage_summary
@@ -129,9 +130,9 @@ def _render_one_line(result: TaskQueryResult) -> str:
             owner = lineage_row.owner_task
             values = lineage_row.values
             owner_id = str(values.get("id", owner.id or "unknown"))
+            colored_owner_id = f"[{TASK_COLORS.task_id}]{owner_id}[/{TASK_COLORS.task_id}]"
             owner_prompt = _headline_prompt(str(values.get("prompt", owner.prompt)))
             reason = lineage_row.values.get("next_action_reason")
-            unresolved_text = _render_unresolved_summary(lineage_row.unresolved_tasks)
 
             if isinstance(reason, str) and reason:
                 if incomplete_view:
@@ -141,51 +142,23 @@ def _render_one_line(result: TaskQueryResult) -> str:
                     )
                     if reason == parked_prereq_reason:
                         reason = "SKIP: legacy prereq parked"
-                prefix = f"{owner_id}: {reason} — "
-                lines.append(f"{prefix}{owner_prompt}{unresolved_text}")
+                prefix = f"{colored_owner_id}: {reason} — "
+                lines.append(f"{prefix}{owner_prompt}")
                 continue
 
             unresolved_count = len(lineage_row.unresolved_tasks)
             lines.append(
-                f"{owner_id}: unresolved lineage ({unresolved_count} task{'s' if unresolved_count != 1 else ''})"
-                f" — {owner_prompt}{unresolved_text}"
+                f"{colored_owner_id}: unresolved lineage ({unresolved_count} task{'s' if unresolved_count != 1 else ''})"
+                f" — {owner_prompt}"
             )
             continue
 
         task_row: TaskRow = row
         task = task_row.task
-        lines.append(f"{task.id or 'unknown'}: {task.status}")
+        colored_task_id = f"[{TASK_COLORS.task_id}]{task.id or 'unknown'}[/{TASK_COLORS.task_id}]"
+        lines.append(f"{colored_task_id}: {task.status}")
 
     return "\n".join(lines)
-
-
-def _render_unresolved_summary(unresolved_tasks: tuple[DbTask, ...]) -> str:
-    if len(unresolved_tasks) <= 1:
-        return ""
-
-    parts: list[str] = []
-    for task in unresolved_tasks:
-        task_id = getattr(task, "id", None) or "unknown"
-        reason = _unresolved_reason(task)
-        parts.append(f"{task_id} ({reason})" if reason else task_id)
-    return " | unresolved: " + "; ".join(parts)
-
-
-def _unresolved_reason(task: object) -> str | None:
-    status = getattr(task, "status", None)
-    if status == "failed":
-        failure_reason = getattr(task, "failure_reason", None)
-        if isinstance(failure_reason, str) and failure_reason and failure_reason != "UNKNOWN":
-            return failure_reason
-        return None
-    if status == "completed":
-        completion_reason = getattr(task, "completion_reason", None)
-        if isinstance(completion_reason, str) and completion_reason:
-            return completion_reason
-        return None
-    if status == "dropped":
-        return "dropped"
-    return None
 
 
 def _render_rich(result: TaskQueryResult) -> str:

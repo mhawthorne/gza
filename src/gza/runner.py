@@ -6305,8 +6305,15 @@ def resolve_lifecycle_verify_timeout_settings(
     *,
     scope: str | None = None,
     verify_command: str | None = None,
+    quiet: bool = False,
 ) -> tuple[int, float]:
-    """Resolve lifecycle verify timeout, deriving headroom from recent green full-suite runs."""
+    """Resolve lifecycle verify timeout, deriving headroom from recent green full-suite runs.
+
+    ``quiet`` suppresses the derivation warning for callers that only need the
+    timeout value to identify a verify gate/epoch (e.g. checking whether main
+    is red) rather than to actually budget a verify run — for those callers
+    the derived-vs-configured discrepancy isn't actionable.
+    """
     configured_timeout, grace = _resolve_review_verify_timeout_settings(config)
     command_identity = normalized_verify_command(
         verify_command if verify_command is not None else getattr(config, "verify_command", None)
@@ -6318,12 +6325,13 @@ def resolve_lifecycle_verify_timeout_settings(
     )
     if derived_timeout is None or derived_timeout <= configured_timeout:
         return configured_timeout, grace
-    logger.warning(
-        "autonomous_verify_timeout_seconds=%ss is below recent green verify runtime plus headroom; "
-        "using derived lifecycle verify budget %ss",
-        configured_timeout,
-        derived_timeout,
-    )
+    if not quiet:
+        logger.warning(
+            "autonomous_verify_timeout_seconds=%ss is below recent green verify runtime plus headroom; "
+            "using derived lifecycle verify budget %ss",
+            configured_timeout,
+            derived_timeout,
+        )
     return derived_timeout, grace
 
 

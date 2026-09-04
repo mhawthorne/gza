@@ -18621,7 +18621,7 @@ class TestIncompleteCommand:
 
         captured = capsys.readouterr()
         assert result == 0
-        assert "Deferred blockers outstanding: 0" in captured.out
+        assert "Deferred blockers outstanding" not in captured.out
         assert task.id in captured.out.splitlines()
 
     def test_incomplete_json_fields_override_limits_projection(
@@ -18672,7 +18672,7 @@ class TestIncompleteCommand:
         result = invoke_gza("incomplete", "--fields", "id", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Deferred blockers outstanding: 0" in result.stdout
+        assert "Deferred blockers outstanding" not in result.stdout
         assert task.id in result.stdout.splitlines()
         assert result.stderr == ""
 
@@ -19410,7 +19410,7 @@ class TestIncompleteCommand:
         captured = capsys.readouterr()
         assert result == 0
         assert phases == ["cache-enter", "run", "normalize", "cache-exit"]
-        assert "Deferred blockers outstanding: 0" in captured.out
+        assert "Deferred blockers outstanding" not in captured.out
         assert "No unresolved task lineages" in captured.out
 
     def test_incomplete_cli_json_uses_real_next_action_when_git_context_is_available(self, tmp_path: Path):
@@ -19696,7 +19696,7 @@ class TestIncompleteCommand:
 
         captured = capsys.readouterr()
         assert result == 0
-        assert "Deferred blockers outstanding: 0" in captured.out
+        assert "Deferred blockers outstanding" not in captured.out
         assert f"{failed_review.id}: Resume failed task (MAX_TURNS)" in captured.out
         assert plan.id not in self._one_line_row_id(captured.out)
 
@@ -19708,7 +19708,7 @@ class TestIncompleteCommand:
         captured = capsys.readouterr()
         assert result == 0
         tree_text = captured.out
-        assert "Deferred blockers outstanding: 0" in tree_text
+        assert "Deferred blockers outstanding" not in tree_text
         assert any(line.startswith("failed") for line in tree_text.splitlines())
         assert failed_review.id in tree_text
         assert self._tree_root_id(tree_text) == failed_review.id
@@ -19741,7 +19741,7 @@ class TestIncompleteCommand:
         captured = capsys.readouterr()
         assert result == 0
         lines = captured.out.splitlines()
-        assert lines[0] == "Deferred blockers outstanding: 0"
+        assert not lines[0].startswith("Deferred blockers outstanding")
         assert any(line.startswith(f"{failed_review.id}: Resume failed task (MAX_TURNS)") for line in lines)
         assert plan.id not in self._one_line_row_id(captured.out)
         assert "Blocked dependents:" in captured.out
