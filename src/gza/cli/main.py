@@ -515,7 +515,7 @@ def main() -> int:
         ),
     )
     add_common_args(incomplete_parser)
-    incomplete_parser.set_defaults(last=5, all_tags=False)
+    incomplete_parser.set_defaults(last=10, all_tags=False)
     incomplete_parser.add_argument(
         "--json",
         action="store_true",
@@ -552,7 +552,7 @@ def main() -> int:
         "-n",
         type=_parse_non_negative_int,
         metavar="N",
-        help="Show last N unresolved rows (default: 5, 0 for all)",
+        help="Show last N unresolved rows (default: 10, 0 for all)",
     )
     incomplete_parser.add_argument(
         "--type",
