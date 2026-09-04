@@ -177,6 +177,49 @@ def test_create_isolated_rebase_checkout_imports_immutable_target_sha(monkeypatc
     assert not checkout.path.exists()
 
 
+def test_create_isolated_rebase_checkout_imports_default_branch_alongside_immutable_target_sha(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """gza-10227: rebase task prompts name the mutable default branch (e.g. "main")
+    even when execution pins the target to an immutable SHA snapshot of it. The
+    isolated checkout must still import that branch ref so it isn't missing."""
+    _FakeGit.instances = []
+    _FakeGit.existing_refs = set()
+    _FakeGit.config_values = {}
+    _FakeGit.rev_parse_values = {}
+    _FakeGit.update_ref_error = None
+    _FakeGit.run_error_command = None
+    _FakeGit.run_error = None
+    monkeypatch.setattr("gza.rebase_checkout.Git", _FakeGit)
+
+    source_repo = tmp_path / "repo"
+    source_repo.mkdir()
+    source_git = _FakeGit(source_repo)
+    config = Config(
+        project_dir=source_repo,
+        project_name="repo",
+        worktree_dir=str(tmp_path / "managed-worktrees"),
+    )
+    target_sha = "b" * 40
+
+    checkout = create_isolated_rebase_checkout(
+        config=config,
+        source_git=source_git,
+        branch="feature/private-rebase",
+        target_ref=target_sha,
+        checkout_name="gza-10227-regression",
+        default_branch="main",
+    )
+
+    assert checkout.imported_refs == (
+        "+refs/heads/feature/private-rebase:refs/heads/feature/private-rebase",
+        f"+{target_sha}:refs/gza/rebase-target/{target_sha[:12]}",
+        "+refs/heads/main:refs/heads/main",
+    )
+
+    cleanup_isolated_rebase_checkout(checkout)
+
+
 def test_create_isolated_rebase_checkout_removes_temp_dir_when_fetch_fails(monkeypatch, tmp_path: Path) -> None:
     _FakeGit.instances = []
     _FakeGit.existing_refs = set()
