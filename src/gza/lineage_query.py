@@ -350,6 +350,7 @@ def _candidate_owner_can_match_tag_filters(
         return True
     if _owner_matches_tag_filters(owner, query, tag_matcher=tag_matcher):
         return True
+    owner_merge_unit = merge_units_by_task_id.get(owner.id or "")
     if not _owner_has_terminal_resolution_for_incomplete_display(owner, merge_units_by_task_id=merge_units_by_task_id):
         return False
     return any(
@@ -357,8 +358,54 @@ def _candidate_owner_can_match_tag_filters(
         and task.id != owner.id
         and task.status == "failed"
         and _owner_matches_tag_filters(task, query, tag_matcher=tag_matcher)
+        and _failed_leaf_could_reroot_under_terminal_owner_candidate(
+            failed_task=task,
+            completed_owner=owner,
+            owner_merge_unit=owner_merge_unit,
+            leaf_merge_unit=merge_units_by_task_id.get(task.id),
+        )
         for task in owner_members
     )
+
+
+def _failed_leaf_could_reroot_under_terminal_owner_candidate(
+    *,
+    failed_task: DbTask,
+    completed_owner: DbTask,
+    owner_merge_unit: MergeUnit | None,
+    leaf_merge_unit: MergeUnit | None,
+) -> bool:
+    """Return whether a matching failed member must survive cheap tag pruning.
+
+    This is a one-sided approximation for candidate selection. Exact failed-leaf
+    suppression depends on store-backed recovery state, resumable execution
+    evidence, and sometimes live git proof, so the cheap predicate only rejects
+    facts that are conclusive from the in-memory snapshot.
+    """
+    if failed_task.id is None or failed_task.id == completed_owner.id or failed_task.status != "failed":
+        return False
+
+    leaf_has_own_merge_unit = leaf_merge_unit is not None and leaf_merge_unit.owner_task_id == failed_task.id
+    if leaf_has_own_merge_unit and leaf_merge_unit is not None:
+        leaf_state = effective_no_work_merge_state(failed_task, leaf_merge_unit.state)
+        return leaf_state != "merged"
+
+    if owner_merge_unit is not None and owner_merge_unit.state != "merged":
+        return True
+    if owner_merge_unit is None and not (
+        completed_owner.status == "completed" and completed_owner.merge_status == "merged"
+    ):
+        return True
+
+    if failed_task.has_commits is None:
+        return True
+    if failed_task.has_commits is False and failed_task.session_id is not None:
+        return True
+    if failed_task.branch is None:
+        return failed_task.has_commits is not False
+    if completed_owner.branch is not None and failed_task.branch != completed_owner.branch:
+        return True
+    return failed_task.has_commits is not False
 
 
 def _effective_merge_state(task: DbTask, *, merge_unit: MergeUnit | None) -> str | None:
