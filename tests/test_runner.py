@@ -3847,21 +3847,29 @@ class TestReviewContextFromChain:
         assert observation is not None
         assert observation.duration_seconds == duration_seconds
 
-        with patch(
-            "gza.runner._run_review_verify_command",
-            return_value=ReviewVerifyResult(
-                command="./bin/tests",
-                status="passed",
-                exit_status="0",
-                captured_at=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
-                reviewed_branch="feature/cross-project",
-                reviewed_head_sha="deadbeef",
-                reviewed_base_sha="cafebabe",
-                working_directory=str(worktree_child_dir),
-                output=output,
-                duration_seconds=1.0,
-            ),
-        ) as mock_verify:
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 8, 28, 13, 0, tzinfo=UTC)
+
+        with (
+            patch("gza.runner.datetime", _FixedDatetime),
+            patch(
+                "gza.runner._run_review_verify_command",
+                return_value=ReviewVerifyResult(
+                    command="./bin/tests",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
+                    reviewed_branch="feature/cross-project",
+                    reviewed_head_sha="deadbeef",
+                    reviewed_base_sha="cafebabe",
+                    working_directory=str(worktree_child_dir),
+                    output=output,
+                    duration_seconds=1.0,
+                ),
+            ) as mock_verify,
+        ):
             second = _run_review_verify_commands_for_projects(
                 config=config,
                 store=store,
