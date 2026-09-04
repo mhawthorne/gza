@@ -2921,7 +2921,7 @@ def _create_rebase_task(
     parent_task = store.get(parent_task_id)
     if config is not None:
         _require_model_for_task_creation(config, "rebase")
-    return store.add(
+    rebase_task = store.add(
         prompt=(
             f"Rebase branch '{branch}' onto the local branch '{target_branch}' and resolve "
             f"any conflicts. Use /gza-rebase --auto to perform the rebase. "
@@ -2945,6 +2945,11 @@ def _create_rebase_task(
         skip_learnings=True,
         trigger_source=trigger_source,
     )
+    if parent_task is not None and parent_task.id is not None:
+        parent_unit = store.resolve_merge_unit_for_task(parent_task.id)
+        if parent_unit is not None:
+            store.get_or_create_merge_unit_for_task(rebase_task)
+    return rebase_task
 
 
 def format_duplicate_rebase_message(
@@ -3441,7 +3446,7 @@ def _create_improve_task(
     )
     if config is not None:
         _require_model_for_task_creation(config, "improve", provider=provider, model=model)
-    return store.add(
+    improve_task = store.add(
         prompt=prompt,
         task_type="improve",
         depends_on=review_task.id if review_task is not None else None,
@@ -3457,6 +3462,10 @@ def _create_improve_task(
         provider=provider,
         trigger_source=trigger_source,
     )
+    impl_unit = store.resolve_merge_unit_for_task(impl_task.id)
+    if impl_unit is not None:
+        store.get_or_create_merge_unit_for_task(improve_task)
+    return improve_task
 
 
 def _create_plan_review_task(
