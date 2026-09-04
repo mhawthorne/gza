@@ -6,7 +6,11 @@ import argparse
 from typing import Any, Literal
 
 from gza.cli._common import get_store, resolve_id
-from gza.cli.advance_engine import plan_manual_verify_gate_action
+from gza.cli.advance_engine import (
+    get_needs_attention_reason,
+    is_needs_attention_action,
+    plan_manual_verify_gate_action,
+)
 from gza.cli.advance_executor import AdvanceActionExecutionContext, execute_advance_action
 from gza.cli.git_ops import (
     _advance_progress_console,
@@ -190,6 +194,19 @@ def _print_manual_verify_rebase_required(action: dict[str, Any], *, task_id: str
         print(f"Requested task: {task_id}")
 
 
+def _print_manual_verify_needs_attention(action: dict[str, Any]) -> None:
+    print("Error: Verify gate cannot run because lifecycle requires manual attention.")
+    description = action.get("description")
+    if isinstance(description, str) and description:
+        print(description)
+    diagnostic = action.get("diagnostic")
+    if isinstance(diagnostic, str) and diagnostic:
+        print(f"diagnostic: {diagnostic}")
+    reason = get_needs_attention_reason(action)
+    if reason:
+        print(f"reason: {reason}")
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     """Rerun or inspect a task merge unit's lifecycle verify gate."""
     config = Config.load(args.project_dir)
@@ -317,6 +334,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
         )
     if action.get("type") == "needs_rebase":
         _print_manual_verify_rebase_required(action, task_id=task_id)
+        return 1
+    if is_needs_attention_action(action):
+        _print_manual_verify_needs_attention(action)
         return 1
     previous_artifact_ids = _verify_artifact_ids(store, verify_owner_task) if args.force else set()
     result = execute_advance_action(

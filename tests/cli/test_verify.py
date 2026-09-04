@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from gza.cli.advance_engine import determine_next_action
 import gza.cli.advance_executor as advance_executor
 from gza.cli.advance_executor import AdvanceActionExecutionResult
@@ -403,6 +405,51 @@ def test_verify_stale_branch_needs_rebase_exits_without_running_verify(tmp_path,
     assert f"task {task.id}" in output
     assert task.branch in output
     assert "main" in output
+
+
+@pytest.mark.parametrize(
+    ("behind_probe_result", "behind_probe_error", "expected_diagnostic"),
+    [
+        (None, None, "count_commits_behind returned no result"),
+        ("two", None, "count_commits_behind returned malformed result 'two'"),
+        (0, RuntimeError("behind probe failed"), "behind probe failed"),
+    ],
+)
+def test_verify_freshness_attention_exits_without_running_verify(
+    tmp_path,
+    capsys,
+    behind_probe_result,
+    behind_probe_error,
+    expected_diagnostic,
+):
+    config = _setup_verify_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_unmerged_task(store)
+    git = _fake_git(tmp_path)
+    git.resolve_fresh_merge_source_ref = MagicMock(return_value=task.branch)
+    git.resolve_fresh_merge_source = MagicMock(return_value=SimpleNamespace(ref=task.branch, warning=None))
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: {
+            task.branch: "branch-tip",
+            "main": "target-tip",
+        }.get(ref)
+    )
+    git.is_ancestor = MagicMock(return_value=False)
+    git.count_commits_behind = MagicMock(side_effect=behind_probe_error, return_value=behind_probe_result)
+
+    with (
+        patch("gza.cli.verify.Git", return_value=git),
+        patch("gza.cli.verify.execute_advance_action") as execute_action,
+    ):
+        rc = cmd_verify(_args(tmp_path, task.id, force=True))
+
+    assert rc == 1
+    execute_action.assert_not_called()
+    output = capsys.readouterr().out
+    assert "pre-dispatch-target-freshness-unverified" in output
+    assert expected_diagnostic in output
+    assert "unsupported action" not in output
+    assert "Verify gate:" not in output
 
 
 def test_verify_merge_unit_newer_contributor_red_rerun_can_clear_block(tmp_path, capsys):
