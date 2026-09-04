@@ -1006,13 +1006,15 @@ def acquire_one_post_rebase_review(
                 _evidence_refs(request.impl_task.id),
             ),
         )
-    need = _post_rebase_review_need(request, source_head=source_head, target_head=target_head)
+    need = _post_rebase_review_need(store, request, config=config, source_head=source_head, target_head=target_head)
     if need == "none":
         return LandingPostRebaseReviewResult(
             status="not_required",
             need="none",
             review_budget_used=review_budget_used,
         )
+    if need == "resolution" and not _resolution_review_identity_is_bindable(request):
+        need = "full"
     action = _post_rebase_review_action(request, need)
     if action is None:
         return LandingPostRebaseReviewResult(
@@ -1484,8 +1486,10 @@ def _aggregate_tree_fingerprint_is_complete(aggregate: dict[str, Any]) -> bool:
 
 
 def _post_rebase_review_need(
+    store: SqliteTaskStore,
     request: LandingPostRebaseReviewRequest,
     *,
+    config: Any | None = None,
     source_head: str | None = None,
     target_head: str | None = None,
 ) -> LandingPostRebaseReviewNeed:
@@ -1503,9 +1507,43 @@ def _post_rebase_review_need(
         and source_head is not None
         and target_head is not None
         and _valid_post_rebase_carry_forward_identity(request, source_head=source_head, target_head=target_head)
+        and _has_valid_post_rebase_carry_forward_review(store, request, config=config, source_head=source_head)
     ):
         return "none"
     return "full"
+
+
+def _resolution_review_identity_is_bindable(request: LandingPostRebaseReviewRequest) -> bool:
+    return request.rebase_task is not None and bool(request.rebase_task.id)
+
+
+def _has_valid_post_rebase_carry_forward_review(
+    store: SqliteTaskStore,
+    request: LandingPostRebaseReviewRequest,
+    *,
+    config: Any | None,
+    source_head: str,
+) -> bool:
+    if request.impl_task.id is None:
+        return False
+    review_head = source_head
+    if request.rebase_outcome_kind == "mechanical":
+        try:
+            review_head = _normalize_required_ref(
+                request.pre_rebase_source_head,
+                "landing pre-rebase source head",
+            )
+        except ValueError:
+            return False
+    action = {
+        "type": "create_review",
+        "review_head_sha": review_head,
+    }
+    review = _find_exact_landing_review(store, request.impl_task, action=action)
+    if review is None or review.status != "completed":
+        return False
+    verdict = _landing_review_verdict_from_task(config, review)
+    return verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS", "CHANGES_REQUESTED"}
 
 
 def _valid_post_rebase_carry_forward_identity(
