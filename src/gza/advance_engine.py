@@ -138,13 +138,11 @@ from gza.review_verify_state import (
     make_verify_epoch,
     resolve_verify_gate_decision,
     select_current_merge_unit_verify_evidence,
-    validate_verify_phase_summary,
     verify_epoch_matches,
     verify_result_is_timeout_origin,
 )
 from gza.runner import (
     PHASE_EVIDENCE_INDETERMINATE,
-    PHASE_EVIDENCE_RED,
     PHASE_EVIDENCE_VALID_ZERO_RED,
     PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
     REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
@@ -6141,54 +6139,24 @@ def _verify_gate_reconciled_phase_evidence(decision: VerifyGateDecision) -> Phas
     metadata = decision.lookup.artifact_metadata
     result = decision.lookup.result
     aggregate_present = isinstance(metadata, dict) and "aggregate_details" in metadata
-    aggregate_details = metadata.get("aggregate_details") if isinstance(metadata, dict) else None
-    if aggregate_present and not isinstance(aggregate_details, dict):
+    if aggregate_present:
         return validation
-    if isinstance(aggregate_details, dict) and "phase_results" in aggregate_details:
-        return validation
-    if isinstance(aggregate_details, dict):
-        scopes = aggregate_details.get("scopes")
-        invalid_reason = getattr(result, "phase_summary_invalid_reason", None) if result is not None else None
-        if not isinstance(scopes, list) or invalid_reason is not None:
-            return validation
-        phase_summary = getattr(result, "phase_summary", None)
-        scoped_summary, scoped_invalid_reason = validate_verify_phase_summary(phase_summary)
-        if scoped_invalid_reason is not None:
-            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason=scoped_invalid_reason)
-        if scoped_summary is None:
-            return validation
-        completed_phases = tuple(str(phase["name"]) for phase in scoped_summary["completed"])
-        failed_phases = tuple(str(name) for name in scoped_summary["failed"])
-        state = PHASE_EVIDENCE_RED if failed_phases else PHASE_EVIDENCE_VALID_ZERO_RED
-        return PhaseEvidenceValidation(
-            state,
-            failed_phase_names=failed_phases,
-            completed_phase_names=completed_phases,
-            not_started_phase_names=tuple(str(name) for name in scoped_summary["never_started"]),
-            started_phase_names=completed_phases + tuple(str(name) for name in scoped_summary["running"]),
-            phase_results=tuple(scoped_summary["completed"]),
-        )
     if isinstance(metadata, dict) and "phase_summary" in metadata:
         return validation
     phase_summary = getattr(result, "phase_summary", None)
-    direct_summary, invalid_reason = validate_verify_phase_summary(
-        phase_summary,
-        require_known_full_verify_partition=result.command == "./bin/tests" if result is not None else False,
-    )
-    if invalid_reason is not None:
-        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason=invalid_reason)
-    if direct_summary is None:
+    if not isinstance(phase_summary, dict) or result is None:
         return validation
-    completed_phases = tuple(str(phase["name"]) for phase in direct_summary["completed"])
-    failed_phases = tuple(str(name) for name in direct_summary["failed"])
-    state = PHASE_EVIDENCE_RED if failed_phases else PHASE_EVIDENCE_VALID_ZERO_RED
-    return PhaseEvidenceValidation(
-        state,
-        failed_phase_names=failed_phases,
-        completed_phase_names=completed_phases,
-        not_started_phase_names=tuple(str(name) for name in direct_summary["never_started"]),
-        started_phase_names=completed_phases + tuple(str(name) for name in direct_summary["running"]),
-        phase_results=tuple(direct_summary["completed"]),
+    return validate_verify_phase_evidence_from_metadata(
+        {
+            "result": {
+                "command": result.command,
+                "status": result.status,
+                "exit_status": result.exit_status,
+                "failure": result.failure,
+                "failure_origin": result.failure_origin,
+            },
+            "phase_summary": phase_summary,
+        }
     )
 
 
@@ -6239,6 +6207,11 @@ def _verify_gate_phase_budget_summary(decision: VerifyGateDecision) -> dict[str,
                 diagnostics = scope.get("phase_summary")
             if not isinstance(diagnostics, dict):
                 continue
+            not_started_raw = diagnostics.get("not_started_phase_names")
+            if not isinstance(not_started_raw, list):
+                not_started_raw = diagnostics.get("never_started")
+            if not isinstance(not_started_raw, list):
+                not_started_raw = ()
             scoped_summary.append(
                 {
                     "scope": scope.get("scope"),
@@ -6260,7 +6233,7 @@ def _verify_gate_phase_budget_summary(decision: VerifyGateDecision) -> dict[str,
                     ),
                     "not_started_phase_names": tuple(
                         item
-                        for item in diagnostics.get("not_started_phase_names", ())
+                        for item in not_started_raw
                         if isinstance(item, str) and item
                     ),
                 }

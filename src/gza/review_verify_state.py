@@ -248,23 +248,30 @@ def _summarize_verify_phase_events(
     started: list[str] = []
     started_names: set[str] = set()
     terminal_names: set[str] = set()
+    active_phase: str | None = None
     for event in events:
         name = event["name"]
         status = event["status"]
         if status == "start":
+            if active_phase is not None:
+                return None, f"phase {active_phase} lacks terminal before phase {name} starts"
             if name in started_names:
                 return None, f"phase {name} has duplicate start"
             if name in terminal_names:
                 return None, f"phase {name} start appears after terminal"
             started.append(name)
             started_names.add(name)
+            active_phase = name
             continue
         if name not in started_names:
             return None, f"terminal phase lacks start: {name}"
         if name in terminal_names:
             return None, f"phase {name} has duplicate terminal"
+        if active_phase != name:
+            return None, f"terminal phase out of order: {name}"
         completed.append(event)
         terminal_names.add(name)
+        active_phase = None
 
     running = [name for name in started if name not in terminal_names]
     completed_names = [str(phase["name"]) for phase in completed]
@@ -522,6 +529,17 @@ def _coerce_optional_float(value: object) -> float | None:
     return None
 
 
+def _coerce_phase_name_list(value: object) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    names: list[str] = []
+    for name in value:
+        if not isinstance(name, str) or not name:
+            return None
+        names.append(name)
+    return names
+
+
 def _coerce_failure_origin(result_payload: dict[str, Any]) -> str | None:
     if "failure_origin" not in result_payload:
         return None
@@ -606,6 +624,58 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
     phase_results = value.get("phase_results")
     if not isinstance(phase_results, list):
         return None, None
+    completed_names_raw = value.get("completed_phase_names")
+    if not isinstance(completed_names_raw, list):
+        return None, "phase diagnostics completed_phase_names must be a list"
+    completed_names: list[str] = []
+    for name in completed_names_raw:
+        if not isinstance(name, str) or not name:
+            return None, "phase diagnostics completed_phase_names entries must be strings"
+        completed_names.append(name)
+    if len(completed_names) != len(set(completed_names)):
+        return None, "phase diagnostics completed_phase_names contains duplicate phases"
+    failed_names_raw = value.get("failed_phase_names")
+    if not isinstance(failed_names_raw, list):
+        return None, "phase diagnostics failed_phase_names must be a list"
+    supplied_failed_names: list[str] = []
+    for name in failed_names_raw:
+        if not isinstance(name, str) or not name:
+            return None, "phase diagnostics failed_phase_names entries must be strings"
+        supplied_failed_names.append(name)
+    if len(supplied_failed_names) != len(set(supplied_failed_names)):
+        return None, "phase diagnostics failed_phase_names contains duplicate phases"
+    expected_names_raw = value.get("expected_phase_names")
+    if not isinstance(expected_names_raw, list):
+        return None, "phase diagnostics expected_phase_names must be a list"
+    expected_names: list[str] = []
+    for name in expected_names_raw:
+        if not isinstance(name, str) or not name:
+            return None, "phase diagnostics expected_phase_names entries must be strings"
+        expected_names.append(name)
+    if len(expected_names) != len(set(expected_names)):
+        return None, "phase diagnostics expected_phase_names contains duplicate phases"
+    not_started_names_raw = value.get("not_started_phase_names")
+    never_started_names_raw = value.get("never_started")
+    has_not_started = "not_started_phase_names" in value
+    has_never_started = "never_started" in value
+    not_started_alias = _coerce_phase_name_list(not_started_names_raw) if has_not_started else None
+    never_started_alias = _coerce_phase_name_list(never_started_names_raw) if has_never_started else None
+    if has_not_started and not_started_alias is None:
+        return None, "phase diagnostics not_started_phase_names must be a list"
+    if has_never_started and never_started_alias is None:
+        return None, "phase diagnostics not_started_phase_names must be a list"
+    if has_not_started and has_never_started and not_started_alias != never_started_alias:
+        return None, "phase diagnostics not_started_phase_names contradict never_started"
+    if has_not_started:
+        not_started_names = not_started_alias
+    elif has_never_started:
+        not_started_names = never_started_alias
+    else:
+        not_started_names = None
+    if not_started_names is None:
+        return None, "phase diagnostics not_started_phase_names must be a list"
+    if len(not_started_names) != len(set(not_started_names)):
+        return None, "phase diagnostics not_started_phase_names contains duplicate phases"
     started_names_raw = value.get("started_phase_names")
     if not isinstance(started_names_raw, list):
         return None, "phase diagnostics started_phase_names must be a list"
@@ -616,6 +686,18 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
         started_names.append(name)
     if len(started_names) != len(set(started_names)):
         return None, "phase diagnostics started_phase_names contains duplicate phases"
+    running_names_raw = value.get("running_phase_names")
+    supplied_running_names: list[str] | None = None
+    if running_names_raw is not None:
+        if not isinstance(running_names_raw, list):
+            return None, "phase diagnostics running_phase_names must be a list"
+        supplied_running_names = []
+        for name in running_names_raw:
+            if not isinstance(name, str) or not name:
+                return None, "phase diagnostics running_phase_names entries must be strings"
+            supplied_running_names.append(name)
+        if len(supplied_running_names) != len(set(supplied_running_names)):
+            return None, "phase diagnostics running_phase_names contains duplicate phases"
     started_name_set = set(started_names)
     terminal_names: set[str] = set()
     completed: list[dict[str, Any]] = []
@@ -649,25 +731,38 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
         if isinstance(duration, int | float) and not isinstance(duration, bool):
             total_duration += float(duration)
             duration_seen = True
-
-    running = value.get("running_phase_names")
-    if not isinstance(running, list):
-        completed_names = value.get("completed_phase_names")
-        if isinstance(completed_names, list):
-            completed_set = {name for name in completed_names if isinstance(name, str)}
-            running = [name for name in started_names if name not in completed_set]
-        else:
-            running = []
-    never_started = value.get("not_started_phase_names")
-    if not isinstance(never_started, list):
-        never_started = value.get("never_started")
-    if not isinstance(never_started, list):
-        never_started = []
-    observed_count = len(completed) + len([name for name in running if isinstance(name, str)])
+    if completed_names != [str(phase["name"]) for phase in completed]:
+        return None, "phase diagnostics completed_phase_names contradict phase_results"
+    if supplied_failed_names != failed:
+        return None, "phase diagnostics failed_phase_names contradict phase_results"
+    completed_count = value.get("completed_count")
+    if completed_count is not None and (
+        not isinstance(completed_count, int) or isinstance(completed_count, bool) or completed_count != len(completed)
+    ):
+        return None, "phase diagnostics completed_count contradict phase_results"
+    failed_count = value.get("failed_count")
+    if failed_count is not None and (
+        not isinstance(failed_count, int) or isinstance(failed_count, bool) or failed_count != len(failed)
+    ):
+        return None, "phase diagnostics failed_count contradict phase_results"
+    running = [name for name in started_names if name not in set(completed_names)]
+    if supplied_running_names is not None and supplied_running_names != running:
+        return None, "phase diagnostics running_phase_names contradict phase_results"
+    if expected_names:
+        expected_set = set(expected_names)
+        if any(name not in expected_set for name in (*started_names, *completed_names, *not_started_names)):
+            return None, "phase diagnostics names outside expected_phase_names"
+        expected_not_started = [
+            name for name in expected_names if name not in set(started_names) and name not in set(completed_names)
+        ]
+        if expected_not_started != not_started_names:
+            return None, "phase diagnostics not_started_phase_names contradict phase_results"
+    elif not_started_names:
+        return None, "phase diagnostics not_started_phase_names without expected_phase_names"
+    observed_count = len(completed) + len(running)
     last_observed: str | None = None
-    if isinstance(running, list) and running:
-        last = running[-1]
-        last_observed = last if isinstance(last, str) else None
+    if running:
+        last_observed = running[-1]
     elif completed:
         last_name = completed[-1].get("name")
         last_observed = last_name if isinstance(last_name, str) else None
@@ -675,8 +770,8 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
         "completed": completed,
         "passed": passed,
         "failed": failed,
-        "running": [name for name in running if isinstance(name, str)],
-        "never_started": [name for name in never_started if isinstance(name, str)],
+        "running": running,
+        "never_started": not_started_names,
         "last_observed": last_observed,
         "observed_count": observed_count,
         "completed_count": len(completed),
@@ -687,6 +782,9 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
 def _aggregate_phase_summary_from_details(value: object) -> tuple[dict[str, Any] | None, str | None]:
     if not isinstance(value, dict):
         return None, None
+    lifecycle_invalid_reason = value.get("phase_lifecycle_invalid_reason")
+    if isinstance(lifecycle_invalid_reason, str) and lifecycle_invalid_reason:
+        return None, lifecycle_invalid_reason
     scopes = value.get("scopes")
     phase_results = value.get("phase_results")
     if not isinstance(scopes, list) and isinstance(phase_results, list):
@@ -725,15 +823,39 @@ def _aggregate_phase_summary_from_details(value: object) -> tuple[dict[str, Any]
             if not isinstance(name, str) or not name:
                 return None, "malformed phase name summary"
             started_names.append(name)
-        never_started_names_raw = value.get("not_started_phase_names")
-        if not isinstance(never_started_names_raw, list):
+        has_not_started = "not_started_phase_names" in value
+        has_never_started = "never_started" in value
+        not_started_alias = _coerce_phase_name_list(value.get("not_started_phase_names")) if has_not_started else None
+        never_started_alias = _coerce_phase_name_list(value.get("never_started")) if has_never_started else None
+        if has_not_started and not_started_alias is None:
             return None, "malformed phase name summary"
-        aggregate_never_started: list[str] = []
-        for name in never_started_names_raw:
-            if not isinstance(name, str) or not name:
-                return None, "malformed phase name summary"
-            aggregate_never_started.append(name)
+        if has_never_started and never_started_alias is None:
+            return None, "malformed phase name summary"
+        if has_not_started and has_never_started and not_started_alias != never_started_alias:
+            return None, "not-started phase aliases contradict"
+        if has_not_started:
+            aggregate_never_started = not_started_alias
+        elif has_never_started:
+            aggregate_never_started = never_started_alias
+        else:
+            aggregate_never_started = None
+        if aggregate_never_started is None:
+            return None, "malformed phase name summary"
         aggregate_running = [name for name in started_names if name not in aggregate_completed_names]
+        completed_count = value.get("completed_count")
+        if completed_count is not None and (
+            not isinstance(completed_count, int)
+            or isinstance(completed_count, bool)
+            or completed_count != len(aggregate_completed)
+        ):
+            return None, "completed_count contradicts results"
+        failed_count = value.get("failed_count")
+        if failed_count is not None and (
+            not isinstance(failed_count, int)
+            or isinstance(failed_count, bool)
+            or failed_count != len(aggregate_failed)
+        ):
+            return None, "failed_count contradicts results"
         aggregate_summary: dict[str, Any] = {
             "completed": aggregate_completed,
             "passed": aggregate_passed,
@@ -758,29 +880,58 @@ def _aggregate_phase_summary_from_details(value: object) -> tuple[dict[str, Any]
     duration_seen = False
     last_observed: str | None = None
     runnable_seen = False
+    seen_scope_identities: set[str] = set()
+    expected_names: list[str] = []
     for index, scope in enumerate(scopes):
         if not isinstance(scope, dict):
             return None, f"aggregate scope entry {index}: must be an object"
         scope_identity = scope.get("scope")
         if not isinstance(scope_identity, str) or not scope_identity:
             return None, f"aggregate scope entry {index}: scope identity is required"
+        if scope_identity in seen_scope_identities:
+            return None, "duplicate scope identity"
+        seen_scope_identities.add(scope_identity)
+        scope_invalid_reason = scope.get("phase_summary_invalid_reason")
+        if isinstance(scope_invalid_reason, str) and scope_invalid_reason:
+            return None, scope_invalid_reason
         if scope.get("status") == "skipped":
             continue
         runnable_seen = True
         command = _coerce_optional_str(scope.get("command_identity"))
         scope_summary = scope.get("phase_summary")
-        if scope_summary is None:
-            scope_summary, diagnostics_invalid_reason = _phase_summary_from_diagnostics_details(
-                scope.get("phase_diagnostics")
-            )
-            if diagnostics_invalid_reason is not None:
-                return None, f"aggregate scope {scope_identity}: {diagnostics_invalid_reason}"
         scope_valid_summary, invalid_reason = validate_verify_phase_summary(
             scope_summary,
             require_known_full_verify_partition=normalized_verify_command(command) == "./bin/tests",
         )
         if invalid_reason is not None:
             return None, f"aggregate scope {scope_identity}: {invalid_reason}"
+        diagnostics_summary, diagnostics_invalid_reason = _phase_summary_from_diagnostics_details(
+            scope.get("phase_diagnostics")
+        )
+        if diagnostics_invalid_reason is not None:
+            return None, f"aggregate scope {scope_identity}: {diagnostics_invalid_reason}"
+        diagnostics_valid_summary: dict[str, Any] | None = None
+        if diagnostics_summary is not None:
+            diagnostics_valid_summary, diagnostics_summary_invalid_reason = validate_verify_phase_summary(
+                diagnostics_summary,
+                require_known_full_verify_partition=normalized_verify_command(command) == "./bin/tests",
+            )
+            if diagnostics_summary_invalid_reason is not None:
+                return None, f"aggregate scope {scope_identity}: {diagnostics_summary_invalid_reason}"
+        if scope_valid_summary is not None and diagnostics_valid_summary is not None:
+            for key in ("passed", "failed", "running", "never_started", "observed_count", "completed_count"):
+                if scope_valid_summary.get(key) != diagnostics_valid_summary.get(key):
+                    return None, f"aggregate scope {scope_identity}: phase_summary contradicts phase_diagnostics"
+            scope_completed = [
+                (phase.get("name"), phase.get("status")) for phase in scope_valid_summary.get("completed", [])
+            ]
+            diagnostics_completed = [
+                (phase.get("name"), phase.get("status")) for phase in diagnostics_valid_summary.get("completed", [])
+            ]
+            if scope_completed != diagnostics_completed:
+                return None, f"aggregate scope {scope_identity}: phase_summary contradicts phase_diagnostics"
+        if scope_valid_summary is None:
+            scope_valid_summary = diagnostics_valid_summary
         if scope_valid_summary is None:
             return None, f"aggregate scope {scope_identity}: phase_summary is missing"
         prefix = scope_identity
@@ -799,11 +950,21 @@ def _aggregate_phase_summary_from_details(value: object) -> tuple[dict[str, Any]
         failed.extend(_scoped(str(name)) for name in scope_valid_summary["failed"])
         running.extend(_scoped(str(name)) for name in scope_valid_summary["running"])
         never_started.extend(_scoped(str(name)) for name in scope_valid_summary["never_started"])
+        expected_names.extend(_scoped(str(phase["name"])) for phase in scope_valid_summary["completed"])
+        expected_names.extend(_scoped(str(name)) for name in scope_valid_summary["running"])
+        expected_names.extend(_scoped(str(name)) for name in scope_valid_summary["never_started"])
         observed_count += int(scope_valid_summary["observed_count"])
         if isinstance(scope_valid_summary["last_observed"], str):
             last_observed = _scoped(scope_valid_summary["last_observed"])
     if not runnable_seen:
         return None, None
+    supplied_expected_names = value.get("expected_phase_names")
+    if supplied_expected_names is not None:
+        coerced_expected = _coerce_phase_name_list(supplied_expected_names)
+        if coerced_expected is None:
+            return None, "malformed phase name summary"
+        if coerced_expected != expected_names:
+            return None, "scoped expected phases contradict aggregate"
     summary: dict[str, Any] = {
         "completed": completed,
         "passed": passed,
@@ -828,6 +989,9 @@ def _resolve_artifact_phase_summary(
     output_artifact_path: str | None,
     project_dir: Path | None,
 ) -> tuple[dict[str, Any] | None, str | None]:
+    metadata_invalid_reason = metadata.get("phase_summary_invalid_reason")
+    if isinstance(metadata_invalid_reason, str) and metadata_invalid_reason:
+        return None, metadata_invalid_reason
     if "aggregate_details" in metadata:
         aggregate_details = metadata.get("aggregate_details")
         if not isinstance(aggregate_details, dict):
@@ -1426,14 +1590,19 @@ def build_verify_gate_artifact_payload(
     if duration_seconds is not None:
         result_payload["duration_seconds"] = duration_seconds
     result_output = getattr(result, "output", None)
-    phase_summary = (
-        summarize_verify_phases(
+    phase_summary = None
+    phase_summary_invalid_reason = None
+    if result_output is not None:
+        phase_summary, phase_summary_invalid_reason = summarize_verify_phases_with_validation(
             command=getattr(result, "command", None),
             output=result_output,
         )
-        if result_output is not None
-        else None
-    )
+        if phase_summary_invalid_reason is None:
+            phase_summary, phase_summary_invalid_reason = validate_verify_phase_summary(
+                phase_summary,
+                require_known_full_verify_partition=normalized_verify_command(getattr(result, "command", None))
+                == "./bin/tests",
+            )
     payload = {
         "schema_version": VERIFY_GATE_ARTIFACT_SCHEMA_VERSION,
         "verify_epoch": {
@@ -1452,6 +1621,8 @@ def build_verify_gate_artifact_payload(
     }
     if phase_summary is not None:
         payload["phase_summary"] = phase_summary
+    if phase_summary_invalid_reason is not None:
+        payload["phase_summary_invalid_reason"] = phase_summary_invalid_reason
     tree_fingerprint = _verify_gate_tree_fingerprint(
         provenance=provenance,
         aggregate_details=aggregate_details,
