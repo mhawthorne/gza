@@ -1,16 +1,18 @@
 """Tests for task query presentation helpers."""
 
+import ast
 from datetime import UTC, datetime
 from pathlib import Path
 
-from gza.colors import TASK_COLORS
+from gza import task_presenters
 from gza.console import truncate
 from gza.db import SqliteTaskStore
 from gza.task_query import LineageRow, PresentationSpec, TaskQuery, TaskQueryResult
 
 
 def _colored_id(task_id: str) -> str:
-    return f"[{TASK_COLORS.task_id}]{task_id}[/{TASK_COLORS.task_id}]"
+    color = task_presenters.TASK_COLORS.task_id
+    return f"[{color}]{task_id}[/{color}]"
 
 
 def _store(tmp_path: Path) -> SqliteTaskStore:
@@ -127,3 +129,25 @@ def test_one_line_renders_merge_reason(tmp_path: Path) -> None:
 
     rendered = result.render()
     assert rendered == f"{_colored_id(owner.id)}: Merge branch into main — Owner prompt"
+
+
+def test_task_presenters_has_no_unused_import_bindings() -> None:
+    path = Path(__file__).resolve().parents[1] / "src/gza/task_presenters.py"
+    module = ast.parse(path.read_text(), filename=str(path))
+    imported: dict[str, int] = {}
+    used_names: set[str] = set()
+
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported[alias.asname or alias.name.split(".")[0]] = node.lineno
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "__future__":
+                continue
+            for alias in node.names:
+                if alias.name != "*":
+                    imported[alias.asname or alias.name] = node.lineno
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            used_names.add(node.id)
+
+    assert {name: line for name, line in imported.items() if name not in used_names} == {}

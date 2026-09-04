@@ -9,7 +9,6 @@ from typing import Literal
 import gza.colors as _colors
 from gza.colors import TASK_COLORS
 from gza.console import shorten_prompt, truncate
-from gza.db import Task as DbTask
 from gza.lineage_grouping import format_lineage_summary
 from gza.query import TaskLineageNode
 from gza.task_query import (

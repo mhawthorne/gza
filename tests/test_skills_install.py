@@ -378,7 +378,7 @@ class TestSkillsInstallClaudeTarget:
         bundled = (get_skills_source_path() / "gza-rebase" / "SKILL.md").read_text()
         assert refreshed == bundled
         assert "configured `verify_command`" in refreshed
-        assert "after any stashed changes have been restored" in refreshed
+        assert "After the rebase is fully complete and any stashed changes have been restored" in refreshed
         assert "python -m py_compile" not in refreshed
         assert "`origin/main` (default)" not in refreshed
 
@@ -725,8 +725,8 @@ class TestSkillContentValidation:
         skill_file = get_skills_source_path() / "gza-rebase" / "SKILL.md"
         content = skill_file.read_text()
 
-        assert "project `verify_command`" in content
-        assert "after any stashed changes have been restored" in content
+        assert "project's full `verify_command` gate already runs downstream" in content
+        assert "After the rebase is fully complete and any stashed changes have been restored" in content
         assert "rely on the configured `verify_command`, not language-specific hardcoded checks" in content
         assert "python -m py_compile" not in content
         assert "verifies Python syntax" not in content
@@ -751,8 +751,8 @@ class TestSkillContentValidation:
         rebase_content = (get_skills_source_path() / "gza-rebase" / "SKILL.md").read_text()
         test_and_fix_content = (get_skills_source_path() / "gza-test-and-fix" / "SKILL.md").read_text()
 
-        assert "read `verify_command` directly from `gza.yaml`" in rebase_content
-        assert "do not treat `gza config` failure as an error when `gza.yaml` was readable" in rebase_content
+        assert "Do not run the full `verify_command` as part of this skill" in rebase_content
+        assert "the project's full `verify_command` gate already runs downstream" in rebase_content
         assert "Read `verify_command` directly from `gza.yaml`" in test_and_fix_content
         assert "do not treat `gza config` failure as an error when `gza.yaml` was readable" in test_and_fix_content
 

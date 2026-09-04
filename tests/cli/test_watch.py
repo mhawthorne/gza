@@ -33091,7 +33091,8 @@ def test_main_verify_remediation_prompt_for_ruff_fix_includes_verify_requirement
     assert "Failure signature: phase:ruff" in prompt
     assert "Observed main HEAD: 0cd6b17f7704" in prompt
     assert "Observed verify environment: unknown/unavailable" in prompt
-    assert "- rerun the project verify gate after the fix" in prompt
+    assert "Do not run the full project verify command yourself" in prompt
+    assert "the runner re-verifies automatically after you finish" in prompt
 
 
 def test_maybe_file_main_verify_remediation_reuses_task_with_unknown_observed_environment(
