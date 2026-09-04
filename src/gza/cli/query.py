@@ -1660,7 +1660,13 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     store = get_store(config, open_mode="query_only")
     service = _TaskQueryService(store)
-    limit = None if args.last == 0 else args.last
+    display_limit = None if args.last == 0 else args.last
+    # When filtering to needs_attention rows, the limit must apply AFTER that
+    # filter, not before - capping the underlying query first would silently
+    # truncate to the wrong rows (e.g. "last 5 unresolved" instead of "last 5
+    # needing attention"), hiding rows that actually need a human.
+    query_limit = None if needs_attention_only else display_limit
+    limit = query_limit
     mode = cast(_PresentationMode, "tree" if getattr(args, "tree", False) else "one_line")
     task_type_filter: str | None = getattr(args, "type", None)
     projection_fields = _validate_projection_fields(
@@ -1775,7 +1781,10 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
             and row.next_action_data is not None
             and classify_advance_action(row.next_action_data) == "needs_attention"
         )
-        result = _TaskQueryResult(query=result.query, rows=attention_rows, total_count=len(attention_rows))
+        attention_total = len(attention_rows)
+        if display_limit is not None and attention_total > display_limit:
+            attention_rows = attention_rows[:display_limit]
+        result = _TaskQueryResult(query=result.query, rows=attention_rows, total_count=attention_total)
     deferred_blockers_outstanding = count_outstanding_deferred_review_blockers(
         store,
         tags=normalized_tag_filters,
@@ -1821,6 +1830,12 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
     rendered = result.render(mode)
     if rendered:
         console.print(rendered)
+
+    if display_limit is not None and result.total_count and result.total_count > len(result.rows):
+        console.print(
+            f"\n[dim]Showing {len(result.rows)} of {result.total_count} rows "
+            "(use -n 0 for all)[/dim]"
+        )
 
     dirty_merge_warning = _incomplete_dirty_checkout_warning(
         result,

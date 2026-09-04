@@ -20913,6 +20913,46 @@ class TestIncompleteCommand:
         assert "strict project scope could not be verified" in one_line_output
         assert "fatal: bad revision" in one_line_output
 
+    def test_incomplete_needs_attention_applies_last_after_filter_not_before(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--last must cap the needs_attention rows, not the pre-filter query.
+
+        Capping the underlying lineage query at --last N before filtering to
+        needs_attention would silently drop rows that need a human, showing
+        e.g. "4 of 5 unresolved lineages happen to be needs_attention" instead
+        of the true "4 of 14 lineages need attention". The limit belongs after
+        the filter.
+        """
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_ids = []
+        for i in range(3):
+            task = store.add(f"Failed manual task {i}", task_type="implement")
+            assert task.id is not None
+            task.status = "failed"
+            task.failure_reason = "TEST_FAILURE"
+            task.completed_at = datetime(2026, 5, 10, 10, i, tzinfo=UTC)
+            store.update(task)
+            failed_ids.append(task.id)
+
+        args = self._incomplete_args(tmp_path, fields=None)
+        args.last = 1
+        args.needs_attention = True
+
+        with patch("gza.cli.query.Git", return_value=_FastUnmergedGit()):
+            result = query_cli.cmd_incomplete(args)
+        captured = capsys.readouterr()
+
+        assert result == 0
+        output = captured.out
+        shown_ids = self._ids_present_in_output(output, *[store.get(tid) for tid in failed_ids])
+        assert len(shown_ids) == 1, output
+        assert "Showing 1 of 3 rows" in output
+
 
 class TestLineageOwnerParity:
     @staticmethod
