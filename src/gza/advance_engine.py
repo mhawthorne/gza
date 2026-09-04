@@ -3731,15 +3731,19 @@ def _pre_dispatch_failed_rebase_policy_action(ctx: AdvanceContext) -> dict[str, 
     ):
         return _rebase_failure_circuit_breaker_action(ctx)
     if _failed_rebase_still_blocks_advance(ctx):
-        return with_needs_attention(
-            {
-                "type": "needs_discussion",
-                "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
-            },
-            reason="rebase-failed-needs-manual-resolution",
-            subject_task_id=ctx.task.id,
-        )
+        return _rebase_failed_manual_resolution_action(ctx)
     return None
+
+
+def _rebase_failed_manual_resolution_action(ctx: AdvanceContext) -> dict[str, Any]:
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
+        },
+        reason="rebase-failed-needs-manual-resolution",
+        subject_task_id=_needs_attention_subject_id(ctx),
+    )
 
 
 def _rebase_before_dispatch_action(
@@ -8653,14 +8657,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="conflict_rebase_failed",
         matches=lambda ctx: not ctx.can_merge and _failed_rebase_still_blocks_advance(ctx),
-        action=lambda ctx: with_needs_attention(
-            {
-                "type": "needs_discussion",
-                "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
-            },
-            reason="rebase-failed-needs-manual-resolution",
-            subject_task_id=ctx.task.id,
-        ),
+        action=_rebase_failed_manual_resolution_action,
     ),
     AdvanceRule(
         name="conflict_rebase_completed_but_still_blocked",
@@ -8782,26 +8779,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="failed_rebase_without_successful_review",
         matches=lambda ctx: _failed_rebase_still_blocks_advance(ctx),
-        action=lambda ctx: with_needs_attention(
-            {
-                "type": "needs_discussion",
-                "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
-            },
-            reason="rebase-failed-needs-manual-resolution",
-            subject_task_id=ctx.task.id,
-        ),
-    ),
-    AdvanceRule(
-        name="failed_rebase_without_successful_review",
-        matches=lambda ctx: _failed_rebase_still_blocks_advance(ctx),
-        action=lambda ctx: with_needs_attention(
-            {
-                "type": "needs_discussion",
-                "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
-            },
-            reason="rebase-failed-needs-manual-resolution",
-            subject_task_id=ctx.task.id,
-        ),
+        action=_rebase_failed_manual_resolution_action,
     ),
     AdvanceRule(
         name="closing_review_invariant",

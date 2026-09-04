@@ -27296,6 +27296,94 @@ def test_failed_rebase_manual_resolution_still_wins_over_clean_mergeable_tip(tmp
     assert action["subject_task_id"] == impl.id
 
 
+@pytest.mark.parametrize("descendant_type", ("improve", "rebase", "fix"))
+def test_clean_behind_failed_rebase_manual_resolution_uses_impl_subject_for_same_branch_descendant(
+    tmp_path: Path,
+    descendant_type: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    branch = f"feature/failed-rebase-clean-behind-{descendant_type}"
+    impl, _failed_rebase = _make_completed_impl_with_failed_rebase(store, branch=branch)
+    assert impl.id is not None
+
+    descendant = store.add(
+        f"Completed {descendant_type}",
+        task_type=descendant_type,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert descendant.id is not None
+    descendant.status = "completed"
+    descendant.completed_at = datetime(2026, 5, 14, 9, 30, tzinfo=UTC)
+    descendant.branch = branch
+    descendant.merge_status = "unmerged"
+    descendant.has_commits = True
+    store.update(descendant)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            behind_count=2,
+            existing_branches={branch},
+        ),
+        descendant,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
+    assert action["subject_task_id"] == impl.id
+    assert action["subject_task_id"] != descendant.id
+
+
+@pytest.mark.parametrize("descendant_type", ("improve", "rebase", "fix"))
+def test_conflicting_failed_rebase_manual_resolution_uses_impl_subject_for_same_branch_descendant(
+    tmp_path: Path,
+    descendant_type: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    branch = f"feature/failed-rebase-conflict-{descendant_type}"
+    impl, _failed_rebase = _make_completed_impl_with_failed_rebase(store, branch=branch)
+    assert impl.id is not None
+
+    descendant = store.add(
+        f"Completed {descendant_type}",
+        task_type=descendant_type,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert descendant.id is not None
+    descendant.status = "completed"
+    descendant.completed_at = datetime(2026, 5, 14, 9, 30, tzinfo=UTC)
+    descendant.branch = branch
+    descendant.merge_status = "unmerged"
+    descendant.has_commits = True
+    store.update(descendant)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=False,
+            can_merge_by_ref={(branch, "main"): False},
+            existing_branches={branch},
+        ),
+        descendant,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
+    assert action["subject_task_id"] == impl.id
+    assert action["subject_task_id"] != descendant.id
+
+
 def test_rebase_failure_circuit_breaker_wins_over_clean_mergeable_behind_tip(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
