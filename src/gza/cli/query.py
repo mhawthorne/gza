@@ -1651,6 +1651,10 @@ def cmd_search(args: argparse.Namespace) -> int:
 def cmd_incomplete(args: argparse.Namespace) -> int:
     """Show unresolved task lineages that still need attention."""
     blocked_by_dropped_only = bool(getattr(args, "blocked_by_dropped", False))
+    needs_attention_only = bool(getattr(args, "needs_attention", False))
+    if needs_attention_only and blocked_by_dropped_only:
+        print("Error: --needs-attention cannot be combined with --blocked-by-dropped")
+        return 2
     if getattr(args, "list_fields", False):
         return _print_projection_fields("incomplete", blocked_by_dropped=blocked_by_dropped_only)
     config = Config.load(args.project_dir)
@@ -1763,6 +1767,15 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
                 target_branch=target_branch,
                 **normalize_kwargs,
             )
+    if needs_attention_only:
+        attention_rows = tuple(
+            row
+            for row in result.rows
+            if isinstance(row, _LineageRow)
+            and row.next_action_data is not None
+            and classify_advance_action(row.next_action_data) == "needs_attention"
+        )
+        result = _TaskQueryResult(query=result.query, rows=attention_rows, total_count=len(attention_rows))
     deferred_blockers_outstanding = count_outstanding_deferred_review_blockers(
         store,
         tags=normalized_tag_filters,

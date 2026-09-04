@@ -525,6 +525,16 @@ def main() -> int:
         help="Show pending tasks blocked by dropped dependencies instead of unresolved lineages",
     )
     incomplete_parser.add_argument(
+        "--needs-attention",
+        action="store_true",
+        dest="needs_attention",
+        help=(
+            "Show only rows the lifecycle planner has classified as needs_attention "
+            "(max cycles reached, red verify after a completed fix, or other manual-"
+            "intervention states) - excludes rows the engine is still actively driving"
+        ),
+    )
+    incomplete_parser.add_argument(
         "--last",
         "-n",
         type=_parse_non_negative_int,
