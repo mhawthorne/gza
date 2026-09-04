@@ -375,6 +375,36 @@ class TestDerivedTaskReviewScopePropagation:
 
         assert improve_task.tags == impl_task.tags
 
+    def test_create_improve_task_attaches_to_parents_merge_unit(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add("Implement scoped slice", task_type="implement")
+        assert impl_task.id is not None
+        impl_task.status = "completed"
+        impl_task.has_commits = True
+        impl_task.merge_status = "unmerged"
+        impl_task.branch = "feature/test-slice"
+        store.update(impl_task)
+        unit = store.create_merge_unit(
+            source_branch=impl_task.branch,
+            target_branch="main",
+            owner_task_id=impl_task.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(impl_task.id, unit.id, "owner")
+        review_task = store.add("Review scoped slice", task_type="review", depends_on=impl_task.id)
+
+        improve_task = _create_improve_task(
+            store,
+            impl_task,
+            review_task,
+            trigger_source="manual",
+        )
+
+        assert improve_task.id is not None
+        improve_unit = store.resolve_merge_unit_for_task(improve_task.id)
+        assert improve_unit is not None
+        assert improve_unit.id == unit.id
+
     def test_create_improve_task_opts_into_singleton_guard(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl_task = store.add("Implement scoped slice", task_type="implement")
@@ -623,6 +653,36 @@ class TestReleaseHeldPlanSource:
 
         assert second_rebase.id is not None
         assert second_rebase.id != first_rebase.id
+
+    def test_create_rebase_task_attaches_to_parents_merge_unit(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add("Implement scoped slice", task_type="implement")
+        assert impl_task.id is not None
+        impl_task.status = "completed"
+        impl_task.has_commits = True
+        impl_task.merge_status = "unmerged"
+        impl_task.branch = "feature/test-slice"
+        store.update(impl_task)
+        unit = store.create_merge_unit(
+            source_branch=impl_task.branch,
+            target_branch="main",
+            owner_task_id=impl_task.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(impl_task.id, unit.id, "owner")
+
+        rebase_task = _create_rebase_task(
+            store,
+            impl_task.id,
+            "feature/test-slice",
+            "main",
+            trigger_source="manual",
+        )
+
+        assert rebase_task.id is not None
+        rebase_unit = store.resolve_merge_unit_for_task(rebase_task.id)
+        assert rebase_unit is not None
+        assert rebase_unit.id == unit.id
 
 
 def test_format_duplicate_active_rebase_prefers_active_branch_and_preserves_legacy_fallback(

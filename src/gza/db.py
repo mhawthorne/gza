@@ -13131,8 +13131,19 @@ class SqliteTaskStore:
             self.attach_task_to_merge_unit(review_task.id, unit.id, "review")
 
     def _attach_branchless_review_to_merge_unit(self, task: Task) -> MergeUnit | None:
-        """Attach a branchless review row to the implementation unit it reviews."""
-        if task.id is None or task.task_type != "review":
+        """Attach a branchless task row to the implementation unit it belongs to.
+
+        Not just reviews: an ``improve``/``fix``/``rebase`` task created with
+        ``same_branch=True`` also has no branch of its own at creation time (it
+        inherits the parent's branch later, e.g. at worktree setup) but is
+        already part of the same merge unit via its ``based_on``/``depends_on``
+        link. Any recognized non-owner role (see ``merge_unit_membership_role``)
+        is eligible; unrecognized types are left unattached.
+        """
+        if task.id is None:
+            return None
+        role = merge_unit_membership_role(task)
+        if role not in {"review", "contributor"}:
             return None
         for linked_id in (task.based_on, task.depends_on):
             if linked_id is None:
@@ -13144,7 +13155,7 @@ class SqliteTaskStore:
             if unit is None and linked_task.branch:
                 unit = self.get_or_create_merge_unit_for_task(linked_task)
             if unit is not None:
-                self.attach_task_to_merge_unit(task.id, unit.id, "review")
+                self.attach_task_to_merge_unit(task.id, unit.id, role)
                 return unit
         return None
 
