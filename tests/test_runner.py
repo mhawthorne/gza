@@ -14,7 +14,7 @@ from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import ANY, MagicMock, Mock, patch
 
 import pytest
@@ -82,6 +82,7 @@ from gza.runner import (
     _apply_transcript_stats_fallback,
     _build_code_task_commit_subject,
     _build_context_from_chain,
+    _build_cross_project_verify_aggregate_details,
     _build_review_improve_lineage_context,
     _capture_noop_improve_review_verify_result,
     _capture_noop_verify_fix_timeout_rerun,
@@ -26888,6 +26889,252 @@ class TestProviderPromptSanitization:
         if expected_action_type != "create_verify_fix":
             assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
 
+    def test_verify_gate_cross_project_custom_timeout_from_builder_uses_budget_route(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        config.verify_command = "(per-project verify_command)"
+        project_results = [
+            ProjectReviewVerifyResult(
+                project=None,
+                scope="services/foo",
+                working_directory="services/foo",
+                result=ReviewVerifyResult(
+                    command="./bin/foo-verify",
+                    status="failed",
+                    exit_status="timed out",
+                    captured_at=datetime(2026, 8, 28, 18, 37, tzinfo=UTC),
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="head-1",
+                    reviewed_base_sha="base-1",
+                    working_directory="services/foo",
+                    failure="verify_command timed out after 600s",
+                    output="\n".join(
+                        [
+                            "gza-verify phase=start name=unit",
+                            "gza-verify phase=passed name=unit duration_seconds=12.0",
+                            "gza-verify phase=start name=integration",
+                        ]
+                    ),
+                    failure_origin="timeout",
+                ),
+            ),
+        ]
+        aggregate = _aggregate_cross_project_verify_result(
+            command="(per-project verify_command)",
+            captured_at=datetime(2026, 8, 28, 18, 38, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            project_results=project_results,
+        )
+        aggregate_details = _build_cross_project_verify_aggregate_details(tuple(project_results))
+        assert aggregate_details is not None
+        assert aggregate_details["expected_phase_partition"] == "unknown"
+        assert aggregate_details["expected_phase_names"] == []
+        assert aggregate_details["scopes"][0]["phase_diagnostics"]["expected_phase_partition"] == "unknown"
+
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=aggregate,
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+            aggregate_details=aggregate_details,
+        )
+
+        lookup = latest_verify_result_for_epoch(
+            store,
+            impl,
+            current_epoch=VerifyEpoch(
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                verify_command="(per-project verify_command)",
+                verify_timeout_seconds=600,
+                verify_timeout_grace_seconds=5.0,
+            ),
+        )
+        assert lookup.result is not None
+        assert lookup.result.phase_summary_invalid_reason is None
+        assert lookup.result.phase_summary is not None
+        assert lookup.result.phase_summary["completed"] == [
+            {
+                "name": "services/foo:unit",
+                "status": "passed",
+                "duration_seconds": 12.0,
+            }
+        ]
+        assert lookup.result.phase_summary["running"] == ["services/foo:integration"]
+
+        action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
+
+        assert action["type"] == "needs_discussion"
+        assert action["needs_attention_reason"] == PARK_REASON_VERIFY_BUDGET_EXCEEDED
+        assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    def _timeout_lookup_for_head(self, store: SqliteTaskStore, impl: Task) -> Any:
+        return latest_verify_result_for_epoch(
+            store,
+            impl,
+            current_epoch=VerifyEpoch(
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                verify_command="(per-project verify_command)",
+                verify_timeout_seconds=600,
+                verify_timeout_grace_seconds=5.0,
+            ),
+        )
+
+    def _assert_timeout_routes_with_reason(
+        self,
+        config: Config,
+        store: SqliteTaskStore,
+        impl: Task,
+        expected_reason: str,
+        *,
+        expected_loading_reason: str | None = None,
+    ) -> None:
+        lookup = self._timeout_lookup_for_head(store, impl)
+        assert lookup.result is not None
+        if expected_reason == PARK_REASON_VERIFY_BUDGET_EXCEEDED:
+            assert lookup.result.phase_summary_invalid_reason is None
+            assert lookup.result.phase_summary is not None
+        else:
+            assert lookup.result.phase_summary is None
+            assert lookup.result.phase_summary_invalid_reason is not None
+            if expected_loading_reason is not None:
+                assert expected_loading_reason in lookup.result.phase_summary_invalid_reason
+
+        action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
+
+        assert action["type"] == "needs_discussion"
+        assert action["needs_attention_reason"] == expected_reason
+        assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    def _known_bin_project_result(self, impl: Task, *, completed: bool) -> ProjectReviewVerifyResult:
+        lines: list[str] = []
+        phases = ("ruff", "ty", "mypy", "checks", "unit", "functional")
+        if completed:
+            for phase in phases:
+                lines.append(f"gza-verify phase=start name={phase}")
+                lines.append(f"gza-verify phase=passed name={phase} duration_seconds=1.0")
+            status = "passed"
+            exit_status = "0"
+            failure = None
+            failure_origin = None
+        else:
+            lines = [
+                "gza-verify phase=start name=ruff",
+                "gza-verify phase=passed name=ruff duration_seconds=1.0",
+                "gza-verify phase=start name=ty",
+            ]
+            status = "failed"
+            exit_status = "timed out"
+            failure = "verify_command timed out after 600s"
+            failure_origin = "timeout"
+        return ProjectReviewVerifyResult(
+            project=None,
+            scope="libs/bar",
+            working_directory="libs/bar",
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status=status,
+                exit_status=exit_status,
+                captured_at=datetime(2026, 8, 28, 18, 37, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory="libs/bar",
+                failure=failure,
+                output="\n".join(lines),
+                failure_origin=failure_origin,
+            ),
+        )
+
+    def _custom_timeout_project_result(self, impl: Task) -> ProjectReviewVerifyResult:
+        return ProjectReviewVerifyResult(
+            project=None,
+            scope="services/foo",
+            working_directory="services/foo",
+            result=ReviewVerifyResult(
+                command="./bin/foo-verify",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 37, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory="services/foo",
+                failure="verify_command timed out after 600s",
+                output="\n".join(
+                    [
+                        "gza-verify phase=start name=unit",
+                        "gza-verify phase=passed name=unit duration_seconds=12.0",
+                        "gza-verify phase=start name=integration",
+                    ]
+                ),
+                failure_origin="timeout",
+            ),
+        )
+
+    @pytest.mark.parametrize("known_completed", [False, True])
+    def test_verify_gate_cross_project_mixed_builder_preserves_known_expected_evidence(
+        self,
+        tmp_path: Path,
+        known_completed: bool,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        config.verify_command = "(per-project verify_command)"
+        project_results = [
+            self._known_bin_project_result(impl, completed=known_completed),
+            self._custom_timeout_project_result(impl),
+        ]
+        aggregate = _aggregate_cross_project_verify_result(
+            command="(per-project verify_command)",
+            captured_at=datetime(2026, 8, 28, 18, 38, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            project_results=project_results,
+        )
+        aggregate_details = _build_cross_project_verify_aggregate_details(tuple(project_results))
+        assert aggregate_details is not None
+        assert aggregate_details["expected_phase_partition"] == "mixed"
+        assert aggregate_details["expected_phase_names"] == [
+            "libs/bar:ruff",
+            "libs/bar:ty",
+            "libs/bar:mypy",
+            "libs/bar:checks",
+            "libs/bar:unit",
+            "libs/bar:functional",
+        ]
+        if known_completed:
+            assert aggregate_details["not_started_phase_names"] == []
+        else:
+            assert aggregate_details["not_started_phase_names"] == [
+                "libs/bar:mypy",
+                "libs/bar:checks",
+                "libs/bar:unit",
+                "libs/bar:functional",
+            ]
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=aggregate,
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+            aggregate_details=aggregate_details,
+        )
+
+        self._assert_timeout_routes_with_reason(config, store, impl, PARK_REASON_VERIFY_BUDGET_EXCEEDED)
+
     def test_verify_gate_timeout_with_contradictory_phase_summary_parks_as_invalid_evidence(self, tmp_path: Path) -> None:
         store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
         persist_verify_gate_artifact(
@@ -27101,6 +27348,481 @@ class TestProviderPromptSanitization:
         assert expected_reason in action["description"]
         assert PARK_REASON_VERIFY_BUDGET_EXCEEDED not in action["description"]
         assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    def _coherent_unknown_partition_scope_patch(self) -> dict[str, object]:
+        return {
+            "phase_summary": {
+                "completed": [
+                    {
+                        "name": "unit",
+                        "status": "passed",
+                        "duration_seconds": 3.25,
+                        "tree_fingerprint": "a" * 64,
+                    },
+                ],
+                "passed": ["unit"],
+                "failed": [],
+                "running": ["integration"],
+                "never_started": [],
+                "last_observed": "integration",
+                "observed_count": 2,
+                "completed_count": 1,
+                "failed_count": 0,
+                "total_duration_seconds": 3.25,
+            },
+            "phase_diagnostics": {
+                "phase_results": [
+                    {
+                        "name": "unit",
+                        "status": "passed",
+                        "duration_seconds": 3.25,
+                        "tree_fingerprint": "a" * 64,
+                    },
+                ],
+                "started_phase_names": ["unit", "integration"],
+                "completed_phase_names": ["unit"],
+                "failed_phase_names": [],
+                "expected_phase_names": [],
+                "expected_phase_partition": "unknown",
+                "not_started_phase_names": [],
+                "running": ["integration"],
+                "failed_count": 0,
+            },
+        }
+
+    def _coherent_known_partition_scope_patch(self, expected_names: list[str]) -> dict[str, object]:
+        if expected_names == ["unit", "integration"]:
+            running = ["integration"]
+            never_started: list[str] = []
+        else:
+            running = ["ty"]
+            never_started = ["mypy", "checks", "unit", "functional"]
+        return {
+            "phase_summary": {
+                "completed": [
+                    {
+                        "name": expected_names[0],
+                        "status": "passed",
+                        "duration_seconds": 3.25,
+                        "tree_fingerprint": "a" * 64,
+                    },
+                ],
+                "passed": [expected_names[0]],
+                "failed": [],
+                "running": running,
+                "never_started": never_started,
+                "last_observed": running[-1],
+                "observed_count": 2,
+                "completed_count": 1,
+                "failed_count": 0,
+                "total_duration_seconds": 3.25,
+            },
+            "phase_diagnostics": {
+                "phase_results": [
+                    {
+                        "name": expected_names[0],
+                        "status": "passed",
+                        "duration_seconds": 3.25,
+                        "tree_fingerprint": "a" * 64,
+                    },
+                ],
+                "started_phase_names": [expected_names[0], running[-1]],
+                "completed_phase_names": [expected_names[0]],
+                "failed_phase_names": [],
+                "expected_phase_names": expected_names,
+                "expected_phase_partition": "known",
+                "not_started_phase_names": never_started,
+                "running": running,
+                "failed_count": 0,
+            },
+        }
+
+    @pytest.mark.parametrize(
+        ("command", "expected_names"),
+        [
+            ("./bin/custom-verify", ["unit", "integration"]),
+            ("bin/tests", ["ruff", "ty", "mypy", "checks", "unit", "functional"]),
+        ],
+    )
+    def test_verify_gate_legacy_scoped_known_diagnostics_with_same_summary_uses_budget_route(
+        self,
+        tmp_path: Path,
+        command: str,
+        expected_names: list[str],
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        config.verify_command = "(per-project verify_command)"
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=ReviewVerifyResult(
+                command="(per-project verify_command)",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 38, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory="(per-project; see artifact)",
+                failure="verify_command timed out after 600s",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+            aggregate_details={
+                "runnable_count": 1,
+                "scopes": [
+                    {
+                        "scope": "services/foo",
+                        "working_directory": "services/foo",
+                        "status": "failed",
+                        "exit_status": "timed out",
+                        "failure_origin": "timeout",
+                        "command_identity": command,
+                        **self._coherent_known_partition_scope_patch(expected_names),
+                    },
+                ],
+            },
+        )
+
+        self._assert_timeout_routes_with_reason(config, store, impl, PARK_REASON_VERIFY_BUDGET_EXCEEDED)
+
+    def test_verify_gate_legacy_scoped_aggregate_with_coherent_payload_uses_budget_route(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        config.verify_command = "(per-project verify_command)"
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=ReviewVerifyResult(
+                command="(per-project verify_command)",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 38, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory="(per-project; see artifact)",
+                failure="verify_command timed out after 600s",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+            aggregate_details={
+                "runnable_count": 1,
+                "scopes": [
+                    {
+                        "scope": "services/foo",
+                        "working_directory": "services/foo",
+                        "status": "failed",
+                        "exit_status": "timed out",
+                        "failure_origin": "timeout",
+                        "command_identity": "./bin/foo-verify",
+                        **self._coherent_unknown_partition_scope_patch(),
+                    },
+                ],
+            },
+        )
+
+        action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
+
+        assert action["type"] == "needs_discussion"
+        assert action["needs_attention_reason"] == PARK_REASON_VERIFY_BUDGET_EXCEEDED
+        assert action["verify_phase_summary"]["failed"] == []
+        assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    @pytest.mark.parametrize("mismatch_field", ["terminal_payload", "failed_count"])
+    def test_verify_gate_legacy_scoped_aggregate_rejects_payload_and_lifecycle_contradictions(
+        self,
+        tmp_path: Path,
+        mismatch_field: str,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        config.verify_command = "(per-project verify_command)"
+        scope_patch = self._coherent_unknown_partition_scope_patch()
+        if mismatch_field == "terminal_payload":
+            phase_summary = cast(dict[str, object], scope_patch["phase_summary"])
+            completed = cast(list[dict[str, object]], phase_summary["completed"])
+            completed[0]["duration_seconds"] = 3.5
+            phase_summary["total_duration_seconds"] = 3.5
+        else:
+            phase_summary = cast(dict[str, object], scope_patch["phase_summary"])
+            phase_summary["failed_count"] = 1
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=ReviewVerifyResult(
+                command="(per-project verify_command)",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 38, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory="(per-project; see artifact)",
+                failure="verify_command timed out after 600s",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+            aggregate_details={
+                "runnable_count": 1,
+                "scopes": [
+                    {
+                        "scope": "services/foo",
+                        "working_directory": "services/foo",
+                        "status": "failed",
+                        "exit_status": "timed out",
+                        "failure_origin": "timeout",
+                        "command_identity": "./bin/foo-verify",
+                        **scope_patch,
+                    },
+                ],
+            },
+        )
+
+        action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
+
+        assert action["type"] == "needs_discussion"
+        assert action["needs_attention_reason"] == PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID
+        if mismatch_field == "failed_count":
+            assert "failed_count contradicts results" in action["description"]
+        else:
+            assert "phase_summary contradicts phase_diagnostics" in action["description"]
+        assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    @pytest.mark.parametrize(
+        ("diagnostics_patch", "expected_routing_detail", "expected_loading_detail"),
+        [
+            ({"passed": []}, "passed phases contradict results", "passed phases contradict results"),
+            ({"failed": ["unit"]}, "failed phases contradict results", "failed phases contradict results"),
+            ({"running": []}, "running phases contradict results", "running phases contradict results"),
+            ({"failed_count": 1}, "failed_count contradicts results", "failed_count contradicts results"),
+        ],
+    )
+    def test_verify_gate_scoped_diagnostics_rejects_contradictory_supplied_aliases_for_routing_and_loading(
+        self,
+        tmp_path: Path,
+        diagnostics_patch: dict[str, object],
+        expected_routing_detail: str,
+        expected_loading_detail: str,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        config.verify_command = "(per-project verify_command)"
+        scope_patch = self._coherent_unknown_partition_scope_patch()
+        diagnostics = cast(dict[str, object], scope_patch["phase_diagnostics"])
+        diagnostics.update(diagnostics_patch)
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=ReviewVerifyResult(
+                command="(per-project verify_command)",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 38, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory="(per-project; see artifact)",
+                failure="verify_command timed out after 600s",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+            aggregate_details={
+                "runnable_count": 1,
+                "scopes": [
+                    {
+                        "scope": "services/foo",
+                        "working_directory": "services/foo",
+                        "status": "failed",
+                        "exit_status": "timed out",
+                        "failure_origin": "timeout",
+                        "command_identity": "./bin/foo-verify",
+                        **scope_patch,
+                    },
+                ],
+            },
+        )
+        artifact = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert artifact.metadata is not None
+
+        validation = validate_verify_phase_evidence_from_metadata(artifact.metadata)
+        lookup = latest_verify_result_for_epoch(
+            store,
+            impl,
+            current_epoch=VerifyEpoch(
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                verify_command="(per-project verify_command)",
+                verify_timeout_seconds=600,
+                verify_timeout_grace_seconds=5.0,
+            ),
+        )
+
+        assert validation.state == PHASE_EVIDENCE_INDETERMINATE
+        assert expected_routing_detail in (validation.reason or "")
+        assert lookup.result is not None
+        assert lookup.result.phase_summary is None
+        assert lookup.result.phase_summary_invalid_reason is not None
+        assert expected_loading_detail in lookup.result.phase_summary_invalid_reason
+
+    @pytest.mark.parametrize(
+        ("metadata_patch", "expected_detail"),
+        [
+            (
+                {
+                    "phase_results": [{"name": "unit", "status": "passed", "duration_seconds": 3.25}],
+                    "started_phase_names": ["unit"],
+                    "completed_phase_names": ["unit"],
+                    "failed_phase_names": [],
+                    "expected_phase_names": [],
+                    "expected_phase_partition": "invalid",
+                    "not_started_phase_names": [],
+                },
+                "expected_phase_partition must be known, unknown, or mixed",
+            ),
+            (
+                {
+                    "phase_results": [{"name": "unit", "status": "passed", "duration_seconds": 3.25}],
+                    "started_phase_names": ["unit"],
+                    "completed_phase_names": ["unit"],
+                    "failed_phase_names": [],
+                    "expected_phase_names": ["unit"],
+                    "expected_phase_partition": "unknown",
+                    "not_started_phase_names": [],
+                },
+                "unknown expected partition has phases",
+            ),
+        ],
+    )
+    def test_verify_gate_top_level_explicit_partition_contradictions_fail_for_routing_and_loading(
+        self,
+        tmp_path: Path,
+        metadata_patch: dict[str, object],
+        expected_detail: str,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        config.verify_command = "(per-project verify_command)"
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=ReviewVerifyResult(
+                command="(per-project verify_command)",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 38, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory="(per-project; see artifact)",
+                failure="verify_command timed out after 600s",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+            aggregate_details=metadata_patch,
+        )
+        artifact = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert artifact.metadata is not None
+        validation = validate_verify_phase_evidence_from_metadata(artifact.metadata)
+        assert validation.state == PHASE_EVIDENCE_INDETERMINATE
+        assert expected_detail in (validation.reason or "")
+
+        self._assert_timeout_routes_with_reason(
+            config,
+            store,
+            impl,
+            PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID,
+            expected_loading_reason=expected_detail,
+        )
+
+    @pytest.mark.parametrize(
+        ("diagnostics_patch", "expected_detail"),
+        [
+            ({"expected_phase_partition": "invalid"}, "expected_phase_partition must be known, unknown, or mixed"),
+            (
+                {"expected_phase_partition": "unknown", "expected_phase_names": ["unit"]},
+                "unknown expected partition has phases",
+            ),
+        ],
+    )
+    def test_verify_gate_scoped_explicit_partition_contradictions_fail_for_routing_and_loading(
+        self,
+        tmp_path: Path,
+        diagnostics_patch: dict[str, object],
+        expected_detail: str,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        config.verify_command = "(per-project verify_command)"
+        scope_patch = self._coherent_unknown_partition_scope_patch()
+        diagnostics = cast(dict[str, object], scope_patch["phase_diagnostics"])
+        diagnostics.update(diagnostics_patch)
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=ReviewVerifyResult(
+                command="(per-project verify_command)",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 38, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory="(per-project; see artifact)",
+                failure="verify_command timed out after 600s",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+            aggregate_details={
+                "runnable_count": 1,
+                "scopes": [
+                    {
+                        "scope": "services/foo",
+                        "working_directory": "services/foo",
+                        "status": "failed",
+                        "exit_status": "timed out",
+                        "failure_origin": "timeout",
+                        "command_identity": "./bin/foo-verify",
+                        **scope_patch,
+                    },
+                ],
+            },
+        )
+        artifact = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert artifact.metadata is not None
+        validation = validate_verify_phase_evidence_from_metadata(artifact.metadata)
+        assert validation.state == PHASE_EVIDENCE_INDETERMINATE
+        assert expected_detail in (validation.reason or "")
+
+        self._assert_timeout_routes_with_reason(
+            config,
+            store,
+            impl,
+            PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID,
+            expected_loading_reason=expected_detail,
+        )
 
     def test_verify_gate_timeout_with_malformed_aggregate_phase_summary_parks_as_invalid_evidence(
         self,

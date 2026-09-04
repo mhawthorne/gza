@@ -170,6 +170,21 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   counts; `last_observed` is a string or null; and `total_duration_seconds` is a
   non-negative number or null. Malformed phase summaries MUST fail closed as
   `verify-phase-evidence-invalid` instead of being interpreted as zero failures.
+- Structured verify evidence MUST preserve expected-phase partition identity. The
+  built-in `./bin/tests` partition is known and must enumerate all expected phases;
+  custom verify commands have an unknown partition unless their persisted evidence
+  explicitly supplies a known expected set. Cross-project aggregates spanning both
+  known and unknown scopes MUST carry an explicit mixed partition and preserve only
+  the known scopes' expected and not-started names. Consumers MUST NOT synthesize
+  expected phases from observed completed or running phases for an unknown partition.
+- When persisted evidence supplies both `phase_summary` and `phase_diagnostics` for
+  the same verify scope, lifecycle MUST reconcile both through the same canonical
+  evidence rules before routing. The complete terminal phase dictionaries,
+  started/completed/failed/not-started/expected phase-name lists, expected-partition
+  identity, and every lifecycle field supplied by both forms, including aliases such
+  as `passed`, `failed`, and `running` and counts such as `failed_count`, MUST agree.
+  Contradictions MUST fail closed as `verify-phase-evidence-invalid` instead of being
+  normalized away.
 - For the known `./bin/tests` lifecycle gate, automation MUST guard against a fixed
   wall-clock cap silently becoming binding as the suite grows. Before launching
   lifecycle verify, it MUST validate the configured timeout against recent persisted

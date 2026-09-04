@@ -61,7 +61,17 @@ gza-verify phase=failed name=functional duration_seconds=12.500000
   not-started phase names when structured phase output is available.
 - Cross-project lifecycle verify aggregates preserve the same diagnostics per scope
   and prefix aggregate phase-name lists with the scope, so a failed child phase remains
-  visible to routing and operator summaries.
+  visible to routing and operator summaries. Aggregates with both known and unknown
+  expected-phase scopes use `expected_phase_partition: "mixed"` and preserve the
+  known scopes' expected and not-started names without manufacturing expectations for
+  unknown scopes.
+- Custom verify commands have an unknown expected-phase partition unless their own
+  persisted evidence names one. Consumers must not invent expected phases from the
+  observed completed/running set just to compare summaries and diagnostics.
+- When both a phase summary and phase diagnostics are supplied for one scope, consumers
+  reconcile them through the same normalized evidence: full terminal phase payloads,
+  phase name lists, expected-partition identity, and lifecycle summary fields that both
+  representations explicitly supply must agree.
 - A verify timeout with `failure_origin == "timeout"` and no parsed failed phase is
   classified as a wall-clock budget condition, not as a code-fixing `verify_fix`
   candidate, only when the structured phase records affirmatively validate as

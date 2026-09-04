@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Iterable
 from copy import deepcopy
@@ -621,10 +622,11 @@ def _read_persisted_verify_output(project_dir: Path | None, stored_path: str | N
 def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, Any] | None, str | None]:
     if not isinstance(value, dict):
         return None, None
-    phase_results = value.get("phase_results")
+    value_dict = cast(dict[str, Any], value)
+    phase_results = value_dict.get("phase_results")
     if not isinstance(phase_results, list):
         return None, None
-    completed_names_raw = value.get("completed_phase_names")
+    completed_names_raw = value_dict.get("completed_phase_names")
     if not isinstance(completed_names_raw, list):
         return None, "phase diagnostics completed_phase_names must be a list"
     completed_names: list[str] = []
@@ -634,7 +636,7 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
         completed_names.append(name)
     if len(completed_names) != len(set(completed_names)):
         return None, "phase diagnostics completed_phase_names contains duplicate phases"
-    failed_names_raw = value.get("failed_phase_names")
+    failed_names_raw = value_dict.get("failed_phase_names")
     if not isinstance(failed_names_raw, list):
         return None, "phase diagnostics failed_phase_names must be a list"
     supplied_failed_names: list[str] = []
@@ -644,7 +646,7 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
         supplied_failed_names.append(name)
     if len(supplied_failed_names) != len(set(supplied_failed_names)):
         return None, "phase diagnostics failed_phase_names contains duplicate phases"
-    expected_names_raw = value.get("expected_phase_names")
+    expected_names_raw = value_dict.get("expected_phase_names")
     if not isinstance(expected_names_raw, list):
         return None, "phase diagnostics expected_phase_names must be a list"
     expected_names: list[str] = []
@@ -654,10 +656,18 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
         expected_names.append(name)
     if len(expected_names) != len(set(expected_names)):
         return None, "phase diagnostics expected_phase_names contains duplicate phases"
-    not_started_names_raw = value.get("not_started_phase_names")
-    never_started_names_raw = value.get("never_started")
-    has_not_started = "not_started_phase_names" in value
-    has_never_started = "never_started" in value
+    expected_phase_partition_raw = value_dict.get("expected_phase_partition")
+    if expected_phase_partition_raw in {"known", "unknown"}:
+        if expected_phase_partition_raw == "known" and not expected_names:
+            return None, "phase diagnostics known expected partition lacks phases"
+        if expected_phase_partition_raw == "unknown" and expected_names:
+            return None, "phase diagnostics unknown expected partition has phases"
+    elif "expected_phase_partition" in value_dict:
+        return None, "phase diagnostics expected_phase_partition must be known or unknown"
+    not_started_names_raw = value_dict.get("not_started_phase_names")
+    never_started_names_raw = value_dict.get("never_started")
+    has_not_started = "not_started_phase_names" in value_dict
+    has_never_started = "never_started" in value_dict
     not_started_alias = _coerce_phase_name_list(not_started_names_raw) if has_not_started else None
     never_started_alias = _coerce_phase_name_list(never_started_names_raw) if has_never_started else None
     if has_not_started and not_started_alias is None:
@@ -676,7 +686,7 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
         return None, "phase diagnostics not_started_phase_names must be a list"
     if len(not_started_names) != len(set(not_started_names)):
         return None, "phase diagnostics not_started_phase_names contains duplicate phases"
-    started_names_raw = value.get("started_phase_names")
+    started_names_raw = value_dict.get("started_phase_names")
     if not isinstance(started_names_raw, list):
         return None, "phase diagnostics started_phase_names must be a list"
     started_names: list[str] = []
@@ -686,7 +696,7 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
         started_names.append(name)
     if len(started_names) != len(set(started_names)):
         return None, "phase diagnostics started_phase_names contains duplicate phases"
-    running_names_raw = value.get("running_phase_names")
+    running_names_raw = value_dict.get("running_phase_names")
     supplied_running_names: list[str] | None = None
     if running_names_raw is not None:
         if not isinstance(running_names_raw, list):
@@ -719,9 +729,7 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
         if name in terminal_names:
             return None, f"phase {name} has duplicate terminal"
         terminal_names.add(name)
-        completed_phase: dict[str, Any] = {"name": name, "status": status}
-        if "duration_seconds" in phase:
-            completed_phase["duration_seconds"] = phase.get("duration_seconds")
+        completed_phase = cast(dict[str, Any], deepcopy(phase))
         completed.append(completed_phase)
         if status == "passed":
             passed.append(name)
@@ -735,12 +743,12 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
         return None, "phase diagnostics completed_phase_names contradict phase_results"
     if supplied_failed_names != failed:
         return None, "phase diagnostics failed_phase_names contradict phase_results"
-    completed_count = value.get("completed_count")
+    completed_count = value_dict.get("completed_count")
     if completed_count is not None and (
         not isinstance(completed_count, int) or isinstance(completed_count, bool) or completed_count != len(completed)
     ):
         return None, "phase diagnostics completed_count contradict phase_results"
-    failed_count = value.get("failed_count")
+    failed_count = value_dict.get("failed_count")
     if failed_count is not None and (
         not isinstance(failed_count, int) or isinstance(failed_count, bool) or failed_count != len(failed)
     ):
@@ -766,7 +774,7 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
     elif completed:
         last_name = completed[-1].get("name")
         last_observed = last_name if isinstance(last_name, str) else None
-    return {
+    summary = {
         "completed": completed,
         "passed": passed,
         "failed": failed,
@@ -775,8 +783,23 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
         "last_observed": last_observed,
         "observed_count": observed_count,
         "completed_count": len(completed),
+        "failed_count": len(failed),
         "total_duration_seconds": total_duration if duration_seen else None,
-    }, None
+    }
+    for key in (
+        "passed",
+        "failed",
+        "running",
+        "never_started",
+        "last_observed",
+        "observed_count",
+        "completed_count",
+        "failed_count",
+        "total_duration_seconds",
+    ):
+        if key in value_dict:
+            summary[key] = deepcopy(value_dict[key])
+    return summary, None
 
 
 def _aggregate_phase_summary_from_details(value: object) -> tuple[dict[str, Any] | None, str | None]:
@@ -919,17 +942,22 @@ def _aggregate_phase_summary_from_details(value: object) -> tuple[dict[str, Any]
             if diagnostics_summary_invalid_reason is not None:
                 return None, f"aggregate scope {scope_identity}: {diagnostics_summary_invalid_reason}"
         if scope_valid_summary is not None and diagnostics_valid_summary is not None:
-            for key in ("passed", "failed", "running", "never_started", "observed_count", "completed_count"):
+            if scope_valid_summary.get("completed") != diagnostics_valid_summary.get("completed"):
+                return None, f"aggregate scope {scope_identity}: phase_summary contradicts phase_diagnostics"
+            diagnostics = scope.get("phase_diagnostics")
+            for key in ("passed", "failed", "running", "never_started"):
                 if scope_valid_summary.get(key) != diagnostics_valid_summary.get(key):
                     return None, f"aggregate scope {scope_identity}: phase_summary contradicts phase_diagnostics"
-            scope_completed = [
-                (phase.get("name"), phase.get("status")) for phase in scope_valid_summary.get("completed", [])
-            ]
-            diagnostics_completed = [
-                (phase.get("name"), phase.get("status")) for phase in diagnostics_valid_summary.get("completed", [])
-            ]
-            if scope_completed != diagnostics_completed:
-                return None, f"aggregate scope {scope_identity}: phase_summary contradicts phase_diagnostics"
+            for key in (
+                "last_observed",
+                "observed_count",
+                "completed_count",
+                "failed_count",
+                "total_duration_seconds",
+            ):
+                if isinstance(diagnostics, dict) and key in diagnostics and key in scope_valid_summary:
+                    if scope_valid_summary.get(key) != diagnostics_valid_summary.get(key):
+                        return None, f"aggregate scope {scope_identity}: phase_summary contradicts phase_diagnostics"
         if scope_valid_summary is None:
             scope_valid_summary = diagnostics_valid_summary
         if scope_valid_summary is None:
@@ -950,9 +978,25 @@ def _aggregate_phase_summary_from_details(value: object) -> tuple[dict[str, Any]
         failed.extend(_scoped(str(name)) for name in scope_valid_summary["failed"])
         running.extend(_scoped(str(name)) for name in scope_valid_summary["running"])
         never_started.extend(_scoped(str(name)) for name in scope_valid_summary["never_started"])
-        expected_names.extend(_scoped(str(phase["name"])) for phase in scope_valid_summary["completed"])
-        expected_names.extend(_scoped(str(name)) for name in scope_valid_summary["running"])
-        expected_names.extend(_scoped(str(name)) for name in scope_valid_summary["never_started"])
+        scope_expected_partition = "unknown"
+        scope_expected_names: list[str] = []
+        diagnostics = scope.get("phase_diagnostics")
+        if isinstance(diagnostics, dict):
+            raw_partition = diagnostics.get("expected_phase_partition")
+            raw_expected_names = diagnostics.get("expected_phase_names")
+            coerced_expected_names = _coerce_phase_name_list(raw_expected_names)
+            if raw_partition == "known" and coerced_expected_names:
+                scope_expected_partition = "known"
+                scope_expected_names = coerced_expected_names
+            elif raw_partition not in {"known", "unknown"} and coerced_expected_names:
+                scope_expected_partition = "known"
+                scope_expected_names = coerced_expected_names
+        command_identity = _coerce_optional_str(scope.get("command_identity"))
+        if normalized_verify_command(command_identity) == "./bin/tests":
+            scope_expected_partition = "known"
+            scope_expected_names = list(KNOWN_FULL_VERIFY_PHASES)
+        if scope_expected_partition == "known":
+            expected_names.extend(_scoped(str(name)) for name in scope_expected_names)
         observed_count += int(scope_valid_summary["observed_count"])
         if isinstance(scope_valid_summary["last_observed"], str):
             last_observed = _scoped(scope_valid_summary["last_observed"])
@@ -974,9 +1018,52 @@ def _aggregate_phase_summary_from_details(value: object) -> tuple[dict[str, Any]
         "last_observed": last_observed,
         "observed_count": observed_count,
         "completed_count": len(completed),
+        "failed_count": len(failed),
         "total_duration_seconds": total_duration if duration_seen else None,
     }
     return validate_verify_phase_summary(summary)
+
+
+def _phase_summary_from_canonical_validation(validation: object) -> dict[str, Any]:
+    phase_results = tuple(getattr(validation, "phase_results"))
+    completed_phase_names = tuple(getattr(validation, "completed_phase_names"))
+    started_phase_names = tuple(getattr(validation, "started_phase_names"))
+    not_started_phase_names = tuple(getattr(validation, "not_started_phase_names"))
+    completed: list[dict[str, Any]] = []
+    passed: list[str] = []
+    failed: list[str] = []
+    total_duration = 0.0
+    duration_seen = False
+    for phase, completed_name in zip(phase_results, completed_phase_names, strict=True):
+        copied = deepcopy(phase)
+        copied.pop("scope", None)
+        copied["name"] = completed_name
+        completed.append(copied)
+        if copied.get("status") == "passed":
+            passed.append(completed_name)
+        elif copied.get("status") == "failed":
+            failed.append(completed_name)
+        duration = copied.get("duration_seconds")
+        if isinstance(duration, int | float) and not isinstance(duration, bool):
+            duration_value = float(duration)
+            if math.isfinite(duration_value) and duration_value >= 0:
+                total_duration += duration_value
+                duration_seen = True
+    completed_name_set = set(completed_phase_names)
+    running = [name for name in started_phase_names if name not in completed_name_set]
+    last_observed = running[-1] if running else (completed[-1]["name"] if completed else None)
+    return {
+        "completed": completed,
+        "passed": passed,
+        "failed": failed,
+        "running": running,
+        "never_started": list(not_started_phase_names),
+        "last_observed": last_observed,
+        "observed_count": len(completed) + len(running),
+        "completed_count": len(completed),
+        "failed_count": len(failed),
+        "total_duration_seconds": total_duration if duration_seen else None,
+    }
 
 
 def _resolve_artifact_phase_summary(
@@ -996,11 +1083,12 @@ def _resolve_artifact_phase_summary(
         aggregate_details = metadata.get("aggregate_details")
         if not isinstance(aggregate_details, dict):
             return None, "malformed aggregate_details: must be an object"
-        aggregate_summary, aggregate_invalid_reason = _aggregate_phase_summary_from_details(aggregate_details)
-        if aggregate_invalid_reason is not None or aggregate_summary is not None:
-            return aggregate_summary, aggregate_invalid_reason
-        if "phase_results" not in aggregate_details:
-            return None, "missing phase results"
+        from gza.runner import PHASE_EVIDENCE_INDETERMINATE, validate_verify_phase_evidence_from_metadata
+
+        validation = validate_verify_phase_evidence_from_metadata(metadata)
+        if validation.state == PHASE_EVIDENCE_INDETERMINATE:
+            return None, validation.reason or "indeterminate phase evidence"
+        return validate_verify_phase_summary(_phase_summary_from_canonical_validation(validation))
 
     summary, invalid_reason = validate_verify_phase_summary(
         metadata.get("phase_summary"),

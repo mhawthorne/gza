@@ -3543,6 +3543,9 @@ class PhaseEvidenceValidation:
     started_phase_names: tuple[str, ...] = ()
     expected_phase_names: tuple[str, ...] = ()
     phase_results: tuple[dict[str, Any], ...] = ()
+    expected_phase_partition: str = "unknown"
+    expected_phase_partition_supplied: bool = False
+    supplied_lifecycle_fields: dict[str, Any] | None = None
     reason: str | None = None
 
 
@@ -3718,6 +3721,7 @@ def _build_single_project_verify_aggregate_details(result: VerificationResult) -
         "completed_phase_names": completed_phase_names,
         "failed_phase_names": failed_phase_names,
         "expected_phase_names": list(expected_phase_names),
+        "expected_phase_partition": "known" if expected_phase_names else "unknown",
         "not_started_phase_names": list(not_started_phase_names),
         "completed_count": len(completed_phase_names),
         "failed_count": len(failed_phase_names),
@@ -3735,14 +3739,17 @@ def _build_project_phase_diagnostics(result: VerificationResult | None) -> dict[
             "completed_phase_names": [],
             "failed_phase_names": [],
             "expected_phase_names": [],
+            "expected_phase_partition": "unknown",
             "not_started_phase_names": [],
         }
+    expected_phase_names = _expected_verify_phase_names(result.command)
     return _build_single_project_verify_aggregate_details(result) or {
         "phase_results": [],
         "started_phase_names": [],
         "completed_phase_names": [],
         "failed_phase_names": [],
-        "expected_phase_names": list(_expected_verify_phase_names(result.command)),
+        "expected_phase_names": list(expected_phase_names),
+        "expected_phase_partition": "known" if expected_phase_names else "unknown",
         "not_started_phase_names": [],
     }
 
@@ -3991,9 +3998,15 @@ def _build_cross_project_verify_aggregate_details(
     started_phase_names: list[str] = []
     not_started_phase_names: list[str] = []
     expected_phase_names: list[str] = []
+    has_known_expected_partition = False
+    has_unknown_expected_partition = False
     scope_entries: list[dict[str, Any]] = []
     for entry in project_results:
         diagnostics = _build_project_phase_diagnostics(entry.result)
+        if diagnostics.get("expected_phase_partition") == "known":
+            has_known_expected_partition = True
+        else:
+            has_unknown_expected_partition = True
         tree_fingerprint = _review_verify_tree_fingerprint(entry.result)
         phase_summary = None
         phase_summary_invalid_reason = None
@@ -4005,7 +4018,7 @@ def _build_cross_project_verify_aggregate_details(
             if phase_summary_invalid_reason is None:
                 phase_summary, phase_summary_invalid_reason = validate_verify_phase_summary(
                     phase_summary,
-                    require_known_full_verify_partition=normalized_verify_command(entry.result.command) == "./bin/tests",
+                    require_known_full_verify_partition=bool(_expected_verify_phase_names(entry.result.command)),
                 )
         scope_entries.append(
             {
@@ -4044,6 +4057,12 @@ def _build_cross_project_verify_aggregate_details(
             for child_phase in child_phase_results:
                 if isinstance(child_phase, dict):
                     phase_results.append({"scope": entry.scope, **child_phase})
+    if has_known_expected_partition and has_unknown_expected_partition:
+        expected_phase_partition = "mixed"
+    elif has_known_expected_partition:
+        expected_phase_partition = "known"
+    else:
+        expected_phase_partition = "unknown"
     fingerprints = [
         scope["tree_fingerprint"]
         for scope in scope_entries
@@ -4082,6 +4101,7 @@ def _build_cross_project_verify_aggregate_details(
         "completed_phase_names": completed_phase_names,
         "failed_phase_names": failed_phase_names,
         "expected_phase_names": expected_phase_names,
+        "expected_phase_partition": expected_phase_partition,
         "not_started_phase_names": not_started_phase_names,
         "scopes": scope_entries,
     }
@@ -4140,13 +4160,16 @@ def _phase_summary_to_details(
     phase_summary: object,
     *,
     expected_phase_names: tuple[str, ...] = (),
+    expected_phase_partition: str | None = None,
+    expected_phase_partition_supplied: bool = False,
 ) -> dict[str, Any] | None:
     if not isinstance(phase_summary, dict):
         return None
-    completed = phase_summary.get("completed")
-    failed = phase_summary.get("failed")
-    running = phase_summary.get("running")
-    never_started = phase_summary.get("never_started")
+    phase_summary_dict = cast(dict[str, Any], phase_summary)
+    completed = phase_summary_dict.get("completed")
+    failed = phase_summary_dict.get("failed")
+    running = phase_summary_dict.get("running")
+    never_started = phase_summary_dict.get("never_started")
     if not isinstance(completed, list) or not isinstance(failed, list):
         return None
     if not isinstance(running, list) or not isinstance(never_started, list):
@@ -4158,30 +4181,54 @@ def _phase_summary_to_details(
     ]
     running_names = [name for name in running if isinstance(name, str) and name]
     not_started_names = [name for name in never_started if isinstance(name, str) and name]
-    return {
+    details = {
         "schema_version": 1,
         "phase_results": [deepcopy(phase) for phase in completed],
         "started_phase_names": [*completed_names, *running_names],
         "completed_phase_names": completed_names,
         "failed_phase_names": [name for name in failed if isinstance(name, str) and name],
-        "expected_phase_names": (
-            list(expected_phase_names)
-            if expected_phase_names
-            else [*completed_names, *running_names, *not_started_names]
-        ),
+        "expected_phase_names": list(expected_phase_names),
+        "expected_phase_partition": expected_phase_partition or ("known" if expected_phase_names else "unknown"),
+        "_expected_phase_partition_supplied": expected_phase_partition_supplied,
         "not_started_phase_names": not_started_names,
     }
+    for key in (
+        "passed",
+        "failed",
+        "running",
+        "never_started",
+        "last_observed",
+        "observed_count",
+        "completed_count",
+        "failed_count",
+        "total_duration_seconds",
+    ):
+        if key in phase_summary_dict:
+            details[key] = deepcopy(phase_summary_dict[key])
+    return details
 
 
 def _phase_evidence_matches(left: PhaseEvidenceValidation, right: PhaseEvidenceValidation) -> bool:
-    return (
+    core_matches = (
         left.state == right.state
         and left.failed_phase_names == right.failed_phase_names
         and left.completed_phase_names == right.completed_phase_names
         and left.not_started_phase_names == right.not_started_phase_names
         and left.started_phase_names == right.started_phase_names
         and left.expected_phase_names == right.expected_phase_names
+        and left.phase_results == right.phase_results
     )
+    if not core_matches:
+        return False
+    if left.expected_phase_partition_supplied and right.expected_phase_partition_supplied:
+        if left.expected_phase_partition != right.expected_phase_partition:
+            return False
+    left_lifecycle = left.supplied_lifecycle_fields or {}
+    right_lifecycle = right.supplied_lifecycle_fields or {}
+    for key in set(left_lifecycle) & set(right_lifecycle):
+        if left_lifecycle[key] != right_lifecycle[key]:
+            return False
+    return True
 
 
 def _validate_phase_summary_evidence(
@@ -4191,6 +4238,9 @@ def _validate_phase_summary_evidence(
     failure_origin: str | None = None,
     allow_timeout_budget_in_flight: bool = False,
     require_known_full_verify_partition: bool = False,
+    expected_phase_names: tuple[str, ...] | None = None,
+    expected_phase_partition: str | None = None,
+    expected_phase_partition_supplied: bool = False,
 ) -> PhaseEvidenceValidation:
     valid_summary, invalid_reason = validate_verify_phase_summary(
         phase_summary,
@@ -4202,7 +4252,13 @@ def _validate_phase_summary_evidence(
         return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="missing phase_summary")
     details = _phase_summary_to_details(
         valid_summary,
-        expected_phase_names=KNOWN_FULL_VERIFY_PHASES if require_known_full_verify_partition else (),
+        expected_phase_names=(
+            expected_phase_names
+            if expected_phase_names is not None
+            else (KNOWN_FULL_VERIFY_PHASES if require_known_full_verify_partition else ())
+        ),
+        expected_phase_partition=expected_phase_partition,
+        expected_phase_partition_supplied=expected_phase_partition_supplied or require_known_full_verify_partition,
     )
     if details is None:
         return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase_summary")
@@ -4297,6 +4353,18 @@ def _validate_phase_summary_details(
         return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="completed phases contradict results")
     if tuple(result_failed_names) != failed_names:
         return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="failed phases contradict results")
+    supplied_passed_names = _coerce_phase_name_list(aggregate_details.get("passed")) if "passed" in aggregate_details else None
+    if "passed" in aggregate_details and supplied_passed_names is None:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed passed phase summary")
+    if supplied_passed_names is not None:
+        result_passed_names = tuple(name for name, phase in zip(result_names, phase_results, strict=True) if phase.get("status") == "passed")
+        if supplied_passed_names != result_passed_names:
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="passed phases contradict results")
+    supplied_failed_alias = _coerce_phase_name_list(aggregate_details.get("failed")) if "failed" in aggregate_details else None
+    if "failed" in aggregate_details and supplied_failed_alias is None:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed failed phase summary")
+    if supplied_failed_alias is not None and supplied_failed_alias != failed_names:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="failed phases contradict results")
     counts_are_project_counts = isinstance(aggregate_details.get("scopes"), list) and any(
         key in aggregate_details for key in ("passed_count", "unavailable_count", "skipped_count", "runnable_count")
     )
@@ -4309,13 +4377,22 @@ def _validate_phase_summary_details(
             failed_count = _phase_count_field(aggregate_details.get("failed_count"))
             if failed_count is None or failed_count != len(result_failed_names):
                 return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="failed_count contradicts results")
+    scopes = aggregate_details.get("scopes")
+    has_scopes = isinstance(scopes, list)
     result_name_set = set(result_names)
     if any(name not in started_names for name in result_names):
         return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="terminal phase lacks start")
-    if tuple(result_names) != started_names[: len(result_names)]:
+    if not has_scopes and tuple(result_names) != started_names[: len(result_names)]:
         return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="terminal phases contradict started order")
     started_without_result = tuple(name for name in started_names if name not in result_name_set)
+    supplied_running_alias = (
+        _coerce_phase_name_list(aggregate_details.get("running")) if "running" in aggregate_details else None
+    )
+    if "running" in aggregate_details and supplied_running_alias is None:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed running phase summary")
     if running_names is not None and running_names != started_without_result:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="running phases contradict results")
+    if supplied_running_alias is not None and supplied_running_alias != started_without_result:
         return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="running phases contradict results")
     allow_final_in_flight = (
         allow_timeout_budget_in_flight
@@ -4328,9 +4405,28 @@ def _validate_phase_summary_details(
     )
     if not phase_results and not allow_final_in_flight:
         return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="missing phase results")
-    if started_without_result and not allow_final_in_flight:
+    if started_without_result and not allow_final_in_flight and not has_scopes:
         return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="started phase lacks terminal result")
-    if expected_names:
+    expected_phase_partition_raw = aggregate_details.get("expected_phase_partition")
+    expected_phase_partition_supplied = "expected_phase_partition" in aggregate_details
+    valid_expected_partitions = {"known", "unknown", "mixed"}
+    if expected_phase_partition_raw in valid_expected_partitions:
+        expected_phase_partition = cast(str, expected_phase_partition_raw)
+        if expected_phase_partition == "known" and not expected_names:
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="known expected partition lacks phases")
+        if expected_phase_partition == "unknown" and expected_names:
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="unknown expected partition has phases")
+        if expected_phase_partition == "mixed":
+            if not expected_names:
+                return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="mixed expected partition lacks phases")
+            if not isinstance(aggregate_details.get("scopes"), list):
+                return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="mixed expected partition requires scopes")
+    elif expected_phase_partition_supplied:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="expected_phase_partition must be known, unknown, or mixed")
+    else:
+        expected_phase_partition = "known" if expected_names else "unknown"
+
+    if expected_phase_partition == "known":
         expected_set = set(expected_names)
         if any(name not in expected_set for name in (*started_names, *result_names, *not_started_names)):
             return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="result phase outside expected set")
@@ -4339,18 +4435,27 @@ def _validate_phase_summary_details(
         )
         if expected_not_started != not_started_names:
             return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="not-started phases contradict results")
+    elif expected_phase_partition == "mixed":
+        expected_set = set(expected_names)
+        if any(name not in expected_set for name in not_started_names):
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="not-started phases outside expected set")
+        expected_not_started = tuple(
+            name for name in expected_names if name not in set(started_names) and name not in result_name_set
+        )
+        if expected_not_started != not_started_names:
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="not-started phases contradict results")
     elif not_started_names:
         return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="not-started phases without expected phases")
 
-    scopes = aggregate_details.get("scopes")
-    if isinstance(scopes, list):
+    if has_scopes:
+        scope_items = cast(list[Any], scopes)
         scoped_completed: list[str] = []
         scoped_failed: list[str] = []
         scoped_started: list[str] = []
         scoped_not_started: list[str] = []
         scoped_expected: list[str] = []
         seen_scopes: set[str] = set()
-        for scope in scopes:
+        for scope in scope_items:
             if not isinstance(scope, dict):
                 return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed scope entry")
             scope_name = scope.get("scope")
@@ -4359,6 +4464,11 @@ def _validate_phase_summary_details(
             if scope_name in seen_scopes:
                 return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="duplicate scope identity")
             seen_scopes.add(scope_name)
+        seen_scopes.clear()
+        for scope in scope_items:
+            scope = cast(dict[str, Any], scope)
+            scope_name = scope.get("scope")
+            assert isinstance(scope_name, str)
             scope_status = scope.get("status")
             if scope_status in {"skipped", "unavailable"}:
                 continue
@@ -4385,14 +4495,22 @@ def _validate_phase_summary_details(
             summary_validation: PhaseEvidenceValidation | None = None
             if "phase_summary" in scope:
                 command = scope.get("command_identity")
+                inherited_expected_phase_names = (
+                    diagnostics_validation.expected_phase_names if diagnostics_validation is not None else None
+                )
+                inherited_expected_phase_partition = (
+                    diagnostics_validation.expected_phase_partition if diagnostics_validation is not None else None
+                )
                 summary_validation = _validate_phase_summary_evidence(
                     scope.get("phase_summary"),
                     result_status=scope_result_status,
                     failure_origin=scope_result_failure_origin,
                     allow_timeout_budget_in_flight=allow_timeout_budget_in_flight,
                     require_known_full_verify_partition=(
-                        normalized_verify_command(command if isinstance(command, str) else None) == "./bin/tests"
+                        bool(_expected_verify_phase_names(command if isinstance(command, str) else None))
                     ),
+                    expected_phase_names=inherited_expected_phase_names,
+                    expected_phase_partition=inherited_expected_phase_partition,
                 )
                 if summary_validation.state == PHASE_EVIDENCE_INDETERMINATE:
                     return PhaseEvidenceValidation(
@@ -4421,7 +4539,7 @@ def _validate_phase_summary_details(
             return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="scoped phase summary contradicts aggregate")
         if tuple(scoped_started) != started_names or tuple(scoped_not_started) != not_started_names:
             return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="scoped phase lifecycle contradicts aggregate")
-        if tuple(scoped_expected) != expected_names:
+        if expected_phase_partition in {"known", "mixed"} and tuple(scoped_expected) != expected_names:
             return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="scoped expected phases contradict aggregate")
 
     if result_status == "passed" and failed_names:
@@ -4430,6 +4548,21 @@ def _validate_phase_summary_details(
         return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="failed aggregate lacks failed phase evidence")
 
     state = PHASE_EVIDENCE_RED if failed_names else PHASE_EVIDENCE_VALID_ZERO_RED
+    supplied_lifecycle_fields = {
+        key: deepcopy(aggregate_details[key])
+        for key in (
+            "passed",
+            "failed",
+            "running",
+            "never_started",
+            "last_observed",
+            "observed_count",
+            "completed_count",
+            "failed_count",
+            "total_duration_seconds",
+        )
+        if key in aggregate_details
+    }
     return PhaseEvidenceValidation(
         state,
         failed_phase_names=failed_names,
@@ -4438,6 +4571,9 @@ def _validate_phase_summary_details(
         started_phase_names=started_names,
         expected_phase_names=expected_names,
         phase_results=tuple(phase_results),
+        expected_phase_partition=expected_phase_partition,
+        expected_phase_partition_supplied=expected_phase_partition_supplied,
+        supplied_lifecycle_fields=supplied_lifecycle_fields,
     )
 
 
@@ -4474,6 +4610,11 @@ def _validate_scoped_legacy_phase_evidence(
         if scope_name in seen_scopes:
             return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="duplicate scope identity")
         seen_scopes.add(scope_name)
+    seen_scopes.clear()
+    for index, scope in enumerate(scopes):
+        scope = cast(dict[str, Any], scope)
+        scope_name = scope.get("scope")
+        assert isinstance(scope_name, str)
         scope_status = scope.get("status")
         if scope_status in {"skipped", "unavailable"}:
             continue
@@ -4503,14 +4644,22 @@ def _validate_scoped_legacy_phase_evidence(
         summary_validation: PhaseEvidenceValidation | None = None
         if "phase_summary" in scope:
             command = scope.get("command_identity")
+            inherited_expected_phase_names = (
+                diagnostics_validation.expected_phase_names if diagnostics_validation is not None else None
+            )
+            inherited_expected_phase_partition = (
+                diagnostics_validation.expected_phase_partition if diagnostics_validation is not None else None
+            )
             summary_validation = _validate_phase_summary_evidence(
                 scope.get("phase_summary"),
                 result_status=scope_result_status,
                 failure_origin=scope_result_failure_origin,
                 allow_timeout_budget_in_flight=allow_timeout_budget_in_flight,
                 require_known_full_verify_partition=(
-                    normalized_verify_command(command if isinstance(command, str) else None) == "./bin/tests"
+                    bool(_expected_verify_phase_names(command if isinstance(command, str) else None))
                 ),
+                expected_phase_names=inherited_expected_phase_names,
+                expected_phase_partition=inherited_expected_phase_partition,
             )
             if summary_validation.state == PHASE_EVIDENCE_INDETERMINATE:
                 return PhaseEvidenceValidation(
@@ -4572,6 +4721,7 @@ def _validate_scoped_legacy_phase_evidence(
         started_phase_names=tuple(scoped_started),
         expected_phase_names=tuple(scoped_expected),
         phase_results=tuple(scoped_results),
+        expected_phase_partition="known" if scoped_expected else "unknown",
     )
 
 
@@ -4631,14 +4781,14 @@ def validate_verify_phase_evidence_from_metadata(metadata: object) -> PhaseEvide
         result_status=result_status,
         failure_origin=failure_origin,
         allow_timeout_budget_in_flight=True,
-        require_known_full_verify_partition=normalized_verify_command(command_identity) == "./bin/tests",
+        require_known_full_verify_partition=bool(_expected_verify_phase_names(command_identity)),
     )
 
 
 def _verify_result_has_structured_failed_phase(result: VerificationResult) -> bool:
     phase_summary, invalid_reason = validate_verify_phase_summary(
         summarize_verify_phases(command=result.command, output=result.output),
-        require_known_full_verify_partition=normalized_verify_command(result.command) == "./bin/tests",
+        require_known_full_verify_partition=bool(_expected_verify_phase_names(result.command)),
     )
     return invalid_reason is None and isinstance(phase_summary, dict) and bool(phase_summary.get("failed"))
 
