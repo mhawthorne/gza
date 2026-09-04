@@ -241,8 +241,9 @@ def test_watch_cycle_real_git_dedupes_attention_and_emits_single_task_scoped_rep
         for line in text.splitlines()
         if attention.id in line and "reason=review-needs-manual-creation" in line
     ]
-    assert len(manual_attention_lines) == 2
-    assert sum(" ATTENTION " in line for line in manual_attention_lines) == 1
+    assert len(manual_attention_lines) == 1
+    assert " ATTENTION " in manual_attention_lines[0]
+    assert "Needs attention (2 tasks): advance-attention=2" in text
     assert "Could not resolve freshest merge source" not in text
 
 
