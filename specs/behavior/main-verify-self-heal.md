@@ -167,7 +167,8 @@ The repair path MUST distinguish flaky from deterministic verify failures:
 - Phase progress metadata used for that timeout classification MUST satisfy the complete
   `phase_summary` schema: `completed`, `passed`, `failed`, `running`, and
   `never_started` are lists; `observed_count` and `completed_count` are non-negative
-  counts; `last_observed` is a string or null; and `total_duration_seconds` is a
+  counts; `last_observed` is a string or null; each completed terminal phase has a
+  non-negative numeric `duration_seconds`; and `total_duration_seconds` is a
   non-negative number or null. Malformed phase summaries MUST fail closed as
   `verify-phase-evidence-invalid` instead of being interpreted as zero failures.
 - For the known `./bin/tests` lifecycle gate, automation MUST guard against a fixed

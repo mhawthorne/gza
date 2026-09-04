@@ -4277,12 +4277,11 @@ def _validate_phase_summary_details(
             return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase name")
         if status not in {"passed", "failed"}:
             return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase status")
-        if duration is not None:
-            if isinstance(duration, bool) or not isinstance(duration, int | float):
-                return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase duration")
-            duration_value = float(duration)
-            if not math.isfinite(duration_value) or duration_value < 0:
-                return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase duration")
+        if isinstance(duration, bool) or not isinstance(duration, int | float):
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase duration")
+        duration_value = float(duration)
+        if not math.isfinite(duration_value) or duration_value < 0:
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase duration")
         phase_result = cast(dict[str, Any], phase)
         phase_results.append(phase_result)
         scope = phase.get("scope")
@@ -6086,8 +6085,9 @@ def _phase_duration_observation_from_artifact(
     durations: list[float] = []
     for phase in validation.phase_results:
         duration = phase.get("duration_seconds")
-        if duration is not None:
-            durations.append(float(duration))
+        if isinstance(duration, bool) or not isinstance(duration, int | float):
+            return None
+        durations.append(float(duration))
     if result_status == "passed":
         if validation.state != PHASE_EVIDENCE_VALID_ZERO_RED or validation.completed_phase_names != expected_names:
             return None

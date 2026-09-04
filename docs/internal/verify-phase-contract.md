@@ -59,6 +59,9 @@ gza-verify phase=failed name=functional duration_seconds=12.500000
 - `src/gza/runner.py` parses `phase=start`, `phase=passed`, and `phase=failed`
   lines. Lifecycle verify artifacts persist started, completed, failed, and known
   not-started phase names when structured phase output is available.
+- Any output line beginning with `gza-verify phase=` must match one of the documented
+  grammars exactly. Malformed structured-prefix lines are preserved as invalid phase
+  evidence rather than ignored.
 - Cross-project lifecycle verify aggregates preserve the same diagnostics per scope
   and prefix aggregate phase-name lists with the scope, so a failed child phase remains
   visible to routing and operator summaries.
