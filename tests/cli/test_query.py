@@ -2642,6 +2642,32 @@ class TestHistoryCommand:
         assert "Untagged orphaned task" in result.stdout
         assert "Tagged orphaned task" not in result.stdout
 
+    def test_history_tag_not_filters_orphaned_rows(self, tmp_path: Path) -> None:
+        """History --tag-not should exclude matching orphaned tasks."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        allowed_orphaned = store.add(
+            "Allowed orphaned task",
+            task_type="implement",
+            tags=("release",),
+        )
+        mark_orphaned(store, allowed_orphaned)
+
+        excluded_orphaned = store.add(
+            "Excluded orphaned task",
+            task_type="implement",
+            tags=("blocked",),
+        )
+        mark_orphaned(store, excluded_orphaned)
+
+        result = invoke_gza("history", "--tag-not", "blocked", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Allowed orphaned task" in result.stdout
+        assert "Excluded orphaned task" not in result.stdout
+
     def test_history_no_orphaned_when_status_filter_set(self, tmp_path: Path):
         """History command does not show orphaned tasks when --status filter is active."""
 

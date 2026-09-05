@@ -1385,6 +1385,7 @@ def cmd_history(args: argparse.Namespace) -> int:
             if _task_matches_cli_tag_scope(
                 task,
                 tag_filters=tags,
+                exclude_tag_filters=tags_not,
                 any_tag=any_tag,
                 untagged_only=untagged_only,
             )
