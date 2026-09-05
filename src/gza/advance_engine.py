@@ -4298,6 +4298,7 @@ def _red_verify_gate_proof(ctx: AdvanceContext, *, phase: str) -> dict[str, Any]
     result_epoch = make_verify_epoch(
         reviewed_branch=result.reviewed_branch,
         reviewed_head_sha=result.reviewed_head_sha,
+        reviewed_tree_sha=result.reviewed_tree_sha,
         verify_command=result.command,
         verify_timeout_seconds=decision.current_epoch.verify_timeout_seconds,
         verify_timeout_grace_seconds=decision.current_epoch.verify_timeout_grace_seconds,
@@ -4308,6 +4309,7 @@ def _red_verify_gate_proof(ctx: AdvanceContext, *, phase: str) -> dict[str, Any]
         "phase": phase,
         "reviewed_branch": result.reviewed_branch,
         "reviewed_head_sha": result.reviewed_head_sha,
+        "reviewed_tree_sha": result.reviewed_tree_sha,
         "verify_command": result.command,
         "source_task_id": result.source_task_id,
         "source_task_type": result.source_task_type,

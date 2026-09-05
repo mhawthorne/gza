@@ -50,10 +50,12 @@ from ..review_tasks import (
 from ..review_verify_state import (
     VerifyEpoch,
     VerifyGateDecision,
+    make_verify_epoch,
     owner_task_verify_epoch,
     persist_recredited_verify_gate_artifact,
     resolve_verify_gate_decision,
     select_current_merge_unit_verify_evidence,
+    verify_epoch_matches,
 )
 from ..runner import (
     LifecycleVerifyExecution,
@@ -69,6 +71,7 @@ from ..runner import (
     _project_boundary,
     _resolve_review_verify_base_sha,
     _resolve_review_verify_timeout_settings,
+    _resolve_reviewed_tree_sha,
     _run_lifecycle_verify,
     _run_review_verify_command,
     _run_review_verify_commands_for_projects,
@@ -719,11 +722,17 @@ def _passed_verify_gate_matches_subject(
     current_epoch = decision.current_epoch
     if result is None or current_epoch is None or subject_epoch is None:
         return False
-    return (
-        result.reviewed_branch == subject_epoch.reviewed_branch
-        and result.reviewed_head_sha == subject_epoch.reviewed_head_sha
-        and current_epoch.reviewed_branch == subject_epoch.reviewed_branch
-        and current_epoch.reviewed_head_sha == subject_epoch.reviewed_head_sha
+    result_epoch = make_verify_epoch(
+        reviewed_branch=result.reviewed_branch,
+        reviewed_head_sha=result.reviewed_head_sha,
+        reviewed_tree_sha=getattr(result, "reviewed_tree_sha", None),
+        verify_command=getattr(result, "command", None),
+        verify_timeout_seconds=subject_epoch.verify_timeout_seconds,
+        verify_timeout_grace_seconds=subject_epoch.verify_timeout_grace_seconds,
+    )
+    return verify_epoch_matches(expected=subject_epoch, candidate=current_epoch) and verify_epoch_matches(
+        expected=subject_epoch,
+        candidate=result_epoch,
     )
 
 
@@ -1367,6 +1376,7 @@ def _execute_verify_gate(
                 timeout_seconds=timeout_seconds,
                 reviewed_branch=current_epoch.reviewed_branch,
                 reviewed_head_sha=current_epoch.reviewed_head_sha,
+                reviewed_tree_sha=current_epoch.reviewed_tree_sha,
                 reviewed_base_sha=reviewed_base_sha,
                 working_directory=provider_cwd,
             )
@@ -1384,6 +1394,7 @@ def _execute_verify_gate(
                 timeout_grace_seconds=timeout_grace_seconds,
                 reviewed_branch=current_epoch.reviewed_branch,
                 reviewed_head_sha=current_epoch.reviewed_head_sha,
+                reviewed_tree_sha=current_epoch.reviewed_tree_sha,
                 reviewed_base_sha=reviewed_base_sha,
                 heartbeat_threshold_seconds=context.config.watch.long_phase_threshold_seconds,
                 heartbeat_interval_seconds=context.config.watch.heartbeat_interval_seconds,
@@ -1407,6 +1418,7 @@ def _execute_verify_gate(
                 captured_at=datetime.now(UTC),
                 reviewed_branch=current_epoch.reviewed_branch,
                 reviewed_head_sha=current_epoch.reviewed_head_sha,
+                reviewed_tree_sha=current_epoch.reviewed_tree_sha,
                 reviewed_base_sha=reviewed_base_sha,
                 working_directory=str(provider_cwd),
                 failure="verify_command is not configured for lifecycle verify gating",
@@ -2089,6 +2101,7 @@ def _execute_recover_verify_only_noop_review(
         )
         reviewed_base_sha: str | None = None
         reviewed_head_sha: str | None = None
+        reviewed_tree_sha: str | None = None
         project_results: tuple[ProjectReviewVerifyResult, ...] = ()
         deferred_attention_message: str | None = None
         deferred_attention_outcome_kind: str | None = None
@@ -2100,6 +2113,7 @@ def _execute_recover_verify_only_noop_review(
             default_branch = worktree_git.default_branch()
             reviewed_base_sha = _resolve_review_verify_base_sha(worktree_git, default_branch)
             reviewed_head_sha = worktree_git.rev_parse_if_exists("HEAD")
+            reviewed_tree_sha = _resolve_reviewed_tree_sha(worktree_git, reviewed_head_sha)
             if reviewed_head_sha is None:
                 result = _make_review_verify_result(
                     command_label,
@@ -2108,6 +2122,7 @@ def _execute_recover_verify_only_noop_review(
                     captured_at=datetime.now(UTC),
                     reviewed_branch=task.branch,
                     reviewed_head_sha=None,
+                    reviewed_tree_sha=None,
                     reviewed_base_sha=reviewed_base_sha,
                     working_directory=str(provider_cwd),
                     failure="unable to resolve detached review-verify HEAD",
@@ -2124,6 +2139,7 @@ def _execute_recover_verify_only_noop_review(
                     timeout_grace_seconds=timeout_grace_seconds,
                     reviewed_branch=task.branch,
                     reviewed_head_sha=reviewed_head_sha,
+                    reviewed_tree_sha=reviewed_tree_sha,
                     reviewed_base_sha=reviewed_base_sha,
                 )
                 if cross_project_verify is None:
@@ -2142,6 +2158,7 @@ def _execute_recover_verify_only_noop_review(
                     captured_at=datetime.now(UTC),
                     reviewed_branch=task.branch,
                     reviewed_head_sha=reviewed_head_sha,
+                    reviewed_tree_sha=reviewed_tree_sha,
                     reviewed_base_sha=reviewed_base_sha,
                     working_directory=str(provider_cwd),
                     failure="verify_command is not configured for verify-only no-op recovery",
@@ -2153,6 +2170,7 @@ def _execute_recover_verify_only_noop_review(
                     env=normalize_subprocess_env(runtime_context.env, provider_cwd),
                     reviewed_branch=task.branch,
                     reviewed_head_sha=reviewed_head_sha,
+                    reviewed_tree_sha=reviewed_tree_sha,
                     reviewed_base_sha=reviewed_base_sha,
                     timeout_seconds=timeout_seconds,
                     timeout_grace_seconds=timeout_grace_seconds,
@@ -2165,6 +2183,7 @@ def _execute_recover_verify_only_noop_review(
                 captured_at=datetime.now(UTC),
                 reviewed_branch=task.branch,
                 reviewed_head_sha=reviewed_head_sha,
+                reviewed_tree_sha=reviewed_tree_sha,
                 reviewed_base_sha=reviewed_base_sha,
                 working_directory=str(provider_cwd),
                 failure=f"unable to prepare or run verify_command for verify-only no-op recovery: {exc}",

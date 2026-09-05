@@ -160,7 +160,7 @@ These hold across the whole machine; the detailed rules in
    - the **code-review gate**: a current, valid review whose verdict permits merge
      (`APPROVED` or `APPROVED_WITH_FOLLOWUPS`);
    - the **verify gate**: current runner-owned verify evidence for the current
-     implementation branch content/tree epoch and verify-gate identity, with
+     implementation branch content/tree epoch, with
      fail-closed exact-head fallback when Git tree identity is unavailable.
    When `require_review_before_merge=false` disables the review gate for that
    implementation-owned lineage, the verify gate remains mandatory and that no-review

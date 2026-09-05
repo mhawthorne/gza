@@ -24028,6 +24028,60 @@ class TestLoadDotenv:
         assert execution.aggregate_result.status == "passed"
         assert execution.aggregate_result.exit_status == "0"
 
+    def test_lifecycle_verify_threads_reviewed_tree_from_verified_head(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/verify-tree"
+        store.update(impl)
+        worktree_git = Mock(spec=Git)
+        worktree_git.resolve_refs.return_value = {"head-1": "tree-1"}
+
+        def fake_verify(*_args: object, **kwargs: object) -> ReviewVerifyResult:
+            assert kwargs["reviewed_tree_sha"] == "tree-1"
+            return ReviewVerifyResult(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
+                reviewed_branch=cast(str | None, kwargs["reviewed_branch"]),
+                reviewed_head_sha=cast(str | None, kwargs["reviewed_head_sha"]),
+                reviewed_tree_sha=cast(str | None, kwargs["reviewed_tree_sha"]),
+                reviewed_base_sha=cast(str | None, kwargs["reviewed_base_sha"]),
+                working_directory=str(tmp_path),
+                output="passed\n",
+            )
+
+        with patch("gza.runner._run_review_verify_command", side_effect=fake_verify) as mock_verify:
+            execution = _run_lifecycle_verify(
+                config=config,
+                store=store,
+                task=impl,
+                worktree_git=worktree_git,
+                worktree_path=tmp_path,
+                cwd=tmp_path,
+                timeout_seconds=600,
+                timeout_grace_seconds=5.0,
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+            )
+
+        mock_verify.assert_called_once()
+        worktree_git.resolve_refs.assert_called_once_with(["head-1"], peel="tree")
+        assert execution is not None
+        assert execution.aggregate_result.reviewed_tree_sha == "tree-1"
+
     def test_lifecycle_verify_budget_margin_fails_loudly_before_unsafe_full_suite_runtime(
         self,
         tmp_path: Path,

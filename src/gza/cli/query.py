@@ -4897,6 +4897,8 @@ def _render_verify_markdown(read_model: VerifyReadModel | None, *, config: Confi
         lines.append(f"- Branch: `{result.reviewed_branch}`")
     if result.reviewed_head_sha:
         lines.append(f"- Head SHA: `{result.reviewed_head_sha}`")
+    if result.reviewed_tree_sha:
+        lines.append(f"- Tree SHA: `{result.reviewed_tree_sha}`")
     if result.reviewed_base_sha:
         lines.append(f"- Base SHA: `{result.reviewed_base_sha}`")
     if result.working_directory:

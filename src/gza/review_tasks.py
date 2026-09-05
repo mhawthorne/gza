@@ -201,6 +201,7 @@ class VerifyFixContext:
     working_directory: str
     reviewed_branch: str
     reviewed_head_sha: str
+    reviewed_tree_sha: str | None
     reviewed_base_sha: str | None
     failure: str
     artifact_path: str
@@ -296,6 +297,7 @@ def _verify_fix_epoch_artifact_metadata(
         "verify_epoch": {
             "reviewed_branch": verify_epoch.reviewed_branch,
             "reviewed_head_sha": verify_epoch.reviewed_head_sha,
+            "reviewed_tree_sha": verify_epoch.reviewed_tree_sha,
             "verify_command": verify_epoch.verify_command,
             "verify_timeout_seconds": verify_epoch.verify_timeout_seconds,
             "verify_timeout_grace_seconds": verify_epoch.verify_timeout_grace_seconds,
@@ -333,6 +335,9 @@ def parse_verify_fix_epoch_artifact_metadata(
             else None,
             reviewed_head_sha=cast(str | None, epoch_payload.get("reviewed_head_sha"))
             if isinstance(epoch_payload.get("reviewed_head_sha"), str)
+            else None,
+            reviewed_tree_sha=cast(str | None, epoch_payload.get("reviewed_tree_sha"))
+            if isinstance(epoch_payload.get("reviewed_tree_sha"), str)
             else None,
             verify_command=cast(str | None, epoch_payload.get("verify_command"))
             if isinstance(epoch_payload.get("verify_command"), str)
@@ -460,14 +465,16 @@ def resolve_latest_failed_verify_epoch(
     if not verify_epoch_matches(expected=current_epoch, candidate=evidence.epoch):
         raise VerifyFixContextError(
             f"verify_fix manual creation for {impl_task_id} requires failed verify evidence for the current "
-            "implementation branch/head identity, but the latest persisted failure is stale. "
+            "implementation source epoch, but the latest persisted failure is stale. "
             f"Current: branch={current_epoch.reviewed_branch} head={current_epoch.reviewed_head_sha} "
+            f"tree={current_epoch.reviewed_tree_sha} "
             f"command={current_epoch.verify_command!r} (provenance only). "
             f"Latest failed evidence: branch={evidence.epoch.reviewed_branch} "
             f"head={evidence.epoch.reviewed_head_sha} "
+            f"tree={evidence.epoch.reviewed_tree_sha} "
             f"command={evidence.epoch.verify_command!r} (provenance only)."
         )
-    return evidence.epoch
+    return current_epoch
 
 
 def _verify_fix_representation_recency(task: Task) -> tuple[datetime, str]:
@@ -540,6 +547,7 @@ def resolve_verify_fix_representative_task(
         raise VerifyFixContextError(
             f"verify_fix for {impl_task.id} has no current failed verify evidence for "
             f"branch={verify_epoch.reviewed_branch} head={verify_epoch.reviewed_head_sha} "
+            f"tree={verify_epoch.reviewed_tree_sha} "
             f"command={verify_epoch.verify_command!r}. Re-run or persist the failing verify result first."
         )
     if lookup.result.status != "failed":
@@ -644,6 +652,7 @@ def resolve_verify_fix_context(
         raise VerifyFixContextError(
             f"verify_fix for {resolved_impl.id} has no current failed verify evidence for "
             f"branch={resolved_epoch.reviewed_branch} head={resolved_epoch.reviewed_head_sha} "
+            f"tree={resolved_epoch.reviewed_tree_sha} "
             f"command={resolved_epoch.verify_command!r}. Re-run or persist the failing verify result first."
         )
 
@@ -697,6 +706,7 @@ def resolve_verify_fix_context(
         working_directory=result.working_directory,
         reviewed_branch=result.reviewed_branch,
         reviewed_head_sha=result.reviewed_head_sha,
+        reviewed_tree_sha=result.reviewed_tree_sha,
         reviewed_base_sha=result.reviewed_base_sha,
         failure=result.failure or "(not captured)",
         artifact_path=artifact_path,
@@ -722,6 +732,8 @@ def format_verify_fix_context(context: VerifyFixContext) -> str:
         f"- Reviewed branch: `{context.reviewed_branch}`",
         f"- Reviewed head: `{context.reviewed_head_sha}`",
     ]
+    if context.reviewed_tree_sha:
+        lines.append(f"- Reviewed tree: `{context.reviewed_tree_sha}`")
     if context.reviewed_base_sha:
         lines.append(f"- Reviewed base/default SHA: `{context.reviewed_base_sha}`")
     lines.extend(

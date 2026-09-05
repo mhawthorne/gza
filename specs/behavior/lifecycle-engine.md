@@ -533,8 +533,9 @@ epoch.
   details, and MUST record the reconciliation itself as separate metadata. It MUST then
   reevaluate before routing red, missing, or unavailable owner evidence to verify-gate
   reruns, `verify_fix`, or park states. Legacy evidence without resolvable source
-  provenance MAY use an explicit safe fallback source, but valid source provenance MUST
-  NOT be rewritten to the artifact-holder row. Any no-merge-unit compatibility copy that
+  provenance MAY be copied only with explicit fallback metadata, and the copy MUST NOT
+  recompute historical tree identity from the receiving owner. Valid source provenance
+  MUST NOT be rewritten to the artifact-holder row. Any no-merge-unit compatibility copy that
   attaches canonical owner evidence to a prepared holder row MUST use the same
   provenance-preserving copy semantics.
 - If one same-epoch `verify_fix` attempt already completed and the latest current verify
@@ -846,7 +847,7 @@ failure *and* actionable merge/review work remains eligible for the latter.
   annotated `merge` action only when the review content is unchanged, the live source ref
   still equals the reviewed head, the deterministic persisted `BLOCKER` payload is
   validated, and current lifecycle-owned verify evidence is fresh and passing for that
-  same head. The executor MUST create or reuse every deferred-blocker task before
+  current source verify epoch. The executor MUST create or reuse every deferred-blocker task before
   promotion, already-merged mutation, or merge-unit finalization records success.
   Missing or stale verify evidence MUST run the normal pre-merge verify path before
   eligibility is reconsidered; spec-coherence reviews, red or unavailable verify gates,
@@ -1054,8 +1055,8 @@ proven from current state:
   ancestry/behind proof is unavailable, or the rebase fails, is unresolved, is superseded
   without exact target-tip containment proof, or still leaves the source unmergeable, the
   command MUST stop.
-- Current lifecycle verify evidence is green for the exact final live source head/tree
-  and current verify-gate identity. If evidence is absent or stale, writable `land` MUST
+- Current lifecycle verify evidence is green for the final live source verify epoch. If
+  evidence is absent or stale, writable `land` MUST
   run or exact-reuse the shared direct verify acquisition path when acquisition is
   enabled and identity proof is available. It MUST refuse only for an enumerated
   inability: verify acquisition disabled, source/epoch or active-work identity conflict,
@@ -1156,7 +1157,7 @@ unrepaired-provenance, and recovered/resumed rebase outcomes MUST NOT create, ru
 or wait on a code review or resolution review, and MUST NOT create or run a landing
 judgment. After any rebase or source-head-changing step, both `strict` and
 non-escalated `guarded` landing MUST obtain current canonical green lifecycle verify
-evidence for the exact final live source head/tree and current gate identity, satisfy all
+evidence for the final live source verify epoch, satisfy all
 other non-review prerequisites and final preflight rules, and then continue through
 ordinary no-review landing with `manual_land` provenance.
 

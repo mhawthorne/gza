@@ -3475,6 +3475,7 @@ class ReviewVerifyResult:
     captured_at: datetime
     reviewed_branch: str | None = None
     reviewed_head_sha: str | None = None
+    reviewed_tree_sha: str | None = None
     reviewed_base_sha: str | None = None
     working_directory: str | None = None
     failure: str | None = None
@@ -3570,6 +3571,21 @@ def _combine_review_verify_output(*parts: str | bytes | None) -> str:
     return _combine_verify_output(*parts)
 
 
+def _resolve_reviewed_tree_sha(git: object, ref: str | None) -> str | None:
+    """Resolve the committed Git tree OID for a verified ref when available."""
+    if not isinstance(ref, str) or not ref:
+        return None
+    resolve_refs = getattr(git, "resolve_refs", None)
+    if not callable(resolve_refs):
+        return None
+    try:
+        resolved = resolve_refs([ref], peel="tree")
+    except (AssertionError, GitError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    tree_sha = resolved.get(ref) if isinstance(resolved, dict) else None
+    return tree_sha if isinstance(tree_sha, str) and tree_sha else None
+
+
 def _make_verify_result(
     command: str,
     *,
@@ -3578,6 +3594,7 @@ def _make_verify_result(
     captured_at: datetime,
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
+    reviewed_tree_sha: str | None = None,
     reviewed_base_sha: str | None = None,
     working_directory: str | None = None,
     failure: str | None = None,
@@ -3595,6 +3612,7 @@ def _make_verify_result(
         captured_at=captured_at,
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
+        reviewed_tree_sha=reviewed_tree_sha,
         reviewed_base_sha=reviewed_base_sha,
         working_directory=working_directory,
         failure=failure,
@@ -3621,6 +3639,7 @@ def _make_review_verify_result(
     captured_at: datetime,
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
+    reviewed_tree_sha: str | None = None,
     reviewed_base_sha: str | None = None,
     working_directory: str | None = None,
     failure: str | None = None,
@@ -3635,6 +3654,7 @@ def _make_review_verify_result(
         captured_at=captured_at,
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
+        reviewed_tree_sha=reviewed_tree_sha,
         reviewed_base_sha=reviewed_base_sha,
         working_directory=working_directory,
         failure=failure,
@@ -3651,6 +3671,7 @@ def _format_review_verify_failure(
     output: str | bytes | None = None,
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
+    reviewed_tree_sha: str | None = None,
     reviewed_base_sha: str | None = None,
     working_directory: str | None = None,
     captured_at: datetime | None = None,
@@ -3664,6 +3685,7 @@ def _format_review_verify_failure(
             captured_at=captured_at or datetime.now(UTC),
             reviewed_branch=reviewed_branch,
             reviewed_head_sha=reviewed_head_sha,
+            reviewed_tree_sha=reviewed_tree_sha,
             reviewed_base_sha=reviewed_base_sha,
             working_directory=working_directory,
             failure=failure,
@@ -3784,6 +3806,7 @@ def _store_review_verify_artifact_records(
     shared_metadata = {
         "reviewed_branch": result.reviewed_branch,
         "reviewed_head_sha": result.reviewed_head_sha,
+        "reviewed_tree_sha": result.reviewed_tree_sha,
         "reviewed_base_sha": result.reviewed_base_sha,
         "tree_fingerprint": next(
             (
@@ -3821,6 +3844,7 @@ def _store_review_verify_artifact_records(
                     "skip_reason": entry.skip_reason,
                     "reviewed_branch": entry_result.reviewed_branch,
                     "reviewed_head_sha": entry_result.reviewed_head_sha,
+                    "reviewed_tree_sha": entry_result.reviewed_tree_sha,
                     "reviewed_base_sha": entry_result.reviewed_base_sha,
                     **({"cwd": entry.working_directory} if entry.working_directory is not None else {}),
                     **(metadata or {}),
@@ -3923,6 +3947,7 @@ def _build_verify_gate_provenance(
         "command_identity": normalized_verify_command(result.command),
         "reviewed_branch": result.reviewed_branch,
         "reviewed_head_sha": result.reviewed_head_sha,
+        "reviewed_tree_sha": result.reviewed_tree_sha,
         "reviewed_base_sha": result.reviewed_base_sha,
         "working_directory": result.working_directory,
         "config_identity": {
@@ -4036,6 +4061,7 @@ def _build_cross_project_verify_aggregate_details(
                 "verify_timeout_grace_seconds": entry.timeout_grace_seconds,
                 "reviewed_branch": entry.result.reviewed_branch if entry.result is not None else None,
                 "reviewed_head_sha": entry.result.reviewed_head_sha if entry.result is not None else None,
+                "reviewed_tree_sha": entry.result.reviewed_tree_sha if entry.result is not None else None,
                 "reviewed_base_sha": entry.result.reviewed_base_sha if entry.result is not None else None,
                 "skip_reason": entry.skip_reason,
                 "tree_fingerprint": tree_fingerprint,
@@ -5021,6 +5047,7 @@ def _capture_review_verify_result(
                 "review_verify_captured_at": persisted_result.captured_at.isoformat(),
                 "review_verify_branch": persisted_result.reviewed_branch,
                 "review_verify_head_sha": persisted_result.reviewed_head_sha,
+                "review_verify_tree_sha": persisted_result.reviewed_tree_sha,
                 "review_verify_base_sha": persisted_result.reviewed_base_sha,
                 "review_verify_cwd": persisted_result.working_directory,
                 "review_verify_artifact_file": artifact_path,
@@ -5420,6 +5447,8 @@ def _format_review_verify_result(
         lines.append(f"- Reviewed branch: `{result.reviewed_branch}`")
     if result.reviewed_head_sha:
         lines.append(f"- Reviewed head: `{result.reviewed_head_sha}`")
+    if result.reviewed_tree_sha:
+        lines.append(f"- Reviewed tree: `{result.reviewed_tree_sha}`")
     if result.reviewed_base_sha:
         lines.append(f"- Reviewed base/default SHA: `{result.reviewed_base_sha}`")
     if result.failure:
@@ -6356,6 +6385,7 @@ def _lifecycle_verify_budget_margin_failure(
     reviewed_base_sha: str | None,
     working_directory: Path,
     now: datetime | None = None,
+    reviewed_tree_sha: str | None = None,
 ) -> ReviewVerifyResult | None:
     """Return a loud pre-run failure when the full-suite timeout has unsafe margin."""
     if normalized_verify_command(command) != "./bin/tests":
@@ -6403,6 +6433,7 @@ def _lifecycle_verify_budget_margin_failure(
             captured_at=checked_at,
             reviewed_branch=reviewed_branch,
             reviewed_head_sha=reviewed_head_sha,
+            reviewed_tree_sha=reviewed_tree_sha,
             reviewed_base_sha=reviewed_base_sha,
             working_directory=str(working_directory),
             failure=failure,
@@ -6424,6 +6455,7 @@ def _lifecycle_verify_budget_margin_failure(
         captured_at=checked_at,
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
+        reviewed_tree_sha=reviewed_tree_sha,
         reviewed_base_sha=reviewed_base_sha,
         working_directory=str(working_directory),
         failure=failure,
@@ -6438,6 +6470,7 @@ def _run_verify_command(
     env: Mapping[str, str] | None = None,
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
+    reviewed_tree_sha: str | None = None,
     reviewed_base_sha: str | None = None,
     timeout_seconds: int = AUTONOMOUS_VERIFY_TIMEOUT_SECONDS,
     timeout_grace_seconds: float = REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
@@ -6470,6 +6503,7 @@ def _run_verify_command(
             captured_at=captured_at,
             reviewed_branch=reviewed_branch,
             reviewed_head_sha=reviewed_head_sha,
+            reviewed_tree_sha=reviewed_tree_sha,
             reviewed_base_sha=reviewed_base_sha,
             working_directory=str(cwd),
             failure=f"failed to launch verify_command: {exc}",
@@ -6492,6 +6526,7 @@ def _run_verify_command(
             captured_at=captured_at,
             reviewed_branch=reviewed_branch,
             reviewed_head_sha=reviewed_head_sha,
+            reviewed_tree_sha=reviewed_tree_sha,
             reviewed_base_sha=reviewed_base_sha,
             working_directory=str(cwd),
             failure=f"verify_command timed out after {timeout_seconds}s",
@@ -6513,6 +6548,7 @@ def _run_verify_command(
         captured_at=captured_at,
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
+        reviewed_tree_sha=reviewed_tree_sha,
         reviewed_base_sha=reviewed_base_sha,
         working_directory=str(cwd),
         output=_combine_verify_output(result.stdout, result.stderr),
@@ -6527,6 +6563,7 @@ def _run_review_verify_command(
     env: Mapping[str, str] | None = None,
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
+    reviewed_tree_sha: str | None = None,
     reviewed_base_sha: str | None = None,
     timeout_seconds: int = AUTONOMOUS_VERIFY_TIMEOUT_SECONDS,
     timeout_grace_seconds: float = REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
@@ -6541,6 +6578,7 @@ def _run_review_verify_command(
         env=env,
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
+        reviewed_tree_sha=reviewed_tree_sha,
         reviewed_base_sha=reviewed_base_sha,
         timeout_seconds=timeout_seconds,
         timeout_grace_seconds=timeout_grace_seconds,
@@ -6762,6 +6800,7 @@ def _aggregate_cross_project_verify_result(
     reviewed_head_sha: str | None,
     reviewed_base_sha: str | None,
     project_results: list[ProjectReviewVerifyResult],
+    reviewed_tree_sha: str | None = None,
 ) -> ReviewVerifyResult:
     """Summarize per-project verification into one persisted aggregate result."""
     runnable_results = [entry.result for entry in project_results if entry.result is not None]
@@ -6830,6 +6869,7 @@ def _aggregate_cross_project_verify_result(
         captured_at=captured_at,
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
+        reviewed_tree_sha=reviewed_tree_sha,
         reviewed_base_sha=reviewed_base_sha,
         working_directory="(per-project; see artifact)",
         failure=failure,
@@ -6845,6 +6885,7 @@ def _aggregate_cross_project_review_verify_result(
     reviewed_head_sha: str | None,
     reviewed_base_sha: str | None,
     project_results: list[ProjectReviewVerifyResult],
+    reviewed_tree_sha: str | None = None,
 ) -> ReviewVerifyResult:
     """Compatibility wrapper for review-specific cross-project aggregation."""
     return _aggregate_cross_project_verify_result(
@@ -6852,6 +6893,7 @@ def _aggregate_cross_project_review_verify_result(
         captured_at=captured_at,
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
+        reviewed_tree_sha=reviewed_tree_sha,
         reviewed_base_sha=reviewed_base_sha,
         project_results=project_results,
     )
@@ -6869,6 +6911,7 @@ def _run_verify_commands_for_projects(
     timeout_grace_seconds: float,
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
+    reviewed_tree_sha: str | None = None,
     reviewed_base_sha: str | None = None,
     heartbeat_threshold_seconds: int | None = None,
     heartbeat_interval_seconds: int | None = None,
@@ -6944,6 +6987,7 @@ def _run_verify_commands_for_projects(
                     captured_at=datetime.now(UTC),
                     reviewed_branch=reviewed_branch,
                     reviewed_head_sha=reviewed_head_sha,
+                    reviewed_tree_sha=reviewed_tree_sha,
                     reviewed_base_sha=reviewed_base_sha,
                     working_directory=str(project_cwd),
                     failure=f"could not resolve lifecycle verify budget for scope {scope}: {exc}",
@@ -6969,6 +7013,7 @@ def _run_verify_commands_for_projects(
                 timeout_seconds=project_timeout_seconds,
                 reviewed_branch=reviewed_branch,
                 reviewed_head_sha=reviewed_head_sha,
+                reviewed_tree_sha=reviewed_tree_sha,
                 reviewed_base_sha=reviewed_base_sha,
                 working_directory=project_cwd,
             )
@@ -6990,6 +7035,7 @@ def _run_verify_commands_for_projects(
                 ),
                 reviewed_branch=reviewed_branch,
                 reviewed_head_sha=reviewed_head_sha,
+                reviewed_tree_sha=reviewed_tree_sha,
                 reviewed_base_sha=reviewed_base_sha,
                 timeout_seconds=project_timeout_seconds,
                 timeout_grace_seconds=project_timeout_grace_seconds,
@@ -7035,6 +7081,7 @@ def _run_verify_commands_for_projects(
         captured_at=datetime.now(UTC),
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
+        reviewed_tree_sha=reviewed_tree_sha,
         reviewed_base_sha=reviewed_base_sha,
         project_results=project_results,
     )
@@ -7060,6 +7107,7 @@ def _run_review_verify_commands_for_projects(
     timeout_grace_seconds: float,
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
+    reviewed_tree_sha: str | None = None,
     reviewed_base_sha: str | None = None,
     heartbeat_threshold_seconds: int | None = None,
     heartbeat_interval_seconds: int | None = None,
@@ -7077,6 +7125,7 @@ def _run_review_verify_commands_for_projects(
         timeout_grace_seconds=timeout_grace_seconds,
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
+        reviewed_tree_sha=reviewed_tree_sha,
         reviewed_base_sha=reviewed_base_sha,
         heartbeat_threshold_seconds=heartbeat_threshold_seconds,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
@@ -7098,12 +7147,15 @@ def _run_lifecycle_verify(
     timeout_grace_seconds: float,
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
+    reviewed_tree_sha: str | None = None,
     reviewed_base_sha: str | None = None,
     heartbeat_threshold_seconds: int | None = None,
     heartbeat_interval_seconds: int | None = None,
     heartbeat_for_phase: Callable[[str], LongPhaseHeartbeat | None] | None = None,
 ) -> LifecycleVerifyExecution | None:
     """Run the reusable lifecycle verify path for the current evaluated head."""
+    if reviewed_tree_sha is None:
+        reviewed_tree_sha = _resolve_reviewed_tree_sha(worktree_git, reviewed_head_sha)
     if _task_is_cross_project(task, config):
         execution = _run_review_verify_commands_for_projects(
             config=config,
@@ -7116,6 +7168,7 @@ def _run_lifecycle_verify(
             timeout_grace_seconds=timeout_grace_seconds,
             reviewed_branch=reviewed_branch,
             reviewed_head_sha=reviewed_head_sha,
+            reviewed_tree_sha=reviewed_tree_sha,
             reviewed_base_sha=reviewed_base_sha,
             heartbeat_threshold_seconds=heartbeat_threshold_seconds,
             heartbeat_interval_seconds=heartbeat_interval_seconds,
@@ -7142,6 +7195,7 @@ def _run_lifecycle_verify(
             timeout_seconds=timeout_seconds,
             reviewed_branch=reviewed_branch,
             reviewed_head_sha=reviewed_head_sha,
+            reviewed_tree_sha=reviewed_tree_sha,
             reviewed_base_sha=reviewed_base_sha,
             working_directory=cwd,
         )
@@ -7156,6 +7210,7 @@ def _run_lifecycle_verify(
         env=normalize_subprocess_env(runtime_context.env, cwd),
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
+        reviewed_tree_sha=reviewed_tree_sha,
         reviewed_base_sha=reviewed_base_sha,
         timeout_seconds=timeout_seconds,
         timeout_grace_seconds=timeout_grace_seconds,
@@ -7262,6 +7317,7 @@ def _capture_noop_verify_fix_timeout_rerun(
         timeout_grace_seconds=timeout_grace_seconds,
         reviewed_branch=branch_name,
         reviewed_head_sha=proven_head,
+        reviewed_tree_sha=_resolve_reviewed_tree_sha(worktree_git, proven_head),
         reviewed_base_sha=base_sha,
     )
     if lifecycle_execution is None:
@@ -7310,6 +7366,7 @@ def _capture_noop_verify_fix_timeout_rerun(
                 "review_verify_captured_at": persisted_result.captured_at.isoformat(),
                 "review_verify_branch": persisted_result.reviewed_branch,
                 "review_verify_head_sha": persisted_result.reviewed_head_sha,
+                "review_verify_tree_sha": persisted_result.reviewed_tree_sha,
                 "review_verify_base_sha": persisted_result.reviewed_base_sha,
                 "review_verify_cwd": persisted_result.working_directory,
                 "review_verify_artifact_file": artifact_path,

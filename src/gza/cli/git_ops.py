@@ -183,6 +183,7 @@ from ..review_verdict import (
 )
 from ..review_verify_state import (
     VerifyEpoch,
+    make_verify_epoch,
     refresh_preserved_rebase_review_verify_heads,
     resolve_verify_gate_decision,
     verify_epoch_matches,
@@ -4422,10 +4423,20 @@ def _require_live_capped_review_merge_authorization(
             f"(state={decision.state})"
         )
     if not verify_epoch_matches(expected=annotated_epoch, candidate=decision.current_epoch):
-        raise GitError("max-cycle merge-and-defer verify epoch no longer matches current source head")
+        raise GitError("max-cycle merge-and-defer verify epoch no longer matches current source epoch")
     result = decision.lookup.result
-    if result is None or result.reviewed_head_sha != resolved_source_sha or result.status != "passed":
-        raise GitError("max-cycle merge-and-defer verify result does not authorize the live source head")
+    if result is None or result.status != "passed":
+        raise GitError("max-cycle merge-and-defer verify result does not authorize the live source epoch")
+    result_epoch = make_verify_epoch(
+        reviewed_branch=result.reviewed_branch,
+        reviewed_head_sha=result.reviewed_head_sha,
+        reviewed_tree_sha=result.reviewed_tree_sha,
+        verify_command=result.command,
+        verify_timeout_seconds=decision.current_epoch.verify_timeout_seconds,
+        verify_timeout_grace_seconds=decision.current_epoch.verify_timeout_grace_seconds,
+    )
+    if not verify_epoch_matches(expected=decision.current_epoch, candidate=result_epoch):
+        raise GitError("max-cycle merge-and-defer verify result does not authorize the live source epoch")
     return resolved_source_sha
 
 

@@ -389,6 +389,7 @@ def _seed_failed_verify_evidence(
             "captured_at": datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
             "reviewed_branch": epoch.reviewed_branch,
             "reviewed_head_sha": epoch.reviewed_head_sha,
+            "reviewed_tree_sha": epoch.reviewed_tree_sha,
             "reviewed_base_sha": "base-sha",
             "working_directory": str(config.project_dir / "worktrees" / "verify"),
             "failure": "pytest failed",
@@ -477,6 +478,7 @@ class TestVerifyFixTasks:
         epoch = VerifyEpoch(
             reviewed_branch="feature/test",
             reviewed_head_sha="deadbeef",
+            reviewed_tree_sha="treebeef",
             verify_command="set -e\n./bin/tests",
             verify_timeout_seconds=300,
             verify_timeout_grace_seconds=5.0,
@@ -487,6 +489,7 @@ class TestVerifyFixTasks:
             "verify_epoch": {
                 "reviewed_branch": epoch.reviewed_branch,
                 "reviewed_head_sha": epoch.reviewed_head_sha,
+                "reviewed_tree_sha": epoch.reviewed_tree_sha,
                 "verify_command": epoch.verify_command,
                 "verify_timeout_seconds": epoch.verify_timeout_seconds,
                 "verify_timeout_grace_seconds": epoch.verify_timeout_grace_seconds,
@@ -919,7 +922,55 @@ class TestVerifyFixTasks:
         git = MagicMock()
         git.rev_parse_if_exists.return_value = "deadbeef"
 
-        assert resolve_latest_failed_verify_epoch(store, config, impl, git) == recorded_epoch
+        assert resolve_latest_failed_verify_epoch(store, config, impl, git) == VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            reviewed_tree_sha=None,
+            verify_command="./bin/tests --current",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+
+    def test_resolve_latest_failed_verify_epoch_rebinds_same_tree_rewrite_to_current_head(
+        self, tmp_path: Path
+    ) -> None:
+        config, store = _make_store(tmp_path)
+        config.verify_command = "./bin/tests"
+        config.autonomous_verify_timeout_seconds = 1800
+        config.review_verify_timeout_grace_seconds = 5.0
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/test"
+        store.update(impl)
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        recorded_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="old-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=improve,
+            epoch=recorded_epoch,
+        )
+
+        git = MagicMock()
+        git.rev_parse_if_exists.return_value = "new-head"
+        git.resolve_refs.return_value = {"feature/test": "tree-same"}
+
+        assert resolve_latest_failed_verify_epoch(store, config, impl, git) == VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="new-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
 
     def test_resolve_latest_failed_verify_epoch_rejects_stale_owner_epoch(self, tmp_path: Path) -> None:
         config, store = _make_store(tmp_path)
@@ -984,7 +1035,7 @@ class TestVerifyFixTasks:
             resolve_latest_failed_verify_epoch(store, config, impl, git)
 
         message = str(exc_info.value)
-        assert "implementation branch/head identity" in message
+        assert "implementation source epoch" in message
         assert "branch/head/command identity" not in message
         assert "provenance only" in message
 

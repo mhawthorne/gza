@@ -3287,6 +3287,7 @@ def _verify_epoch_identity(epoch: Any | None) -> str | None:
         {
             "branch": getattr(epoch, "reviewed_branch", None),
             "head": getattr(epoch, "reviewed_head_sha", None),
+            "tree": getattr(epoch, "reviewed_tree_sha", None),
             "command": getattr(epoch, "verify_command", None),
             "timeout": getattr(epoch, "verify_timeout_seconds", None),
             "grace": getattr(epoch, "verify_timeout_grace_seconds", None),
