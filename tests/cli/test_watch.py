@@ -1187,7 +1187,7 @@ def test_watch_failed_recovery_scan_same_target_phantom_failure_keeps_previous_m
         side_effect=lambda ref: "phantom-head" if ref == failed.branch else "target-head" if ref == "main" else None
     )
 
-    with caplog.at_level("WARNING", logger="gza.cli.watch"):
+    with caplog.at_level("DEBUG", logger="gza.cli.watch"):
         assert not _watch_failed_recovery_scan_is_current(
             store=store,
             git=git,
@@ -1426,7 +1426,7 @@ def test_watch_failed_recovery_scan_proven_merged_classifier_exception_keeps_pre
     record_marker = MagicMock(side_effect=AssertionError("incomplete proof must not record scan marker"))
     monkeypatch.setattr(store, "record_watch_failed_recovery_scan", record_marker)
 
-    with caplog.at_level("WARNING", logger="gza.cli.watch"):
+    with caplog.at_level("DEBUG", logger="gza.cli.watch"):
         assert not _watch_failed_recovery_scan_is_current(
             store=store,
             git=git,
@@ -1478,7 +1478,7 @@ def test_watch_failed_recovery_scan_proven_merged_unknown_refinement_keeps_previ
     record_marker = MagicMock(side_effect=AssertionError("incomplete proof must not record scan marker"))
     monkeypatch.setattr(store, "record_watch_failed_recovery_scan", record_marker)
 
-    with caplog.at_level("WARNING", logger="gza.cli.watch"):
+    with caplog.at_level("DEBUG", logger="gza.cli.watch"):
         assert not _watch_failed_recovery_scan_is_current(
             store=store,
             git=git,
@@ -1533,7 +1533,7 @@ def test_watch_failed_recovery_scan_incomplete_no_work_reclassification_keeps_pr
     record_marker = MagicMock(side_effect=AssertionError("incomplete proof must not record scan marker"))
     monkeypatch.setattr(store, "record_watch_failed_recovery_scan", record_marker)
 
-    with caplog.at_level("WARNING", logger="gza.cli.watch"):
+    with caplog.at_level("DEBUG", logger="gza.cli.watch"):
         assert not _watch_failed_recovery_scan_is_current(
             store=store,
             git=git,
@@ -1755,7 +1755,7 @@ def test_watch_failed_recovery_scan_git_error_keeps_marker_non_authoritative_and
         side_effect=lambda ref: "old-head" if ref == task.branch else "target-new" if ref == "main" else None
     )
 
-    with caplog.at_level("WARNING", logger="gza.cli.watch"):
+    with caplog.at_level("DEBUG", logger="gza.cli.watch"):
         assert not _watch_failed_recovery_scan_is_current(
             store=store,
             git=git,
@@ -1796,7 +1796,7 @@ def test_watch_failed_recovery_scan_missing_source_ref_keeps_marker_until_ref_re
     )
     git.merge_base = MagicMock(return_value="base-new")  # type: ignore[method-assign]
 
-    with caplog.at_level("WARNING", logger="gza.cli.watch"):
+    with caplog.at_level("DEBUG", logger="gza.cli.watch"):
         assert not _watch_failed_recovery_scan_is_current(
             store=store,
             git=git,
@@ -1846,7 +1846,7 @@ def test_watch_failed_recovery_scan_persistence_failure_keeps_marker_and_retries
         return original_refresh(*args, **kwargs)
 
     monkeypatch.setattr(store, "refresh_merge_unit_head", flaky_refresh)
-    with caplog.at_level("WARNING", logger="gza.cli.watch"):
+    with caplog.at_level("DEBUG", logger="gza.cli.watch"):
         assert not _watch_failed_recovery_scan_is_current(
             store=store,
             git=git,
@@ -2029,7 +2029,7 @@ def test_watch_failed_recovery_scan_target_snapshot_mismatch_keeps_marker_non_au
 
     monkeypatch.setattr(watch_module, "reconcile_branch_merge_truth", mixed_snapshot_reconcile)
 
-    with caplog.at_level("WARNING", logger="gza.cli.watch"):
+    with caplog.at_level("DEBUG", logger="gza.cli.watch"):
         assert not _watch_failed_recovery_scan_is_current(
             store=store,
             git=git,
@@ -2238,7 +2238,7 @@ def test_watch_failed_recovery_scan_classifier_exception_keeps_marker_and_retrie
 
     monkeypatch.setattr("gza.sync_ops.classify_branch_merge_state_for_target", flaky_classifier)
 
-    with caplog.at_level("WARNING", logger="gza.cli.watch"):
+    with caplog.at_level("DEBUG", logger="gza.cli.watch"):
         assert not _watch_failed_recovery_scan_is_current(
             store=store,
             git=git,
