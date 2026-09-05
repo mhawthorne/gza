@@ -24,12 +24,12 @@ See `docs/` for detailed documentation:
 - [docs/merge-policy.md](docs/merge-policy.md) — review severity and merge-gate policy (`BLOCKER` blocks merge; `FOLLOWUP` ships with follow-up)
 - [docs/internal/](docs/internal/README.md) — internal architecture, design notes & practices (index); writing/maintaining docs: [writing-docs.md](docs/internal/writing-docs.md)
 ## Critical Rules
+**Getting code merged is the top priority.** A stuck task should be pushed toward a real merge, not left to accumulate more review/improve cycles. Prefer a bounded, auditable override (e.g. force-approving a stale/inconclusive review) over re-running a review that risks re-parking the task on a new nitpick.
 **Task management**: When the user mentions "task", "add a task", or asks to track something for later, use `uv run gza add "..."`. NEVER edit `etc/todo.txt` or other files manually.
 
 **Default to filing a gza task**: When the user asks for a substantive code change (a feature, fix, or refactor), file it with `uv run gza add` rather than editing inline — do NOT start editing right away. Work in-line only when the user explicitly says to, or for trivial edits. If unsure which way they want it, ask before implementing.
 
 **Config example artifacts**: If you change any discoverable config key/default, regenerate `src/gza/gza.yaml.example` and `src/gza/gza.local.yaml.example` via `uv run gza config example --write` and `uv run gza config example --local --write`, then commit them.
-
 **Failed tasks**: Do NOT run `uv run gza retry ...` or `uv run gza resume ...` unless the user explicitly asks for that exact action.
 
 **Always run from the project root.** Gza uses the current directory to find `gza.yaml` and `.gza/`.
