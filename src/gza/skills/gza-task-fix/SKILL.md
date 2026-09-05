@@ -2,7 +2,7 @@
 name: gza-task-fix
 description: Rescue a stuck gza task inline — diagnoses review/improve churn, verifies each blocker against current code, addresses the open ones, runs verify, and commits. Runs entirely in Claude Code, no background worker.
 allowed-tools: Read, Edit, Write, Glob, Grep, Bash(uv run:*), Bash(git:*), Bash(mkdir:*), Bash(ls:*), Bash(cd:*), AskUserQuestion
-version: 2.0.1
+version: 2.1.0
 public: true
 ---
 
@@ -16,13 +16,13 @@ This skill runs entirely inline in the current Claude Code session. Do not invok
 
 ## Process
 
-### Step 0: Capture the starting checkout
+### Step 0: Capture the starting directory
 
 ```bash
-git symbolic-ref --quiet --short HEAD || git rev-parse --short HEAD
+pwd
 ```
 
-Save as `<START_CHECKOUT>`. You must return the user here before finishing. If detached, restore with `git checkout --detach <START_CHECKOUT>`.
+Save as `<START_DIR>`. This skill must never change the branch checked out in the directory the user invoked it from — all branch work happens in a separate worktree (Step 3). You return here at the end by `cd`, not by any `git checkout`.
 
 ### Step 1: Resolve the target task and recent review history
 
@@ -80,15 +80,25 @@ Then read the prior 1–2 reviews and look for repeated blocker keys or overlapp
 
 Present a one-paragraph loop-diagnosis summary to the user. If the situation is `stale_review` or `scope_creep`, confirm with the user before making any changes — the right outcome may be zero code changes plus an explicit `diagnosed_no_change` handoff.
 
-### Step 3: Check out the implementation branch
+### Step 3: Check out the implementation branch in an isolated worktree
+
+**Never `git checkout <impl_branch>` in `<START_DIR>`.** That switches whatever branch is checked out there (often the shared main checkout) onto the task branch, and if this session ends before Step 8 runs, that checkout is left stranded on the task branch — with no automatic way back. This has happened in practice and is why this step exists.
+
+1. Check whether the branch is already checked out somewhere:
 
 ```bash
-git checkout <impl_branch>
+git worktree list
 ```
 
-If the branch is checked out in another worktree, **default to working in that existing worktree path** and continue there without asking. Treat this as an interactive task rescue: prefer the active task worktree over switching the user's current checkout. Ask only if the existing worktree path is unavailable or there are multiple plausible task worktrees and the right target is ambiguous. Do not create duplicate worktrees.
+2. If `<impl_branch>` appears there, `cd` into that existing path and continue. Do not create a duplicate worktree.
+3. Otherwise, create a dedicated worktree for it rather than touching `<START_DIR>`:
 
-If `<START_CHECKOUT>` already equals `<impl_branch>`, do not switch away and back.
+```bash
+git worktree add .gza-worktrees/<impl_branch> <impl_branch>
+cd .gza-worktrees/<impl_branch>
+```
+
+Use a fixed, git-ignored parent directory (`.gza-worktrees/`) so repeat rescues of the same branch land in the same place instead of piling up duplicates. All remaining steps run from this worktree, not from `<START_DIR>`.
 
 ### Step 4: Verify each blocker against the current code before editing
 
@@ -229,15 +239,13 @@ print(f'Fix saved as task #{created.id} ({created.report_file})')
 "
 ```
 
-### Step 8: Restore the starting checkout
+### Step 8: Return to the starting directory
 
 ```bash
-git checkout <START_CHECKOUT>
+cd <START_DIR>
 ```
 
-If detached, use `git checkout --detach <START_CHECKOUT>`.
-
-If the restore fails, stop and tell the user exactly what checkout you left them on. Do not silently finish on the implementation branch.
+`<START_DIR>`'s branch was never touched, so there is nothing to restore — this is just a `cd` back. The task worktree at `.gza-worktrees/<impl_branch>` is left in place (not removed) so a later rescue of the same branch can reuse it without recreating.
 
 ## Important notes
 
@@ -246,5 +254,6 @@ If the restore fails, stop and tell the user exactly what checkout you left them
 - **Bounded scope.** Only touch files and tests named by the current review's Must-Fix items. No opportunistic cleanup, no drive-by refactors, no renames.
 - **Ask the user before** broadening scope, deciding an `ambiguous` blocker, or committing to a `stale_review` / `scope_creep` diagnosis.
 - **No review request without a commit.** `follow_up_review_required: true` is only valid when code changed in this pass. A no-op pass is an operational finding, not work for a reviewer.
-- **Restore the user's checkout before exit.** Final state returns to `<START_CHECKOUT>`; closing message should name both checkouts explicitly.
+- **Never check out the impl branch in `<START_DIR>`.** Always work in a separate worktree (Step 3) so the user's original checkout is never at risk of being left stranded on a task branch.
+- **Return to the starting directory before exit.** Final state is `cd <START_DIR>`; closing message should name the worktree path used and confirm `<START_DIR>`'s branch was untouched.
 - **Role separation.** `review` is the independent approval boundary. `improve` is the normal response to one review. `fix` is escalation for churn.
