@@ -276,11 +276,7 @@ class _FakeGit:
 
 
 def _make_store(tmp_path: Path) -> SqliteTaskStore:
-    (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
-        "provider: codex\n"
-        "model: gpt-5.5\n"
-    )
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n")
     config = Config.load(tmp_path)
     db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -299,7 +295,9 @@ def _set_subdir_project_boundary(config: Config, tmp_path: Path) -> None:
     repo_root = tmp_path
     project_dir = tmp_path / "services" / "foo"
     project_dir.mkdir(parents=True, exist_ok=True)
-    (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+    (project_dir / "gza.yaml").write_text(
+        "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+    )
     config.project_dir = project_dir
     config.enforce_project_scope = True
     setattr(
@@ -407,7 +405,9 @@ def _set_subdir_project_boundary_with_dependency(config: Config, tmp_path: Path)
     repo_root = tmp_path
     project_dir = tmp_path / "services" / "foo"
     project_dir.mkdir(parents=True, exist_ok=True)
-    (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+    (project_dir / "gza.yaml").write_text(
+        "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
+    )
     dependency_path = tmp_path / "dre"
     dependency_path.mkdir(parents=True, exist_ok=True)
     config.project_dir = project_dir
@@ -779,7 +779,7 @@ def _add_rebase_diff_provenance(
     rebase: DbTask,
     *,
     resolved_head_sha: str = "rebased-sha",
-    resolved_target_sha: str = "target-sha",
+    resolved_target_sha: str | None = "target-sha",
     target_at_start: str = "target-sha",
     changed_diff_boundary_proven: bool = True,
 ) -> DbTask:
@@ -1157,7 +1157,7 @@ def _off_topic_failed_verify_output(*, tree_fingerprint: str) -> str:
         f"gza-verify phase=failed name=unit duration_seconds=0.20 tree_fingerprint={tree_fingerprint}\n"
         "_________________________________ test_worker_registry __________________________________\n\n"
         "    def test_worker_registry():\n"
-        ">       assert worker.status == \"completed\"\n"
+        '>       assert worker.status == "completed"\n'
         "E       AssertionError: assert 'running' == 'completed'\n\n"
         "tests/cli/test_query.py:10:\n"
         "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n"
@@ -1175,12 +1175,12 @@ def _branch_introduced_failed_verify_output(*, tree_fingerprint: str) -> str:
         f"gza-verify phase=failed name=unit duration_seconds=0.20 tree_fingerprint={tree_fingerprint}\n"
         "_________________________________ test_runner __________________________________\n\n"
         "    def test_runner():\n"
-        ">       assert behavior() == \"ok\"\n"
+        '>       assert behavior() == "ok"\n'
         "E       AssertionError: assert 'bad' == 'ok'\n\n"
         "tests/test_runner.py:10:\n"
         "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n"
         "src/gza/cli/git_ops.py:42: in behavior\n"
-        "    return \"bad\"\n"
+        '    return "bad"\n'
         "E   AssertionError: assert 'bad' == 'ok'\n\n"
         "=========================== short test summary info ============================\n"
         "FAILED tests/test_runner.py::test_runner - AssertionError: assert 'bad' == 'ok'\n"
@@ -1510,7 +1510,9 @@ def test_completed_plan_with_running_plan_review_returns_wait_plan_review(tmp_pa
     assert action["plan_review_task"].id == review.id
 
 
-def test_completed_plan_with_pending_plan_review_uses_legacy_create_implement_when_gate_disabled(tmp_path: Path) -> None:
+def test_completed_plan_with_pending_plan_review_uses_legacy_create_implement_when_gate_disabled(
+    tmp_path: Path,
+) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     config.require_plan_review_before_implement = False
@@ -1856,7 +1858,9 @@ def test_completed_plan_review_with_unknown_verdict_parks_without_implement(tmp_
 @pytest.mark.parametrize(
     ("review_output", "expected_type", "expected_reason"),
     [
-        pytest.param("## Verdict\n\nVerdict: APPROVED\n", "needs_discussion", "plan-review-invalid-slices", id="invalid-approved"),
+        pytest.param(
+            "## Verdict\n\nVerdict: APPROVED\n", "needs_discussion", "plan-review-invalid-slices", id="invalid-approved"
+        ),
         pytest.param(
             "## Verdict\n\nVerdict: MAYBE\n",
             "needs_discussion",
@@ -1960,9 +1964,7 @@ def test_completed_plan_review_with_valid_approved_manifest_materializes_slices(
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
     review.output_content = (
-        "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n"
-        + json.dumps(manifest)
-        + "\n```\n"
+        "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n" + json.dumps(manifest) + "\n```\n"
     )
     store.update(review)
 
@@ -2061,9 +2063,7 @@ def test_completed_plan_with_partial_unrecorded_plan_materialization_needs_repai
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
     review.output_content = (
-        "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n"
-        + json.dumps(manifest)
-        + "\n```\n"
+        "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n" + json.dumps(manifest) + "\n```\n"
     )
     store.update(review)
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
@@ -2475,9 +2475,7 @@ def test_completed_plan_review_with_already_materialized_manifest_skips_rerun(tm
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
     review.output_content = (
-        "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n"
-        + json.dumps(manifest)
-        + "\n```\n"
+        "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n" + json.dumps(manifest) + "\n```\n"
     )
     store.update(review)
     initial_action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
@@ -2716,9 +2714,7 @@ def test_completed_plan_with_incomplete_recorded_plan_materialization_needs_repa
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
     review.output_content = (
-        "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n"
-        + json.dumps(manifest)
-        + "\n```\n"
+        "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n" + json.dumps(manifest) + "\n```\n"
     )
     store.update(review)
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
@@ -2815,15 +2811,11 @@ def test_completed_plan_with_mismatched_recorded_plan_materialization_needs_repa
     elif mismatch_kind == "wrong-prompt":
         persisted_task_specs[0] = NewTaskParams(**{**persisted_task_specs[0].__dict__, "prompt": "Wrong prompt"})
     elif mismatch_kind == "wrong-review-scope":
-        persisted_task_specs[0] = NewTaskParams(
-            **{**persisted_task_specs[0].__dict__, "review_scope": "Wrong scope"}
-        )
+        persisted_task_specs[0] = NewTaskParams(**{**persisted_task_specs[0].__dict__, "review_scope": "Wrong scope"})
     elif mismatch_kind == "wrong-tags":
         persisted_task_specs[0] = NewTaskParams(**{**persisted_task_specs[0].__dict__, "tags": ()})
     elif mismatch_kind == "wrong-create-review":
-        persisted_task_specs[0] = NewTaskParams(
-            **{**persisted_task_specs[0].__dict__, "create_review": False}
-        )
+        persisted_task_specs[0] = NewTaskParams(**{**persisted_task_specs[0].__dict__, "create_review": False})
     else:
         raise AssertionError(f"Unhandled mismatch kind: {mismatch_kind}")
     store.add_tasks_with_artifact_atomic(
@@ -2895,9 +2887,7 @@ def test_completed_plan_review_uses_derived_timeout_budget_for_valid_approved_ma
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
     review.output_content = (
-        "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n"
-        + json.dumps(manifest)
-        + "\n```\n"
+        "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n" + json.dumps(manifest) + "\n```\n"
     )
     store.update(review)
 
@@ -3102,7 +3092,9 @@ def test_completed_held_plan_with_approved_valid_review_releases_before_awaiting
         pytest.param("## Verdict\n\nVerdict: NEEDS_DISCUSSION\n", "completed", id="needs_discussion"),
         pytest.param("## Verdict\n\nVerdict: MAYBE\n", "completed", id="unknown_verdict"),
         pytest.param("## Verdict\n\nVerdict: APPROVED\n", "completed", id="invalid_approved"),
-        pytest.param(_approved_plan_review_report(_approved_plan_review_manifest("source-id")), "pending", id="pending_status"),
+        pytest.param(
+            _approved_plan_review_report(_approved_plan_review_manifest("source-id")), "pending", id="pending_status"
+        ),
     ],
 )
 def test_completed_held_plan_with_non_releasing_review_stays_awaiting_human(
@@ -3890,9 +3882,7 @@ def test_review_freshness_probe_failure_parks_approved_review_instead_of_merging
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert ctx.current_review_head_sha is None
-    assert ctx.current_review_head_probe_warning == (
-        f"branch-head probe failed for {impl.branch}: probe blew up"
-    )
+    assert ctx.current_review_head_probe_warning == (f"branch-head probe failed for {impl.branch}: probe blew up")
     assert ctx.review_invalidated_by_progress is False
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "review-freshness-unverified"
@@ -4141,11 +4131,11 @@ def test_completed_timeout_verify_fix_legacy_planning_ignores_canonical_checkout
             reviewed_branch=impl.branch,
             reviewed_head_sha="head-1",
             reviewed_base_sha="base-1",
-                working_directory="/tmp/worktree",
-                failure="verify_command timed out after 120s",
-                failure_origin="timeout",
-                output="gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=1.0",
-            ),
+            working_directory="/tmp/worktree",
+            failure="verify_command timed out after 120s",
+            failure_origin="timeout",
+            output="gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=1.0",
+        ),
         verify_timeout_seconds=120,
         verify_timeout_grace_seconds=5.0,
         producer="review_verify",
@@ -4243,11 +4233,11 @@ def test_legacy_timeout_verify_fix_branch_head_mismatch_does_not_plan_legacy_rer
             reviewed_branch=impl.branch,
             reviewed_head_sha="head-1",
             reviewed_base_sha="base-1",
-                working_directory="/tmp/worktree",
-                failure="verify_command timed out after 120s",
-                failure_origin="timeout",
-                output="gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=1.0",
-            ),
+            working_directory="/tmp/worktree",
+            failure="verify_command timed out after 120s",
+            failure_origin="timeout",
+            output="gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=1.0",
+        ),
         verify_timeout_seconds=120,
         verify_timeout_grace_seconds=5.0,
         producer="review_verify",
@@ -4504,11 +4494,11 @@ def test_completed_timeout_verify_fix_with_existing_rerun_red_artifact_parks_eve
             reviewed_branch=impl.branch,
             reviewed_head_sha="head-1",
             reviewed_base_sha="base-1",
-                working_directory="/tmp/worktree",
-                failure="verify_command timed out after 120s",
-                failure_origin="timeout",
-                output="gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=1.0",
-            ),
+            working_directory="/tmp/worktree",
+            failure="verify_command timed out after 120s",
+            failure_origin="timeout",
+            output="gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=1.0",
+        ),
         verify_timeout_seconds=120,
         verify_timeout_grace_seconds=5.0,
         producer="verify_fix",
@@ -4671,9 +4661,7 @@ def test_review_freshness_probe_failure_preempts_review_max_cycles(
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert ctx.current_review_head_sha is None
-    assert ctx.current_review_head_probe_warning == (
-        f"branch-head probe failed for {impl.branch}: probe blew up"
-    )
+    assert ctx.current_review_head_probe_warning == (f"branch-head probe failed for {impl.branch}: probe blew up")
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "review-freshness-unverified"
     assert action["probe_warning"] == ctx.current_review_head_probe_warning
@@ -4729,9 +4717,7 @@ def test_review_freshness_probe_failure_parks_cleared_review_instead_of_merging(
 
     assert ctx.review_cleared is True
     assert ctx.current_review_head_sha is None
-    assert ctx.current_review_head_probe_warning == (
-        f"branch-head probe failed for {impl.branch}: probe blew up"
-    )
+    assert ctx.current_review_head_probe_warning == (f"branch-head probe failed for {impl.branch}: probe blew up")
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "review-freshness-unverified"
 
@@ -5052,7 +5038,11 @@ def test_capped_review_candidate_with_missing_verify_runs_pre_merge_verify_befor
     action = evaluate_advance_rules(
         config,
         store,
-        _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "current-sha"}),
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "current-sha", "main": "base-sha"},
+        ),
         impl,
         "main",
     )
@@ -5137,7 +5127,11 @@ def test_capped_review_candidate_with_zero_parsed_blockers_stays_on_attention_pa
     action = evaluate_advance_rules(
         config,
         store,
-        _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "current-sha"}),
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "current-sha", "main": "base-sha"},
+        ),
         impl,
         "main",
     )
@@ -5167,7 +5161,11 @@ def test_capped_review_candidate_with_missing_report_stays_on_unavailable_attent
     action = evaluate_advance_rules(
         config,
         store,
-        _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "current-sha"}),
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "current-sha", "main": "base-sha"},
+        ),
         impl,
         "main",
     )
@@ -5541,7 +5539,9 @@ def test_opt_in_on_max_cycles_with_green_verify_emits_annotated_merge_action(
     )
 
     parsed_blockers = tuple(
-        finding for finding in parse_review_report(review.output_content or "").findings if finding.severity == "BLOCKER"
+        finding
+        for finding in parse_review_report(review.output_content or "").findings
+        if finding.severity == "BLOCKER"
     )
     assert action["type"] == "merge"
     assert action["description"] == "Merge and defer blockers after max review cycles"
@@ -6169,7 +6169,11 @@ def test_capped_review_candidate_with_newer_red_verify_uses_pre_merge_verify_fix
     action = evaluate_advance_rules(
         config,
         store,
-        _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "current-sha"}),
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "current-sha", "main": "base-sha"},
+        ),
         impl,
         "main",
     )
@@ -6572,9 +6576,7 @@ def test_review_cycle_cap_counts_legacy_history_without_changing_linked_current_
     )
     evidence = get_implementation_review_evidence(store, impl)
     evidence_ids = {review.id for review in evidence}
-    accounting_evidence_ids = {
-        review.id for review in get_implementation_review_cycle_accounting_evidence(store, impl)
-    }
+    accounting_evidence_ids = {review.id for review in get_implementation_review_cycle_accounting_evidence(store, impl)}
     accounting = resolve_review_cycle_accounting(
         store,
         impl.id,
@@ -6656,9 +6658,7 @@ def test_newer_legacy_approved_review_cannot_override_linked_changes_requested_r
         ref_shas={impl.branch: "current-head"},
     )
     evidence = get_implementation_review_evidence(store, impl)
-    accounting_evidence_ids = {
-        review.id for review in get_implementation_review_cycle_accounting_evidence(store, impl)
-    }
+    accounting_evidence_ids = {review.id for review in get_implementation_review_cycle_accounting_evidence(store, impl)}
     ctx = resolve_advance_context(config, store, git, impl, "main")
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -8258,9 +8258,7 @@ def test_non_stale_changes_requested_non_verify_review_keeps_legacy_freshness_ex
             {
                 "existing_branches": {"feature/rebase-active-invalid-probe-error"},
                 "ref_shas": {"main": "target-sha"},
-                "rev_parse_errors": {
-                    "feature/rebase-active-invalid-probe-error": GitError("probe failed")
-                },
+                "rev_parse_errors": {"feature/rebase-active-invalid-probe-error": GitError("probe failed")},
             },
             "reviewed-sha",
             None,
@@ -10166,15 +10164,15 @@ def test_changed_rebase_with_missing_persisted_provenance_rederives_resolution_r
         tmp_path,
         impl.branch,
         (
-            f"{'a'*40} {pre_head} user <u@example.com> {rebase_ts - 10} +0000\tcommit: prior",
+            f"{'a' * 40} {pre_head} user <u@example.com> {rebase_ts - 10} +0000\tcommit: prior",
             f"{pre_head} {rebased_head} user <u@example.com> {rebase_ts - 1} +0000\t"
-            f"rebase (finish): refs/heads/{impl.branch} onto {'d'*40}",
+            f"rebase (finish): refs/heads/{impl.branch} onto {'d' * 40}",
         ),
     )
     _write_reflog(
         tmp_path,
         "main",
-        (f"{'d'*40} {target_now} user <u@example.com> {rebase_ts - 2} +0000\tcommit: target",),
+        (f"{'d' * 40} {target_now} user <u@example.com> {rebase_ts - 2} +0000\tcommit: target",),
     )
 
     monkeypatch.setattr(
@@ -10259,7 +10257,7 @@ def test_lineage_owner_read_session_applies_chained_resolution_repairs_without_p
         tmp_path,
         impl.branch,
         (
-            f"{'a'*40} {pre_head} user <u@example.com> {rebase_ts - 10} +0000\tcommit: prior",
+            f"{'a' * 40} {pre_head} user <u@example.com> {rebase_ts - 10} +0000\tcommit: prior",
             f"{pre_head} {rebased_head} user <u@example.com> {rebase_ts - 1} +0000\t"
             f"rebase (finish): refs/heads/{impl.branch} onto {target_now}",
         ),
@@ -10267,7 +10265,7 @@ def test_lineage_owner_read_session_applies_chained_resolution_repairs_without_p
     _write_reflog(
         tmp_path,
         "main",
-        (f"{'d'*40} {target_now} user <u@example.com> {rebase_ts - 2} +0000\tcommit: target",),
+        (f"{'d' * 40} {target_now} user <u@example.com> {rebase_ts - 2} +0000\tcommit: target",),
     )
 
     monkeypatch.setattr(
@@ -10445,14 +10443,14 @@ def test_changed_rebase_with_missing_persisted_provenance_without_reflog_proof_d
         tmp_path,
         impl.branch,
         (
-            f"{'a'*40} {pre_head} user <u@example.com> {rebase_ts - 10} +0000\tcommit: prior",
+            f"{'a' * 40} {pre_head} user <u@example.com> {rebase_ts - 10} +0000\tcommit: prior",
             f"{pre_head} {rebased_head} user <u@example.com> {rebase_ts - 1} +0000\treset: moving to HEAD",
         ),
     )
     _write_reflog(
         tmp_path,
         "main",
-        (f"{'d'*40} {target_now} user <u@example.com> {rebase_ts - 2} +0000\tcommit: target",),
+        (f"{'d' * 40} {target_now} user <u@example.com> {rebase_ts - 2} +0000\tcommit: target",),
     )
 
     monkeypatch.setattr(
@@ -10546,14 +10544,14 @@ def test_changed_rebase_with_missing_persisted_provenance_readonly_repair_degrad
         tmp_path,
         impl.branch,
         (
-            f"{'a'*40} {pre_head} user <u@example.com> {rebase_ts - 10} +0000\tcommit: prior",
+            f"{'a' * 40} {pre_head} user <u@example.com> {rebase_ts - 10} +0000\tcommit: prior",
             f"{pre_head} {rebased_head} user <u@example.com> {rebase_ts - 1} +0000\t",
         ),
     )
     _write_reflog(
         tmp_path,
         "main",
-        (f"{'d'*40} {target_now} user <u@example.com> {rebase_ts - 2} +0000\tcommit: target",),
+        (f"{'d' * 40} {target_now} user <u@example.com> {rebase_ts - 2} +0000\tcommit: target",),
     )
 
     monkeypatch.setattr(
@@ -10727,7 +10725,7 @@ def test_changed_rebase_completed_approved_review_with_missing_persisted_provena
         tmp_path,
         impl.branch,
         (
-            f"{'0'*40} {pre_head} user <u@example.com> {rebase_ts - 10} +0000\tcommit: prior",
+            f"{'0' * 40} {pre_head} user <u@example.com> {rebase_ts - 10} +0000\tcommit: prior",
             f"{pre_head} {rebased_head} user <u@example.com> {rebase_ts - 1} +0000\t"
             f"rebase (finish): refs/heads/{impl.branch} onto {target_sha}",
         ),
@@ -10735,7 +10733,7 @@ def test_changed_rebase_completed_approved_review_with_missing_persisted_provena
     _write_reflog(
         tmp_path,
         "main",
-        (f"{'2'*40} {target_sha} user <u@example.com> {rebase_ts - 2} +0000\tcommit: target",),
+        (f"{'2' * 40} {target_sha} user <u@example.com> {rebase_ts - 2} +0000\tcommit: target",),
     )
 
     monkeypatch.setattr(
@@ -10843,7 +10841,9 @@ def test_changed_rebase_completed_review_missing_resolution_metadata_readonly_re
 
 
 def test_evaluate_resumes_timeout_retry_descendant_once(tmp_path: Path):
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\nmax_resume_attempts: 1\n")
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\nmax_resume_attempts: 1\n"
+    )
     config = Config.load(tmp_path)
     db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -11073,7 +11073,9 @@ def test_failed_recovery_next_step_requires_completed_implementation(tmp_path: P
         subject_task_id=failed.id,
     )
 
-    assert needs_attention_recommended_next_step(store, failed, action) == FAILED_RECOVERY_RETRY_OR_REIMPLEMENT_NEXT_STEP
+    assert (
+        needs_attention_recommended_next_step(store, failed, action) == FAILED_RECOVERY_RETRY_OR_REIMPLEMENT_NEXT_STEP
+    )
 
 
 def test_failed_improve_recovery_next_step_keeps_fix_for_completed_impl(tmp_path: Path) -> None:
@@ -11668,7 +11670,9 @@ def test_cross_project_tag_allows_out_of_scope_change_to_advance(tmp_path: Path)
     _set_subdir_project_boundary(config, tmp_path)
     sibling_project_dir = tmp_path / "dre" / "web"
     sibling_project_dir.mkdir(parents=True, exist_ok=True)
-    (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/web-verify\n")
+    (sibling_project_dir / "gza.yaml").write_text(
+        "project_name: dre-web\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/web-verify\n"
+    )
 
     impl = _make_completed_unmerged_impl(
         store,
@@ -11698,7 +11702,9 @@ def test_default_cross_project_allows_out_of_scope_change_to_advance(tmp_path: P
     config.default_cross_project = True
     sibling_project_dir = tmp_path / "dre" / "web"
     sibling_project_dir.mkdir(parents=True, exist_ok=True)
-    (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/web-verify\n")
+    (sibling_project_dir / "gza.yaml").write_text(
+        "project_name: dre-web\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/web-verify\n"
+    )
 
     impl = _make_completed_unmerged_impl(
         store,
@@ -11726,7 +11732,9 @@ def test_cross_project_tag_still_parks_unknown_paths_outside_discovered_roots(tm
     (tmp_path / "gza.yaml").unlink()
     sibling_project_dir = tmp_path / "dre" / "web"
     sibling_project_dir.mkdir(parents=True, exist_ok=True)
-    (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/web-verify\n")
+    (sibling_project_dir / "gza.yaml").write_text(
+        "project_name: dre-web\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/web-verify\n"
+    )
 
     impl = _make_completed_unmerged_impl(
         store,
@@ -11770,9 +11778,7 @@ def test_cross_project_tag_branch_declared_project_root_advances_without_checkou
         can_merge=True,
         name_status_by_range={
             "main...feat/cross-project-branch-local-root": (
-                "M\tservices/foo/app.py\n"
-                "A\tlibs/new/gza.yaml\n"
-                "A\tlibs/new/src/file.py\n"
+                "M\tservices/foo/app.py\nA\tlibs/new/gza.yaml\nA\tlibs/new/src/file.py\n"
             ),
         },
     )
@@ -11875,9 +11881,7 @@ def test_cross_project_tag_deleted_project_root_still_parks_without_declared_roo
         can_merge=True,
         name_status_by_range={
             "main...feat/cross-project-deleted-root": (
-                "M\tservices/foo/app.py\n"
-                "D\tlibs/removed/gza.yaml\n"
-                "D\tlibs/removed/src/file.py\n"
+                "M\tservices/foo/app.py\nD\tlibs/removed/gza.yaml\nD\tlibs/removed/src/file.py\n"
             ),
         },
     )
@@ -11906,10 +11910,7 @@ def test_cross_project_tag_branch_local_path_without_declared_root_still_parks(t
     git = _FakeGit(
         can_merge=True,
         name_status_by_range={
-            "main...feat/cross-project-missing-branch-root": (
-                "M\tservices/foo/app.py\n"
-                "A\tlibs/new/src/file.py\n"
-            ),
+            "main...feat/cross-project-missing-branch-root": ("M\tservices/foo/app.py\nA\tlibs/new/src/file.py\n"),
         },
     )
 
@@ -11966,7 +11967,9 @@ def test_strict_scope_uninspectable_git_diff_parks_for_human(tmp_path: Path) -> 
     git = _FakeGit(
         can_merge=True,
         name_status_error_by_range={
-            "main...feat/scope-uninspectable-diff": GitError("git diff --name-status main...feat/scope-uninspectable-diff failed:\nfatal: bad revision"),
+            "main...feat/scope-uninspectable-diff": GitError(
+                "git diff --name-status main...feat/scope-uninspectable-diff failed:\nfatal: bad revision"
+            ),
         },
     )
 
@@ -12037,7 +12040,9 @@ def test_one_noop_improve_permits_another_improve_with_warning_description(tmp_p
     review.report_file = "reviews/fake.md"
     store.update(review)
 
-    improve = store.add("Improve attempt", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+    improve = store.add(
+        "Improve attempt", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True
+    )
     improve.status = "completed"
     improve.completed_at = datetime(2026, 5, 14, 11, 0, tzinfo=UTC)
     improve.branch = impl.branch
@@ -12084,7 +12089,9 @@ def test_two_consecutive_noop_improves_return_needs_discussion(tmp_path: Path, m
     store.update(review)
 
     for hour in (11, 12):
-        improve = store.add("Improve attempt", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+        improve = store.add(
+            "Improve attempt", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True
+        )
         improve.status = "completed"
         improve.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
         improve.branch = impl.branch
@@ -13369,10 +13376,7 @@ def test_replacement_blocker_adjudication_is_run_on_next_advance_pass(tmp_path: 
     )
 
     stale_adjudication = store.add(
-        (
-            f"{build_review_blocker_adjudication_prompt_prefix(review.id, impl.id, 'B1')} "
-            "Missing API guard"
-        ),
+        (f"{build_review_blocker_adjudication_prompt_prefix(review.id, impl.id, 'B1')} Missing API guard"),
         task_type="internal",
         based_on=review.id,
         depends_on=impl.id,
@@ -15142,9 +15146,7 @@ def test_off_topic_verify_unblock_disabled_keeps_existing_noop_red_behavior(
         ref_shas={impl.branch: "same-head-sha", "main": "main-head-sha"},
         default_branch_name="main",
         resolved_tree_shas={"main": "b" * 64},
-        name_status_by_range={
-            f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"
-        },
+        name_status_by_range={f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"},
     )
 
     with patch(
@@ -15244,9 +15246,7 @@ def test_off_topic_verify_unblock_clears_review_and_persists_audit_artifact(
         ref_shas={impl.branch: "same-head-sha", "main": "main-head-sha"},
         default_branch_name="main",
         resolved_tree_shas={"main": "d" * 64},
-        name_status_by_range={
-            f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"
-        },
+        name_status_by_range={f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"},
     )
 
     with patch(
@@ -15385,9 +15385,7 @@ def test_off_topic_verify_unblock_reads_failed_noop_reverify_from_improve_artifa
         ref_shas={impl.branch: "same-head-sha", "main": "main-head-sha"},
         default_branch_name="main",
         resolved_tree_shas={"main": "f" * 64},
-        name_status_by_range={
-            f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"
-        },
+        name_status_by_range={f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"},
     )
 
     with patch(
@@ -15503,15 +15501,11 @@ def test_off_topic_verify_unblock_fails_closed_when_investigation_persistence_fa
         ref_shas={impl.branch: "same-head-sha", "main": "main-head-sha"},
         default_branch_name="main",
         resolved_tree_shas={"main": "d" * 64},
-        name_status_by_range={
-            f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"
-        },
+        name_status_by_range={f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"},
     )
     artifact_root = tmp_path / ".gza" / "artifacts"
     existing_artifacts = sorted(
-        path.relative_to(artifact_root).as_posix()
-        for path in artifact_root.rglob("*")
-        if path.is_file()
+        path.relative_to(artifact_root).as_posix() for path in artifact_root.rglob("*") if path.is_file()
     )
 
     with (
@@ -15539,9 +15533,7 @@ def test_off_topic_verify_unblock_fails_closed_when_investigation_persistence_fa
 
     stored_impl = store.get(impl.id)
     remaining_artifacts = sorted(
-        path.relative_to(artifact_root).as_posix()
-        for path in artifact_root.rglob("*")
-        if path.is_file()
+        path.relative_to(artifact_root).as_posix() for path in artifact_root.rglob("*") if path.is_file()
     )
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
@@ -15552,9 +15544,7 @@ def test_off_topic_verify_unblock_fails_closed_when_investigation_persistence_fa
     assert not [
         task
         for task in store.get_all()
-        if task.task_type == "explore"
-        and task.depends_on == impl.id
-        and task.based_on == review.id
+        if task.task_type == "explore" and task.depends_on == impl.id and task.based_on == review.id
     ]
     assert remaining_artifacts == existing_artifacts
 
@@ -15642,9 +15632,7 @@ def test_off_topic_verify_unblock_baseline_exception_parks_with_warning_and_no_a
         ref_shas={impl.branch: "same-head-sha", "main": "main-head-sha"},
         default_branch_name="main",
         resolved_tree_shas={"main": "5" * 64},
-        name_status_by_range={
-            f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"
-        },
+        name_status_by_range={f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"},
     )
 
     with patch(
@@ -15755,9 +15743,7 @@ def test_off_topic_verify_unblock_uses_requested_target_branch(
         },
         default_branch_name="main",
         resolved_tree_shas={"release": "8" * 64, "main": "9" * 64},
-        name_status_by_range={
-            f"release...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"
-        },
+        name_status_by_range={f"release...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"},
     )
 
     def _baseline_for_release(plan, **_kwargs):
@@ -15878,9 +15864,7 @@ def test_read_only_off_topic_verify_candidate_skips_baseline_and_keeps_review_bl
         ref_shas={impl.branch: "same-head-sha", "main": "main-head-sha"},
         default_branch_name="main",
         resolved_tree_shas={"main": "b" * 64},
-        name_status_by_range={
-            f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"
-        },
+        name_status_by_range={f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"},
     )
 
     with patch(
@@ -16085,9 +16069,7 @@ def test_off_topic_verify_unblock_fails_closed_when_classifier_is_unavailable(
         ref_shas={impl.branch: "same-head-sha", "main": "main-head-sha"},
         default_branch_name="main",
         resolved_tree_shas={"main": "1" * 64},
-        name_status_by_range={
-            f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"
-        },
+        name_status_by_range={f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"},
     )
 
     with patch(
@@ -16104,7 +16086,17 @@ def test_off_topic_verify_unblock_fails_closed_when_classifier_is_unavailable(
 
 
 @pytest.mark.parametrize(
-    ("label", "review_status", "review_branch", "review_head_sha", "review_report", "improve_status", "improve_branch", "improve_head_sha", "captured_offset_seconds"),
+    (
+        "label",
+        "review_status",
+        "review_branch",
+        "review_head_sha",
+        "review_report",
+        "improve_status",
+        "improve_branch",
+        "improve_head_sha",
+        "captured_offset_seconds",
+    ),
     [
         (
             "missing_passing_improve_evidence",
@@ -16579,9 +16571,7 @@ def test_verify_only_noop_recovery_requires_successful_current_head_probe(tmp_pa
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert ctx.current_review_head_sha is None
-    assert ctx.current_review_head_probe_warning == (
-        f"branch-head probe failed for {impl.branch}: probe blew up"
-    )
+    assert ctx.current_review_head_probe_warning == (f"branch-head probe failed for {impl.branch}: probe blew up")
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "review-freshness-unverified"
     assert action["probe_warning"] == ctx.current_review_head_probe_warning
@@ -16666,7 +16656,9 @@ def test_verify_blocked_noop_improves_refresh_review_when_review_sha_is_stale(tm
     store.update(review)
 
     for hour in (11, 12):
-        improve = store.add("No-op improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+        improve = store.add(
+            "No-op improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True
+        )
         improve.status = "completed"
         improve.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
         improve.branch = impl.branch
@@ -17467,7 +17459,9 @@ def test_noop_improve_limit_preempts_max_review_cycles_when_thresholds_match(tmp
     store.update(review)
 
     for hour in (11, 12):
-        improve = store.add("Improve attempt", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+        improve = store.add(
+            "Improve attempt", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True
+        )
         improve.status = "completed"
         improve.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
         improve.branch = impl.branch
@@ -18291,14 +18285,18 @@ def test_threshold_reached_with_in_progress_improve_still_waits(tmp_path: Path, 
     store.update(review)
 
     for hour in (11, 12):
-        improve = store.add("No-op improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+        improve = store.add(
+            "No-op improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True
+        )
         improve.status = "completed"
         improve.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
         improve.branch = impl.branch
         improve.changed_diff = False
         store.update(improve)
 
-    active_improve = store.add("Active improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+    active_improve = store.add(
+        "Active improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True
+    )
     assert active_improve.id is not None
     active_improve.status = "in_progress"
     active_improve.started_at = datetime(2026, 5, 14, 13, 0, tzinfo=UTC)
@@ -18345,14 +18343,18 @@ def test_threshold_reached_with_pending_improve_still_runs(tmp_path: Path, monke
     store.update(review)
 
     for hour in (11, 12):
-        improve = store.add("No-op improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+        improve = store.add(
+            "No-op improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True
+        )
         improve.status = "completed"
         improve.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
         improve.branch = impl.branch
         improve.changed_diff = False
         store.update(improve)
 
-    pending_improve = store.add("Pending improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+    pending_improve = store.add(
+        "Pending improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True
+    )
     assert pending_improve.id is not None
     pending_improve.status = "pending"
     pending_improve.branch = impl.branch
@@ -18399,7 +18401,9 @@ def test_legacy_noop_override_tag_is_inert_at_noop_limit(tmp_path: Path, monkeyp
     store.update(review)
 
     for hour in (11, 12):
-        improve = store.add("Improve attempt", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+        improve = store.add(
+            "Improve attempt", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True
+        )
         improve.status = "completed"
         improve.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
         improve.branch = impl.branch
@@ -18444,14 +18448,18 @@ def test_legacy_unknown_changed_diff_does_not_trigger_noop_stop_rule(tmp_path: P
     review.report_file = "reviews/fake.md"
     store.update(review)
 
-    legacy_improve = store.add("Legacy improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+    legacy_improve = store.add(
+        "Legacy improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True
+    )
     legacy_improve.status = "completed"
     legacy_improve.completed_at = datetime(2026, 5, 14, 11, 0, tzinfo=UTC)
     legacy_improve.branch = impl.branch
     legacy_improve.changed_diff = None
     store.update(legacy_improve)
 
-    latest_improve = store.add("Latest improve", task_type="improve", based_on=legacy_improve.id, depends_on=review.id, same_branch=True)
+    latest_improve = store.add(
+        "Latest improve", task_type="improve", based_on=legacy_improve.id, depends_on=review.id, same_branch=True
+    )
     latest_improve.status = "completed"
     latest_improve.completed_at = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
     latest_improve.branch = impl.branch
@@ -18499,7 +18507,9 @@ def test_comments_triggered_noop_improves_use_same_stop_rule(tmp_path: Path, mon
     store.add_comment(impl.id, "Unresolved comments still remain", source="direct")
 
     for hour in (11, 12):
-        improve = store.add("Comments improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
+        improve = store.add(
+            "Comments improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True
+        )
         improve.status = "completed"
         improve.completed_at = datetime(2026, 5, 14, hour, 0, tzinfo=UTC)
         improve.branch = impl.branch
@@ -18920,10 +18930,7 @@ def test_failed_commitless_same_branch_child_recovery_uses_owner_branch_for_pref
     impl.has_commits = True
     store.update(impl)
 
-    resolved_kwargs = {
-        key: impl.id if value == "__impl__" else value
-        for key, value in child_kwargs.items()
-    }
+    resolved_kwargs = {key: impl.id if value == "__impl__" else value for key, value in child_kwargs.items()}
     failed_child = store.add(f"Failed {child_type}", task_type=child_type, **resolved_kwargs)
     assert failed_child.id is not None
     failed_child.status = "failed"
@@ -21367,8 +21374,7 @@ def test_remote_only_merge_source_is_ignored_for_advance_proof_and_diff_gates(tm
     assert ctx.merge_source_ref is None
     assert ctx.post_merge_rebase_state is not None
     assert ctx.post_merge_rebase_state.warning == (
-        f"fresh merge source for branch '{impl.branch}' is unavailable; "
-        "cannot resolve post-merge rebase state"
+        f"fresh merge source for branch '{impl.branch}' is unavailable; cannot resolve post-merge rebase state"
     )
     assert git.can_merge_calls == []
     assert git.name_status_calls == []
@@ -21820,9 +21826,7 @@ def test_orphan_rebase_descendant_skips_when_canonical_target_has_no_merge_unit(
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=False), orphan_rebase, "main")
 
     assert action["type"] == "skip"
-    assert action["description"] == (
-        "SKIP: rebase target has no merge unit (rebase-target-missing-merge-unit)"
-    )
+    assert action["description"] == ("SKIP: rebase target has no merge unit (rebase-target-missing-merge-unit)")
 
 
 def test_remote_only_merged_post_rebase_branch_keeps_resolution_review_requirements(
@@ -22500,9 +22504,7 @@ def test_code_focused_blocker_with_open_state_citation_does_not_trigger_verify_t
     review1.output_content = _code_focused_blocker_with_timeout_in_open_state_review_report()
     store.update(review1)
 
-    improve1 = store.add(
-        "Improve round 1", task_type="improve", based_on=impl.id, depends_on=review1.id
-    )
+    improve1 = store.add("Improve round 1", task_type="improve", based_on=impl.id, depends_on=review1.id)
     improve1.status = "completed"
     improve1.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
     improve1.branch = impl.branch
@@ -23136,27 +23138,27 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
             rebase_target_missing_merge_unit=False,
             reason="manual-resolution",
         ),
-            can_merge=False,
-            rebase_pending_or_running=None,
-            rebase_failed=failed_rebase,
-            latest_completed_rebase=failed_rebase,
-            rebase_failure_streak=SimpleNamespace(
-                attempts=3,
-                branch=impl.branch,
-                failed_task_ids=(failed_rebase.id,),
-            ),
-            rebase_invalidates_review=False,
-            review_invalidated_by_progress=False,
-            review_invalidation_reason=None,
-            active_review=None,
-            review_invalidated_by_rebase=failed_rebase,
-            review_preserved_by_rebase=None,
-            current_review_head_sha=None,
-            current_review_head_probe_warning=None,
-            latest_reviewed_head_sha=None,
-            latest_completed_review=review,
-            latest_completed_code_change=impl,
-            review_cleared=False,
+        can_merge=False,
+        rebase_pending_or_running=None,
+        rebase_failed=failed_rebase,
+        latest_completed_rebase=failed_rebase,
+        rebase_failure_streak=SimpleNamespace(
+            attempts=3,
+            branch=impl.branch,
+            failed_task_ids=(failed_rebase.id,),
+        ),
+        rebase_invalidates_review=False,
+        review_invalidated_by_progress=False,
+        review_invalidation_reason=None,
+        active_review=None,
+        review_invalidated_by_rebase=failed_rebase,
+        review_preserved_by_rebase=None,
+        current_review_head_sha=None,
+        current_review_head_probe_warning=None,
+        latest_reviewed_head_sha=None,
+        latest_completed_review=review,
+        latest_completed_code_change=impl,
+        review_cleared=False,
         review_verdict="CHANGES_REQUESTED",
         followup_findings=(),
         recent_verify_timeout_only_reviews=(review, review),
@@ -23371,9 +23373,7 @@ def test_failed_closing_review_blocks_merge_and_routes_to_retry(
     )
 
     # Improve clears the review state
-    improve = _add_completed_improve_for_review(
-        store, impl, stale_review, when=datetime(2026, 5, 1, 11, 0, tzinfo=UTC)
-    )
+    improve = _add_completed_improve_for_review(store, impl, stale_review, when=datetime(2026, 5, 1, 11, 0, tzinfo=UTC))
     impl.review_cleared_at = improve.completed_at
     store.update(impl)
 
@@ -23983,6 +23983,7 @@ def test_closing_review_in_progress_db_known_wait_matches_full_path_and_skips_la
     assert early_git.rev_parse_calls
     assert full_git.rev_parse_calls == early_git.rev_parse_calls
     assert full_git.resolve_fresh_merge_source_calls == early_git.resolve_fresh_merge_source_calls
+
 
 def test_closing_review_in_progress_still_respects_strict_scope_violation(tmp_path: Path) -> None:
     from gza.cli.advance_engine import determine_next_action
@@ -25287,12 +25288,549 @@ def test_pre_review_failed_verify_creates_verify_fix(tmp_path: Path) -> None:
         verify_timeout_grace_seconds=5.0,
         producer="test",
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "create_verify_fix"
     assert action["verify_epoch"].reviewed_head_sha == "verify-head"
+
+
+def _persist_pre_review_failed_verify(
+    store: SqliteTaskStore,
+    config: Config,
+    impl: DbTask,
+    tmp_path: Path,
+    *,
+    reviewed_head_sha: str = "verify-head",
+    reviewed_base_sha: str = "base-head",
+    captured_at: datetime | None = None,
+) -> None:
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=captured_at or datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_base_sha=reviewed_base_sha,
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+
+
+def _add_verify_fix_for_epoch(
+    store: SqliteTaskStore,
+    impl: DbTask,
+    action: dict[str, object],
+    *,
+    status: str,
+    failure_reason: str | None = None,
+) -> DbTask:
+    verify_epoch = action["verify_epoch"]
+    assert isinstance(verify_epoch, VerifyEpoch)
+    assert impl.id is not None
+    verify_fix = store.add(
+        build_verify_fix_prompt(impl.id, verify_epoch),
+        task_type="verify_fix",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert verify_fix.id is not None
+    verify_fix.status = status
+    verify_fix.branch = impl.branch
+    verify_fix.failure_reason = failure_reason
+    store.update(verify_fix)
+    return verify_fix
+
+
+def _assert_needs_rebase_executes_rebase_without_verify_fix_worker(
+    store: SqliteTaskStore,
+    impl: DbTask,
+    action: dict[str, object],
+) -> None:
+    from gza.cli.advance_executor import AdvanceActionExecutionContext, execute_advance_action
+
+    spawned: list[tuple[str, str]] = []
+
+    def create_rebase_task(parent: DbTask) -> DbTask:
+        assert parent.id == impl.id
+        rebase = store.add("Rebase stale verify base", task_type="rebase", based_on=parent.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.branch = parent.branch
+        store.update(rebase)
+        return rebase
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=2,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=create_rebase_task,
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda task, kind: spawned.append((task.id or "", kind)) or 0,
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda *_args, **_kwargs: pytest.fail("unused"),
+    )
+
+    result = execute_advance_action(task=impl, action=action, context=context)
+
+    assert result.status == "success"
+    assert result.created_task is not None
+    assert result.created_task.task_type == "rebase"
+    assert spawned == [(result.created_task.id, "rebase")]
+
+
+def test_pre_review_failed_verify_with_stale_base_routes_to_rebase(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-stale-base-rebase",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    _persist_pre_review_failed_verify(
+        store,
+        config,
+        impl,
+        tmp_path,
+        reviewed_base_sha="old-target-head",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "current-target-head"},
+        ancestor_pairs={("old-target-head", "current-target-head"): True},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "verify-fix-stale-base-rebase"
+    assert action["rebase_parent_task_id"] == impl.id
+    assert action["verify_epoch"].reviewed_head_sha == "verify-head"
+    assert git.is_ancestor_calls[-1] == ("old-target-head", "current-target-head")
+
+
+@pytest.mark.parametrize("existing_status", ["pending", "failed"])
+def test_pre_review_stale_base_routes_to_rebase_before_existing_verify_fix_worker_paths(
+    tmp_path: Path,
+    existing_status: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/pre-review-stale-base-existing-{existing_status}",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    _persist_pre_review_failed_verify(
+        store,
+        config,
+        impl,
+        tmp_path,
+        reviewed_base_sha="old-target-head",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "current-target-head"},
+        ancestor_pairs={("old-target-head", "current-target-head"): True},
+    )
+    original_action = evaluate_advance_rules(config, store, git, impl, "main")
+    _add_verify_fix_for_epoch(
+        store,
+        impl,
+        original_action,
+        status=existing_status,
+        failure_reason="INFRASTRUCTURE_ERROR" if existing_status == "failed" else None,
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "verify-fix-stale-base-rebase"
+    assert action["rebase_parent_task_id"] == impl.id
+    _assert_needs_rebase_executes_rebase_without_verify_fix_worker(store, impl, action)
+
+    _persist_pre_review_failed_verify(
+        store,
+        config,
+        impl,
+        tmp_path,
+        reviewed_head_sha="rebased-head",
+        reviewed_base_sha="current-target-head",
+        captured_at=datetime(2026, 7, 6, 12, 30, tzinfo=UTC),
+    )
+    fresh_git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "rebased-head", "main": "current-target-head"},
+        ancestor_pairs={("current-target-head", "current-target-head"): True},
+    )
+
+    fresh_action = evaluate_advance_rules(config, store, fresh_git, impl, "main")
+
+    assert fresh_action["type"] == "create_verify_fix"
+    assert fresh_action["verify_epoch"].reviewed_head_sha == "rebased-head"
+
+
+def test_pre_review_failed_verify_with_current_base_creates_verify_fix(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-current-base-verify-fix",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    _persist_pre_review_failed_verify(
+        store,
+        config,
+        impl,
+        tmp_path,
+        reviewed_base_sha="current-target-head",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "current-target-head"},
+        ancestor_pairs={("current-target-head", "current-target-head"): True},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_verify_fix"
+    assert action["verify_epoch"].reviewed_head_sha == "verify-head"
+    assert ("current-target-head", "current-target-head") not in git.is_ancestor_calls
+
+
+def test_pre_review_failed_verify_after_rebase_does_not_rebase_again_for_same_epoch(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-stale-base-anti-loop",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    verify_captured_at = datetime(2026, 7, 6, 12, 20, tzinfo=UTC)
+    rebase = store.add("Rebase stale verify base", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert rebase.id is not None
+    rebase.status = "completed"
+    rebase.branch = impl.branch
+    rebase.completed_at = datetime(2026, 7, 6, 12, 10, tzinfo=UTC)
+    rebase.changed_diff = False
+    store.update(rebase)
+    _add_rebase_diff_provenance(
+        store,
+        rebase,
+        resolved_head_sha="verify-head",
+        resolved_target_sha="old-target-head",
+    )
+    _persist_pre_review_failed_verify(
+        store,
+        config,
+        impl,
+        tmp_path,
+        reviewed_base_sha="old-target-head",
+        captured_at=verify_captured_at,
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "current-target-head"},
+        ancestor_pairs={("old-target-head", "current-target-head"): True},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_verify_fix"
+    assert action["verify_epoch"].reviewed_head_sha == "verify-head"
+    assert git.is_ancestor_calls[-1] == ("old-target-head", "current-target-head")
+
+
+@pytest.mark.parametrize(
+    "resolved_target_sha",
+    ["different-target-head", None],
+)
+def test_pre_review_failed_verify_rebase_target_mismatch_does_not_satisfy_stale_base_anti_loop(
+    tmp_path: Path,
+    resolved_target_sha: str | None,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-stale-base-target-mismatch",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    verify_captured_at = datetime(2026, 7, 6, 12, 20, tzinfo=UTC)
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 10, tzinfo=UTC),
+        changed_diff=False,
+    )
+    _add_rebase_diff_provenance(
+        store,
+        rebase,
+        resolved_head_sha="verify-head",
+        resolved_target_sha=resolved_target_sha,
+    )
+    _persist_pre_review_failed_verify(
+        store,
+        config,
+        impl,
+        tmp_path,
+        reviewed_base_sha="old-target-head",
+        captured_at=verify_captured_at,
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "current-target-head"},
+        ancestor_pairs={("old-target-head", "current-target-head"): True},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "verify-fix-stale-base-rebase"
+    assert git.is_ancestor_calls[-1] == ("old-target-head", "current-target-head")
+
+
+def test_pre_review_failed_verify_branchless_rebase_does_not_satisfy_stale_base_anti_loop(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-stale-base-branchless-rebase",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 10, tzinfo=UTC),
+        changed_diff=False,
+    )
+    rebase.branch = None
+    store.update(rebase)
+    _add_rebase_diff_provenance(
+        store,
+        rebase,
+        resolved_head_sha="verify-head",
+        resolved_target_sha="old-target-head",
+    )
+    _persist_pre_review_failed_verify(
+        store,
+        config,
+        impl,
+        tmp_path,
+        reviewed_base_sha="old-target-head",
+        captured_at=datetime(2026, 7, 6, 12, 20, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "current-target-head"},
+        ancestor_pairs={("old-target-head", "current-target-head"): True},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "verify-fix-stale-base-rebase"
+
+
+def test_pre_review_failed_verify_later_code_change_invalidates_stale_base_anti_loop(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-stale-base-later-code-change",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 10, tzinfo=UTC),
+        changed_diff=False,
+    )
+    _add_rebase_diff_provenance(
+        store,
+        rebase,
+        resolved_head_sha="verify-head",
+        resolved_target_sha="old-target-head",
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 7, 6, 12, 12, tzinfo=UTC))
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 7, 6, 12, 15, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _persist_pre_review_failed_verify(
+        store,
+        config,
+        impl,
+        tmp_path,
+        reviewed_base_sha="old-target-head",
+        captured_at=datetime(2026, 7, 6, 12, 20, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "current-target-head"},
+        ancestor_pairs={("old-target-head", "current-target-head"): True},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "verify-fix-stale-base-rebase"
+
+
+@pytest.mark.parametrize(
+    ("case_name", "git_factory", "expected_detail"),
+    [
+        (
+            "target_raises",
+            lambda impl: _FakeGit(
+                can_merge=True,
+                ref_shas={impl.branch: "verify-head"},
+                rev_parse_errors={"main": RuntimeError("target probe failed")},
+            ),
+            "could not resolve target branch",
+        ),
+        (
+            "target_missing",
+            lambda impl: _FakeGit(
+                can_merge=True,
+                ref_shas={impl.branch: "verify-head", "main": None},
+            ),
+            "did not resolve to a commit SHA",
+        ),
+        (
+            "ancestor_absent",
+            lambda impl: _fake_git_without_ancestor(
+                ref_shas={impl.branch: "verify-head", "main": "current-target-head"}
+            ),
+            "git ancestry probe is unavailable",
+        ),
+        (
+            "ancestor_raises",
+            lambda impl: _fake_git_with_raising_ancestor(
+                ref_shas={impl.branch: "verify-head", "main": "current-target-head"}
+            ),
+            "could not prove whether verify base",
+        ),
+        (
+            "unrelated",
+            lambda impl: _FakeGit(
+                can_merge=True,
+                ref_shas={impl.branch: "verify-head", "main": "current-target-head"},
+                ancestor_pairs={("old-target-head", "current-target-head"): False},
+            ),
+            "ancestry did not prove a stale-base relationship",
+        ),
+    ],
+)
+def test_pre_review_failed_verify_unproven_base_freshness_fails_closed(
+    tmp_path: Path,
+    case_name: str,
+    git_factory,
+    expected_detail: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/pre-review-freshness-{case_name}",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    _persist_pre_review_failed_verify(
+        store,
+        config,
+        impl,
+        tmp_path,
+        reviewed_base_sha="old-target-head",
+    )
+    git = git_factory(impl)
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-base-freshness-unverified"
+    assert expected_detail in action["description"]
+    assert "verify_fix_task" not in action
+
+
+def _fake_git_without_ancestor(*, ref_shas: dict[str | None, str | None]) -> _FakeGit:
+    git = _FakeGit(can_merge=True, ref_shas=ref_shas)
+    git.is_ancestor = None  # type: ignore[method-assign]
+    return git
+
+
+def _fake_git_with_raising_ancestor(*, ref_shas: dict[str | None, str | None]) -> _FakeGit:
+    git = _FakeGit(can_merge=True, ref_shas=ref_shas)
+
+    def raise_ancestor(_ancestor: str, _descendant: str) -> bool:
+        raise RuntimeError("ancestry probe failed")
+
+    git.is_ancestor = raise_ancestor  # type: ignore[method-assign]
+    return git
 
 
 @pytest.mark.parametrize(
@@ -25356,7 +25894,7 @@ def test_pre_review_red_phase_verify_routes_to_verify_fix(
     validation = validate_verify_phase_evidence_from_metadata(artifacts[0].metadata)
     assert validation.state == PHASE_EVIDENCE_RED
     assert validation.failed_phase_names == ("unit",)
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -25414,7 +25952,7 @@ def test_pre_review_budget_timeout_routes_to_attention_without_verify_fix(tmp_pa
             "not_started_phase_names": ["functional"],
         },
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -25484,7 +26022,7 @@ def test_pre_review_budget_timeout_accepts_final_in_flight_phase_without_verify_
         producer="test",
         aggregate_details=aggregate_details,
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -25557,7 +26095,7 @@ def test_pre_review_cross_project_budget_timeout_accepts_lone_started_phase_with
         producer="test",
         aggregate_details=aggregate_details,
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -25661,7 +26199,7 @@ def test_pre_review_timeout_with_indeterminate_phase_evidence_does_not_use_budge
         producer="test",
         aggregate_details=aggregate_details,
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -25788,7 +26326,7 @@ def test_pre_review_legacy_scoped_timeout_contradictions_park_invalid_without_ve
         producer="test",
         aggregate_details=aggregate_details,
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -25862,7 +26400,7 @@ def test_pre_review_legacy_scoped_timeout_rejects_contradictory_phase_counts(
             ],
         },
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -26386,7 +26924,7 @@ def test_pre_review_cross_project_timeout_with_failed_child_phase_routes_to_veri
     validation = validate_verify_phase_evidence_from_metadata(artifacts[0].metadata)
     assert validation.state == PHASE_EVIDENCE_RED
     assert validation.failed_phase_names == ("services/foo:unit",)
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -26504,7 +27042,7 @@ def test_pre_review_failed_verify_reuses_pending_verify_fix_with_timeout_drift(t
         trigger_source="test",
     )
     assert created is True
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -26662,7 +27200,7 @@ def test_pre_review_failed_verify_retries_failed_verify_fix_with_attempts_remain
     verify_fix.branch = impl.branch
     verify_fix.has_commits = True
     store.update(verify_fix)
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -26760,7 +27298,7 @@ def test_pre_review_failed_verify_parks_failed_verify_fix_when_attempts_exhauste
     retry_child.has_commits = True
     retry_child.completed_at = datetime(2026, 7, 6, 12, 15, tzinfo=UTC)
     store.update(retry_child)
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -26844,7 +27382,7 @@ def test_pre_review_failed_verify_parks_manual_failed_verify_fix_without_exhaust
     verify_fix.branch = impl.branch
     verify_fix.has_commits = True
     store.update(verify_fix)
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -26926,7 +27464,7 @@ def test_pre_review_failed_verify_parks_after_completed_verify_fix_with_timeout_
     verify_fix.status = "completed"
     verify_fix.completed_at = datetime(2026, 7, 6, 12, 10, tzinfo=UTC)
     store.update(verify_fix)
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -27310,7 +27848,7 @@ def test_pre_review_verify_fix_failed_manual_rearm_describes_fresh_verify(tmp_pa
         attention_reason="verify-fix-failed",
         subject_task_id=impl.id,
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -27379,7 +27917,11 @@ def test_post_improve_failed_verify_routes_to_verify_fix_before_another_improve(
             format_version="legacy",
         ),
     )
-    git = _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "improved-head"})
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "improved-head", "main": "base-head"},
+    )
 
     ctx = resolve_advance_context(config, store, git, impl, "main")
     action = evaluate_advance_rules(config, store, git, impl, "main")

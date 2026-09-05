@@ -44440,7 +44440,12 @@ def test_watch_cycle_routes_post_improve_failed_verify_to_verify_fix(tmp_path: P
     )
 
     git = _make_watch_git()
-    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "improved-head" if ref == impl.branch else None)
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: {
+            impl.branch: "improved-head",
+            "main": "base-1",
+        }.get(ref)
+    )
 
     with (
         patch(

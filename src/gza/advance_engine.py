@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from gza.artifact_paths import InvalidArtifactPathError, resolve_artifact_path
 from gza.branch_resolution import resolve_rebase_target_task
@@ -177,6 +177,7 @@ PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID = "verify-phase-evidence-invalid"
 PARK_REASON_VERIFY_FAILED_NEEDS_FIX = "verify-failed-needs-fix"
 PARK_REASON_VERIFY_FIX_FAILED = "verify-fix-failed"
 PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE = "verify-fix-proof-unavailable"
+PARK_REASON_VERIFY_BASE_FRESHNESS_UNVERIFIED = "verify-base-freshness-unverified"
 PARK_REASON_VERIFY_UNAVAILABLE = "verify-unavailable"
 PARK_REASON_VERIFY_UNAVAILABLE_AFTER_FIX = "verify-unavailable-after-fix"
 PARK_REASON_REVIEW_BLOCKER_ADJUDICATION_NEEDED = "review-blocker-adjudication-needed"
@@ -612,6 +613,10 @@ class SpecCoherenceInspection:
     inspection_error: str | None = None
 
 
+def _normalize_sha(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
 def _resolve_current_merge_source(git: Any, branch: str) -> ResolvedMergeSourceRef:
     """Return the merge source chosen for advance planning and any warning."""
     return resolve_task_merge_source(git, branch)
@@ -626,10 +631,6 @@ def resolve_post_merge_rebase_state(
     merge_source: ResolvedMergeSourceRef | None = None,
 ) -> PostMergeRebaseState:
     """Resolve local proof that stale failed-rebase state is no longer authoritative."""
-
-    def _normalize_sha(value: object) -> str | None:
-        return value if isinstance(value, str) and value else None
-
     merge_target_task = task
     if task.task_type == "rebase":
         resolved_target = resolve_rebase_target_task(store, task)
@@ -1498,11 +1499,7 @@ def count_completed_review_cycles_since_boundary(
     if impl_task is None:
         return 0
     review_tasks = get_implementation_review_cycle_accounting_evidence(store, impl_task)
-    return sum(
-        1
-        for task in review_tasks
-        if completed_review_cycle_belongs_to_boundary(task, boundary=boundary)
-    )
+    return sum(1 for task in review_tasks if completed_review_cycle_belongs_to_boundary(task, boundary=boundary))
 
 
 def completed_review_cycle_belongs_to_boundary(
@@ -1557,11 +1554,7 @@ def _rebase_has_proven_changed_diff_boundary(task: DbTask) -> bool:
 
 
 def _latest_completed_changed_diff_rebase(rebase_tasks: list[DbTask]) -> DbTask | None:
-    proven = [
-        task
-        for task in rebase_tasks
-        if _rebase_has_proven_changed_diff_boundary(task)
-    ]
+    proven = [task for task in rebase_tasks if _rebase_has_proven_changed_diff_boundary(task)]
     if not proven:
         return None
     return max(proven, key=_task_event_time)
@@ -5858,9 +5851,7 @@ def _review_max_cycles_needs_attention_action(ctx: AdvanceContext) -> dict[str, 
     return with_needs_attention(
         {
             "type": "max_cycles_reached",
-            "description": (
-                f"SKIP: max review cycles ({ctx.max_review_cycles}) reached, needs manual intervention"
-            ),
+            "description": (f"SKIP: max review cycles ({ctx.max_review_cycles}) reached, needs manual intervention"),
             "completed_review_cycles": ctx.completed_review_cycles,
             "max_review_cycles": ctx.max_review_cycles,
             "review_cycle_boundary_task_id": getattr(ctx, "review_cycle_boundary_task_id", None),
@@ -5999,6 +5990,201 @@ class LegacyVerifyFixProofUnavailable:
     """Expected infrastructure failure while proving legacy verify_fix repair eligibility."""
 
     diagnostic: str
+
+
+@dataclass(frozen=True)
+class VerifyBaseFreshness:
+    """Planner-safe freshness proof for red verify evidence against the target head."""
+
+    state: Literal["not_applicable", "current", "stale", "unknown"]
+    diagnostic: str | None = None
+
+
+def _verify_failure_base_freshness(ctx: AdvanceContext) -> VerifyBaseFreshness:
+    decision = getattr(ctx, "verify_gate_decision", None)
+    result = getattr(getattr(decision, "lookup", None), "result", None)
+    verify_base_sha = _normalize_sha(getattr(result, "reviewed_base_sha", None))
+    if decision is None or decision.state != "failed":
+        return VerifyBaseFreshness("not_applicable")
+    if verify_base_sha is None:
+        return VerifyBaseFreshness(
+            "unknown",
+            "failed verify evidence does not record a reviewed base/default SHA",
+        )
+
+    try:
+        target_head_sha = _normalize_sha(ctx.git.rev_parse_if_exists(ctx.target_branch))
+    except Exception as exc:
+        return VerifyBaseFreshness(
+            "unknown",
+            f"could not resolve target branch {ctx.target_branch!r}: {exc}",
+        )
+    if target_head_sha is None:
+        return VerifyBaseFreshness(
+            "unknown",
+            f"target branch {ctx.target_branch!r} did not resolve to a commit SHA",
+        )
+    if target_head_sha == verify_base_sha:
+        return VerifyBaseFreshness("current")
+
+    is_ancestor = getattr(ctx.git, "is_ancestor", None)
+    if not callable(is_ancestor):
+        return VerifyBaseFreshness(
+            "unknown",
+            "git ancestry probe is unavailable",
+        )
+    try:
+        base_is_ancestor = is_ancestor(verify_base_sha, target_head_sha)
+    except Exception as exc:
+        return VerifyBaseFreshness(
+            "unknown",
+            f"could not prove whether verify base {verify_base_sha} is an ancestor of target {target_head_sha}: {exc}",
+        )
+    if base_is_ancestor is True:
+        return VerifyBaseFreshness("stale")
+    return VerifyBaseFreshness(
+        "unknown",
+        (
+            f"verify base {verify_base_sha} differs from target {target_head_sha}, "
+            "but ancestry did not prove a stale-base relationship"
+        ),
+    )
+
+
+def _verify_failure_already_rebased_for_epoch(ctx: AdvanceContext) -> bool:
+    decision = getattr(ctx, "verify_gate_decision", None)
+    result = getattr(getattr(decision, "lookup", None), "result", None)
+    captured_at = getattr(result, "captured_at", None)
+    reviewed_branch = getattr(result, "reviewed_branch", None)
+    reviewed_head_sha = _normalize_sha(getattr(result, "reviewed_head_sha", None))
+    reviewed_base_sha = _normalize_sha(getattr(result, "reviewed_base_sha", None))
+    latest_rebase = ctx.latest_completed_rebase
+    if (
+        latest_rebase is None
+        or captured_at is None
+        or not reviewed_branch
+        or not ctx.task.branch
+        or latest_rebase.branch != ctx.task.branch
+        or latest_rebase.branch != reviewed_branch
+        or reviewed_head_sha is None
+        or reviewed_base_sha is None
+    ):
+        return False
+
+    rebase_time = _task_event_time(latest_rebase)
+    captured_time = _normalize_time(captured_at)
+    if rebase_time >= captured_time:
+        return False
+
+    rebase_provenance = parse_rebase_diff_provenance(latest_rebase.review_scope)
+    if rebase_provenance is None:
+        return False
+    rebase_head_sha = _normalize_sha(rebase_provenance.resolved_head_sha)
+    rebase_target_sha = _normalize_sha(rebase_provenance.resolved_target_sha)
+    if rebase_head_sha != reviewed_head_sha:
+        return False
+    if rebase_target_sha != reviewed_base_sha:
+        return False
+
+    latest_code_change = ctx.latest_completed_code_change
+    if latest_code_change is not None:
+        code_change_time = _task_event_time(latest_code_change)
+        if rebase_time < code_change_time < captured_time:
+            return False
+
+    return True
+
+
+def _stale_verify_base_rebase_action(
+    ctx: AdvanceContext,
+    *,
+    owner_task: DbTask,
+    verify_epoch: Any,
+    phase: str,
+) -> dict[str, Any] | None:
+    freshness = _verify_failure_base_freshness(ctx)
+    if freshness.state != "stale":
+        return None
+    if _verify_failure_already_rebased_for_epoch(ctx):
+        return None
+    if ctx.rebase_pending_or_running is not None:
+        return _with_red_verify_gate_metadata(
+            ctx,
+            {
+                "type": "skip",
+                "description": f"SKIP: rebase {_task_id(ctx.rebase_pending_or_running)} already in progress",
+                "verify_epoch": verify_epoch,
+            },
+            phase=phase,
+        )
+    if (
+        ctx.rebase_failure_streak is not None
+        and ctx.rebase_failure_streak.attempts >= REBASE_FAILURE_CIRCUIT_BREAKER_ATTEMPTS
+    ):
+        return _with_red_verify_gate_metadata(ctx, _rebase_failure_circuit_breaker_action(ctx), phase=phase)
+    if _failed_rebase_still_blocks_advance(ctx):
+        return _with_red_verify_gate_metadata(
+            ctx,
+            with_needs_attention(
+                {
+                    "type": "needs_discussion",
+                    "description": f"SKIP: rebase {_task_id(ctx.rebase_failed)} failed, needs manual resolution",
+                    "verify_epoch": verify_epoch,
+                },
+                reason="rebase-failed-needs-manual-resolution",
+                subject_task_id=owner_task.id,
+            ),
+            phase=phase,
+        )
+    if _branch_contains_target_tip(ctx):
+        return None
+    return _with_red_verify_gate_metadata(
+        ctx,
+        {
+            "type": "needs_rebase",
+            "description": ("Rebase before verify_fix because the failed verify gate ran against a stale target base"),
+            "reason": "verify-fix-stale-base-rebase",
+            "rebase_parent_task_id": owner_task.id,
+            "verify_epoch": verify_epoch,
+        },
+        phase=phase,
+    )
+
+
+def _stale_verify_base_pre_worker_action(
+    ctx: AdvanceContext,
+    *,
+    owner_task: DbTask,
+    verify_epoch: Any,
+    phase: str,
+) -> dict[str, Any] | None:
+    freshness = _verify_failure_base_freshness(ctx)
+    if freshness.state == "not_applicable" or freshness.state == "current":
+        return None
+    if freshness.state == "unknown":
+        detail = f": {freshness.diagnostic}" if freshness.diagnostic else ""
+        return _with_red_verify_gate_metadata(
+            ctx,
+            with_needs_attention(
+                {
+                    "type": "needs_discussion",
+                    "description": (
+                        f"SKIP: verify base freshness could not be proven before verify_fix dispatch{detail}"
+                    ),
+                    "verify_epoch": verify_epoch,
+                    "verify_base_freshness_diagnostic": freshness.diagnostic,
+                },
+                reason=PARK_REASON_VERIFY_BASE_FRESHNESS_UNVERIFIED,
+                subject_task_id=owner_task.id,
+            ),
+            phase=phase,
+        )
+    return _stale_verify_base_rebase_action(
+        ctx,
+        owner_task=owner_task,
+        verify_epoch=verify_epoch,
+        phase=phase,
+    )
 
 
 def _verify_gate_blocks_closing_review(ctx: AdvanceContext) -> bool:
@@ -6182,7 +6368,9 @@ def _verify_gate_phase_budget_summary(decision: VerifyGateDecision) -> dict[str,
         completed = phase_summary.get("completed")
         if isinstance(completed, list):
             direct_summary["completed_phase_names"] = tuple(
-                phase.get("name") for phase in completed if isinstance(phase, dict) and isinstance(phase.get("name"), str)
+                phase.get("name")
+                for phase in completed
+                if isinstance(phase, dict) and isinstance(phase.get("name"), str)
             )
         for source_key, target_key in (
             ("failed", "failed_phase_names"),
@@ -6227,24 +6415,16 @@ def _verify_gate_phase_budget_summary(decision: VerifyGateDecision) -> dict[str,
                     "scope": scope.get("scope"),
                     "status": scope.get("status"),
                     "started_phase_names": tuple(
-                        item
-                        for item in diagnostics.get("started_phase_names", ())
-                        if isinstance(item, str) and item
+                        item for item in diagnostics.get("started_phase_names", ()) if isinstance(item, str) and item
                     ),
                     "completed_phase_names": tuple(
-                        item
-                        for item in diagnostics.get("completed_phase_names", ())
-                        if isinstance(item, str) and item
+                        item for item in diagnostics.get("completed_phase_names", ()) if isinstance(item, str) and item
                     ),
                     "failed_phase_names": tuple(
-                        item
-                        for item in diagnostics.get("failed_phase_names", ())
-                        if isinstance(item, str) and item
+                        item for item in diagnostics.get("failed_phase_names", ()) if isinstance(item, str) and item
                     ),
                     "not_started_phase_names": tuple(
-                        item
-                        for item in not_started_raw
-                        if isinstance(item, str) and item
+                        item for item in not_started_raw if isinstance(item, str) and item
                     ),
                 }
             )
@@ -6418,6 +6598,26 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext, *, phase: str = "pre_revi
                 },
                 phase=phase,
             )
+        if (
+            existing.status == "completed"
+            and _verify_failure_base_freshness(ctx).state == "current"
+            and _verify_fix_failed_manual_rearm_requires_fresh_verify(
+                ctx,
+                owner_task=owner_task,
+            )
+        ):
+            return _verify_gate_action(ctx, phase=phase, explicit_refresh=True)
+
+    stale_base_pre_worker_action = _stale_verify_base_pre_worker_action(
+        ctx,
+        owner_task=owner_task,
+        verify_epoch=current_epoch,
+        phase=phase,
+    )
+    if stale_base_pre_worker_action is not None:
+        return stale_base_pre_worker_action
+
+    if existing is not None:
         if existing.status == "pending":
             return _with_red_verify_gate_metadata(
                 ctx,
@@ -7467,10 +7667,7 @@ def _resolve_pre_closing_review_git_context(
     if (
         (
             ctx.review_verdict == "CHANGES_REQUESTED"
-            or (
-                spec_coherence_review_current
-                and spec_coherence_review_verdict == "CHANGES_REQUESTED"
-            )
+            or (spec_coherence_review_current and spec_coherence_review_verdict == "CHANGES_REQUESTED")
             or ctx.capped_review_content_error_reason == PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE
         )
         and review_root_task.id is not None
@@ -8595,10 +8792,12 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="spec_coherence_review_max_cycles",
-        matches=lambda ctx: _spec_coherence_gate_required(ctx)
-        and ctx.spec_coherence_review_current
-        and ctx.spec_coherence_review_verdict == "CHANGES_REQUESTED"
-        and ctx.completed_review_cycles >= ctx.max_review_cycles,
+        matches=lambda ctx: (
+            _spec_coherence_gate_required(ctx)
+            and ctx.spec_coherence_review_current
+            and ctx.spec_coherence_review_verdict == "CHANGES_REQUESTED"
+            and ctx.completed_review_cycles >= ctx.max_review_cycles
+        ),
         action=lambda ctx: _review_max_cycles_action(
             ctx,
             trigger_review=ctx.spec_coherence_latest_completed_review,
@@ -9124,15 +9323,17 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_max_cycles",
-        matches=lambda ctx: (not ctx.review_cleared)
-        and (
-            (
-                ctx.review_verdict == "CHANGES_REQUESTED"
-                and _review_mode(ctx.latest_completed_review) != "spec_coherence"
+        matches=lambda ctx: (
+            (not ctx.review_cleared)
+            and (
+                (
+                    ctx.review_verdict == "CHANGES_REQUESTED"
+                    and _review_mode(ctx.latest_completed_review) != "spec_coherence"
+                )
+                or _review_max_cycles_content_unavailable_candidate(ctx)
             )
-            or _review_max_cycles_content_unavailable_candidate(ctx)
-        )
-        and ctx.completed_review_cycles >= ctx.max_review_cycles,
+            and ctx.completed_review_cycles >= ctx.max_review_cycles
+        ),
         action=_review_max_cycles_action,
     ),
     AdvanceRule(

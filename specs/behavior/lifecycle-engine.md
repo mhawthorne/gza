@@ -466,6 +466,22 @@ epoch.
   known not-started phase names when available. This classification MUST happen before
   looking up or acting on any existing same-epoch `verify_fix`; existing task rows are
   left untouched.
+- Before lifecycle creates, runs, or retries any not-yet-running `verify_fix` for
+  current red evidence, it MUST cheaply compare the failed verify evidence's recorded
+  base/default SHA to the current canonical local target head. Exact SHA equality is
+  current. A positive strict-ancestor result proves the verify base is stale; lifecycle
+  MUST route through the existing same-branch rebase flow first, leave any old
+  same-epoch `verify_fix` lane unlaunched, and then require a fresh verify gate on the
+  rebased head before considering `verify_fix` again. If target resolution or ancestry
+  probing is unavailable, malformed, or cannot prove either exact current equality or a
+  strict stale-base relationship, lifecycle MUST fail closed with `needs_discussion`
+  (`verify-base-freshness-unverified`) instead of spawning `verify_fix`.
+  If the lineage already completed a same-branch rebase whose durable rebase provenance
+  affirmatively produced the current failed verify result's branch/head and whose
+  resolved target SHA equals that failed verify result's recorded base/default SHA, and
+  no later code-changing lineage event superseded that rebase before verify capture,
+  lifecycle MUST NOT rebase again for that same failed verify evidence and MUST fall
+  through to the ordinary `verify_fix` or park behavior.
 - If the current evidence is not a budget-only timeout and a same-epoch `verify_fix`
   is already `pending`, lifecycle MUST `run_verify_fix`; if it is already
   `in_progress`, lifecycle MUST `wait_verify_fix`.

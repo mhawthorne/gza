@@ -12612,13 +12612,18 @@ class TestIterateCommand:
 
         verify_calls: list[object] = []
         mock_git.current_branch.return_value = "main"
+        mock_git.default_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.count_commits_behind.return_value = 0
         mock_git.ref_exists.return_value = False
         mock_git.can_merge.return_value = True
         mock_git.count_commits_behind.return_value = 0
-        mock_git.rev_parse_if_exists.side_effect = lambda ref: head_sha if ref in {impl.branch, "HEAD"} else None
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: {
+            impl.branch: head_sha,
+            "HEAD": head_sha,
+            "main": "base-head",
+        }.get(ref)
         mock_git.worktree_add_existing.side_effect = (
             lambda path, ref, detach=False: Path(path).mkdir(parents=True, exist_ok=True) or Path(path)
         )
@@ -16153,7 +16158,10 @@ class TestIterateCommand:
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.count_commits_behind.return_value = 0
-        mock_git.rev_parse_if_exists.side_effect = lambda ref: "head-1" if ref == impl.branch else None
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: {
+            impl.branch: "head-1",
+            "main": "base-1",
+        }.get(ref)
 
         with (
             patch("gza.cli.Config.load", return_value=config),
@@ -16203,7 +16211,10 @@ class TestIterateCommand:
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.count_commits_behind.return_value = 0
-        mock_git.rev_parse_if_exists.side_effect = lambda ref: "parked-head" if ref == impl.branch else None
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: {
+            impl.branch: "parked-head",
+            "main": "base-head",
+        }.get(ref)
 
         with (
             patch("gza.cli.Config.load", return_value=config),
@@ -16320,7 +16331,9 @@ class TestIterateCommand:
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.count_commits_behind.return_value = 1
-        mock_git.is_ancestor.return_value = False
+        mock_git.is_ancestor.side_effect = lambda ancestor, descendant: (
+            ancestor == "base-head" and descendant == "target-head"
+        )
         mock_git.resolve_merge_source_ref.return_value = None
         mock_git.rev_parse_if_exists.side_effect = lambda ref: {
             impl.branch: "stale-force-head",
@@ -16344,7 +16357,7 @@ class TestIterateCommand:
         output = capsys.readouterr().out
 
         assert result == 0
-        assert "[dry-run] First next action: needs_rebase - Rebase before verify_gate" in output
+        assert "[dry-run] First next action: needs_rebase - Rebase before verify_fix" in output
 
     def test_iterate_force_verify_fix_failed_stale_owner_runs_rebase_without_verify(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -16379,7 +16392,9 @@ class TestIterateCommand:
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.count_commits_behind.return_value = 1
-        mock_git.is_ancestor.return_value = False
+        mock_git.is_ancestor.side_effect = lambda ancestor, descendant: (
+            ancestor == "base-head" and descendant == "target-head"
+        )
         mock_git.resolve_merge_source_ref.return_value = None
         mock_git.rev_parse_if_exists.side_effect = lambda ref: {
             impl.branch: "stale-force-live-head",
@@ -17836,7 +17851,10 @@ class TestIterateCommand:
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.count_commits_behind.return_value = 0
-        mock_git.rev_parse_if_exists.side_effect = lambda ref: "rearm-head" if ref == impl.branch else None
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: {
+            impl.branch: "rearm-head",
+            "main": "base-head",
+        }.get(ref)
 
         with (
             patch("gza.cli.Config.load", return_value=config),
@@ -18450,7 +18468,10 @@ class TestIterateCommand:
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.count_commits_behind.return_value = 0
-        mock_git.rev_parse_if_exists.side_effect = lambda ref: "advance-force-head" if ref == impl.branch else None
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: {
+            impl.branch: "advance-force-head",
+            "main": "base-head",
+        }.get(ref)
         snapshot = ConcurrencySnapshot(
             limit=1,
             running=0,
@@ -18837,7 +18858,10 @@ class TestIterateCommand:
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.count_commits_behind.return_value = 0
-        mock_git.rev_parse_if_exists.side_effect = lambda ref: "improved-head" if ref == impl.branch else None
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: {
+            impl.branch: "improved-head",
+            "main": "base-1",
+        }.get(ref)
 
         with (
             patch("gza.cli.Config.load", return_value=config),
@@ -19299,7 +19323,10 @@ class TestIterateCommand:
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
-        mock_git.rev_parse_if_exists.side_effect = lambda ref: "failed-child-head" if ref == impl.branch else None
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: {
+            impl.branch: "failed-child-head",
+            "main": "base-head",
+        }.get(ref)
 
         with (
             patch("gza.cli.Config.load", return_value=config),
@@ -19311,7 +19338,13 @@ class TestIterateCommand:
             patch("gza.recovery_engine.Git", return_value=mock_git),
             patch("gza.db.Git", return_value=mock_git, create=True),
             patch("gza.git.Git.branch_exists", return_value=True),
-            patch("gza.git.Git.rev_parse_if_exists", side_effect=lambda ref: "failed-child-head" if ref == impl.branch else None),
+            patch(
+                "gza.git.Git.rev_parse_if_exists",
+                side_effect=lambda ref: {
+                    impl.branch: "failed-child-head",
+                    "main": "base-head",
+                }.get(ref),
+            ),
         ):
             result = cmd_iterate(args)
 
