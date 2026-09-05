@@ -797,11 +797,22 @@ def normalize_review_finding_anchor(value: str) -> str:
     return normalized
 
 
+def _fallback_finding_title_basis(finding: ReviewFinding) -> str | None:
+    """Fall back to evidence text when the heading carries no title beyond its
+    `B<n>` label (e.g. a bare `### B1`), so that finding can still be fingerprinted."""
+    if not finding.evidence:
+        return None
+    normalized = normalize_review_finding_anchor(finding.evidence)
+    return normalized[:300] if normalized else None
+
+
 def get_review_finding_fingerprint_details(
     finding: ReviewFinding,
 ) -> tuple[tuple[str, str], str, str] | None:
     """Return normalized fingerprint plus display title/anchor for one finding."""
     title = normalize_review_finding_title(finding.title)
+    if not title:
+        title = _fallback_finding_title_basis(finding) or ""
     if not title:
         return None
 
