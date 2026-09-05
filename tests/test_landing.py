@@ -2502,7 +2502,7 @@ def test_landing_coordinator_dirty_checkout_precedes_rebase_or_verify(tmp_path) 
 
 
 @pytest.mark.parametrize("case", ("dependency", "scope_violation", "scope_inspection_failure"))
-def test_landing_coordinator_dirty_checkout_does_not_mask_higher_priority_identity_facts(
+def test_landing_coordinator_cleanliness_probe_failure_does_not_mask_higher_priority_identity_facts(
     tmp_path,
     case: str,
 ) -> None:
@@ -2530,6 +2530,10 @@ def test_landing_coordinator_dirty_checkout_does_not_mask_higher_priority_identi
     before_units = _sqlite_merge_unit_snapshot(store)
 
     class ScopeFailureGit(_LandingSourceGit):
+        def has_changes(self, include_untracked: bool = False) -> bool:
+            assert include_untracked is False
+            raise RuntimeError("status failed. secondary diagnostic")
+
         def get_diff_name_status(self, revision_range: str, *, check: bool = True) -> str:
             if case == "scope_inspection_failure":
                 raise RuntimeError("diff inspection failed. secondary diagnostic")
@@ -2539,7 +2543,6 @@ def test_landing_coordinator_dirty_checkout_does_not_mask_higher_priority_identi
         {branch: "source-a", "main": "target-a"},
         local_branches={branch},
         ancestors={("target-a", "source-a")},
-        dirty=True,
         name_status=name_status,
     )
 

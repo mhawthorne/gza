@@ -310,6 +310,7 @@ class LandingResolvedIdentity:
     current_branch: str | None
     member_task_ids: tuple[str, ...] = ()
     checkout_clean: bool = True
+    checkout_clean_block: LandBlocked | None = None
     already_merged: bool = False
     merge_truth: BranchSyncResult | None = None
 
@@ -775,10 +776,12 @@ class LandingCoordinator:
                 _exception_fact("merge-truth reconciliation proof is unavailable", exc),
                 _evidence_refs(request.task_id, owner_id, source_sha, target_sha),
             )
+        checkout_clean_block: LandBlocked | None = None
         try:
             dirty = self.git.has_changes(include_untracked=False)
         except Exception as exc:
-            return LandBlocked(
+            dirty = True
+            checkout_clean_block = LandBlocked(
                 "dirty-checkout",
                 _exception_fact("tracked checkout cleanliness proof is unavailable", exc),
                 _evidence_refs(request.task_id, owner_id, source_sha, target_sha),
@@ -846,6 +849,7 @@ class LandingCoordinator:
             current_branch=current_branch,
             member_task_ids=member_task_ids,
             checkout_clean=not dirty,
+            checkout_clean_block=checkout_clean_block,
             already_merged=already_merged,
             merge_truth=merge_truth,
         )
@@ -899,6 +903,7 @@ class LandingCoordinator:
             spec_coherence=gates.spec_coherence,
             review=review,
             actionable_lifecycle_work=gates.actionable_lifecycle_work,
+            checkout_clean_block=identity.checkout_clean_block,
         )
 
     def _first_execution_required_phase(
@@ -1386,6 +1391,7 @@ class LandingPolicyFacts:
     checkout_clean: bool = False
     source_head: str | None = None
     target_head: str | None = None
+    checkout_clean_block: LandBlocked | None = None
     clean_merge: bool = False
     ancestry_proof_available: bool = False
     rebase_status: LandingRebaseStatus = "unavailable"
@@ -3262,6 +3268,7 @@ def _facts_have_rebase_identity(facts: LandingPolicyFacts) -> bool:
 
 
 def _mechanical_blocked_fact(facts: LandingPolicyFacts) -> LandBlocked | None:
+    candidate_blocks: list[LandBlocked] = []
     if (
         not facts.has_active_merge_unit
         or facts.merge_unit_state != "unmerged"
@@ -3271,25 +3278,34 @@ def _mechanical_blocked_fact(facts: LandingPolicyFacts) -> LandBlocked | None:
         or not facts.source_head
         or not facts.target_head
     ):
-        return LandBlocked(
-            "identity-proof-unavailable",
-            "landing identity, dependency, scope, source, or target proof is unavailable",
-            _identity_evidence(facts),
+        candidate_blocks.append(
+            LandBlocked(
+                "identity-proof-unavailable",
+                "landing identity, dependency, scope, source, or target proof is unavailable",
+                _identity_evidence(facts),
+            )
         )
     lifecycle_identity_block = _actionable_lifecycle_work_blocked_fact(
         facts,
         reason_codes=("identity-proof-unavailable",),
     )
     if lifecycle_identity_block is not None:
-        return lifecycle_identity_block
+        candidate_blocks.append(lifecycle_identity_block)
     if not facts.dependency_ready or not facts.project_scope_ok:
-        return LandBlocked(
-            "identity-proof-unavailable",
-            "landing dependency or project-scope proof is unavailable",
-            _identity_evidence(facts),
+        candidate_blocks.append(
+            LandBlocked(
+                "identity-proof-unavailable",
+                "landing dependency or project-scope proof is unavailable",
+                _identity_evidence(facts),
+            )
         )
     if not facts.checkout_clean:
-        return LandBlocked("dirty-checkout", "tracked checkout is not clean", _identity_evidence(facts))
+        candidate_blocks.append(
+            facts.checkout_clean_block
+            or LandBlocked("dirty-checkout", "tracked checkout is not clean", _identity_evidence(facts))
+        )
+    if candidate_blocks:
+        return _select_landing_block_by_precedence(*candidate_blocks)
     lifecycle_rebase_block = _actionable_lifecycle_work_blocked_fact(
         facts,
         reason_codes=("rebase-or-conflict",),
