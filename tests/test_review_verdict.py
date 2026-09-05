@@ -345,6 +345,25 @@ class TestDisputedBlockers:
 
         assert get_review_finding_fingerprint(report.findings[0]) == ("api error handling", "src/api.py:12-18")
 
+    def test_review_finding_fingerprint_falls_back_to_evidence_for_bare_heading(self) -> None:
+        report = parse_review_report(
+            "## Summary\n\n- Found a blocker.\n\n"
+            "## Blockers\n\n"
+            "### B1\n"
+            "Evidence: `_resolve_identity()` trusts a non-actionable fallback representative\n"
+            "Open-state citation: `src/api.py:12-18`\n"
+            "Impact: crashes\n"
+            "Required fix: handle error path\n"
+            "Required tests: add regression\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        fingerprint = get_review_finding_fingerprint(report.findings[0])
+
+        assert fingerprint is not None
+        assert fingerprint[1] == "src/api.py:12-18"
+
     def test_legacy_report_without_open_state_citation_still_parses(self) -> None:
         content = (
             "## Summary\n\n- Legacy format.\n\n"

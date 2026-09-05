@@ -3683,12 +3683,18 @@ def _pre_dispatch_freshness_probe_failed_action(
 def _pre_dispatch_rebase_required(ctx: AdvanceContext, action: Mapping[str, Any]) -> bool | dict[str, Any]:
     if _branch_contains_target_tip(ctx):
         return False
-    if str(action.get("type", "")) in {"resume", "retry"} and ctx.failed_recovery_decision is not None:
+    action_type = str(action.get("type", ""))
+    if action_type in {"resume", "retry"} and ctx.failed_recovery_decision is not None:
         return True
     if not isinstance(ctx.merge_source_ref, str) or not ctx.merge_source_ref:
         return False
     if not ctx.can_merge:
         return True
+    if action_type in {"merge", "merge_with_followups"}:
+        # A clean conflict-free merge-tree (ctx.can_merge) already proves the
+        # merge itself needs no rebase; gating on raw behind-count here just
+        # chases a moving main and can starve merges when main lands quickly.
+        return False
     behind_probe = _merge_source_behind_target_probe(ctx)
     if behind_probe.failed:
         assert behind_probe.diagnostic is not None

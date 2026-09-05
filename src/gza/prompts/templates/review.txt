@@ -6,6 +6,8 @@ The provided diff is authoritative - do not use git commands to reconstruct, re-
 
 Purpose of this review:
 - You are confirming that THIS TASK landed correctly. You are not performing a general bug hunt over the code it touches.
+- Your dominant, primary job is verifying the stated goal: does the diff do what it was asked to do, correctly, for the inputs and failure modes that goal implies (including obviously wrong inputs and any loop/recursion the diff introduces)? Establish that first, deliberately, before considering anything else.
+- Every other blocker criterion is secondary to that goal check. Spend your effort accordingly: exhaust the goal check first, then look for regressions, correctness defects, and rule violations.
 - The codebase is audited for latent defects by a separate cadence. Findings that are not about this task's goal or this diff's regressions belong in `## Follow-Ups`, not `## Blockers`.
 - A long blocker list is not a sign of a thorough review. Blocking a correct implementation on findings unrelated to its goal is a review defect.
 
@@ -30,6 +32,7 @@ Do not rename, omit, or reorder these sections.
 Section requirements:
 - ## Summary
   - Provide 3-5 bullets summarizing the review.
+  - Before the checklist, enumerate the task's stated acceptance criteria one by one (from `## Review scope:`, `## Original plan:`, or `## Original request:`, whichever is present) and mark each Met / Not Met with one evidence clause. This enumeration is mandatory and comes first; do not let bug-hunting elsewhere in the diff crowd it out or substitute for it.
   - Then answer this checklist with exactly 5 bullets in `Yes/No - ...` form and one short evidence clause each. The first bullet is the primary question this review exists to answer:
     - What was this task asked to do, and does the diff do it? Grade against `## Review scope:` if present; otherwise against `## Original plan:` or `## Original request:`. Treat sibling slices as non-blocking unless they break an explicit contract, and call out intentional deviations. If none of those sections was provided, state "No stated intent provided." and say what goal you inferred from the diff.
     - Does the diff regress behavior that worked before it? Cite the specific prior behavior.
@@ -99,7 +102,9 @@ Blocking discipline:
 - If a finding satisfies none of the four, it is a FOLLOWUP, however real it is. This explicitly includes: pre-existing defects the diff did not introduce, hardening the task's goal does not require, quality debt in untouched code, and improvements to adjacent code paths.
 - Treat unexplained deviations from the provided review scope, plan, or request as BLOCKER under (1).
 - If `## Review scope:` is present, grade ask-adherence against that section only. Use any original plan context section only to understand boundaries and integration contracts.
-- If `## Improve Lineage Context` is present, this is a re-review of work an earlier round already blocked on. Criterion (3) then covers only code changed since that round: a correctness defect in code an earlier review saw and did not block on is a FOLLOWUP, however real. Criteria (1), (2), and (4) still apply to the whole diff, so an unmet goal, a regression, or a rules violation still blocks. Use the `blocked on:` paths in that section to tell the two apart, and prefer FOLLOWUP when you cannot.
+- If `## Improve Lineage Context` is present, this is a re-review, not a fresh review: an earlier round already did the full acceptance-criteria and bug pass. Your job now is to confirm that round's blockers are actually closed and that the code changed since then didn't break or regress anything - not to re-derive new blockers the earlier round could have raised but didn't.
+  - BLOCKER is limited to: (a) a prior round's blocker, under any of criteria (1)-(4), that is not actually closed by the current diff; (b) a new regression, correctness defect, or rules violation (criteria (2)-(4)) introduced in code changed since that round; (c) a new-since-that-round change that itself fails to meet an acceptance criterion the change was supposed to satisfy.
+  - An unmet acceptance criterion (1) in code an earlier round already reviewed and did not block on is a FOLLOWUP, however real - the earlier round had its chance to catch it. Use the `blocked on:` paths in that section to tell "already reviewed" from "changed since" apart, and prefer FOLLOWUP when you cannot.
 - If no `## Review scope:`, `## Original plan:`, or `## Original request:` section was provided, you have no stated intent to grade against. Restrict BLOCKER to criteria (2), (3), and (4), record the missing intent under `## Questions / Assumptions`, and do not substitute open-ended bug-hunting for the absent goal.
 - If `## Resolution review ask:` / `## Resolution Delta Context` are present, review only the rebase-introduced conflict-resolution delta and its provenance. Do not widen the review into a whole-implementation regrade.
 - Do not raise blockers solely because deferred sibling slices from the original plan are not implemented; only raise blockers when in-scope work is missing/broken or the diff violates an explicit integration contract described in the review scope or plan context.

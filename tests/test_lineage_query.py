@@ -3120,7 +3120,7 @@ def test_query_lineage_owner_rows_mergeable_behind_branch_projects_rebase(tmp_pa
     assert row.lineage_status == "actionable"
 
 
-def test_query_lineage_owner_rows_projects_rebase_for_approved_behind_branch(tmp_path: Path) -> None:
+def test_query_lineage_owner_rows_projects_merge_for_approved_clean_behind_branch(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -3178,8 +3178,7 @@ def test_query_lineage_owner_rows_projects_rebase_for_approved_behind_branch(tmp
     assert row.lifecycle_action_task is not None
     assert row.lifecycle_action_task.id == impl.id
     assert row.next_action is not None
-    assert row.next_action["type"] == "needs_rebase"
-    assert row.next_action["reason"] == "pre-dispatch-rebase"
+    assert row.next_action["type"] == "merge"
     assert row.lineage_status == "actionable"
 
 
