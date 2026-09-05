@@ -17,6 +17,75 @@ con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
 con.row_factory = sqlite3.Row
 con.execute("PRAGMA busy_timeout=30000")
 
+# The re-review bound (2dab013c) reached main in merge aa9aeda2. Units merged after
+# this instant are the first that could have been reviewed under the narrowed rule.
+REREVIEW_BOUND_LANDED_AT = os.environ.get("GZA_REREVIEW_BOUND_LANDED_AT", "2026-09-04T15:08:45")
+
+
+def reviews_per_merged_unit(con):
+    """Return (merged_at, review_count) for every merged unit that has an implement."""
+    rows = con.execute("""
+        SELECT mu.id, mu.merged_at,
+               SUM(CASE WHEN t.task_type = 'review' THEN 1 ELSE 0 END) AS reviews
+        FROM merge_units mu
+        JOIN merge_unit_tasks mut
+          ON mut.merge_unit_id = mu.id AND mut.project_id = mu.project_id
+        JOIN tasks t
+          ON t.id = mut.task_id AND t.project_id = mut.project_id
+        WHERE mu.state = 'merged' AND mu.merged_at IS NOT NULL
+        GROUP BY mu.id, mu.merged_at
+        HAVING SUM(CASE WHEN t.task_type = 'implement' THEN 1 ELSE 0 END) > 0
+    """).fetchall()
+    return [(r["merged_at"], r["reviews"]) for r in rows]
+
+
+def _mean(values):
+    return sum(values) / len(values) if values else 0.0
+
+
+def convergence_section(con):
+    data = reviews_per_merged_unit(con)
+    lines = ["## Convergence: reviews per merged unit\n"]
+    lines.append(
+        "The churn this report describes shows up here. A unit that converges is reviewed "
+        "once or twice; one that does not accumulates reviews. `2dab013c` narrowed what a "
+        "re-review may block on, so this mean should fall for units merged after it landed "
+        f"(`{REREVIEW_BOUND_LANDED_AT}`).\n"
+    )
+
+    by_month = collections.defaultdict(list)
+    for merged_at, reviews in data:
+        by_month[merged_at[:7]].append(reviews)
+    lines.append("| month merged | units | mean reviews | median | units needing 4+ |")
+    lines.append("|---|---|---|---|---|")
+    for month in sorted(by_month):
+        counts = sorted(by_month[month])
+        median = counts[len(counts) // 2]
+        heavy = sum(1 for c in counts if c >= 4)
+        lines.append(
+            f"| {month} | {len(counts)} | {_mean(counts):.2f} | {median} | "
+            f"{heavy} ({100 * heavy / len(counts):.0f}%) |"
+        )
+    lines.append("")
+
+    before = [r for merged_at, r in data if merged_at < REREVIEW_BOUND_LANDED_AT]
+    after = [r for merged_at, r in data if merged_at >= REREVIEW_BOUND_LANDED_AT]
+    lines.append(f"**Before the bound:** {len(before)} units, mean {_mean(before):.2f} reviews.")
+    if after:
+        lines.append(f"**After the bound:** {len(after)} units, mean {_mean(after):.2f} reviews.")
+        if len(after) < 30:
+            lines.append(
+                f"\n> Only {len(after)} units have merged since the change. Too few to "
+                "conclude anything; re-run once this reaches ~50."
+            )
+    else:
+        lines.append(
+            "**After the bound:** no units merged yet. Re-run this once some have; "
+            "that is the measurement, not the prose above."
+        )
+    lines.append("")
+    return lines
+
 def cohort(src):
     # null predates the trigger_source column; every null row carries a review dep,
     # so all of them are the manual churn-rescue shape.
@@ -116,6 +185,7 @@ lines.append("`gza fix` does not reliably produce a passing review, but the caus
 lines.append("Addressed in `2dab013c`, which scopes blocker criterion (3) on a re-review to code "
              "changed since the round that already reviewed it. These numbers are the pre-change "
              "baseline; re-run this to measure the effect.\n")
+lines.extend(convergence_section(con))
 lines.append("## Per-task detail (churn-rescue)\n")
 lines.append("| fix | impl | created | next review | outcome |")
 lines.append("|---|---|---|---|---|")

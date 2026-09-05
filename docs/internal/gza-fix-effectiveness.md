@@ -62,6 +62,23 @@ The fix generally does close the blocker it was handed. The next reviewer, by de
 
 Addressed in `2dab013c`, which scopes blocker criterion (3) on a re-review to code changed since the round that already reviewed it. These numbers are the pre-change baseline; re-run this to measure the effect.
 
+## Convergence: reviews per merged unit
+
+The churn this report describes shows up here. A unit that converges is reviewed once or twice; one that does not accumulates reviews. `2dab013c` narrowed what a re-review may block on, so this mean should fall for units merged after it landed (`2026-09-04T15:08:45`).
+
+| month merged | units | mean reviews | median | units needing 4+ |
+|---|---|---|---|---|
+| 2026-05 | 151 | 3.27 | 2 | 41 (27%) |
+| 2026-06 | 261 | 2.72 | 1 | 59 (23%) |
+| 2026-07 | 94 | 3.88 | 2 | 35 (37%) |
+| 2026-08 | 121 | 4.36 | 3 | 55 (45%) |
+| 2026-09 | 29 | 3.76 | 3 | 12 (41%) |
+
+**Before the bound:** 652 units, mean 3.37 reviews.
+**After the bound:** 4 units, mean 2.25 reviews.
+
+> Only 4 units have merged since the change. Too few to conclude anything; re-run once this reaches ~50.
+
 ## Per-task detail (churn-rescue)
 
 | fix | impl | created | next review | outcome |
