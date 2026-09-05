@@ -1681,13 +1681,10 @@ def _expand_recovery_scope_from_seed_ids(
             for member in indexes.skipped_same_branch_members_by_root_id.get(owner.id, ()):
                 _add_task(member)
 
-        for parent_id in (current_task.based_on, current_task.depends_on):
-            if parent_id is not None:
-                _add_task(indexes.task_by_id.get(parent_id))
+        if current_task.based_on is not None:
+            _add_task(indexes.task_by_id.get(current_task.based_on))
 
         for child in indexes.based_on_children.get(task_id, ()):
-            _add_task(child)
-        for child in indexes.depends_on_children.get(task_id, ()):
             _add_task(child)
 
     return frozenset(scoped_task_ids)

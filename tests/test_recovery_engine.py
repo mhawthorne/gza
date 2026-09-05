@@ -3012,6 +3012,363 @@ def test_query_lineage_owner_rows_in_read_session_persists_prerequisite_no_work_
     assert unit.state == "empty"
 
 
+def test_query_lineage_owner_rows_in_read_session_scopes_deferred_prerequisite_reconciliation_to_tag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    dependency = store.add("Merged dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    def _add_failed(prompt: str, *, branch: str, tags: tuple[str, ...]) -> Task:
+        failed = store.add(prompt, task_type="implement", depends_on=dependency.id, tags=tags)
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "PREREQUISITE_UNMERGED"
+        failed.branch = branch
+        failed.has_commits = False
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+        return failed
+
+    in_scope = _add_failed("In-scope legacy prerequisite failure", branch="feature/prereq-empty-in-scope", tags=("alpha",))
+    out_of_scope = _add_failed(
+        "Out-of-scope legacy prerequisite failure",
+        branch="feature/prereq-empty-out-of-scope",
+        tags=("beta",),
+    )
+    empty_branches = {in_scope.branch, out_of_scope.branch}
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(
+            git=_StubMergeGit(empty_merged_branches=empty_branches, prove_empty_diff=True),
+            default_branch="main",
+        ),
+    )
+
+    mutated_task_ids: list[str] = []
+    original_get_or_create = store.get_or_create_merge_unit_for_task
+
+    def _record_get_or_create(task):
+        assert task.id is not None
+        mutated_task_ids.append(task.id)
+        return original_get_or_create(task)
+
+    monkeypatch.setattr(store, "get_or_create_merge_unit_for_task", _record_get_or_create)
+
+    rows, read_context = query_lineage_owner_rows_in_read_session(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            statuses=("failed",),
+            tags=("alpha",),
+            include_skipped=True,
+            max_recovery_attempts=1,
+        ),
+        config=config,
+        git=None,
+        target_branch=None,
+    )
+
+    assert [row.owner_task.id for row in rows] == []
+    assert read_context.recovery_scope_task_ids is not None
+    assert in_scope.id in read_context.recovery_scope_task_ids
+    assert out_of_scope.id not in read_context.recovery_scope_task_ids
+    assert mutated_task_ids == [in_scope.id]
+
+    in_scope_unit = store.resolve_merge_unit_for_task(in_scope.id)
+    out_of_scope_unit = store.resolve_merge_unit_for_task(out_of_scope.id)
+    assert in_scope_unit is not None
+    assert in_scope_unit.state == "empty"
+    assert out_of_scope_unit is None
+
+
+def test_query_lineage_owner_rows_in_read_session_scopes_deferred_prerequisite_reconciliation_to_untagged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    dependency = store.add("Merged dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    def _add_failed(prompt: str, *, branch: str, tags: tuple[str, ...]) -> Task:
+        failed = store.add(prompt, task_type="implement", depends_on=dependency.id, tags=tags)
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "PREREQUISITE_UNMERGED"
+        failed.branch = branch
+        failed.has_commits = False
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+        return failed
+
+    untagged = _add_failed("Untagged legacy prerequisite failure", branch="feature/prereq-empty-untagged", tags=())
+    tagged = _add_failed("Tagged legacy prerequisite failure", branch="feature/prereq-empty-tagged", tags=("alpha",))
+    empty_branches = {untagged.branch, tagged.branch}
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(
+            git=_StubMergeGit(empty_merged_branches=empty_branches, prove_empty_diff=True),
+            default_branch="main",
+        ),
+    )
+
+    mutated_task_ids: list[str] = []
+    original_get_or_create = store.get_or_create_merge_unit_for_task
+
+    def _record_get_or_create(task):
+        assert task.id is not None
+        mutated_task_ids.append(task.id)
+        return original_get_or_create(task)
+
+    monkeypatch.setattr(store, "get_or_create_merge_unit_for_task", _record_get_or_create)
+
+    rows, read_context = query_lineage_owner_rows_in_read_session(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            statuses=("failed",),
+            untagged_only=True,
+            include_skipped=True,
+            max_recovery_attempts=1,
+        ),
+        config=config,
+        git=None,
+        target_branch=None,
+    )
+
+    assert [row.owner_task.id for row in rows] == []
+    assert read_context.recovery_scope_task_ids is not None
+    assert untagged.id in read_context.recovery_scope_task_ids
+    assert tagged.id not in read_context.recovery_scope_task_ids
+    assert mutated_task_ids == [untagged.id]
+
+    untagged_unit = store.resolve_merge_unit_for_task(untagged.id)
+    tagged_unit = store.resolve_merge_unit_for_task(tagged.id)
+    assert untagged_unit is not None
+    assert untagged_unit.state == "empty"
+    assert tagged_unit is None
+
+
+def test_query_lineage_owner_rows_in_read_session_does_not_reconcile_tagged_dependency_ancestor_for_untagged_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    merged_dependency = store.add("Merged dependency", task_type="implement")
+    assert merged_dependency.id is not None
+    merged_dependency.status = "completed"
+    merged_dependency.merge_status = "merged"
+    merged_dependency.completed_at = datetime.now(UTC)
+    store.update(merged_dependency)
+
+    tagged_prerequisite = store.add(
+        "Tagged failed prerequisite",
+        task_type="implement",
+        depends_on=merged_dependency.id,
+        tags=("excluded-scope",),
+    )
+    assert tagged_prerequisite.id is not None
+    tagged_prerequisite.status = "failed"
+    tagged_prerequisite.failure_reason = "PREREQUISITE_UNMERGED"
+    tagged_prerequisite.branch = "feature/tagged-prereq-empty"
+    tagged_prerequisite.has_commits = False
+    tagged_prerequisite.completed_at = datetime.now(UTC)
+    store.update(tagged_prerequisite)
+
+    manual_completion = store.add(
+        "Manual completion for prerequisite",
+        task_type="implement",
+        based_on=tagged_prerequisite.id,
+        recovery_origin="manual",
+        tags=("excluded-scope",),
+    )
+    assert manual_completion.id is not None
+    manual_completion.status = "completed"
+    manual_completion.branch = "feature/tagged-prereq-manual-completion"
+    manual_completion.has_commits = True
+    manual_completion.completed_at = datetime.now(UTC)
+    store.update(manual_completion)
+    manual_completion_unit = store.create_merge_unit(
+        source_branch=manual_completion.branch,
+        target_branch="main",
+        owner_task_id=manual_completion.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(manual_completion.id, manual_completion_unit.id, "owner")
+
+    in_scope = store.add("Untagged dependent failure", task_type="implement", depends_on=tagged_prerequisite.id)
+    assert in_scope.id is not None
+    in_scope.status = "failed"
+    in_scope.failure_reason = "PREREQUISITE_UNMERGED"
+    in_scope.branch = "feature/untagged-dependent-empty"
+    in_scope.has_commits = False
+    in_scope.completed_at = datetime.now(UTC)
+    store.update(in_scope)
+
+    empty_branches = {in_scope.branch, tagged_prerequisite.branch}
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(
+            git=_StubMergeGit(empty_merged_branches=empty_branches, prove_empty_diff=True),
+            default_branch="main",
+        ),
+    )
+
+    rows, read_context = query_lineage_owner_rows_in_read_session(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            statuses=("failed",),
+            untagged_only=True,
+            include_skipped=True,
+            max_recovery_attempts=1,
+        ),
+        config=config,
+        git=None,
+        target_branch=None,
+    )
+
+    assert [row.owner_task.id for row in rows] == []
+    assert read_context.recovery_scope_task_ids is not None
+    assert in_scope.id in read_context.recovery_scope_task_ids
+    assert tagged_prerequisite.id not in read_context.recovery_scope_task_ids
+
+    in_scope_unit = store.resolve_merge_unit_for_task(in_scope.id)
+    tagged_prerequisite_unit = store.resolve_merge_unit_for_task(tagged_prerequisite.id)
+    assert in_scope_unit is not None
+    assert in_scope_unit.state == "empty"
+    assert tagged_prerequisite_unit is None
+    refreshed_prerequisite = store.get(tagged_prerequisite.id)
+    assert refreshed_prerequisite is not None
+    assert refreshed_prerequisite.failure_reason == "PREREQUISITE_UNMERGED"
+
+
+def test_query_lineage_owner_rows_in_read_session_does_not_reconcile_excluded_dependency_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    merged_dependency = store.add("Merged dependency", task_type="implement")
+    assert merged_dependency.id is not None
+    merged_dependency.status = "completed"
+    merged_dependency.merge_status = "merged"
+    merged_dependency.completed_at = datetime.now(UTC)
+    store.update(merged_dependency)
+
+    excluded_prerequisite = store.add(
+        "Excluded failed prerequisite",
+        task_type="implement",
+        depends_on=merged_dependency.id,
+        tags=("excluded-scope",),
+    )
+    assert excluded_prerequisite.id is not None
+    excluded_prerequisite.status = "failed"
+    excluded_prerequisite.failure_reason = "PREREQUISITE_UNMERGED"
+    excluded_prerequisite.branch = "feature/excluded-prereq-empty"
+    excluded_prerequisite.has_commits = False
+    excluded_prerequisite.completed_at = datetime.now(UTC)
+    store.update(excluded_prerequisite)
+
+    manual_completion = store.add(
+        "Manual completion for prerequisite",
+        task_type="implement",
+        based_on=excluded_prerequisite.id,
+        recovery_origin="manual",
+        tags=("excluded-scope",),
+    )
+    assert manual_completion.id is not None
+    manual_completion.status = "completed"
+    manual_completion.branch = "feature/excluded-prereq-manual-completion"
+    manual_completion.has_commits = True
+    manual_completion.completed_at = datetime.now(UTC)
+    store.update(manual_completion)
+    manual_completion_unit = store.create_merge_unit(
+        source_branch=manual_completion.branch,
+        target_branch="main",
+        owner_task_id=manual_completion.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(manual_completion.id, manual_completion_unit.id, "owner")
+
+    in_scope = store.add(
+        "Non-excluded dependent failure",
+        task_type="implement",
+        depends_on=excluded_prerequisite.id,
+        tags=("included-scope",),
+    )
+    assert in_scope.id is not None
+    in_scope.status = "failed"
+    in_scope.failure_reason = "PREREQUISITE_UNMERGED"
+    in_scope.branch = "feature/included-dependent-empty"
+    in_scope.has_commits = False
+    in_scope.completed_at = datetime.now(UTC)
+    store.update(in_scope)
+
+    empty_branches = {in_scope.branch, excluded_prerequisite.branch}
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(
+            git=_StubMergeGit(empty_merged_branches=empty_branches, prove_empty_diff=True),
+            default_branch="main",
+        ),
+    )
+
+    rows, read_context = query_lineage_owner_rows_in_read_session(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            statuses=("failed",),
+            exclude_tags=("excluded-scope",),
+            include_skipped=True,
+            max_recovery_attempts=1,
+        ),
+        config=config,
+        git=None,
+        target_branch=None,
+    )
+
+    assert [row.owner_task.id for row in rows] == []
+    assert read_context.recovery_scope_task_ids is not None
+    assert in_scope.id in read_context.recovery_scope_task_ids
+    assert excluded_prerequisite.id not in read_context.recovery_scope_task_ids
+
+    in_scope_unit = store.resolve_merge_unit_for_task(in_scope.id)
+    excluded_prerequisite_unit = store.resolve_merge_unit_for_task(excluded_prerequisite.id)
+    assert in_scope_unit is not None
+    assert in_scope_unit.state == "empty"
+    assert excluded_prerequisite_unit is None
+    refreshed_prerequisite = store.get(excluded_prerequisite.id)
+    assert refreshed_prerequisite is not None
+    assert refreshed_prerequisite.failure_reason == "PREREQUISITE_UNMERGED"
+
+
 def test_query_lineage_owner_rows_in_read_session_persists_historical_rebase_success_after_read(
     tmp_path: Path,
 ) -> None:

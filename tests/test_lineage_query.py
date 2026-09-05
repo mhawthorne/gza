@@ -6539,6 +6539,134 @@ def test_query_lineage_owner_rows_task_id_scope_classifies_only_target_lineage_f
     assert not (external_failed_ids & set(merged_target_calls))
 
 
+def test_query_lineage_owner_rows_exclude_tags_scope_does_not_classify_excluded_sibling_or_dependent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    shared_plan = store.add("Shared plan", task_type="plan")
+    assert shared_plan.id is not None
+    shared_plan.status = "completed"
+    shared_plan.completed_at = datetime(2026, 8, 26, 8, 0, tzinfo=UTC)
+    store.update(shared_plan)
+
+    owner = store.add("Included owner", task_type="implement", tags=("included-scope",))
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime(2026, 8, 26, 9, 0, tzinfo=UTC)
+    owner.branch = "feature/included-owner"
+    owner.has_commits = True
+    owner.merge_status = "unmerged"
+    owner.depends_on = shared_plan.id
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    selected_failed = store.add("Included failed review", task_type="review", based_on=owner.id, depends_on=owner.id)
+    assert selected_failed.id is not None
+    selected_failed.status = "failed"
+    selected_failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    selected_failed.completed_at = datetime(2026, 8, 26, 9, 1, tzinfo=UTC)
+    store.update(selected_failed)
+    store.attach_task_to_merge_unit(selected_failed.id, owner_unit.id, "review")
+
+    excluded_sibling = store.add(
+        "Excluded shared-plan sibling",
+        task_type="implement",
+        depends_on=shared_plan.id,
+        tags=("excluded-scope",),
+    )
+    assert excluded_sibling.id is not None
+    excluded_sibling.status = "failed"
+    excluded_sibling.failure_reason = "INFRASTRUCTURE_ERROR"
+    excluded_sibling.completed_at = datetime(2026, 8, 26, 10, 0, tzinfo=UTC)
+    excluded_sibling.branch = "feature/excluded-sibling"
+    store.update(excluded_sibling)
+    excluded_sibling_unit = store.create_merge_unit(
+        source_branch=excluded_sibling.branch,
+        target_branch="main",
+        owner_task_id=excluded_sibling.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(excluded_sibling.id, excluded_sibling_unit.id, "owner")
+
+    excluded_dependent = store.add(
+        "Excluded downstream dependent",
+        task_type="implement",
+        depends_on=owner.id,
+        tags=("excluded-scope",),
+    )
+    assert excluded_dependent.id is not None
+    excluded_dependent.status = "failed"
+    excluded_dependent.failure_reason = "INFRASTRUCTURE_ERROR"
+    excluded_dependent.completed_at = datetime(2026, 8, 26, 10, 1, tzinfo=UTC)
+    excluded_dependent.branch = "feature/excluded-dependent"
+    store.update(excluded_dependent)
+    excluded_dependent_unit = store.create_merge_unit(
+        source_branch=excluded_dependent.branch,
+        target_branch="main",
+        owner_task_id=excluded_dependent.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(excluded_dependent.id, excluded_dependent_unit.id, "owner")
+
+    chain_resolved_calls: list[str] = []
+    inactive_merge_unit_calls: list[str] = []
+    merged_target_calls: list[str] = []
+
+    def _record_chain_resolved(store_arg, task, *, read_context=None):
+        assert task.id is not None
+        chain_resolved_calls.append(task.id)
+        return False
+
+    def _record_inactive_merge_unit(store_arg, task, *, read_context=None):
+        assert task.id is not None
+        inactive_merge_unit_calls.append(task.id)
+        return False
+
+    def _record_merged_target(store_arg, task, *, merge_context, read_context=None):
+        assert task.id is not None
+        merged_target_calls.append(task.id)
+        return False
+
+    monkeypatch.setattr(recovery_engine, "is_chain_resolved_by_recovery", _record_chain_resolved)
+    monkeypatch.setattr(
+        recovery_engine,
+        "is_recovery_suppressed_by_inactive_merge_unit",
+        _record_inactive_merge_unit,
+    )
+    monkeypatch.setattr(recovery_engine, "is_resolved_by_merged_target", _record_merged_target)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+            exclude_tags=("excluded-scope",),
+            max_recovery_attempts=1,
+        ),
+        config=Config.load(tmp_path),
+        target_branch="main",
+    )
+
+    assert {row.owner_task.id for row in rows if row.owner_task.id is not None} == {owner.id}
+    assert set(chain_resolved_calls) == {selected_failed.id}
+    assert set(inactive_merge_unit_calls) == {selected_failed.id}
+    assert set(merged_target_calls) == {selected_failed.id}
+    excluded_failed_ids = {excluded_sibling.id, excluded_dependent.id}
+    assert not (excluded_failed_ids & set(chain_resolved_calls))
+    assert not (excluded_failed_ids & set(inactive_merge_unit_calls))
+    assert not (excluded_failed_ids & set(merged_target_calls))
+
+
 @pytest.mark.parametrize("use_matching_tag", (False, True))
 def test_query_lineage_owner_rows_orphan_task_id_scope_classifies_canonical_root_failed_members(
     tmp_path: Path,

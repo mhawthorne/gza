@@ -38,11 +38,13 @@ at `:15349`) — Builds the scheduling picture for the cycle: pulls a
 concurrency snapshot (running tasks, filtering hidden internal tasks like
 `behavior-monitor`), scans all pending tasks and checks blocking dependencies
 per task, then runs `_analyze_watch_cycle` (`watch.py:14056`) — the expensive
-part. That does a full task-table scan plus **a git subprocess call per
-task/branch** (branch existence, merge status, diff-against-target) to work
-out tag-scope gaps, non-dropped implement sources, owner rows, and recovery
-candidates. Cost scales with task count: O(#tasks) git calls every cycle is
-why this routinely takes minutes on a busy queue.
+part. That still does a full task-table scan to build lineage/recovery
+indexes, tag-scope gaps, non-dropped implement sources, owner rows, and
+recovery candidates. Tag-filtered owner-row analysis now prunes ordinary
+out-of-scope owners before lifecycle/recovery action resolution, branch
+priming, and most git probes; the full snapshot remains O(#tasks), while
+expensive owner action work tracks the retained scoped owners plus
+conservative terminal-reroot candidates.
 
 **stale-no-progress-reconcile** (`watch.py:15567`) — Scans parked tasks
 scoped by owner/task selectors and clears "no progress" parks that have gone
@@ -119,8 +121,11 @@ for that kind of phase.
 Three phases dominate wall-clock time, and all three share the same
 underlying pattern — cheap DB reads, expensive per-item subprocess calls:
 
-- **cycle-plan**: one `git` subprocess call per task/branch for merge-status,
-  diff, and branch-existence checks (O(#tasks) per cycle).
+- **cycle-plan**: a full task-table scan every cycle, plus git/status probes
+  for retained owner-action candidates. Untagged or broad queries can still
+  approach one `git` subprocess call per task/branch for merge-status, diff,
+  and branch-existence checks; tag-scoped queries prune ordinary
+  out-of-scope owners before most of that work.
 - **lifecycle-preflight**: runs the actual verify/test suite against main
   when its cached result is stale — a real CI run, not a status check.
 - **blind-parked-auto-rearm**: one `git diff` subprocess per parked
