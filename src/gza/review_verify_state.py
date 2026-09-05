@@ -30,13 +30,14 @@ KNOWN_FULL_VERIFY_PHASES = ("ruff", "ty", "mypy", "checks", "unit", "functional"
 
 @dataclass(frozen=True)
 class VerifyEpoch:
-    """Provenance for one verify gate evaluation at a specific head."""
+    """Provenance for one verify gate evaluation at a specific source epoch."""
 
     reviewed_branch: str | None
     reviewed_head_sha: str | None
     verify_command: str | None
     verify_timeout_seconds: int | None
     verify_timeout_grace_seconds: float | None
+    reviewed_tree_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class VerifyGateResult:
     captured_at: datetime
     reviewed_branch: str | None = None
     reviewed_head_sha: str | None = None
+    reviewed_tree_sha: str | None = None
     reviewed_base_sha: str | None = None
     working_directory: str | None = None
     failure: str | None = None
@@ -442,28 +444,46 @@ def make_verify_epoch(
     verify_command: str | None,
     verify_timeout_seconds: int | None,
     verify_timeout_grace_seconds: float | None,
+    reviewed_tree_sha: str | None = None,
 ) -> VerifyEpoch:
-    """Build canonical verify epoch metadata for one branch head."""
+    """Build canonical verify epoch metadata for one branch source epoch."""
     return VerifyEpoch(
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
         verify_command=normalized_verify_command(verify_command),
         verify_timeout_seconds=verify_timeout_seconds,
         verify_timeout_grace_seconds=verify_timeout_grace_seconds,
+        reviewed_tree_sha=reviewed_tree_sha if isinstance(reviewed_tree_sha, str) and reviewed_tree_sha else None,
     )
 
 
 def verify_epoch_matches(*, expected: VerifyEpoch, candidate: VerifyEpoch) -> bool:
-    """Return whether two verify epochs cover the same reviewed branch head.
+    """Return whether two verify epochs cover the same reviewed branch source.
 
     The verify command and timeout settings are persisted as run provenance, but
     they are not freshness identity: changing the command or budget does not
-    make same-head evidence stale or current.
+    make same-source evidence stale or current.
     """
-    return (
-        expected.reviewed_branch == candidate.reviewed_branch
+    if not (
+        isinstance(expected.reviewed_branch, str)
+        and expected.reviewed_branch.strip()
+        and isinstance(candidate.reviewed_branch, str)
+        and candidate.reviewed_branch.strip()
+    ):
+        return False
+    if expected.reviewed_branch != candidate.reviewed_branch:
+        return False
+    head_matches = bool(
+        expected.reviewed_head_sha
+        and candidate.reviewed_head_sha
         and expected.reviewed_head_sha == candidate.reviewed_head_sha
     )
+    tree_matches = bool(
+        expected.reviewed_tree_sha
+        and candidate.reviewed_tree_sha
+        and expected.reviewed_tree_sha == candidate.reviewed_tree_sha
+    )
+    return head_matches or tree_matches
 
 
 def _task_verify_result(task: Task) -> VerifyGateResult | None:
@@ -481,6 +501,7 @@ def _task_verify_result(task: Task) -> VerifyGateResult | None:
         captured_at=task.review_verify_captured_at,
         reviewed_branch=task.review_verify_branch,
         reviewed_head_sha=task.review_verify_head_sha,
+        reviewed_tree_sha=None,
         reviewed_base_sha=task.review_verify_base_sha,
         working_directory=task.review_verify_cwd,
         failure=task.review_verify_failure,
@@ -499,6 +520,7 @@ def _result_epoch(
     return make_verify_epoch(
         reviewed_branch=result.reviewed_branch,
         reviewed_head_sha=result.reviewed_head_sha,
+        reviewed_tree_sha=result.reviewed_tree_sha,
         verify_command=result.command,
         verify_timeout_seconds=verify_timeout_seconds,
         verify_timeout_grace_seconds=verify_timeout_grace_seconds,
@@ -1150,6 +1172,7 @@ def _artifact_verify_result(metadata: dict[str, Any], *, project_dir: Path | Non
         captured_at=captured_at,
         reviewed_branch=_coerce_optional_str(result_payload.get("reviewed_branch")),
         reviewed_head_sha=_coerce_optional_str(result_payload.get("reviewed_head_sha")),
+        reviewed_tree_sha=_coerce_optional_str(result_payload.get("reviewed_tree_sha")),
         reviewed_base_sha=_coerce_optional_str(result_payload.get("reviewed_base_sha")),
         working_directory=_coerce_optional_str(result_payload.get("working_directory")),
         failure=_coerce_optional_str(result_payload.get("failure")),
@@ -1172,6 +1195,7 @@ def _artifact_verify_epoch(metadata: dict[str, Any]) -> VerifyEpoch | None:
     return make_verify_epoch(
         reviewed_branch=_coerce_optional_str(epoch_payload.get("reviewed_branch")),
         reviewed_head_sha=_coerce_optional_str(epoch_payload.get("reviewed_head_sha")),
+        reviewed_tree_sha=_coerce_optional_str(epoch_payload.get("reviewed_tree_sha")),
         verify_command=_coerce_optional_str(epoch_payload.get("verify_command")),
         verify_timeout_seconds=_coerce_optional_int(epoch_payload.get("verify_timeout_seconds")),
         verify_timeout_grace_seconds=_coerce_optional_float(epoch_payload.get("verify_timeout_grace_seconds")),
@@ -1292,6 +1316,7 @@ def review_task_verify_epoch(task: Task, config: object | None) -> VerifyEpoch |
     return make_verify_epoch(
         reviewed_branch=task.review_verify_branch,
         reviewed_head_sha=task.review_verify_head_sha,
+        reviewed_tree_sha=None,
         verify_command=command,
         verify_timeout_seconds=None,
         verify_timeout_grace_seconds=None,
@@ -1313,11 +1338,22 @@ def owner_task_verify_epoch(task: Task, config: object | None, git: object | Non
         return None
     if not isinstance(head_sha, str) or not head_sha:
         return None
+    tree_sha: str | None = None
+    resolve_refs = getattr(git, "resolve_refs", None)
+    if callable(resolve_refs):
+        try:
+            resolved = resolve_refs([branch], peel="tree")
+        except (AssertionError, GitError, OSError, RuntimeError, TypeError, ValueError):
+            resolved = {}
+        resolved_tree = resolved.get(branch) if isinstance(resolved, dict) else None
+        if isinstance(resolved_tree, str) and resolved_tree:
+            tree_sha = resolved_tree
     timeout_seconds = getattr(config, "autonomous_verify_timeout_seconds", None)
     timeout_grace_seconds = getattr(config, "review_verify_timeout_grace_seconds", None)
     return make_verify_epoch(
         reviewed_branch=branch,
         reviewed_head_sha=head_sha,
+        reviewed_tree_sha=tree_sha,
         verify_command=command,
         verify_timeout_seconds=timeout_seconds if isinstance(timeout_seconds, int) else None,
         verify_timeout_grace_seconds=(
@@ -1656,6 +1692,7 @@ def build_verify_gate_artifact_payload(
     epoch = make_verify_epoch(
         reviewed_branch=getattr(result, "reviewed_branch", None),
         reviewed_head_sha=getattr(result, "reviewed_head_sha", None),
+        reviewed_tree_sha=getattr(result, "reviewed_tree_sha", None),
         verify_command=getattr(result, "command", None),
         verify_timeout_seconds=verify_timeout_seconds,
         verify_timeout_grace_seconds=verify_timeout_grace_seconds,
@@ -1667,6 +1704,7 @@ def build_verify_gate_artifact_payload(
         "captured_at": getattr(result, "captured_at").isoformat(),
         "reviewed_branch": getattr(result, "reviewed_branch", None),
         "reviewed_head_sha": getattr(result, "reviewed_head_sha", None),
+        "reviewed_tree_sha": getattr(result, "reviewed_tree_sha", None),
         "reviewed_base_sha": getattr(result, "reviewed_base_sha", None),
         "working_directory": getattr(result, "working_directory", None),
         "failure": getattr(result, "failure", None),
@@ -1696,6 +1734,7 @@ def build_verify_gate_artifact_payload(
         "verify_epoch": {
             "reviewed_branch": epoch.reviewed_branch,
             "reviewed_head_sha": epoch.reviewed_head_sha,
+            "reviewed_tree_sha": epoch.reviewed_tree_sha,
             "verify_command": epoch.verify_command,
             "verify_timeout_seconds": epoch.verify_timeout_seconds,
             "verify_timeout_grace_seconds": epoch.verify_timeout_grace_seconds,

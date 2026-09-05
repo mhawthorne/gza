@@ -29,7 +29,13 @@ def _config(tmp_path: Path) -> Config:
     return Config(project_dir=tmp_path, project_name="test-project")
 
 
-def _result(*, command: str = "./bin/tests", head_sha: str = "head-1", captured_at: datetime) -> SimpleNamespace:
+def _result(
+    *,
+    command: str = "./bin/tests",
+    head_sha: str = "head-1",
+    tree_sha: str | None = None,
+    captured_at: datetime,
+) -> SimpleNamespace:
     return SimpleNamespace(
         command=command,
         status="passed",
@@ -37,20 +43,122 @@ def _result(*, command: str = "./bin/tests", head_sha: str = "head-1", captured_
         captured_at=captured_at,
         reviewed_branch="feature/verify",
         reviewed_head_sha=head_sha,
+        reviewed_tree_sha=tree_sha,
         reviewed_base_sha="base-1",
         working_directory="/tmp/worktree",
         failure=None,
     )
 
 
-def _epoch(*, command: str = "./bin/tests", branch: str = "feature/verify", head_sha: str = "head-1"):
+def _epoch(
+    *,
+    command: str = "./bin/tests",
+    branch: str | None = "feature/verify",
+    head_sha: str | None = "head-1",
+    tree_sha: str | None = None,
+    timeout_seconds: int | None = 120,
+    timeout_grace_seconds: float | None = 5.0,
+):
     return make_verify_epoch(
         reviewed_branch=branch,
         reviewed_head_sha=head_sha,
+        reviewed_tree_sha=tree_sha,
         verify_command=command,
-        verify_timeout_seconds=120,
-        verify_timeout_grace_seconds=5.0,
+        verify_timeout_seconds=timeout_seconds,
+        verify_timeout_grace_seconds=timeout_grace_seconds,
     )
+
+
+def test_verify_epoch_matches_same_branch_equal_non_empty_tree_with_different_heads() -> None:
+    expected = _epoch(head_sha="head-2", tree_sha="tree-1")
+    candidate = _epoch(head_sha="head-1", tree_sha="tree-1")
+
+    assert verify_epoch_matches(expected=expected, candidate=candidate) is True
+
+
+def test_verify_epoch_matches_rejects_different_tree_and_changed_head() -> None:
+    expected = _epoch(head_sha="head-2", tree_sha="tree-2")
+    candidate = _epoch(head_sha="head-1", tree_sha="tree-1")
+
+    assert verify_epoch_matches(expected=expected, candidate=candidate) is False
+
+
+def test_verify_epoch_matches_requires_same_branch_even_when_tree_matches() -> None:
+    expected = _epoch(branch="feature/current", head_sha="head-2", tree_sha="tree-1")
+    candidate = _epoch(branch="feature/other", head_sha="head-1", tree_sha="tree-1")
+
+    assert verify_epoch_matches(expected=expected, candidate=candidate) is False
+
+
+@pytest.mark.parametrize(
+    ("expected_branch", "candidate_branch"),
+    [
+        (None, "feature/verify"),
+        ("feature/verify", None),
+        (None, None),
+        ("", "feature/verify"),
+        ("feature/verify", ""),
+        ("", ""),
+        ("   ", "feature/verify"),
+        ("feature/verify", "   "),
+        ("   ", "   "),
+    ],
+)
+@pytest.mark.parametrize(
+    ("expected_head", "candidate_head", "expected_tree", "candidate_tree"),
+    [
+        ("head-1", "head-1", None, None),
+        ("head-2", "head-1", "tree-1", "tree-1"),
+    ],
+)
+def test_verify_epoch_matches_requires_concrete_non_blank_branch_proof(
+    expected_branch: str | None,
+    candidate_branch: str | None,
+    expected_head: str,
+    candidate_head: str,
+    expected_tree: str | None,
+    candidate_tree: str | None,
+) -> None:
+    expected = _epoch(branch=expected_branch, head_sha=expected_head, tree_sha=expected_tree)
+    candidate = _epoch(branch=candidate_branch, head_sha=candidate_head, tree_sha=candidate_tree)
+
+    assert verify_epoch_matches(expected=expected, candidate=candidate) is False
+
+
+def test_verify_epoch_matches_does_not_treat_absent_tree_as_tree_proof() -> None:
+    expected = _epoch(head_sha="head-2", tree_sha=None)
+    candidate = _epoch(head_sha="head-1", tree_sha=None)
+
+    assert verify_epoch_matches(expected=expected, candidate=candidate) is False
+
+
+@pytest.mark.parametrize("candidate_tree_sha", [None, "tree-other"])
+def test_verify_epoch_matches_same_head_even_when_tree_metadata_absent_or_contradictory(
+    candidate_tree_sha: str | None,
+) -> None:
+    expected = _epoch(head_sha="head-1", tree_sha="tree-1")
+    candidate = _epoch(head_sha="head-1", tree_sha=candidate_tree_sha)
+
+    assert verify_epoch_matches(expected=expected, candidate=candidate) is True
+
+
+def test_verify_epoch_matches_ignores_command_and_timeout_drift_when_source_matches() -> None:
+    expected = _epoch(
+        command="./bin/tests --new",
+        head_sha="head-2",
+        tree_sha="tree-1",
+        timeout_seconds=240,
+        timeout_grace_seconds=9.0,
+    )
+    candidate = _epoch(
+        command="./bin/tests",
+        head_sha="head-1",
+        tree_sha="tree-1",
+        timeout_seconds=120,
+        timeout_grace_seconds=5.0,
+    )
+
+    assert verify_epoch_matches(expected=expected, candidate=candidate) is True
 
 
 def _seed_legacy_review(
@@ -100,6 +208,74 @@ def test_latest_verify_result_for_epoch_prefers_current_owner_artifact(tmp_path:
     assert lookup.result is not None
     assert lookup.result.reviewed_head_sha == "head-1"
     assert len(store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)) == 1
+
+
+def test_latest_verify_result_for_epoch_selects_same_tree_owner_artifact_after_commit_rewrite(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    impl = store.add("Implement tree-aware verify gate owner", task_type="implement")
+    assert impl.id is not None
+    review = store.add("Review tree-aware owner artifact", task_type="review", based_on=impl.id, depends_on=impl.id)
+
+    persist_verify_gate_artifact(
+        store,
+        _config(tmp_path),
+        owner_task=impl,
+        source_task=review,
+        result=_result(head_sha="head-1", tree_sha="tree-1", captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC)),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    lookup = latest_verify_result_for_epoch(store, impl, current_epoch=_epoch(head_sha="head-2", tree_sha="tree-1"))
+
+    assert lookup.source == "owner_artifact"
+    assert lookup.is_current is True
+    assert lookup.result is not None
+    assert lookup.result.reviewed_head_sha == "head-1"
+    assert lookup.result.reviewed_tree_sha == "tree-1"
+
+
+def test_latest_verify_result_for_epoch_keeps_legacy_head_only_artifact_stale_after_commit_rewrite(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    impl = store.add("Implement legacy head-only verify gate owner", task_type="implement")
+    assert impl.id is not None
+    review = store.add("Review legacy owner artifact", task_type="review", based_on=impl.id, depends_on=impl.id)
+
+    captured_at = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+    metadata = build_verify_gate_artifact_payload(
+        result=_result(head_sha="head-1", tree_sha=None, captured_at=captured_at),
+        source_task=review,
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    metadata["verify_epoch"].pop("reviewed_tree_sha")
+    metadata["result"].pop("reviewed_tree_sha")
+    store.add_artifact(
+        impl.id,
+        kind=VERIFY_GATE_ARTIFACT_KIND,
+        label="verify_gate_result",
+        path=".gza/artifacts/legacy-verify.json",
+        byte_size=2,
+        sha256="0" * 64,
+        created_at=captured_at,
+        producer="review_verify",
+        command="./bin/tests",
+        status="passed",
+        exit_status="0",
+        head_sha="head-1",
+        metadata=metadata,
+    )
+
+    lookup = latest_verify_result_for_epoch(store, impl, current_epoch=_epoch(head_sha="head-2", tree_sha="tree-1"))
+
+    assert lookup.source == "owner_artifact"
+    assert lookup.is_current is False
+    assert lookup.result is not None
+    assert lookup.result.reviewed_head_sha == "head-1"
+    assert lookup.result.reviewed_tree_sha is None
 
 
 @pytest.mark.parametrize(
@@ -494,6 +670,75 @@ def test_owner_task_verify_epoch_returns_none_when_branch_probe_raises(tmp_path:
     git = SimpleNamespace(rev_parse_if_exists=lambda _ref: (_ for _ in ()).throw(GitError("boom")))
 
     assert owner_task_verify_epoch(impl, config, git) is None
+
+
+def test_owner_task_verify_epoch_records_tree_probe_success(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    store = SqliteTaskStore(tmp_path / "test.db")
+    impl = store.add("Implement tree epoch", task_type="implement")
+    impl.branch = "feature/verify-tree"
+    store.update(impl)
+
+    def resolve_refs(refs: list[str], peel: str = "commit") -> dict[str, str | None]:
+        assert refs == ["feature/verify-tree"]
+        assert peel == "tree"
+        return {"feature/verify-tree": "tree-1"}
+
+    epoch = owner_task_verify_epoch(
+        impl,
+        config,
+        SimpleNamespace(rev_parse_if_exists=lambda _ref: "head-1", resolve_refs=resolve_refs),
+    )
+
+    assert epoch == make_verify_epoch(
+        reviewed_branch="feature/verify-tree",
+        reviewed_head_sha="head-1",
+        reviewed_tree_sha="tree-1",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+
+
+@pytest.mark.parametrize(
+    "resolve_refs",
+    [
+        lambda _refs, peel="commit": {},
+        lambda _refs, peel="commit": (_ for _ in ()).throw(GitError("tree probe failed")),
+    ],
+)
+def test_owner_task_verify_epoch_returns_head_only_epoch_when_tree_probe_fails(
+    tmp_path: Path,
+    resolve_refs: object,
+) -> None:
+    config = _config(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    store = SqliteTaskStore(tmp_path / "test.db")
+    impl = store.add("Implement head-only tree fallback", task_type="implement")
+    impl.branch = "feature/verify-tree-fallback"
+    store.update(impl)
+
+    epoch = owner_task_verify_epoch(
+        impl,
+        config,
+        SimpleNamespace(rev_parse_if_exists=lambda _ref: "head-1", resolve_refs=resolve_refs),
+    )
+
+    assert epoch == make_verify_epoch(
+        reviewed_branch="feature/verify-tree-fallback",
+        reviewed_head_sha="head-1",
+        reviewed_tree_sha=None,
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
 
 
 def test_review_task_verify_epoch_preserves_legacy_timeout_identity_as_none(tmp_path: Path) -> None:

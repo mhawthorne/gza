@@ -453,7 +453,7 @@ epoch.
   (`merge-source-needs-manual-resolution`) before any pre-review `verify_gate`,
   `create_review`, or `run_review` automation.
 - Missing or stale verify evidence for the current owner epoch MUST select `verify_gate`
-  first. Lifecycle MUST rerun verify before it creates a review for that head.
+  first. Lifecycle MUST rerun verify before it creates a review for that source epoch.
 - Current red verify evidence before review MUST route into the `verify_fix` lane, not the
   review/improve lane, unless it is a budget-only timeout. Lifecycle MUST create, reuse,
   run, or wait on one same-branch `verify_fix` task keyed by the exact current verify
@@ -496,17 +496,25 @@ epoch.
   recovery rerun persists any
   non-green result, including another timeout, lifecycle MUST record the rerun as consumed
   and the next decision MUST park rather than rerun indefinitely.
-- Latest same-head verify evidence wins inside a verify epoch: a newer persisted green
-  result for the same reviewed branch and reviewed head SHA supersedes older same-head
-  red evidence. The normalized verify command and timeout settings are run provenance,
-  not verify freshness identity; changing only `verify_command`,
-  `autonomous_verify_timeout_seconds`, or `review_verify_timeout_grace_seconds` MUST NOT
-  be the supported way to clear or stale a verify gate.
-- When the newest current same-head verify evidence in a merge unit is credited to a
-  contributor instead of the canonical owner, writable lifecycle execution MUST recredit
-  that evidence to the canonical owner by copying the selected artifact's original
-  source task, verify epoch run settings, structured provenance, and aggregate details,
-  and MUST record the reconciliation itself as separate metadata. It MUST then
+- Latest same-source-epoch verify evidence wins inside a verify epoch: branch identity is
+  mandatory and fail-closed, so both persisted and current `reviewed_branch` values MUST
+  be concrete non-blank strings that match exactly. Within that exact branch, a newer
+  persisted green result supersedes older red evidence when both sides have equal
+  non-empty Git tree object IDs in `reviewed_tree_sha`; if tree proof is unavailable on
+  either side, exact non-empty `reviewed_head_sha` equality is the fallback freshness
+  proof. Equal heads also preserve the existing current-evidence authority when optional
+  tree metadata is absent or contradictory. Missing tree proof MUST NOT be treated as
+  tree equality, and the committed Git tree OID in `reviewed_tree_sha` MUST NOT be
+  conflated with phase/worktree `tree_fingerprint` checkpoints. The normalized verify
+  command and timeout settings are run provenance, not verify freshness identity;
+  changing only `verify_command`, `autonomous_verify_timeout_seconds`, or
+  `review_verify_timeout_grace_seconds` MUST NOT be the supported way to clear or stale a
+  verify gate.
+- When the newest current same-source-epoch verify evidence in a merge unit is credited
+  to a contributor instead of the canonical owner, writable lifecycle execution MUST
+  recredit that evidence to the canonical owner by copying the selected artifact's
+  original source task, verify epoch run settings, structured provenance, and aggregate
+  details, and MUST record the reconciliation itself as separate metadata. It MUST then
   reevaluate before routing red, missing, or unavailable owner evidence to verify-gate
   reruns, `verify_fix`, or park states. Legacy evidence without resolvable source
   provenance MAY use an explicit safe fallback source, but valid source provenance MUST
@@ -517,18 +525,18 @@ epoch.
   gate remains red for that epoch, lifecycle MUST park with reason `verify-fix-failed`
   instead of spawning another `verify_fix`. Deterministic test failures and unknown
   structured failure origins are not timeout-origin and MUST remain blocking unless a
-  later source-changing fix or valid same-head green verify result replaces them. A
-  manual `iterate --force` or `unstick --reason verify-fix-failed` rearm MAY bypass only
-  this park and MUST first run a fresh verify gate for the current head; if that fresh
-  verify is still red, cannot be executed, or cannot be persisted, lifecycle MUST remain
-  blocked and surface an actionable direct diagnostic rather than continuing to review or
-  merge.
+  later source-changing fix or valid same-source-epoch green verify result replaces
+  them. A manual `iterate --force` or `unstick --reason verify-fix-failed` rearm MAY
+  bypass only this park and MUST first run a fresh verify gate for the current source
+  epoch; if that fresh verify is still red, cannot be executed, or cannot be persisted,
+  lifecycle MUST remain blocked and surface an actionable direct diagnostic rather than
+  continuing to review or merge.
 - `gza verify <task_id>` is a manual verify-gate refresh surface for a resolved
   merge unit. It MUST run the same lifecycle verify executor and persist the same
   `verify_gate_result` evidence for the current epoch; it MUST NOT bypass,
   suppress, or fake green evidence. If the current epoch is already green, it MUST
   avoid rerunning unless `--force` is supplied. The command MUST select the same
-  effective newest current same-epoch merge-unit evidence as lifecycle before
+  effective newest current same-source-epoch merge-unit evidence as lifecycle before
   reporting `--dry-run`, no-op, or refresh outcomes. A writable no-force invocation
   MUST recredit non-owner current merge-unit evidence to the canonical owner. After
   that reconciliation, it MAY return without rerunning only when the refreshed
@@ -767,7 +775,7 @@ failure *and* actionable merge/review work remains eligible for the latter.
 - For implementation-owned units whose review gate is enabled, merge eligibility remains
   the ordinary two-gate rule even after an approved review: automation MUST have both a
   merge-permitting current review verdict and current passing lifecycle-owned verify
-  evidence for the current implementation head/verify epoch. If the verify gate is
+  evidence for the current source verify epoch. If the verify gate is
   missing or stale, automation MUST rerun it; if it is red or unavailable, automation
   MUST block merge and follow the shared verify-gate handling instead of merging on
   review alone.
@@ -1121,8 +1129,8 @@ ordinary no-review landing with `manual_land` provenance.
 
 After every rebase or any other source-head-changing step in a review-enabled lineage,
 `land` MUST first obtain or reuse current canonical green lifecycle verify evidence for
-the new live source head and current gate identity before it creates, runs, reuses, or
-waits on the invocation's post-rebase code/resolution review. Red, unavailable,
+the new live source verify epoch before it creates, runs, reuses, or waits on the
+invocation's post-rebase code/resolution review. Red, unavailable,
 malformed, stale, or missing verify evidence after that acquisition attempt MUST stop
 without consuming the one post-rebase review budget and without creating or running a
 landing judgment.

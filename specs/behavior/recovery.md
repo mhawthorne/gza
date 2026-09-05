@@ -241,10 +241,10 @@ its stored action.
   completed-implementation failed recovery whose terminal failure category is not
   retryable. Under default `on_max_cycles=merge_and_defer`, an eligible capped review is
   no longer a recovery handoff: it remains a direct annotated merge action only after the
-  lifecycle engine proves fresh green current-head verify evidence plus deterministic
-  persisted blocker payload. The merge executor then durably creates or reuses every
-  deferred-blocker task before promotion, already-merged mutation, or merge-unit
-  finalization. Missing or stale verify evidence MUST run the normal pre-merge verify
+  lifecycle engine proves fresh green current branch content/tree epoch verify evidence
+  plus deterministic persisted blocker payload. The merge executor then durably creates
+  or reuses every deferred-blocker task before promotion, already-merged mutation, or
+  merge-unit finalization. Missing or stale verify evidence MUST run the normal pre-merge verify
   path before eligibility is reconsidered; red or unavailable evidence remains on the
   existing verify-fix or attention path and cannot merge-and-defer.
 - `iterate` MUST check the shared recovery predicate before printing an `empty` /
