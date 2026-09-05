@@ -330,6 +330,16 @@ class ProjectBoundary:
     @property
     def strict_project_rooted_paths(self) -> frozenset[Path]:
         return frozenset({self.scope_root})
+
+
+@dataclass(frozen=True)
+class StagedProviderDbSnapshot:
+    """Host and provider-visible paths for a staged task DB snapshot."""
+
+    host_path: Path
+    provider_path: Path
+
+
 def _git_error_failure() -> ResolvedRunFailure:
     return ResolvedRunFailure(
         reason="GIT_ERROR",
@@ -647,6 +657,43 @@ def _worktree_execution_dir(worktree_path: Path, boundary: ProjectBoundary) -> P
     if boundary.scope_root == Path("."):
         return worktree_path
     return _worktree_project_root(worktree_path, boundary)
+
+
+def _staged_provider_db_snapshot(
+    config: Config,
+    worktree_path: Path,
+    boundary: ProjectBoundary,
+) -> StagedProviderDbSnapshot:
+    """Return the staged DB snapshot path visible to the provider child."""
+    host_path = _worktree_project_root(worktree_path, boundary) / ".gza" / "gza.db"
+    if config.use_docker:
+        provider_path = _container_project_root(boundary) / ".gza" / "gza.db"
+    else:
+        provider_path = host_path
+    return StagedProviderDbSnapshot(host_path=host_path, provider_path=provider_path)
+
+
+def _provider_runtime_env_with_db_snapshot(
+    runtime_env: Mapping[str, str],
+    snapshot: StagedProviderDbSnapshot,
+) -> dict[str, str]:
+    """Return a provider child env routed to the staged DB snapshot."""
+    child_env = dict(runtime_env)
+    child_env["GZA_DB_PATH"] = str(snapshot.provider_path)
+    return child_env
+
+
+def _route_docker_provider_db_snapshot(config: Config, snapshot: StagedProviderDbSnapshot) -> None:
+    """Pass the provider-visible DB snapshot path through Docker container env."""
+    if not config.use_docker:
+        return
+    docker_env = [
+        str(value)
+        for value in (getattr(config, "docker_env", None) or [])
+        if not str(value).startswith("GZA_DB_PATH=")
+    ]
+    docker_env.append(f"GZA_DB_PATH={snapshot.provider_path}")
+    setattr(config, "docker_env", docker_env)
 
 
 def _format_repo_project_scope(scope_root: Path) -> str:
@@ -12334,6 +12381,7 @@ def _run_inner(
         boundary,
         read_only_db_snapshot=task.task_type != "rebase",
     )
+    staged_db_snapshot = _staged_provider_db_snapshot(config, worktree_path, boundary)
     if n_installed:
         console.print(f"Installed {n_installed} skill(s) into worktree")
 
@@ -12343,6 +12391,7 @@ def _run_inner(
     task_config.provider_cwd = provider_cwd
     task_config.docker_workdir = str(_container_execution_dir(boundary))
     task_config.docker_volumes = _build_runtime_docker_volumes(config)
+    provider_runtime_env = _provider_runtime_env_with_db_snapshot(runtime_context.env, staged_db_snapshot)
 
     if not config.use_docker:
         _create_local_dep_symlinks(config, worktree_path)
@@ -12550,6 +12599,7 @@ def _run_inner(
             canonical_git=git,
             phase="provider docker metadata preparation",
         )
+        _route_docker_provider_db_snapshot(task_config, staged_db_snapshot)
         provider_run_kwargs: dict[str, Any] = {
             "resume_session_id": task.session_id if resume else None,
             "on_session_id": _on_session_id,
@@ -12568,7 +12618,7 @@ def _run_inner(
                 log_file,
                 worktree_path,
                 provider_run_kwargs=provider_run_kwargs,
-                runtime_env=runtime_context.env,
+                runtime_env=provider_runtime_env,
             )
         finally:
             _restore_validated_docker_worktree_git_metadata(
@@ -12912,6 +12962,7 @@ def _run_non_code_task(
             boundary,
             read_only_db_snapshot=task.task_type != "rebase",
         )
+        staged_db_snapshot = _staged_provider_db_snapshot(config, worktree_path, boundary)
         if n_installed:
             console.print(f"Installed {n_installed} skill(s) into worktree")
 
@@ -12922,6 +12973,7 @@ def _run_non_code_task(
         config.provider_cwd = provider_cwd
         config.docker_workdir = str(_container_execution_dir(boundary))
         config.docker_volumes = _build_runtime_docker_volumes(config)
+        provider_runtime_env = _provider_runtime_env_with_db_snapshot(runtime_context.env, staged_db_snapshot)
 
         if not config.use_docker:
             _create_local_dep_symlinks(config, worktree_path)
@@ -12975,6 +13027,7 @@ def _run_non_code_task(
             canonical_git=git,
             phase="non-code provider docker metadata preparation",
         )
+        _route_docker_provider_db_snapshot(config, staged_db_snapshot)
         try:
             provider_run_kwargs: dict[str, Any] = {
                 "resume_session_id": task.session_id if resume else None,
@@ -12993,7 +13046,7 @@ def _run_non_code_task(
                 log_file,
                 worktree_path,
                 provider_run_kwargs=provider_run_kwargs,
-                runtime_env=runtime_context.env,
+                runtime_env=provider_runtime_env,
             )
             _apply_transcript_stats_fallback(
                 result,

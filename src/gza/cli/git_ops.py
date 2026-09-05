@@ -197,8 +197,14 @@ from ..runner import (
     _complete_failed_code_task_after_pr_publication,
     _compute_tree_fingerprint,
     _LongPhaseHeartbeatState,
+    _project_boundary,
+    _provider_runtime_env_with_db_snapshot,
     _resolve_impl_ancestor,
     _resolve_root_implementation_for_fix,
+    _resolve_task_db_path,
+    _route_docker_provider_db_snapshot,
+    _snapshot_task_db_to_worktree,
+    _staged_provider_db_snapshot,
     ensure_task_log_path,
     get_effective_config_for_task,
     task_log_storage_path,
@@ -2367,6 +2373,17 @@ def invoke_provider_resolve(
 
     provider = get_provider(resolve_config)
     work_dir = worktree_path if worktree_path is not None else config.project_dir
+    provider_runtime_env = runtime_context.env
+    if worktree_path is not None:
+        boundary = _project_boundary(config)
+        staged_db_snapshot = _staged_provider_db_snapshot(config, worktree_path, boundary)
+        _snapshot_task_db_to_worktree(
+            _resolve_task_db_path(config),
+            staged_db_snapshot.host_path.parent.parent,
+            read_only=False,
+        )
+        _route_docker_provider_db_snapshot(resolve_config, staged_db_snapshot)
+        provider_runtime_env = _provider_runtime_env_with_db_snapshot(runtime_context.env, staged_db_snapshot)
 
     if provider_target_ref is not None and provider_target_sha is not None:
         skill_cmd = build_immutable_rebase_provider_prompt(
@@ -2395,7 +2412,7 @@ def invoke_provider_resolve(
             log_file,
             work_dir,
             provider_run_kwargs={"ops_log_file": resolve_ops_log_path(config, log_file)},
-            runtime_env=runtime_context.env,
+            runtime_env=provider_runtime_env,
         )
     except Exception as exc:
         traceback_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))

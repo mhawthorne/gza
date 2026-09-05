@@ -130,6 +130,9 @@ from gza.runner import (
     _slug_exists,
     _snapshot_task_db_to_worktree,
     _stage_worktree_agent_resources,
+    _staged_provider_db_snapshot,
+    _provider_runtime_env_with_db_snapshot,
+    _route_docker_provider_db_snapshot,
     _wait_for_review_verify_process_group_exit,
     backup_database,
     build_prompt,
@@ -6578,6 +6581,94 @@ class TestStageWorktreeAgentResources:
         snapshot_path = worktree_dir / ".gza" / "gza.db"
         assert stat.S_IMODE(snapshot_path.stat().st_mode) == 0o644
 
+    def test_provider_env_routes_to_readonly_snapshot_without_mutating_runtime_env(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "repo"
+        worktree_dir = tmp_path / "worktree"
+        live_db_path = project_dir / ".gza" / "gza.db"
+        project_dir.mkdir(parents=True)
+        worktree_dir.mkdir()
+        live_db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(live_db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.commit()
+        conn.close()
+
+        config = Mock(spec=Config)
+        config.project_dir = project_dir
+        config.db_path = live_db_path
+        config.use_docker = False
+        boundary = ProjectBoundary(repo_root=project_dir, scope_root=Path("."), local_dependencies=())
+        runtime_env = {"GZA_DB_PATH": str(live_db_path), "TOKEN": "runtime"}
+
+        with patch("gza.skills_utils.ensure_all_skills", return_value=0):
+            _stage_worktree_agent_resources(config, worktree_dir, boundary=boundary)
+
+        snapshot = _staged_provider_db_snapshot(config, worktree_dir, boundary)
+        provider_env = _provider_runtime_env_with_db_snapshot(runtime_env, snapshot)
+
+        assert provider_env["GZA_DB_PATH"] == str(worktree_dir / ".gza" / "gza.db")
+        assert runtime_env["GZA_DB_PATH"] == str(live_db_path)
+        assert stat.S_IMODE(snapshot.host_path.stat().st_mode) == 0o444
+
+    def test_provider_env_routes_rebase_to_writable_snapshot(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "repo"
+        worktree_dir = tmp_path / "worktree"
+        live_db_path = project_dir / ".gza" / "gza.db"
+        project_dir.mkdir(parents=True)
+        worktree_dir.mkdir()
+        live_db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(live_db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.commit()
+        conn.close()
+
+        config = Mock(spec=Config)
+        config.project_dir = project_dir
+        config.db_path = live_db_path
+        config.use_docker = False
+        boundary = ProjectBoundary(repo_root=project_dir, scope_root=Path("."), local_dependencies=())
+
+        with patch("gza.skills_utils.ensure_all_skills", return_value=0):
+            _stage_worktree_agent_resources(
+                config,
+                worktree_dir,
+                boundary=boundary,
+                read_only_db_snapshot=False,
+            )
+
+        snapshot = _staged_provider_db_snapshot(config, worktree_dir, boundary)
+        provider_env = _provider_runtime_env_with_db_snapshot({"GZA_DB_PATH": str(live_db_path)}, snapshot)
+
+        assert stat.S_IMODE(snapshot.host_path.stat().st_mode) == 0o644
+        assert provider_env["GZA_DB_PATH"] == str(worktree_dir / ".gza" / "gza.db")
+
+    def test_docker_provider_env_uses_container_visible_snapshot_path(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "repo" / "services" / "foo"
+        worktree_dir = tmp_path / "worktree"
+        project_dir.mkdir(parents=True)
+        worktree_dir.mkdir()
+        config = Mock(spec=Config)
+        config.project_dir = project_dir
+        config.db_path = project_dir / ".gza" / "gza.db"
+        config.use_docker = True
+        config.docker_env = ["TOKEN=runtime", "GZA_DB_PATH=/old/live.db"]
+        boundary = ProjectBoundary(
+            repo_root=tmp_path / "repo",
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+
+        snapshot = _staged_provider_db_snapshot(config, worktree_dir, boundary)
+        provider_env = _provider_runtime_env_with_db_snapshot(
+            {"GZA_DB_PATH": str(config.db_path), "TOKEN": "runtime"},
+            snapshot,
+        )
+        _route_docker_provider_db_snapshot(config, snapshot)
+
+        assert snapshot.host_path == worktree_dir / "services" / "foo" / ".gza" / "gza.db"
+        assert provider_env["GZA_DB_PATH"] == "/workspace/services/foo/.gza/gza.db"
+        assert config.docker_env == ["TOKEN=runtime", "GZA_DB_PATH=/workspace/services/foo/.gza/gza.db"]
+
     def test_run_non_code_task_creates_readonly_snapshot(self, tmp_path: Path):
         """Non-code task path should expose readonly worktree DB snapshot."""
         db_path = tmp_path / "test.db"
@@ -6603,16 +6694,28 @@ class TestStageWorktreeAgentResources:
             "snapshot_mode": None,
             "task_prompt": None,
             "write_error": None,
+            "provider_db_path": None,
+            "work_dir_db_path": None,
         }
 
         def provider_run(
-            _cfg, _prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None
+            _cfg,
+            _prompt,
+            _log_file,
+            work_dir,
+            resume_session_id=None,
+            on_session_id=None,
+            on_step_count=None,
+            env=None,
         ):
             snapshot_path = work_dir / ".gza" / "gza.db"
             assert snapshot_path.exists()
+            assert env is not None
+            observed["provider_db_path"] = env["GZA_DB_PATH"]
+            observed["work_dir_db_path"] = str(snapshot_path)
             observed["snapshot_mode"] = stat.S_IMODE(snapshot_path.stat().st_mode)
 
-            snapshot_conn = sqlite3.connect(str(snapshot_path))
+            snapshot_conn = sqlite3.connect(env["GZA_DB_PATH"])
             row = snapshot_conn.execute("SELECT prompt FROM tasks WHERE id = ?", (task.id,)).fetchone()
             assert row is not None
             observed["task_prompt"] = row[0]
@@ -6650,6 +6753,7 @@ class TestStageWorktreeAgentResources:
 
         assert result == 0
         assert observed["snapshot_mode"] == 0o444
+        assert observed["provider_db_path"] == observed["work_dir_db_path"]
         assert observed["task_prompt"] == "Explore snapshot behavior"
         assert observed["write_error"] is not None and "readonly" in str(observed["write_error"])
 
@@ -9167,7 +9271,7 @@ class TestFailureReasonGroundTruth:
         assert failed.failure_reason == "TERMINATED"
         assert provider_seen["interrupt_source"] == "watch_reconcile_no_activity"
         assert provider_seen["interrupt_detail"] == "watch reconciliation detected no recent task log activity"
-        assert provider_seen["db_path"] == str(db_path.resolve())
+        assert provider_seen["db_path"] == str(config.worktree_path / task.slug / ".gza" / "gza.db")
         assert failed.log_file is not None
         ops_text = ops_log_path_for(tmp_path / failed.log_file).read_text()
         assert '"subtype": "interrupt"' in ops_text
@@ -9923,7 +10027,7 @@ class TestRunStepPersistenceIntegration:
         assert refreshed.log_file is not None
         assert provider_seen["interrupt_source"] == "watch_reconcile_no_activity"
         assert provider_seen["interrupt_detail"] == "watch reconciliation detected no recent task log activity"
-        assert provider_seen["db_path"] == str(db_path.resolve())
+        assert provider_seen["db_path"] == str(config.worktree_path / f"{task.slug}-{task.task_type}" / ".gza" / "gza.db")
 
         log_path = tmp_path / refreshed.log_file
         log_text = ops_log_path_for(log_path).read_text()
@@ -11248,8 +11352,10 @@ class TestNoChangesWithExistingCommits:
         assert seen["verify_cwd"] == runtime_context.cwd
         assert seen["run_env"] == {
             **expected_env,
+            "GZA_DB_PATH": "/workspace/.gza/gza.db",
             "PWD": str((config.worktree_path / task.slug).resolve()),
         }
+        assert runtime_context.env["GZA_DB_PATH"] == str(config.db_path)
         assert seen["run_work_dir"] == config.worktree_path / task.slug
         assert git_calls[0] == (runtime_context.cwd, expected_env)
         assert runtime_context.env["PATH"] == "/captured/bin"

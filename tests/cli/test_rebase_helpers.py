@@ -1,5 +1,7 @@
 """Tests for rebase helper functions."""
 
+import sqlite3
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -8,6 +10,7 @@ from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.log_paths import ops_log_path_for
 from gza.providers.base import RunResult
+from gza.runtime_context import RuntimeExecutionContext
 
 
 def _new_config(tmp_path: Path, provider: str = "codex", use_docker: bool = True) -> Config:
@@ -88,6 +91,56 @@ def test_invoke_provider_resolve_uses_worktree_mode_without_continue(tmp_path: P
     assert result is True
     assert mock_provider.run.call_args.args[1] == "/gza-rebase --auto"
     assert mock_provider.run.call_args.args[3] == worktree
+
+
+def test_invoke_provider_resolve_routes_rebase_to_writable_snapshot(tmp_path: Path) -> None:
+    from gza.cli import invoke_provider_resolve
+
+    config = _new_config(tmp_path, provider="claude", use_docker=False)
+    store = SqliteTaskStore.from_config(config)
+    store.add("Parent", task_type="implement")
+    task = _new_task()
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    log_file = _new_log_file(tmp_path)
+    runtime_context = RuntimeExecutionContext(
+        cwd=config.project_dir,
+        env={"GZA_DB_PATH": str(config.db_path), "PATH": "/bin"},
+        project_id=config.project_id,
+        db_path=config.db_path,
+    )
+    observed: dict[str, str | int | None] = {"db_path": None, "mode": None}
+
+    def provider_run(_config, _prompt, _log_file, _work_dir, env=None, **_kwargs):
+        assert env is not None
+        observed["db_path"] = env["GZA_DB_PATH"]
+        snapshot_path = Path(env["GZA_DB_PATH"])
+        observed["mode"] = stat.S_IMODE(snapshot_path.stat().st_mode)
+        return RunResult(exit_code=0)
+
+    with (
+        patch("gza.cli.ensure_skill", return_value=True),
+        patch("gza.providers.get_provider") as mock_get_provider,
+        patch("gza.cli.git_ops._is_rebase_in_progress", return_value=False),
+        patch("gza.skills_utils.copy_skill", return_value=(True, "installed")),
+    ):
+        mock_provider = Mock()
+        mock_provider.run.side_effect = provider_run
+        mock_get_provider.return_value = mock_provider
+
+        result = invoke_provider_resolve(
+            task,
+            "feature",
+            "main",
+            config,
+            log_file=log_file,
+            worktree_path=worktree,
+            runtime_context=runtime_context,
+        )
+
+    assert result is True
+    assert observed == {"db_path": str(worktree / ".gza" / "gza.db"), "mode": 0o644}
+    assert runtime_context.env["GZA_DB_PATH"] == str(config.db_path)
 
 
 def test_invoke_provider_resolve_names_immutable_target_ref_and_sha(tmp_path: Path) -> None:
