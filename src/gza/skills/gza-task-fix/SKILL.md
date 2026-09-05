@@ -110,11 +110,14 @@ print(Config.load(Path.cwd()).db_path)
 "
 ```
 
-Compare this to the same command run from `<START_DIR>`. If they differ and the DB path is project-relative (not an absolute path like `~/.gza/gza.db`), hardlink the real file in before doing anything else:
+Compare this to the same command run from `<START_DIR>`. If they differ and the DB path is project-relative (not an absolute path like `~/.gza/gza.db`), link the whole `.gza` directory in before doing anything else — do **not** hardlink only `gza.db`. SQLite keeps `-wal`/`-shm` files alongside the main `.db` file, and those are ordinary per-directory files, not covered by a hardlink of the main file alone. Hardlinking just `gza.db` gives the new worktree a private WAL that silently diverges from every other worktree's writes until someone manually checkpoints it — a write made here can be invisible everywhere else, and vice versa, with no error. Symlinking the whole directory instead makes `gza.db`, `gza.db-wal`, and `gza.db-shm` the literal same files everywhere, so there is only ever one WAL.
 
 ```bash
-ln <START_DIR>/.gza/gza.db .gza-worktrees/<impl_branch>/.gza/gza.db
+rm -rf .gza-worktrees/<impl_branch>/.gza   # only if it's an empty/throwaway DB this worktree just created
+ln -s <START_DIR>/.gza .gza-worktrees/<impl_branch>/.gza
 ```
+
+If a stray local DB was already created here (any `uv run gza`/`SqliteTaskStore` command ran before this check), the `rm -rf` above discards it — that's correct as long as you haven't already relied on data written to it. If you have, checkpoint it first (`PRAGMA wal_checkpoint(TRUNCATE)`) and inspect before deleting.
 
 If the db paths already match (common when the project uses a global/absolute `db_path`), skip this — there is nothing to link.
 
