@@ -2234,6 +2234,7 @@ class _FakeGit:
         ancestors: set[tuple[str, str]] | None = None,
         can_merge_refs: set[tuple[str, str]] | None = None,
         name_status: str = "",
+        diff: str = "diff --git a/example b/example\n+landing change\n",
     ) -> None:
         self.heads = heads
         self._current_branch = current_branch
@@ -2242,6 +2243,7 @@ class _FakeGit:
         self.ancestors = ancestors or set()
         self.can_merge_refs = can_merge_refs
         self.name_status = name_status
+        self.diff = diff
         self.merge_calls: list[tuple[str, str | None]] = []
         self.mutation_calls: list[str] = []
 
@@ -2267,6 +2269,9 @@ class _FakeGit:
     def get_diff_name_status(self, revision_range: str, *, check: bool = True) -> str:
         assert check is True
         return self.name_status
+
+    def get_diff(self, revision_range: str) -> str:
+        return self.diff
 
     def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
         del use_cherry
@@ -3657,7 +3662,7 @@ def test_landing_coordinator_production_fingerprint_tracks_park_and_judgment_ide
     assert first.parked_reason is None
     assert second.parked_reason == "review-max-cycles-reached"
     assert second.policy_judgment_identity is not None
-    assert second.policy_judgment_identity.startswith("artifact:")
+    assert second.policy_judgment_identity.startswith("sha256:")
 
 
 def test_landing_coordinator_dry_run_uses_merge_unit_attached_code_review_evidence(tmp_path) -> None:
@@ -5249,6 +5254,146 @@ def test_cmd_land_guarded_uses_durable_judge_and_typed_authorization_to_reach_me
     assert merge_authorizations[0].review_id == review.id
     assert merge_authorizations[0].blocker_fingerprints
     assert "Landed" in capsys.readouterr().out
+
+
+def test_cmd_land_judge_receives_normalized_adjudication_content_and_actual_diff(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from gza.cli import land as land_cli
+    from gza.landing_judge import LandingJudgeResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "CLI guarded landing content", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", "Out-of-scope polish debt", "docs/internal/landing.md:12"),),
+    )
+    store.update(review)
+    _add_review_blocker_resolution(store, impl=impl, review=review, reason="adjacent")
+    _park_for_review_blocker_adjudication(store, impl)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+        diff="diff --git a/docs/internal/landing.md b/docs/internal/landing.md\n+current patch\n",
+    )
+    captured: dict[str, Any] = {}
+
+    def obtain(**kwargs: Any) -> LandingJudgeResult:
+        captured["identity"] = kwargs["identity"]
+        captured["prompt"] = kwargs["prompt"]
+        return LandingJudgeResult(judgment=LandingJudgment("BLOCK", blocking_fact="captured context"))
+
+    def merge_single(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("merge must not run when the judge refuses")
+
+    monkeypatch.setattr(land_cli.Config, "load", lambda _project_dir: config)
+    monkeypatch.setattr(land_cli, "get_store", lambda _config, open_mode="readwrite": store)
+    monkeypatch.setattr(land_cli, "resolve_id", lambda _config, task_id: task_id)
+    monkeypatch.setattr(land_cli, "Git", lambda _project_dir: git)
+    monkeypatch.setattr("gza.landing_judge.obtain_landing_judgment", obtain)
+    monkeypatch.setattr("gza.cli.git_ops._merge_single_task", merge_single)
+
+    rc = land_cli.cmd_land(argparse.Namespace(project_dir=tmp_path, task_id=impl.id, policy="guarded", dry_run=False))
+
+    assert rc == 1
+    assert "normalized_reason" in captured["prompt"]
+    assert "adjacent" in captured["prompt"]
+    assert "diff --git a/docs/internal/landing.md b/docs/internal/landing.md" in captured["prompt"]
+    assert captured["identity"].adjudication_content_identity.startswith("sha256:")
+
+
+@pytest.mark.parametrize("failure", ("diff", "judge"))
+def test_cmd_land_diff_and_judge_exceptions_are_typed_refusals_without_merge(
+    monkeypatch,
+    capsys,
+    tmp_path,
+    failure: str,
+) -> None:
+    from gza.cli import land as land_cli
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "CLI guarded landing failure", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", "Out-of-scope polish debt", "docs/internal/landing.md:12"),),
+    )
+    store.update(review)
+    _add_review_blocker_resolution(store, impl=impl, review=review)
+    _park_for_review_blocker_adjudication(store, impl)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    if failure == "diff":
+        def bad_diff(_revision_range: str) -> str:
+            raise RuntimeError("diff unavailable")
+
+        git.get_diff = bad_diff  # type: ignore[method-assign]
+
+    def obtain(**_kwargs: Any) -> Any:
+        if failure == "judge":
+            raise RuntimeError("judge unavailable")
+        raise AssertionError("judge service must not run when diff evidence is unavailable")
+
+    def merge_single(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("merge must not run after judge evidence failure")
+
+    monkeypatch.setattr(land_cli.Config, "load", lambda _project_dir: config)
+    monkeypatch.setattr(land_cli, "get_store", lambda _config, open_mode="readwrite": store)
+    monkeypatch.setattr(land_cli, "resolve_id", lambda _config, task_id: task_id)
+    monkeypatch.setattr(land_cli, "Git", lambda _project_dir: git)
+    monkeypatch.setattr("gza.landing_judge.obtain_landing_judgment", obtain)
+    monkeypatch.setattr("gza.cli.git_ops._merge_single_task", merge_single)
+
+    rc = land_cli.cmd_land(argparse.Namespace(project_dir=tmp_path, task_id=impl.id, policy="guarded", dry_run=False))
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "Cannot land" in output
+    assert "guarded landing judgment" in output
+    assert ("diff unavailable" in output) if failure == "diff" else ("judge unavailable" in output)
+
+
+def test_landing_adjudication_identity_changes_when_reason_changes_with_stable_artifact_id(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "adjudication reason identity", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", "Out-of-scope polish debt", "docs/internal/landing.md:12"),),
+    )
+    store.update(review)
+    artifact = _add_review_blocker_resolution(store, impl=impl, review=review, reason="out_of_scope")
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    first = coordinator._landing_policy_facts(identity)
+
+    _add_review_blocker_resolution(store, impl=impl, review=review, reason="adjacent", artifact_id=artifact.id)
+    second = coordinator._landing_policy_facts(identity)
+
+    assert first.adjudication_fingerprints != second.adjudication_fingerprints
+    assert first.open_blockers[0].blocker_class == "out_of_scope"
+    assert second.open_blockers[0].blocker_class == "adjacent"
 
 
 def _verify_config(tmp_path) -> Config:

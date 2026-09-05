@@ -69,14 +69,22 @@ class MergeLandingAuthorization:
     target_branch: str
     source_sha: str
     target_sha: str
+    representative_task_id: str | None = None
+    member_task_ids: tuple[str, ...] = ()
+    policy_version: str | None = None
+    schema_version: str | None = None
+    authoritative_scope_identity: str | None = None
     allowed_overrides: tuple[str, ...] = ()
     judgment_artifact_id: str | None = None
     judgment_key: str | None = None
+    live_judgment_identity: str | None = None
     review_id: str | None = None
     reviewed_head: str | None = None
     review_mode: str | None = None
     review_verdict: str | None = None
+    blocker_identities: tuple[str, ...] = ()
     blocker_fingerprints: tuple[str, ...] = ()
+    followup_identities: tuple[str, ...] = ()
     followup_fingerprints: tuple[str, ...] = ()
     verify_epoch: str | None = None
     verify_verdict: str | None = None
@@ -86,8 +94,11 @@ class MergeLandingAuthorization:
     adjudication_fingerprints: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "member_task_ids", tuple(sorted(set(self.member_task_ids))))
         object.__setattr__(self, "allowed_overrides", tuple(sorted(set(self.allowed_overrides))))
+        object.__setattr__(self, "blocker_identities", tuple(sorted(set(self.blocker_identities))))
         object.__setattr__(self, "blocker_fingerprints", tuple(sorted(set(self.blocker_fingerprints))))
+        object.__setattr__(self, "followup_identities", tuple(sorted(set(self.followup_identities))))
         object.__setattr__(self, "followup_fingerprints", tuple(sorted(set(self.followup_fingerprints))))
         object.__setattr__(self, "adjudication_fingerprints", tuple(sorted(set(self.adjudication_fingerprints))))
 
