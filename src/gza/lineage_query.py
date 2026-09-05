@@ -2424,6 +2424,7 @@ def _query_lineage_owner_rows_with_context(
             )
             if resolved_in_query:
                 continue
+            reroot_failed_leaves = bool(rerootable_failed_leaves)
 
             lifecycle_action_task = _select_representative_completed_task(
                 store,
@@ -2431,6 +2432,7 @@ def _query_lineage_owner_rows_with_context(
                 unresolved_tasks,
                 include_dropped=not query.exclude_dropped_from_planning,
             )
+            reroot_failed_leaves = reroot_failed_leaves and lifecycle_action_task is None
             planning_task = lifecycle_action_task
             recovery_action_task: DbTask | None = None
             recovery_leaf_task: DbTask | None = None
@@ -2477,7 +2479,7 @@ def _query_lineage_owner_rows_with_context(
                     continue
                 if decision.action != "skip" or attention_action is not None:
                     failed_action_candidates.append((failed_task, decision, attention_action))
-                    if query.task_ids is None:
+                    if query.task_ids is None and not reroot_failed_leaves:
                         break
             failed_action_candidate = failed_action_candidates[0][0] if failed_action_candidates else None
             failed_action_candidate_decision = failed_action_candidates[0][1] if failed_action_candidates else None
@@ -2616,8 +2618,14 @@ def _query_lineage_owner_rows_with_context(
                 if query.task_ids is not None and lifecycle_action_task is None and failed_action_candidates
                 else ()
             )
-            if selector_recovery_plans:
-                for leaf, decision, attention_action in selector_recovery_plans:
+            reroot_recovery_plans = (
+                tuple(failed_action_candidates)
+                if reroot_failed_leaves and lifecycle_action_task is None and failed_action_candidates
+                else ()
+            )
+            split_recovery_plans = reroot_recovery_plans or selector_recovery_plans
+            if split_recovery_plans:
+                for leaf, decision, attention_action in split_recovery_plans:
                     row_action = attention_action
                     if row_action is None and decision.action in {"resume", "retry"}:
                         recovery_action = {
@@ -2634,9 +2642,26 @@ def _query_lineage_owner_rows_with_context(
                         )
                         row_action = get_active_watch_no_progress_attention(store, candidate=candidate)
                     row_status = _classify_lineage_status(row_action) if row_action is not None else "actionable"
+                    row_owner = leaf if reroot_recovery_plans else owner
+                    row_tree = tree
+                    row_members = rendered_members
+                    if reroot_recovery_plans:
+                        row_tree, row_members = _build_owner_tree(
+                            root_task=root,
+                            owner_task=leaf,
+                            unresolved_tasks=(leaf,),
+                            based_on_children=indexes.based_on_children,
+                            depends_on_children=indexes.depends_on_children,
+                            drop_excluded_task_ids=drop_excluded_task_ids,
+                        )
+                    if not _owner_matches_tag_filters(row_owner, query, tag_matcher=task_matches_tag_filters):
+                        continue
                     rows.append(
                         replace(
                             base_row,
+                            owner_task=row_owner,
+                            members=row_members,
+                            tree=row_tree,
                             lineage_status=row_status,
                             next_action=row_action,
                             next_action_reason=str(row_action.get("description", "")) if row_action is not None else "",

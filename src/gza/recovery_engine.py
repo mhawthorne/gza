@@ -2225,6 +2225,8 @@ def _is_resolved_by_landed_merge_unit_or_owner(
         return False
     unit = _resolve_task_merge_unit(store, task.id, read_context=read_context)
     if unit is not None:
+        if unit.owner_task_id and unit.owner_task_id != task.id and task.has_commits:
+            return False
         if unit.state == "merged":
             return unit.owner_task_id == task.id
         owner_task_id = unit.owner_task_id

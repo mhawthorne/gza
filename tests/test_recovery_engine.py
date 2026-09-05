@@ -22,6 +22,7 @@ from gza.operator_state import MOOT_EMPTY_LIFECYCLE_DETAIL, MOOT_REDUNDANT_LIFEC
 from gza.recovery_engine import (
     FailedRecoveryDecision,
     _build_recovery_chain_snapshot,
+    _is_resolved_by_landed_merge_unit_or_owner,
     _is_resolved_by_landed_lineage,
     _MergeContext,
     classify_failed_task_landed_same_unit_suppression,
@@ -6279,6 +6280,47 @@ def test_get_completed_same_slice_sibling_attempt_requires_terminal_merge_proof_
     decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
     assert decision.reason_code != "same_slice_sibling_landed"
     assert decision.recovery_task_id is None
+
+
+def test_landed_owner_unit_does_not_swallow_failed_leaf_with_own_commits(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Merged owner", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.branch = "feature/merged-owner-recovery"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    owner.completed_at = datetime(2026, 6, 30, 8, 0, tzinfo=UTC)
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed_leaf = store.add(
+        "Failed leaf with distinct commits",
+        task_type="implement",
+        based_on=owner.id,
+        recovery_origin="manual",
+    )
+    assert failed_leaf.id is not None
+    failed_leaf.status = "failed"
+    failed_leaf.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed_leaf.branch = "feature/distinct-failed-leaf"
+    failed_leaf.has_commits = True
+    failed_leaf.completed_at = datetime(2026, 6, 30, 9, 0, tzinfo=UTC)
+    store.update(failed_leaf)
+    store.attach_task_to_merge_unit(failed_leaf.id, owner_unit.id, "implement")
+
+    assert _is_resolved_by_landed_merge_unit_or_owner(store, failed_leaf) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed_leaf.id]
 
 
 def test_list_failed_tasks_for_recovery_keeps_later_plan_slice_with_its_own_branch_after_earlier_slice_merges(

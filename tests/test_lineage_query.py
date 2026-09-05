@@ -2693,6 +2693,7 @@ def test_query_lineage_owner_rows_reroots_same_unit_leaf_when_live_branch_is_unm
     assert row.recovery_action_task.id == failed_leaf.id
     assert row.recovery_leaf_task is not None
     assert row.recovery_leaf_task.id == failed_leaf.id
+    assert row.unresolved_tasks == (failed_leaf,)
     assert owner.id not in {row.owner_task.id for row in rows}
     assert ("count_commits_ahead_checked", f"{owner.branch}->main") in git.probes
 
@@ -2754,6 +2755,9 @@ def test_query_lineage_owner_rows_reroots_same_unit_failed_leaf_when_proof_unava
     assert row.owner_task.id == failed_leaf.id
     assert row.recovery_action_task is not None
     assert row.recovery_action_task.id == failed_leaf.id
+    assert row.recovery_leaf_task is not None
+    assert row.recovery_leaf_task.id == failed_leaf.id
+    assert row.unresolved_tasks == (failed_leaf,)
 
 
 def test_query_lineage_owner_rows_reroots_branchless_failed_review_leaf_under_merged_owner(
