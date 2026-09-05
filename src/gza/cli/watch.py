@@ -6682,6 +6682,7 @@ def _bucket_unit_live_task(
     store: SqliteTaskStore,
     analysis: "_WatchCycleAnalysis",
     max_recovery_attempts: int,
+    unit: MergeUnit | None = None,
 ) -> str | None:
     """Classify one unit's live task into a _CycleUnitAccounting bucket, or None to exclude it."""
     if task.status == "in_progress":
@@ -6700,6 +6701,11 @@ def _bucket_unit_live_task(
         if decision.action in {"resume", "retry", "reconcile"}:
             return "recovery"
         return "parked"
+    if task.status == "completed":
+        # The live task finished but the unit isn't merged yet - it's ready to
+        # advance to its next lifecycle step (create review, merge, ...)
+        # unless the unit itself is blocked on a prerequisite.
+        return "blocked" if unit is not None and unit.state == "blocked" else "pending"
     return "other"
 
 
@@ -6725,7 +6731,11 @@ def _compute_cycle_unit_accounting(
             counts["other"] += 1
             continue
         bucket = _bucket_unit_live_task(
-            live_task, store=store, analysis=analysis, max_recovery_attempts=max_recovery_attempts
+            live_task,
+            store=store,
+            analysis=analysis,
+            max_recovery_attempts=max_recovery_attempts,
+            unit=unit,
         )
         if bucket is not None:
             counts[bucket] += 1

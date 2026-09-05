@@ -28,7 +28,6 @@ from rich.console import Console
 import gza.cli.watch as watch_module
 import gza.colors as colors
 import gza.recovery_engine as recovery_engine
-from gza.merge_state import BranchMergeClassification
 from gza.advance_engine import (
     NOOP_IMPROVE_KIND_VERIFY_ONLY,
     PARK_REASON_VERIFY_BUDGET_EXCEEDED,
@@ -67,7 +66,6 @@ from gza.cli.git_ops import (
     _StagedIsolatedMergeAction,
     ensure_watch_main_checkout,
 )
-from gza.sync_ops import BranchSyncResult
 from gza.cli.watch import (
     MAIN_VERIFY_REMEDIATION_ATTEMPT_LIMIT,
     MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON,
@@ -98,6 +96,8 @@ from gza.cli.watch import (
     _collect_completed_transition_ids,
     _collect_live_running_state,
     _collect_unhandled_failures,
+    _compute_cycle_task_accounting,
+    _compute_cycle_unit_accounting,
     _compute_failure_backoff_seconds,
     _count_live_workers,
     _CycleResult,
@@ -127,7 +127,6 @@ from gza.cli.watch import (
     _maybe_repair_target_already_merged_skip,
     _maybe_skip_watch_no_progress_for_transient_terminal,
     _observe_selected_watch_no_progress_without_dispatch,
-    _compute_cycle_task_accounting,
     _OwnerFailureBackoffState,
     _query_owner_rows_with_context,
     _record_failure_backoff_updates,
@@ -141,10 +140,10 @@ from gza.cli.watch import (
     _system_can_run_tasks,
     _task_snapshot,
     _warn_if_installed_gza_changed,
+    _watch_failed_recovery_scan_is_current,
     _watch_iterate_impl_target,
     _watch_log_path,
     _watch_needs_attention_message,
-    _watch_failed_recovery_scan_is_current,
     _watch_no_progress_result_deferred_for_transient_backoff,
     _watch_reexec_argv,
     _WatchCycleAnalysis,
@@ -229,6 +228,7 @@ from gza.merge_finalization_proof import (
     persist_merge_finalization_attempt_proof,
     persist_merge_finalization_prepared_attempt,
 )
+from gza.merge_state import BranchMergeClassification
 from gza.plan_review_verdict import validate_plan_review_manifest
 from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
@@ -248,6 +248,7 @@ from gza.review_verdict import ParsedReviewReport, ReviewFinding, parse_review_r
 from gza.review_verify_state import VERIFY_GATE_ARTIFACT_KIND, persist_verify_gate_artifact
 from gza.runner import LongPhaseProgress, _make_review_verify_result, _read_darwin_process_tree_cpu_seconds
 from gza.runtime_context import RuntimeExecutionContext
+from gza.sync_ops import BranchSyncResult
 from gza.unstick import VERIFY_FIX_FAILED_REASON, select_and_clear_parked_tasks
 from gza.watch_leases import (
     WATCH_SUPERVISOR_LEASE_NAME,
@@ -22621,6 +22622,78 @@ def test_compute_cycle_task_accounting_classifies_failed_tasks(tmp_path: Path) -
     assert accounting.recovery == 1
     assert accounting.other == 0
     assert accounting.total == 2
+
+
+def test_compute_cycle_unit_accounting_counts_units_not_tasks(tmp_path: Path) -> None:
+    """A completed owner awaiting its next step is pending/blocked, never other.
+
+    Regression: the live task of a not-yet-merged unit is very commonly
+    ``completed`` (the implement finished; watch hasn't created the review or
+    dispatched the merge yet). That case was originally unhandled and fell
+    into the ``other`` residual bucket for the large majority of real units.
+    """
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    ready_impl = store.add("Implement ready slice", task_type="implement")
+    assert ready_impl.id is not None
+    ready_impl.status = "completed"
+    ready_impl.has_commits = True
+    ready_impl.merge_status = "unmerged"
+    ready_impl.branch = "feature/ready-slice"
+    ready_impl.completed_at = datetime.now(UTC)
+    store.update(ready_impl)
+    ready_unit = store.create_merge_unit(
+        source_branch=ready_impl.branch,
+        target_branch="main",
+        owner_task_id=ready_impl.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(ready_impl.id, ready_unit.id, "owner")
+
+    blocked_impl = store.add("Implement blocked slice", task_type="implement")
+    assert blocked_impl.id is not None
+    blocked_impl.status = "completed"
+    blocked_impl.has_commits = True
+    blocked_impl.merge_status = "unmerged"
+    blocked_impl.branch = "feature/blocked-slice"
+    blocked_impl.completed_at = datetime.now(UTC)
+    store.update(blocked_impl)
+    blocked_unit = store.create_merge_unit(
+        source_branch=blocked_impl.branch,
+        target_branch="main",
+        owner_task_id=blocked_impl.id,
+        state="blocked",
+    )
+    store.attach_task_to_merge_unit(blocked_impl.id, blocked_unit.id, "owner")
+
+    running_impl = store.add("Implement running slice", task_type="implement")
+    assert running_impl.id is not None
+    running_impl.status = "in_progress"
+    running_impl.branch = "feature/running-slice"
+    store.update(running_impl)
+    running_unit = store.create_merge_unit(
+        source_branch=running_impl.branch,
+        target_branch="main",
+        owner_task_id=running_impl.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(running_impl.id, running_unit.id, "owner")
+
+    analysis = SimpleNamespace(watch_read_context=RecoveryReadContext())
+    accounting = _compute_cycle_unit_accounting(
+        store=store,
+        analysis=analysis,
+        tags=None,
+        any_tag=True,
+        max_recovery_attempts=3,
+    )
+
+    assert accounting.pending == 1
+    assert accounting.blocked == 1
+    assert accounting.running == 1
+    assert accounting.other == 0
+    assert accounting.total == 3
 
 
 def test_watch_cycle_logs_tag_scope_with_all_mode(tmp_path: Path) -> None:
