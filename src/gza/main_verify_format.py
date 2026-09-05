@@ -12,6 +12,11 @@ from .main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
 )
 from .main_verify_target import current_local_target_head_sha
+from .schema_compat import (
+    SCHEMA_RUNTIME_SKEW_EXIT_STATUS,
+    SchemaCompatibilityDiagnostic,
+    parse_schema_compatibility_diagnostic,
+)
 
 MainVerifyTargetProof = Literal["current", "stale", "unproven"]
 
@@ -71,6 +76,8 @@ def format_red_duration(red_since: datetime, now: datetime) -> str:
 
 
 def main_verify_state_failure_signature(state: Any) -> str | None:
+    if main_verify_state_is_schema_runtime_skew(state):
+        return None
     signature = getattr(state, "failure_signature", None)
     if isinstance(signature, str) and signature:
         return signature
@@ -89,6 +96,29 @@ def main_verify_state_failure_signature(state: Any) -> str | None:
 
 def main_verify_state_is_freshness_unavailable(state: Any) -> bool:
     return getattr(state, "verify_exit_status", None) == MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
+
+
+def main_verify_state_schema_compatibility(state: Any) -> SchemaCompatibilityDiagnostic | None:
+    diagnostic = getattr(state, "schema_compatibility", None)
+    if isinstance(diagnostic, SchemaCompatibilityDiagnostic):
+        return diagnostic
+    return parse_schema_compatibility_diagnostic(
+        "\n".join(
+            value
+            for value in (
+                getattr(state, "failure", None),
+                getattr(state, "alert_message", None),
+            )
+            if isinstance(value, str) and value
+        )
+    )
+
+
+def main_verify_state_is_schema_runtime_skew(state: Any) -> bool:
+    return (
+        getattr(state, "verify_exit_status", None) == SCHEMA_RUNTIME_SKEW_EXIT_STATUS
+        or main_verify_state_schema_compatibility(state) is not None
+    )
 
 
 def main_verify_state_status_classification(state: Any) -> MainVerifyStatusClassification:
@@ -123,6 +153,7 @@ def main_verify_state_exhausted_remediation_attention(state: Any) -> MainVerifyR
     if verify_exit_status in {
         MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
         MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+        SCHEMA_RUNTIME_SKEW_EXIT_STATUS,
     }:
         return None
     status_classification = main_verify_state_status_classification(state)
@@ -146,6 +177,7 @@ def main_verify_state_is_red_verdict(state: Any) -> bool:
     if verify_exit_status in {
         MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
         MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+        SCHEMA_RUNTIME_SKEW_EXIT_STATUS,
     }:
         return False
     status_classification = main_verify_state_status_classification(state)
@@ -165,9 +197,9 @@ def main_verify_state_is_red_verdict(state: Any) -> bool:
 
 
 def main_verify_state_needs_non_red_attention(state: Any) -> bool:
-    return (
-        not main_verify_state_gate_disabled(state)
-        and getattr(state, "verify_exit_status", None) == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
+    return not main_verify_state_gate_disabled(state) and (
+        getattr(state, "verify_exit_status", None) == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
+        or main_verify_state_is_schema_runtime_skew(state)
     )
 
 
@@ -241,6 +273,20 @@ def _format_unproven_freshness_unavailable_message(state: Any) -> str:
     return "main verify freshness unproven at current HEAD; exact tree fingerprint unavailable"
 
 
+def _format_schema_runtime_skew_message(state: Any) -> str:
+    diagnostic = main_verify_state_schema_compatibility(state)
+    detail = ""
+    if diagnostic is not None:
+        detail = (
+            f"; observed DB v{diagnostic.observed_db_version}, "
+            f"supported v{diagnostic.supported_db_version}"
+        )
+    return (
+        "main verify runtime unavailable - verify runtime is stale relative to the database schema"
+        f"{detail}; restart or update the runtime, then rerun from canonical main"
+    )
+
+
 def _format_generic_launch_failed_message() -> str:
     return "main verify misconfigured - verify command launch failed; fix the environment, not the code"
 
@@ -295,6 +341,8 @@ def format_main_verify_attention_message(
         message = "main verify disabled; merges allowed"
     elif verify_status == "passed":
         message = "main verify passed; merges allowed"
+    elif main_verify_state_is_schema_runtime_skew(state):
+        message = _format_schema_runtime_skew_message(state)
     elif main_verify_state_is_freshness_unavailable(state):
         if target_proof == "current":
             message = _format_current_freshness_unavailable_message(state)

@@ -54,6 +54,11 @@ from gza.review_verify_state import (
     persist_verify_gate_artifact,
     summarize_verify_phases,
 )
+from gza.schema_compat import (
+    SCHEMA_RUNTIME_SKEW_EXIT_STATUS,
+    SCHEMA_RUNTIME_SKEW_FAILURE_ORIGIN,
+    SchemaCompatibilityDiagnostic,
+)
 from gza.runner import (
     BACKUP_DIR,
     BRANCH_UNPUSHABLE_FAILURE_REASON,
@@ -1766,6 +1771,70 @@ class TestReviewContextFromChain:
         assert "## verify_command result" in rendered
         assert "Failing output (trimmed):" in rendered
         assert "lint failed" in rendered
+
+    def test_run_review_verify_command_classifies_structured_schema_runtime_skew(self, tmp_path: Path):
+        diagnostic = SchemaCompatibilityDiagnostic(
+            observed_db_version=72,
+            supported_db_version=71,
+            db_role="private_snapshot",
+            reason="newer_schema",
+        )
+        helper_result = Mock(
+            timed_out=False,
+            returncode=1,
+            stdout=f"Traceback\n{diagnostic.marker_line()}\n",
+            stderr="",
+        )
+        with patch(
+            "gza.runner._run_review_verify_command_with_timeout_diagnostics",
+            return_value=helper_result,
+        ):
+            result = _run_review_verify_command("./bin/tests", cwd=tmp_path)
+
+        assert result.status == "unavailable"
+        assert result.exit_status == SCHEMA_RUNTIME_SKEW_EXIT_STATUS
+        assert result.failure_origin == SCHEMA_RUNTIME_SKEW_FAILURE_ORIGIN
+        assert result.schema_compatibility == diagnostic
+        assert "verify runtime is stale" in (result.failure or "")
+
+    def test_run_review_verify_command_classifies_exact_legacy_newer_schema_message(self, tmp_path: Path):
+        helper_result = Mock(
+            timed_out=False,
+            returncode=1,
+            stdout="Database schema v72 is newer than supported v71.\n",
+            stderr="",
+        )
+        with patch(
+            "gza.runner._run_review_verify_command_with_timeout_diagnostics",
+            return_value=helper_result,
+        ):
+            result = _run_review_verify_command("./bin/tests", cwd=tmp_path)
+
+        assert result.status == "unavailable"
+        assert result.exit_status == SCHEMA_RUNTIME_SKEW_EXIT_STATUS
+        assert result.failure_origin == SCHEMA_RUNTIME_SKEW_FAILURE_ORIGIN
+        assert result.schema_compatibility is not None
+        assert result.schema_compatibility.observed_db_version == 72
+        assert result.schema_compatibility.supported_db_version == 71
+        assert result.schema_compatibility.reason == "newer_schema"
+
+    def test_run_review_verify_command_keeps_ordinary_failed_test_red(self, tmp_path: Path):
+        helper_result = Mock(
+            timed_out=False,
+            returncode=1,
+            stdout="FAILED tests/test_example.py::test_failure - AssertionError\n",
+            stderr="",
+        )
+        with patch(
+            "gza.runner._run_review_verify_command_with_timeout_diagnostics",
+            return_value=helper_result,
+        ):
+            result = _run_review_verify_command("./bin/tests", cwd=tmp_path)
+
+        assert result.status == "failed"
+        assert result.exit_status == "1"
+        assert result.failure_origin == "test_failure"
+        assert result.schema_compatibility is None
 
     def test_format_review_verify_result_keeps_failure_tail_and_pytest_summary(self):
         """Trimmed failed verify output should preserve the failing pytest tail with line breaks."""

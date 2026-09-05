@@ -16,6 +16,7 @@ from gza.artifact_paths import InvalidArtifactPathError, resolve_artifact_path
 from gza.artifacts import prepare_command_output_artifact, store_command_output_artifact
 from gza.db import SqliteTaskStore, Task
 from gza.git import GitError
+from gza.schema_compat import SchemaCompatibilityDiagnostic
 
 if TYPE_CHECKING:
     from gza.config import Config
@@ -63,6 +64,7 @@ class VerifyGateResult:
     phase_summary: dict[str, Any] | None = None
     phase_summary_invalid_reason: str | None = None
     duration_seconds: float | None = None
+    schema_compatibility: SchemaCompatibilityDiagnostic | None = None
 
 
 @dataclass(frozen=True)
@@ -1185,6 +1187,7 @@ def _artifact_verify_result(metadata: dict[str, Any], *, project_dir: Path | Non
         phase_summary=phase_summary,
         phase_summary_invalid_reason=phase_summary_invalid_reason,
         duration_seconds=_coerce_optional_float(result_payload.get("duration_seconds")),
+        schema_compatibility=SchemaCompatibilityDiagnostic.from_payload(result_payload.get("schema_compatibility")),
     )
 
 
@@ -1715,6 +1718,9 @@ def build_verify_gate_artifact_payload(
     duration_seconds = _coerce_optional_float(getattr(result, "duration_seconds", None))
     if duration_seconds is not None:
         result_payload["duration_seconds"] = duration_seconds
+    schema_compatibility = getattr(result, "schema_compatibility", None)
+    if isinstance(schema_compatibility, SchemaCompatibilityDiagnostic):
+        result_payload["schema_compatibility"] = schema_compatibility.to_payload()
     result_output = getattr(result, "output", None)
     phase_summary = None
     phase_summary_invalid_reason = None

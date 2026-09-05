@@ -23,6 +23,7 @@ from gza.git import GitError
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+    MAIN_INTEGRATION_VERIFY_SCHEMA_RUNTIME_SKEW_REASON,
     CandidateIntegrationVerifyCheck,
     CandidateIntegrationVerifyEvidence,
     MainIntegrationVerifyEnvironmentIdentity,
@@ -34,14 +35,17 @@ from gza.main_integration_verify import (
     current_main_integration_verify_alert,
     format_main_integration_verify_attention_message,
     load_main_integration_verify_state,
+    main_integration_verify_attention_reason,
     main_integration_verify_state_halts_merges,
     main_integration_verify_state_has_exhausted_remediation_attention,
     main_integration_verify_state_is_red_verdict,
+    main_integration_verify_state_is_schema_runtime_skew,
     persist_main_integration_verify_alert_message,
     resolve_main_integration_verify_target_proof,
     run_main_integration_verify,
 )
 from gza.runner import VERIFY_GATE_ARTIFACT_KIND, _compute_tree_fingerprint, _make_review_verify_result
+from gza.schema_compat import SCHEMA_RUNTIME_SKEW_EXIT_STATUS, SchemaCompatibilityDiagnostic
 from tests.cli.conftest import make_store, setup_config
 
 
@@ -4146,3 +4150,83 @@ def test_run_main_integration_verify_does_not_persist_failure_signature_for_laun
     persisted = load_main_integration_verify_state(store)
     assert persisted is not None
     assert persisted.failure_signature is None
+
+
+def test_main_integration_verify_schema_runtime_skew_is_unavailable_not_red(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    diagnostic = SchemaCompatibilityDiagnostic(
+        observed_db_version=72,
+        supported_db_version=71,
+        db_role="live_shared",
+        reason="newer_schema",
+    )
+    skew_result = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 6, 23, 0, 5, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        failure="verify_command failed",
+        output=f"Traceback\n{diagnostic.marker_line()}\n",
+    )
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-verified"),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=skew_result) as run_verify,
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+    ):
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="unit-test-schema-skew",
+            force=True,
+            red_reruns=2,
+        )
+
+    assert run_verify.call_count == 1
+    assert check.merges_halted is True
+    assert check.needs_attention is True
+    assert check.remediation is None
+    assert check.state.verify_status == "unavailable"
+    assert check.state.verify_exit_status == SCHEMA_RUNTIME_SKEW_EXIT_STATUS
+    assert check.state.schema_compatibility == diagnostic
+    assert check.state.red_since is None
+    assert check.state.failure_signature is None
+    assert main_integration_verify_state_is_schema_runtime_skew(check.state)
+    assert not main_integration_verify_state_is_red_verdict(check.state)
+    assert main_integration_verify_state_halts_merges(check.state)
+    assert main_integration_verify_attention_reason(check.state) == MAIN_INTEGRATION_VERIFY_SCHEMA_RUNTIME_SKEW_REASON
+
+    rendered = format_main_integration_verify_attention_message(
+        check.state,
+        target_proof=MainIntegrationVerifyTargetProof("current"),
+    )
+    assert "main verify runtime unavailable" in rendered
+    assert "main verify RED" not in rendered
+    assert "observed DB v72, supported v71" in rendered

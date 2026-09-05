@@ -7137,6 +7137,10 @@ def _main_verify_completion_verdict(check: MainIntegrationVerifyCheck) -> str:
         return "green"
     if status == "failed":
         return "red"
+    from gza.main_integration_verify import main_integration_verify_state_is_schema_runtime_skew
+
+    if main_integration_verify_state_is_schema_runtime_skew(state):
+        return "schema-runtime-skew"
     if status == "unavailable" and exit_status == "launch failed":
         return "launch-failed"
     if status == "unavailable":
