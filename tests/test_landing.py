@@ -12,6 +12,7 @@ import pytest
 
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task
+from gza.db import WatchProgressObservation
 from gza.landing import (
     LANDING_PHASES,
     LandBlocked,
@@ -47,6 +48,7 @@ from gza.landing import (
 from gza.review_scope import build_spec_coherence_review_scope
 from gza.review_scope import build_resolution_review_scope
 from gza.review_tasks import DuplicateReviewError
+from gza.review_verdict import ParsedReviewReport, ReviewFinding
 from gza.review_verify_state import (
     VerifyGateDecision,
     VerifyGateLookup,
@@ -1631,8 +1633,13 @@ def test_followup_identity_changes_materialization_inputs_and_landing_fingerprin
     decision_b = evaluate_landing_policy(policy="guarded", facts=facts_b)
 
     assert decision_a.allowed is True
-    assert decision_b.allowed is True
-    assert decision_a.followup_materialization_identities != decision_b.followup_materialization_identities
+    if field in {"review_id", "source"}:
+        assert decision_b.allowed is False
+        assert decision_b.blocked is not None
+        assert decision_b.blocked.reason_code == "required-review-unavailable"
+    else:
+        assert decision_b.allowed is True
+        assert decision_a.followup_materialization_identities != decision_b.followup_materialization_identities
     assert LandingStateFingerprint.from_facts(facts_a) != LandingStateFingerprint.from_facts(facts_b)
 
 
@@ -3015,6 +3022,645 @@ def test_landing_coordinator_strict_dry_run_never_advertises_judge_for_changes_r
     assert result.blocked.reason_code == "nondeferrable-blocker"
 
 
+def _review_report_with_findings(
+    verdict: str,
+    *,
+    blockers: tuple[tuple[str, str, str], ...] = (),
+    followups: tuple[tuple[str, str, str], ...] = (),
+) -> str:
+    blocker_body = "None."
+    if blockers:
+        blocker_body = "\n\n".join(
+            (
+                f"### {finding_id} {title}\n"
+                f"Evidence: `{path}` shows the issue.\n"
+                "Impact: The landing decision would be wrong.\n"
+                f"Required fix: Resolve {title} at `{path}`.\n"
+                "Required tests: Add store-backed landing coverage.\n"
+                f"Open-state citation: `{path}`"
+            )
+            for finding_id, title, path in blockers
+        )
+    followup_body = "None."
+    if followups:
+        followup_body = "\n\n".join(
+            (
+                f"### {finding_id} {title}\n"
+                f"Evidence: `{path}` needs later work.\n"
+                "Impact: Follow-up work should be tracked.\n"
+                f"Recommended follow-up: Track {title} at `{path}`.\n"
+                "Recommended tests: Add focused coverage.\n"
+                f"Open-state citation: `{path}`"
+            )
+            for finding_id, title, path in followups
+        )
+    return (
+        "## Summary\n\nReview result.\n\n"
+        f"## Blockers\n\n{blocker_body}\n\n"
+        f"## Follow-Ups\n\n{followup_body}\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        f"## Verdict\n\nVerdict: {verdict}\n"
+    )
+
+
+def _finding_fingerprint_metadata(title: str, path: str) -> dict[str, str]:
+    return {
+        "title": title.lower(),
+        "anchor": path.lower(),
+    }
+
+
+def _add_review_blocker_resolution(
+    store: SqliteTaskStore,
+    *,
+    impl: Task,
+    review: Task,
+    finding_id: str = "B1",
+    title: str = "Out-of-scope polish debt",
+    path: str = "docs/internal/landing.md:12",
+    state: str = "invalid",
+    head: str = "head-a",
+    impl_task_id: str | None = None,
+    review_task_id: str | None = None,
+    target_head: str | None = "target-a",
+    reason: str = "out_of_scope",
+    metadata: dict[str, Any] | None = None,
+    artifact_id: int | None = None,
+) -> Any:
+    payload = {
+        "schema_version": 1,
+        "state": state,
+        "review_task_id": review_task_id if review_task_id is not None else review.id,
+        "impl_task_id": impl_task_id if impl_task_id is not None else impl.id,
+        "source_task_id": impl.id,
+        "source_task_type": impl.task_type,
+        "finding_id": finding_id,
+        "finding_fingerprint": _finding_fingerprint_metadata(title, path),
+        "head_sha": head,
+        "target_head_sha": target_head,
+        "reason": reason,
+    }
+    if metadata is not None:
+        payload.update(metadata)
+    body = json.dumps(payload, sort_keys=True)
+    return store.add_artifact(
+        review.id or "",
+        kind="review_blocker_resolution",
+        label=f"{state}-{finding_id}",
+        path=f".gza/artifacts/{review.id}/resolution-{finding_id}-{state}-{len(body)}.json",
+        byte_size=len(body.encode()),
+        sha256=sha256(body.encode()).hexdigest(),
+        metadata=payload,
+        status=state,
+        head_sha=head,
+        artifact_id=artifact_id,
+    )
+
+
+def test_landing_coordinator_store_backed_dry_run_refuses_nondeferrable_blocker(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "store-backed blocker", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", "Correctness nondeferrable blocker", "src/gza/landing.py:10"),),
+    )
+    store.update(review)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(
+        LandRequest(task_id=impl.id, dry_run=True)
+    )
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "nondeferrable-blocker"
+    assert result.blocked.fact == "review blocker B1 is non-deferable"
+    assert "review:" + (review.id or "") in result.blocked.evidence_refs
+    assert all(step.phase != "judge" for step in result.steps)
+
+
+@pytest.mark.parametrize(
+    "blocker_title",
+    (
+        "Correctness defect in out of scope path",
+        "Integration-contract adjacent state corruption",
+    ),
+)
+def test_landing_coordinator_store_backed_dry_run_does_not_infer_deferrable_from_prose(
+    tmp_path,
+    blocker_title: str,
+) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "store-backed misleading prose", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", blocker_title, "src/gza/landing.py:10"),),
+    )
+    store.update(review)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(
+        LandRequest(task_id=impl.id, dry_run=True)
+    )
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "nondeferrable-blocker"
+    assert all(step.phase != "judge" for step in result.steps)
+
+
+def test_landing_coordinator_store_backed_dry_run_requires_authoritative_deferrable_classification(
+    tmp_path,
+) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "store-backed missing classification", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", "Out-of-scope polish debt", "docs/internal/landing.md:12"),),
+    )
+    store.update(review)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(
+        LandRequest(task_id=impl.id, dry_run=True)
+    )
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "nondeferrable-blocker"
+    assert all(step.phase != "judge" for step in result.steps)
+
+
+def test_landing_coordinator_store_backed_dry_run_advertises_judge_for_current_deferrable_classification(
+    tmp_path,
+) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "store-backed judge", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(
+            ("B1", "Out-of-scope polish debt", "docs/internal/landing.md:12"),
+        ),
+    )
+    store.update(review)
+    _add_review_blocker_resolution(store, impl=impl, review=review)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(
+        LandRequest(task_id=impl.id, dry_run=True)
+    )
+
+    statuses = {step.phase: step.status for step in result.steps}
+    assert result.blocked is None
+    assert statuses["judge"] == "conditional"
+    assert "merge" not in statuses
+
+
+def test_landing_coordinator_store_backed_dry_run_materializes_followups_before_merge(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "store-backed followup", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="APPROVED_WITH_FOLLOWUPS")
+    review.output_content = _review_report_with_findings(
+        "APPROVED_WITH_FOLLOWUPS",
+        followups=(("F1", "Follow-up materialization", "src/gza/landing.py:20"),),
+    )
+    store.update(review)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(
+        LandRequest(task_id=impl.id, dry_run=True)
+    )
+
+    statuses = {step.phase: step.status for step in result.steps}
+    assert result.blocked is None
+    assert statuses["defer_blockers"] == "conditional"
+    assert "merge" not in statuses
+
+
+def _park_for_review_blocker_adjudication(store: SqliteTaskStore, impl: Task) -> None:
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind="task",
+            subject_id=impl.id or "",
+            subject_task_id=impl.id,
+            action_type="max_cycles_reached",
+            action_reason="review-blocker-adjudication-needed",
+            evidence_fingerprint="park-adjudication-needed",
+            parked_reason="review-blocker-adjudication-needed",
+            observed_at=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+        )
+    )
+
+
+def _blocked_adjudication_dry_run(
+    tmp_path,
+    *,
+    resolution_kwargs: dict[str, Any] | None = None,
+    blockers: tuple[tuple[str, str, str], ...] = (("B1", "Out-of-scope polish debt", "docs/internal/landing.md:12"),),
+) -> tuple[Any, Any, Any, LandingCoordinator]:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "store-backed adjudication", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings("CHANGES_REQUESTED", blockers=blockers)
+    store.update(review)
+    _park_for_review_blocker_adjudication(store, impl)
+    if resolution_kwargs is not None:
+        _add_review_blocker_resolution(store, impl=impl, review=review, **resolution_kwargs)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+    result = coordinator.run(LandRequest(task_id=impl.id, dry_run=True))
+    return result, impl, review, coordinator
+
+
+@pytest.mark.parametrize(
+    "resolution_kwargs",
+    (
+        {"state": "disputed"},
+        {"impl_task_id": "gza-wrong"},
+        {"review_task_id": "gza-wrong"},
+        {"head": "old-head"},
+        {"path": "docs/internal/other.md:99"},
+        {"state": "needs_human"},
+        {"metadata": {"finding_fingerprint": "malformed"}},
+    ),
+)
+def test_landing_coordinator_store_backed_park_refuses_incomplete_adjudication_evidence(
+    tmp_path,
+    resolution_kwargs: dict[str, Any],
+) -> None:
+    result, impl, _review, coordinator = _blocked_adjudication_dry_run(
+        tmp_path,
+        resolution_kwargs=resolution_kwargs,
+    )
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    facts = coordinator._landing_policy_facts(identity)
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code in {"nondeferrable-blocker", "policy-or-judge-refused"}
+    assert all(step.phase != "judge" for step in result.steps)
+    assert facts.review_blocker_adjudication_evidence_complete is False
+    assert any(
+        item.startswith("review-blocker-resolution-incomplete") or item == "review-blocker-resolution-read-unavailable"
+        for item in facts.adjudication_fingerprints
+    )
+
+
+def test_landing_coordinator_store_backed_park_refuses_partial_adjudication_set(tmp_path) -> None:
+    result, impl, _review, coordinator = _blocked_adjudication_dry_run(
+        tmp_path,
+        blockers=(
+            ("B1", "Out-of-scope polish debt", "docs/internal/landing.md:12"),
+            ("B2", "Adjacent cleanup debt", "docs/internal/landing.md:18"),
+        ),
+        resolution_kwargs={"finding_id": "B1", "title": "Out-of-scope polish debt", "path": "docs/internal/landing.md:12"},
+    )
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    facts = coordinator._landing_policy_facts(identity)
+
+    assert result.blocked is not None
+    assert all(step.phase != "judge" for step in result.steps)
+    assert facts.review_blocker_adjudication_evidence_complete is False
+
+
+def test_landing_coordinator_store_backed_current_complete_adjudication_fingerprint_is_exact(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "store-backed complete adjudication", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", "Out-of-scope polish debt", "docs/internal/landing.md:12"),),
+    )
+    store.update(review)
+    _park_for_review_blocker_adjudication(store, impl)
+    artifact = _add_review_blocker_resolution(store, impl=impl, review=review)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    first_facts = coordinator._landing_policy_facts(identity)
+    first_fingerprint = LandingStateFingerprint.from_facts(first_facts)
+
+    _add_review_blocker_resolution(store, impl=impl, review=review, impl_task_id="gza-wrong", artifact_id=artifact.id)
+    second_facts = coordinator._landing_policy_facts(identity)
+    second_fingerprint = LandingStateFingerprint.from_facts(second_facts)
+
+    assert first_facts.review_blocker_adjudication_evidence_complete is True
+    assert second_facts.review_blocker_adjudication_evidence_complete is False
+    assert first_fingerprint != second_fingerprint
+    assert all(not item.startswith("review-blocker-resolution-incomplete") for item in first_facts.adjudication_fingerprints)
+
+
+def test_landing_coordinator_store_backed_blocker_count_mismatch_fails_closed(monkeypatch, tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "store-backed count mismatch", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", "Out-of-scope blocker", "docs/internal/landing.md:12"),),
+    )
+    store.update(review)
+    monkeypatch.setattr(
+        "gza.landing.summarize_review_blockers",
+        lambda _content: SimpleNamespace(blocker_count=2),
+    )
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+
+    result = coordinator.run(LandRequest(task_id=impl.id, dry_run=True))
+    assert result.owner_task_id == impl.id
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    fingerprint = LandingStateFingerprint.from_facts(coordinator._landing_policy_facts(identity))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "nondeferrable-blocker"
+    assert result.blocked.fact == "review blocker invalid-blocker-count-mismatch is non-deferable"
+    assert f"invalid-review-blockers:{review.id}:blocker-count-mismatch" in fingerprint.blocker_fingerprints
+
+
+def test_landing_coordinator_store_backed_followup_count_disagreement_fails_closed(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "store-backed followup mismatch", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="APPROVED_WITH_FOLLOWUPS")
+    review.output_content = _review_report_with_findings("APPROVED_WITH_FOLLOWUPS")
+    store.update(review)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+
+    result = coordinator.run(LandRequest(task_id=impl.id, dry_run=True))
+    assert result.owner_task_id == impl.id
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    fingerprint = LandingStateFingerprint.from_facts(coordinator._landing_policy_facts(identity))
+
+    decision = evaluate_landing_policy(policy="guarded", facts=coordinator._landing_policy_facts(identity))
+    assert decision.blocked is not None
+    assert decision.blocked.reason_code == "required-review-unavailable"
+    assert f"invalid-review-followups:{review.id}:followup-count-mismatch" in fingerprint.blocker_fingerprints
+
+
+@pytest.mark.parametrize(
+    ("findings", "expected_reason"),
+    (
+        (
+            (ReviewFinding("", "FOLLOWUP", "Missing ID", "", "src/gza/landing.py:1", "impact", "fix", "tests"),),
+            "followup-missing-finding-id",
+        ),
+        (
+            (ReviewFinding("F1", "FOLLOWUP", "Missing fingerprint", "", "evidence", "impact", None, "tests", None),),
+            "followup-missing-fingerprint",
+        ),
+        (
+            (
+                ReviewFinding("F1", "FOLLOWUP", "Duplicate ID A", "", "src/gza/landing.py:1", "impact", "fix", "tests", "src/gza/landing.py:1"),
+                ReviewFinding("F1", "FOLLOWUP", "Duplicate ID B", "", "src/gza/landing.py:2", "impact", "fix", "tests", "src/gza/landing.py:2"),
+            ),
+            "followup-duplicate-finding-id",
+        ),
+        (
+            (
+                ReviewFinding("F1", "FOLLOWUP", "Duplicate followup", "", "src/gza/landing.py:1", "impact", "fix", "tests", "src/gza/landing.py:1"),
+                ReviewFinding("F2", "FOLLOWUP", "Duplicate followup", "", "src/gza/landing.py:1", "impact", "fix", "tests", "src/gza/landing.py:1"),
+            ),
+            "followup-duplicate-fingerprint",
+        ),
+    ),
+)
+def test_landing_coordinator_store_backed_followup_invalid_identity_fails_closed(
+    monkeypatch,
+    tmp_path,
+    findings: tuple[ReviewFinding, ...],
+    expected_reason: str,
+) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "store-backed followup invalid identity", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="APPROVED_WITH_FOLLOWUPS")
+    review.output_content = _review_report_with_findings(
+        "APPROVED_WITH_FOLLOWUPS",
+        followups=(("F1", "placeholder", "src/gza/landing.py:1"),),
+    )
+    store.update(review)
+    parsed = ParsedReviewReport(
+        verdict="APPROVED_WITH_FOLLOWUPS",
+        findings=findings,
+        format_version="legacy",
+    )
+    monkeypatch.setattr("gza.landing._landing_review_report_from_task", lambda _config, _task: parsed)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+
+    result = coordinator.run(LandRequest(task_id=impl.id, dry_run=True))
+    assert result.owner_task_id == impl.id
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    fingerprint = LandingStateFingerprint.from_facts(coordinator._landing_policy_facts(identity))
+
+    decision = evaluate_landing_policy(policy="guarded", facts=coordinator._landing_policy_facts(identity))
+    assert decision.blocked is not None
+    assert decision.blocked.reason_code == "required-review-unavailable"
+    assert f"invalid-review-followups:{review.id}:{expected_reason}" in fingerprint.blocker_fingerprints
+
+
+@pytest.mark.parametrize(
+    ("findings", "expected_reason"),
+    (
+        (
+            (
+                ReviewFinding("B1", "BLOCKER", "Duplicate ID A", "", "src/gza/landing.py:1", "impact", "fix", "tests", "src/gza/landing.py:1"),
+                ReviewFinding("B1", "BLOCKER", "Duplicate ID B", "", "src/gza/landing.py:2", "impact", "fix", "tests", "src/gza/landing.py:2"),
+            ),
+            "blocker-duplicate-finding-id",
+        ),
+        (
+            (
+                ReviewFinding("B1", "BLOCKER", "Duplicate blocker", "", "src/gza/landing.py:1", "impact", "fix", "tests", "src/gza/landing.py:1"),
+                ReviewFinding("B2", "BLOCKER", "Duplicate blocker", "", "src/gza/landing.py:1", "impact", "fix", "tests", "src/gza/landing.py:1"),
+            ),
+            "blocker-duplicate-fingerprint",
+        ),
+    ),
+)
+def test_landing_coordinator_store_backed_blocker_identity_mismatch_fails_closed(
+    monkeypatch,
+    tmp_path,
+    findings: tuple[ReviewFinding, ...],
+    expected_reason: str,
+) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "store-backed blocker invalid identity", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", "placeholder", "src/gza/landing.py:1"),),
+    )
+    store.update(review)
+    parsed = ParsedReviewReport(
+        verdict="CHANGES_REQUESTED",
+        findings=findings,
+        format_version="legacy",
+    )
+    monkeypatch.setattr("gza.landing._landing_review_report_from_task", lambda _config, _task: parsed)
+    monkeypatch.setattr(
+        "gza.landing.summarize_review_blockers",
+        lambda _content: SimpleNamespace(blocker_count=len(findings)),
+    )
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+
+    result = coordinator.run(LandRequest(task_id=impl.id, dry_run=True))
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    fingerprint = LandingStateFingerprint.from_facts(coordinator._landing_policy_facts(identity))
+
+    decision = evaluate_landing_policy(policy="guarded", facts=coordinator._landing_policy_facts(identity))
+    assert decision.blocked is not None
+    assert decision.blocked.reason_code == "required-review-unavailable"
+    assert f"invalid-review-blockers:{review.id}:{expected_reason}" in fingerprint.blocker_fingerprints
+
+
+def test_landing_followup_materialization_rejects_source_review_identity_mismatch() -> None:
+    review = _review(
+        verdict="APPROVED_WITH_FOLLOWUPS",
+        followup_findings=(LandingFollowupFinding("F1", fingerprint="followup:f1", source="review:gza-other"),),
+    )
+
+    decision = evaluate_landing_policy(policy="guarded", facts=_green_facts(review=review))
+
+    assert decision.allowed is False
+    assert decision.blocked is not None
+    assert decision.blocked.reason_code == "required-review-unavailable"
+
+
+def test_landing_coordinator_production_fingerprint_tracks_park_and_judgment_identity_changes(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "store-backed fingerprint identity", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    _completed_full_review(store, impl, head="head-a", verdict="APPROVED")
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+
+    first = LandingStateFingerprint.from_facts(coordinator._landing_policy_facts(identity))
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind="task",
+            subject_id=impl.id,
+            subject_task_id=impl.id,
+            action_type="max_cycles_reached",
+            action_reason="review-max-cycles-reached",
+            evidence_fingerprint="park-a",
+            parked_reason="review-max-cycles-reached",
+            observed_at=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+        )
+    )
+    payload = {"key": "judgment-key-a", "identity": {"source": "a"}}
+    store.add_artifact(
+        impl.id,
+        kind="landing_judgment",
+        label="landing_judgment",
+        path=f".gza/artifacts/{impl.id}/landing-judgment.json",
+        byte_size=len(json.dumps(payload).encode()),
+        sha256=sha256(json.dumps(payload).encode()).hexdigest(),
+        metadata=payload,
+        status="LAND",
+        head_sha="head-a",
+    )
+    second = LandingStateFingerprint.from_facts(coordinator._landing_policy_facts(identity))
+
+    assert first != second
+    assert first.parked_reason is None
+    assert second.parked_reason == "review-max-cycles-reached"
+    assert second.policy_judgment_identity is not None
+    assert second.policy_judgment_identity.startswith("artifact:")
+
+
 def test_landing_coordinator_dry_run_uses_merge_unit_attached_code_review_evidence(tmp_path) -> None:
     store = _coordinator_store(tmp_path)
     config = _verify_config(tmp_path)
@@ -3452,6 +4098,91 @@ def test_landing_coordinator_dry_run_skips_disabled_code_review_and_reaches_merg
     assert statuses["post_rebase_review"] == "skipped"
     assert statuses["judge"] == "skipped"
     assert statuses["merge"] == "conditional"
+    assert git.mutation_calls == []
+
+
+def test_landing_coordinator_review_disabled_ignores_stale_blocker_findings_without_guarded_escalation(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    config.require_review_before_merge = False
+    impl = _completed_impl(store, "review disabled stale blockers", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="stale-head", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", "Stale correctness blocker", "src/gza/landing.py:2564"),),
+    )
+    store.update(review)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+
+    result = coordinator.run(LandRequest(task_id=impl.id, dry_run=True))
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    facts = coordinator._landing_policy_facts(identity)
+    decision = evaluate_landing_policy(
+        policy="guarded",
+        facts=facts,
+        judge=lambda: (_ for _ in ()).throw(AssertionError("stale review must not invoke guarded escalation")),
+    )
+
+    statuses = {step.phase: step.status for step in result.steps}
+    assert result.blocked is None
+    assert facts.review is not None
+    assert facts.review.identity_matched is False
+    assert facts.open_blockers == ()
+    assert decision.allowed is True
+    assert decision.judgment_verdict is None
+    assert statuses["post_rebase_review"] == "skipped"
+    assert statuses["judge"] == "skipped"
+    assert statuses["defer_blockers"] == "skipped"
+    assert statuses["merge"] == "conditional"
+    assert git.mutation_calls == []
+
+
+def test_landing_coordinator_review_disabled_ignores_stale_followups_without_materialization(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    config.require_review_before_merge = False
+    impl = _completed_impl(store, "review disabled stale followups", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="stale-head", verdict="APPROVED_WITH_FOLLOWUPS")
+    review.output_content = _review_report_with_findings(
+        "APPROVED_WITH_FOLLOWUPS",
+        followups=(("F1", "Stale follow-up", "src/gza/landing.py:4183"),),
+    )
+    store.update(review)
+    before_tasks = _sqlite_task_snapshot(store)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+
+    result = coordinator.run(LandRequest(task_id=impl.id, dry_run=True))
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    facts = coordinator._landing_policy_facts(identity)
+    decision = evaluate_landing_policy(policy="guarded", facts=facts)
+
+    statuses = {step.phase: step.status for step in result.steps}
+    assert result.blocked is None
+    assert facts.review is not None
+    assert facts.review.identity_matched is False
+    assert facts.review.followup_findings == ()
+    assert decision.allowed is True
+    assert decision.followup_materialization_identities == ()
+    assert statuses["post_rebase_review"] == "skipped"
+    assert statuses["defer_blockers"] == "skipped"
+    assert statuses["merge"] == "conditional"
+    assert _sqlite_task_snapshot(store) == before_tasks
     assert git.mutation_calls == []
 
 

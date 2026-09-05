@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal, NoReturn, Protocol, cast
 
@@ -41,9 +43,15 @@ from gza.review_scope import (
     parse_spec_coherence_review_scope,
 )
 from gza.review_tasks import DuplicateReviewError, create_resolution_review_task, create_review_task
-from gza.review_verdict import get_review_report
+from gza.review_verdict import (
+    ReviewFinding,
+    get_review_finding_fingerprint,
+    get_review_report,
+    parse_review_report,
+    summarize_review_blockers,
+)
 from gza.review_verify_state import VerifyGateDecision, resolve_verify_gate_decision
-from gza.runner import _compute_tree_fingerprint
+from gza.runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND, _compute_tree_fingerprint
 from gza.sync_ops import BranchSyncResult, reconcile_task_branch_merge_truth
 from gza.watch_progress import review_matches_create_review_action
 
@@ -1153,6 +1161,15 @@ class LandingCoordinator:
             verify=verify,
             spec_coherence=gates.spec_coherence,
             review=review,
+            open_blockers=_landing_open_blockers_from_review(review, store=self.store, identity=identity),
+            parked_reason=_inspect_current_landing_park_reason(self.store, identity),
+            review_blocker_adjudication_evidence_complete=_landing_adjudication_evidence_complete(
+                self.store,
+                review,
+                identity=identity,
+            ),
+            policy_judgment_identity=_inspect_latest_landing_judgment_identity(self.store, identity),
+            adjudication_fingerprints=_inspect_landing_adjudication_fingerprints(self.store, review, identity=identity),
             actionable_lifecycle_work=gates.actionable_lifecycle_work,
             checkout_clean_block=identity.checkout_clean_block,
         )
@@ -1236,8 +1253,12 @@ class LandingCoordinator:
             return review_terminal_block
         if review.required and not _landing_review_evidence_is_current(review):
             return "post_rebase_review"
+        if not review.required and not review.identity_matched:
+            return "merge"
         if review.verdict == "CHANGES_REQUESTED":
             return _dry_run_review_boundary(policy, facts)
+        if review.followup_findings:
+            return "defer_blockers"
         return "merge"
 
     def _boundary_reason_code(self, phase: LandingPhaseName) -> LandBlockedReasonCode:
@@ -1329,6 +1350,21 @@ class LandingFollowupMaterializationIdentity:
 
 
 @dataclass(frozen=True)
+class LandingFindingSetValidation:
+    """Parsed review finding-set validation for one severity."""
+
+    severity: str
+    expected_count: int
+    observed_count: int
+    invalid_reason: str | None = None
+    invalid_identity: str | None = None
+
+    @property
+    def valid(self) -> bool:
+        return self.invalid_reason is None and self.expected_count == self.observed_count
+
+
+@dataclass(frozen=True)
 class LandingReviewEvidence:
     """Decision-bearing review evidence after identity/currentness checks."""
 
@@ -1342,6 +1378,8 @@ class LandingReviewEvidence:
     review_id: str | None = None
     reviewed_head: str | None = None
     followup_findings: tuple[LandingFollowupFinding, ...] = ()
+    blocker_validation: LandingFindingSetValidation | None = None
+    followup_validation: LandingFindingSetValidation | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "review_id", _normalize_optional_identity(self.review_id))
@@ -1781,6 +1819,7 @@ class LandingStateFingerprint:
     verify: LandingVerifyFingerprint = LandingVerifyFingerprint()
     rebase: LandingRebaseFingerprint = LandingRebaseFingerprint()
     blocker_fingerprints: tuple[str, ...] = ()
+    parked_reason: str | None = None
     policy_judgment_identity: str | None = None
     adjudication_fingerprints: tuple[str, ...] = ()
     spec_coherence: LandingSpecCoherenceFingerprint = LandingSpecCoherenceFingerprint()
@@ -1805,6 +1844,14 @@ class LandingStateFingerprint:
             if adjudication_fingerprints is not None
             else facts.adjudication_fingerprints
         )
+        invalid_review_fingerprints = tuple(
+            identity
+            for identity in (
+                _finding_validation_invalid_identity(review.blocker_validation) if review is not None else None,
+                _finding_validation_invalid_identity(review.followup_validation) if review is not None else None,
+            )
+            if identity is not None
+        )
         return cls(
             merge_unit_state=facts.merge_unit_state,
             source_sha=facts.source_head,
@@ -1828,7 +1875,15 @@ class LandingStateFingerprint:
                 tree_fingerprint=verify.tree_fingerprint if verify is not None else None,
             ),
             rebase=resolved_rebase,
-            blocker_fingerprints=tuple(sorted(_blocker_fingerprint(blocker) for blocker in facts.open_blockers)),
+            blocker_fingerprints=tuple(
+                sorted(
+                    (
+                        *(_blocker_fingerprint(blocker) for blocker in facts.open_blockers),
+                        *invalid_review_fingerprints,
+                    )
+                )
+            ),
+            parked_reason=facts.parked_reason,
             policy_judgment_identity=resolved_judgment_identity,
             adjudication_fingerprints=tuple(sorted(resolved_adjudication_fingerprints)),
             spec_coherence=resolved_spec,
@@ -2819,7 +2874,8 @@ def _inspect_query_landing_review_evidence(
     status = cast(LandingReviewStatus, latest.status if latest.status in {"completed", "failed", "pending", "in_progress"} else "unavailable")
     resolution_declared = declares_resolution_review_mode(latest.review_scope)
     mode: LandingReviewMode = "resolution" if resolution_declared else "plain_full"
-    verdict = _landing_review_verdict_from_task(config, latest) if latest.status == "completed" else None
+    report = _landing_review_report_from_task(config, latest) if latest.status == "completed" else None
+    verdict = getattr(report, "verdict", None) if report is not None else None
     parseable = verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS", "CHANGES_REQUESTED", "NEEDS_DISCUSSION"}
     reviewed_head = latest.review_verify_head_sha
     identity_matched = latest.status == "completed" and parseable and reviewed_head == identity.source_sha
@@ -2830,7 +2886,28 @@ def _inspect_query_landing_review_evidence(
             rebase=rebase,
         )
     current = identity_matched
-    return LandingReviewEvidence(
+    findings = tuple(getattr(report, "findings", ())) if report is not None and identity_matched else ()
+    blocker_count: int | None = None
+    if latest.status == "completed" and parseable and latest.output_content:
+        try:
+            blocker_count = summarize_review_blockers(latest.output_content).blocker_count
+        except Exception:
+            blocker_count = None
+    blocker_validation, parsed_blockers = _validate_landing_finding_set(
+        findings,
+        severity="BLOCKER",
+        review_id=latest.id,
+        expected_count=blocker_count,
+    )
+    observed_followup_count = sum(1 for finding in findings if isinstance(finding, ReviewFinding) and finding.severity == "FOLLOWUP")
+    expected_followup_count = max(1, observed_followup_count) if verdict == "APPROVED_WITH_FOLLOWUPS" else observed_followup_count
+    followup_validation, followups = _validate_landing_finding_set(
+        findings,
+        severity="FOLLOWUP",
+        review_id=latest.id,
+        expected_count=expected_followup_count,
+    )
+    evidence = LandingReviewEvidence(
         required=required,
         status=status,
         mode=mode,
@@ -2840,7 +2917,17 @@ def _inspect_query_landing_review_evidence(
         identity_matched=identity_matched,
         review_id=latest.id,
         reviewed_head=reviewed_head,
+        followup_findings=_landing_followups_from_validated_findings(followups, review_id=latest.id) if identity_matched else (),
+        blocker_validation=blocker_validation if identity_matched else None,
+        followup_validation=followup_validation if identity_matched else None,
     )
+    object.__setattr__(
+        evidence,
+        "_parsed_blocker_findings",
+        parsed_blockers,
+    )
+    object.__setattr__(evidence, "_parsed_blocker_count", blocker_count)
+    return evidence
 
 
 def _resolution_review_scope_matches_landing_identity(
@@ -3475,6 +3562,511 @@ def _landing_review_verdict_from_task(config: Any | None, review: DbTask) -> str
         return None
 
 
+def _landing_review_report_from_task(config: Any | None, review: DbTask) -> Any | None:
+    try:
+        return get_review_report(Path(getattr(config, "project_dir", ".")), review)
+    except Exception:
+        if review.output_content:
+            try:
+                return parse_review_report(review.output_content)
+            except Exception:
+                return None
+        return None
+
+
+def _landing_review_finding_fingerprint(finding: ReviewFinding) -> str | None:
+    fingerprint = get_review_finding_fingerprint(finding)
+    if fingerprint is None:
+        return None
+    title, anchor = fingerprint
+    return json.dumps(
+        {"title": title, "anchor": anchor},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _invalid_landing_evidence_identity(
+    *,
+    review_id: str | None,
+    severity: str,
+    reason: str,
+) -> str:
+    return f"invalid-review-{severity.lower()}s:{review_id or 'unknown-review'}:{reason}"
+
+
+def _validate_landing_finding_set(
+    findings: tuple[ReviewFinding, ...],
+    *,
+    severity: str,
+    review_id: str | None,
+    expected_count: int | None,
+) -> tuple[LandingFindingSetValidation, tuple[ReviewFinding, ...]]:
+    parsed = tuple(finding for finding in findings if isinstance(finding, ReviewFinding) and finding.severity == severity)
+    observed_count = len(parsed)
+    resolved_expected = observed_count if expected_count is None else expected_count
+    if resolved_expected != observed_count:
+        reason = f"{severity.lower()}-count-mismatch"
+        return (
+            LandingFindingSetValidation(
+                severity=severity,
+                expected_count=resolved_expected,
+                observed_count=observed_count,
+                invalid_reason=reason,
+                invalid_identity=_invalid_landing_evidence_identity(
+                    review_id=review_id,
+                    severity=severity,
+                    reason=reason,
+                ),
+            ),
+            parsed,
+        )
+    seen_ids: set[str] = set()
+    seen_fingerprints: set[str] = set()
+    for finding in parsed:
+        finding_id = finding.id.strip()
+        if not finding_id:
+            reason = f"{severity.lower()}-missing-finding-id"
+            return (
+                LandingFindingSetValidation(
+                    severity=severity,
+                    expected_count=resolved_expected,
+                    observed_count=observed_count,
+                    invalid_reason=reason,
+                    invalid_identity=_invalid_landing_evidence_identity(
+                        review_id=review_id,
+                        severity=severity,
+                        reason=reason,
+                    ),
+                ),
+                parsed,
+            )
+        if finding_id in seen_ids:
+            reason = f"{severity.lower()}-duplicate-finding-id"
+            return (
+                LandingFindingSetValidation(
+                    severity=severity,
+                    expected_count=resolved_expected,
+                    observed_count=observed_count,
+                    invalid_reason=reason,
+                    invalid_identity=_invalid_landing_evidence_identity(
+                        review_id=review_id,
+                        severity=severity,
+                        reason=reason,
+                    ),
+                ),
+                parsed,
+            )
+        seen_ids.add(finding_id)
+        fingerprint = _landing_review_finding_fingerprint(finding)
+        if fingerprint is None:
+            reason = f"{severity.lower()}-missing-fingerprint"
+            return (
+                LandingFindingSetValidation(
+                    severity=severity,
+                    expected_count=resolved_expected,
+                    observed_count=observed_count,
+                    invalid_reason=reason,
+                    invalid_identity=_invalid_landing_evidence_identity(
+                        review_id=review_id,
+                        severity=severity,
+                        reason=reason,
+                    ),
+                ),
+                parsed,
+            )
+        if fingerprint in seen_fingerprints:
+            reason = f"{severity.lower()}-duplicate-fingerprint"
+            return (
+                LandingFindingSetValidation(
+                    severity=severity,
+                    expected_count=resolved_expected,
+                    observed_count=observed_count,
+                    invalid_reason=reason,
+                    invalid_identity=_invalid_landing_evidence_identity(
+                        review_id=review_id,
+                        severity=severity,
+                        reason=reason,
+                    ),
+                ),
+                parsed,
+            )
+        seen_fingerprints.add(fingerprint)
+    return (
+        LandingFindingSetValidation(
+            severity=severity,
+            expected_count=resolved_expected,
+            observed_count=observed_count,
+        ),
+        parsed,
+    )
+
+
+def _finding_validation_invalid_identity(validation: LandingFindingSetValidation | None) -> str | None:
+    if validation is None or validation.valid:
+        return None
+    return validation.invalid_identity or _invalid_landing_evidence_identity(
+        review_id=None,
+        severity=validation.severity,
+        reason=validation.invalid_reason or "invalid",
+    )
+
+
+def _landing_finding_fingerprint_tuple(finding: ReviewFinding) -> tuple[str, str] | None:
+    return get_review_finding_fingerprint(finding)
+
+
+def _resolution_fingerprint_tuple(metadata: Mapping[str, Any]) -> tuple[str, str] | None:
+    fingerprint = metadata.get("finding_fingerprint")
+    if not isinstance(fingerprint, Mapping):
+        return None
+    title = fingerprint.get("title")
+    anchor = fingerprint.get("anchor")
+    if not isinstance(title, str) or not isinstance(anchor, str) or not title.strip() or not anchor.strip():
+        return None
+    return (title.strip(), anchor.strip())
+
+
+def _resolution_metadata_state(metadata: Mapping[str, Any]) -> str | None:
+    state = metadata.get("state")
+    if not isinstance(state, str):
+        return None
+    normalized = state.strip().lower()
+    if normalized == "needs_human":
+        return "needs_human"
+    if normalized in {"valid", "invalid", "disputed"}:
+        return normalized
+    if normalized == "needs human":
+        return "needs_human"
+    return None
+
+
+def _landing_resolution_matches_current(
+    artifact: Any,
+    *,
+    metadata: Mapping[str, Any],
+    review: LandingReviewEvidence,
+    blocker: ReviewFinding,
+    identity: LandingResolvedIdentity | None,
+) -> bool:
+    if review.review_id is None or review.reviewed_head is None:
+        return False
+    if metadata.get("review_task_id") != review.review_id:
+        return False
+    if identity is not None and metadata.get("impl_task_id") != identity.owner_task_id:
+        return False
+    if identity is not None:
+        metadata_head = metadata.get("head_sha")
+        if metadata_head is not None and metadata_head != identity.source_sha:
+            return False
+        metadata_target = metadata.get("target_head_sha") or metadata.get("target_head")
+        if metadata_target is not None and metadata_target != identity.target_sha:
+            return False
+    if artifact.head_sha != review.reviewed_head:
+        return False
+    if identity is not None and artifact.head_sha != identity.source_sha:
+        return False
+    if metadata.get("finding_id") != blocker.id.strip():
+        return False
+    fingerprint = _landing_finding_fingerprint_tuple(blocker)
+    return fingerprint is not None and _resolution_fingerprint_tuple(metadata) == fingerprint
+
+
+def _resolution_identity_fingerprint(artifact: Any, metadata: Mapping[str, Any]) -> str:
+    payload = {
+        "artifact": artifact.id,
+        "status": artifact.status,
+        "head": artifact.head_sha,
+        "state": _resolution_metadata_state(metadata),
+        "impl_task_id": metadata.get("impl_task_id"),
+        "review_task_id": metadata.get("review_task_id"),
+        "finding_id": metadata.get("finding_id"),
+        "finding_fingerprint": metadata.get("finding_fingerprint"),
+        "target_head_sha": metadata.get("target_head_sha") or metadata.get("target_head"),
+    }
+    return "sha256:" + sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _landing_current_adjudication_fingerprints(
+    store: SqliteTaskStore,
+    review: LandingReviewEvidence | None,
+    *,
+    identity: LandingResolvedIdentity | None = None,
+    allowed_states: frozenset[str] = frozenset({"valid", "invalid"}),
+) -> tuple[str, ...]:
+    if review is None or review.verdict != "CHANGES_REQUESTED" or not review.review_id:
+        return ()
+    blocker_validation_identity = _finding_validation_invalid_identity(review.blocker_validation)
+    if blocker_validation_identity is not None:
+        return (f"review-blocker-resolution-incomplete:{blocker_validation_identity}",)
+    blockers = tuple(
+        finding
+        for finding in getattr(review, "_parsed_blocker_findings", ())
+        if isinstance(finding, ReviewFinding)
+    )
+    if not blockers:
+        return ("review-blocker-resolution-incomplete:missing-blocker-findings",)
+    try:
+        artifacts = store.list_artifacts(review.review_id, kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND)
+    except Exception:
+        return ("review-blocker-resolution-read-unavailable",)
+    matched: dict[str, str] = {}
+    for blocker in blockers:
+        latest_match: Any | None = None
+        latest_metadata: Mapping[str, Any] | None = None
+        for artifact in artifacts:
+            metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
+            if metadata is None:
+                continue
+            state = _resolution_metadata_state(metadata)
+            if state not in allowed_states:
+                continue
+            if not _landing_resolution_matches_current(
+                artifact,
+                metadata=metadata,
+                review=review,
+                blocker=blocker,
+                identity=identity,
+            ):
+                continue
+            if latest_match is None or artifact.created_at > latest_match.created_at:
+                latest_match = artifact
+                latest_metadata = metadata
+        if latest_match is None or latest_metadata is None:
+            return (
+                "review-blocker-resolution-incomplete:"
+                + (review.review_id or "unknown-review")
+                + ":"
+                + (blocker.id.strip() or "missing-finding-id")
+                + ":"
+                + (_landing_review_finding_fingerprint(blocker) or "missing-fingerprint"),
+            )
+        matched[blocker.id.strip()] = _resolution_identity_fingerprint(latest_match, latest_metadata)
+    return tuple(sorted(matched.values()))
+
+
+def _landing_resolution_deferrable_class(
+    store: SqliteTaskStore,
+    review: LandingReviewEvidence,
+    finding: ReviewFinding,
+    *,
+    identity: LandingResolvedIdentity | None,
+) -> LandingBlockerClass | None:
+    if not review.review_id:
+        return None
+    try:
+        artifacts = store.list_artifacts(review.review_id, kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND)
+    except Exception:
+        return None
+    latest_match: Any | None = None
+    latest_metadata: Mapping[str, Any] | None = None
+    for artifact in artifacts:
+        metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
+        if metadata is None or _resolution_metadata_state(metadata) != "invalid":
+            continue
+        if not _landing_resolution_matches_current(
+            artifact,
+            metadata=metadata,
+            review=review,
+            blocker=finding,
+            identity=identity,
+        ):
+            continue
+        if latest_match is None or artifact.created_at > latest_match.created_at:
+            latest_match = artifact
+            latest_metadata = metadata
+    if latest_metadata is None:
+        return None
+    reason = latest_metadata.get("reason")
+    normalized_reason = reason.strip().lower().replace("-", "_") if isinstance(reason, str) else ""
+    if normalized_reason in {"out_of_scope", "beyond_scope"}:
+        return "out_of_scope"
+    if normalized_reason == "adjacent":
+        return "adjacent"
+    return None
+
+
+def _landing_classify_blocker(
+    finding: ReviewFinding,
+    *,
+    mode: LandingReviewMode,
+    authoritative_class: LandingBlockerClass | None = None,
+) -> LandingBlockerClass:
+    del finding
+    if authoritative_class is not None:
+        return authoritative_class
+    if mode == "spec_coherence":
+        return "spec_coherence"
+    return "unknown"
+
+
+def _invalid_landing_blocker(review: LandingReviewEvidence, reason: str) -> tuple[LandingOpenBlocker, ...]:
+    review_id = review.review_id or "unknown-review"
+    return (
+        LandingOpenBlocker(
+            f"invalid-{reason}",
+            deferrable=False,
+            blocker_class="unknown",
+            source=f"review:{review_id}",
+            fingerprint=f"invalid-review-blockers:{review_id}:{reason}",
+        ),
+    )
+
+
+def _landing_open_blockers_from_review(
+    review: LandingReviewEvidence | None,
+    *,
+    store: SqliteTaskStore | None = None,
+    identity: LandingResolvedIdentity | None = None,
+) -> tuple[LandingOpenBlocker, ...]:
+    if review is None or review.verdict != "CHANGES_REQUESTED":
+        return ()
+    if not review.identity_matched:
+        return ()
+    if not review.review_id:
+        return _invalid_landing_blocker(review, "missing-review-identity")
+    invalid_identity = _finding_validation_invalid_identity(review.blocker_validation)
+    if invalid_identity is not None:
+        invalid_reason = (
+            review.blocker_validation.invalid_reason
+            if review.blocker_validation is not None
+            else None
+        )
+        return (
+            LandingOpenBlocker(
+                f"invalid-{invalid_reason or 'blocker-identity-mismatch'}",
+                deferrable=False,
+                blocker_class="unknown",
+                source=f"review:{review.review_id}",
+                fingerprint=invalid_identity,
+            ),
+        )
+    raw_findings = getattr(review, "_parsed_blocker_findings", ())
+    parsed_blockers = tuple(finding for finding in raw_findings if isinstance(finding, ReviewFinding))
+    if not parsed_blockers:
+        return _invalid_landing_blocker(review, "missing-blocker-findings")
+    summary_count = getattr(review, "_parsed_blocker_count", None)
+    if summary_count != len(parsed_blockers):
+        return _invalid_landing_blocker(review, "blocker-count-mismatch")
+    blockers: list[LandingOpenBlocker] = []
+    seen_ids: set[str] = set()
+    seen_fingerprints: set[str] = set()
+    for finding in parsed_blockers:
+        finding_id = finding.id.strip()
+        if not finding_id or finding_id in seen_ids:
+            return _invalid_landing_blocker(review, "blocker-identity-mismatch")
+        seen_ids.add(finding_id)
+        fingerprint = _landing_review_finding_fingerprint(finding)
+        if fingerprint is None or fingerprint in seen_fingerprints:
+            return _invalid_landing_blocker(review, "blocker-identity-mismatch")
+        seen_fingerprints.add(fingerprint)
+        authoritative_class = (
+            _landing_resolution_deferrable_class(store, review, finding, identity=identity)
+            if store is not None
+            else None
+        )
+        blocker_class = _landing_classify_blocker(finding, mode=review.mode, authoritative_class=authoritative_class)
+        blockers.append(
+            LandingOpenBlocker(
+                finding_id,
+                deferrable=blocker_class in {"adjacent", "out_of_scope"},
+                blocker_class=blocker_class,
+                source=f"review:{review.review_id}",
+                fingerprint=fingerprint,
+            )
+        )
+    return tuple(blockers)
+
+
+def _landing_followups_from_validated_findings(
+    findings: tuple[ReviewFinding, ...],
+    *,
+    review_id: str | None,
+) -> tuple[LandingFollowupFinding, ...]:
+    if not review_id:
+        return ()
+    followups: list[LandingFollowupFinding] = []
+    seen_ids: set[str] = set()
+    seen_fingerprints: set[str] = set()
+    for finding in findings:
+        finding_id = finding.id.strip()
+        fingerprint = _landing_review_finding_fingerprint(finding)
+        if not finding_id or fingerprint is None or finding_id in seen_ids or fingerprint in seen_fingerprints:
+            return ()
+        seen_ids.add(finding_id)
+        seen_fingerprints.add(fingerprint)
+        followups.append(
+            LandingFollowupFinding(
+                finding_id,
+                fingerprint=fingerprint,
+                source=f"review:{review_id}",
+            )
+        )
+    return tuple(followups)
+
+
+def _inspect_current_landing_park_reason(store: SqliteTaskStore, identity: LandingResolvedIdentity) -> str | None:
+    try:
+        observations = store.list_all_watch_progress_observations()
+    except Exception:
+        return "landing-park-read-unavailable"
+    relevant: list[Any] = []
+    for observation in observations:
+        if observation.parked_reason is None:
+            continue
+        if (
+            observation.subject_task_id == identity.owner_task_id
+            or observation.subject_id == identity.owner_task_id
+            or observation.merge_unit_id == identity.merge_unit_id
+        ):
+            relevant.append(observation)
+    if not relevant:
+        return None
+    latest = max(relevant, key=lambda item: item.observed_at or datetime.min.replace(tzinfo=UTC))
+    return latest.parked_reason
+
+
+def _inspect_latest_landing_judgment_identity(store: SqliteTaskStore, identity: LandingResolvedIdentity) -> str | None:
+    try:
+        artifacts = store.list_artifacts(identity.owner_task_id, kind="landing_judgment")
+    except Exception:
+        return "landing-judgment-read-unavailable"
+    for artifact in artifacts:
+        metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
+        key = metadata.get("key") if metadata else None
+        if isinstance(key, str) and key.strip():
+            return f"artifact:{artifact.id}:key:{key.strip()}"
+    return None
+
+
+def _inspect_landing_adjudication_fingerprints(
+    store: SqliteTaskStore,
+    review: LandingReviewEvidence | None,
+    *,
+    identity: LandingResolvedIdentity | None = None,
+) -> tuple[str, ...]:
+    return _landing_current_adjudication_fingerprints(store, review, identity=identity)
+
+
+def _landing_adjudication_evidence_complete(
+    store: SqliteTaskStore,
+    review: LandingReviewEvidence | None,
+    *,
+    identity: LandingResolvedIdentity | None = None,
+) -> bool:
+    if review is None or review.verdict != "CHANGES_REQUESTED" or not review.review_id:
+        return False
+    blockers = _landing_open_blockers_from_review(review, store=store, identity=identity)
+    if not blockers:
+        return False
+    fingerprints = _inspect_landing_adjudication_fingerprints(store, review, identity=identity)
+    return bool(fingerprints) and all(
+        not fingerprint.startswith("review-blocker-resolution-read-unavailable")
+        and not fingerprint.startswith("review-blocker-resolution-incomplete")
+        for fingerprint in fingerprints
+    )
+
+
 def _blocker_fingerprint(blocker: LandingOpenBlocker) -> str:
     return _normalize_required_ref(blocker.fingerprint, "blocker normalized fingerprint")
 
@@ -3497,6 +4089,8 @@ def _review_evidence(review: LandingReviewEvidence | None, facts: LandingPolicyF
         review.review_id,
         review.reviewed_head,
         facts.source_head,
+        _finding_validation_invalid_identity(review.blocker_validation),
+        _finding_validation_invalid_identity(review.followup_validation),
         *(
             identity.fingerprint_key
             for identity in _followup_materialization_identities(review)
@@ -3563,6 +4157,8 @@ def _validated_followup_materialization_identities(
         raise ValueError("follow-up materialization requires review identity")
     identities: list[LandingFollowupMaterializationIdentity] = []
     for followup in review.followup_findings:
+        if followup.source != f"review:{review.review_id}":
+            raise ValueError("follow-up materialization source must match review identity")
         identities.append(
             LandingFollowupMaterializationIdentity(
                 review_id=review.review_id,
@@ -4014,27 +4610,36 @@ def _review_availability_block(facts: LandingPolicyFacts) -> LandBlocked | None:
             "spec-coherence review cannot satisfy code-review landing",
             _review_evidence(review, facts),
         )
-    if review.followup_findings:
-        try:
-            _validated_followup_materialization_identities(review)
-        except ValueError:
+    if review.identity_matched:
+        invalid_blocker_identity = _finding_validation_invalid_identity(review.blocker_validation)
+        invalid_followup_identity = _finding_validation_invalid_identity(review.followup_validation)
+        if invalid_blocker_identity is not None or invalid_followup_identity is not None:
             return LandBlocked(
                 "required-review-unavailable",
-                "review has no valid follow-up finding evidence",
+                "review finding evidence is invalid",
                 _review_evidence(review, facts),
             )
-    if review.verdict == "APPROVED_WITH_FOLLOWUPS" and not _has_valid_followup_finding_set(review):
-        return LandBlocked(
-            "required-review-unavailable",
-            "approved-with-followups review has no valid follow-up finding evidence",
-            _review_evidence(review, facts),
-        )
-    if review.verdict == "APPROVED" and review.followup_findings:
-        return LandBlocked(
-            "required-review-unavailable",
-            "approved review contradicts parsed follow-up finding evidence",
-            _review_evidence(review, facts),
-        )
+        if review.followup_findings:
+            try:
+                _validated_followup_materialization_identities(review)
+            except ValueError:
+                return LandBlocked(
+                    "required-review-unavailable",
+                    "review has no valid follow-up finding evidence",
+                    _review_evidence(review, facts),
+                )
+        if review.verdict == "APPROVED_WITH_FOLLOWUPS" and not _has_valid_followup_finding_set(review):
+            return LandBlocked(
+                "required-review-unavailable",
+                "approved-with-followups review has no valid follow-up finding evidence",
+                _review_evidence(review, facts),
+            )
+        if review.verdict == "APPROVED" and review.followup_findings:
+            return LandBlocked(
+                "required-review-unavailable",
+                "approved review contradicts parsed follow-up finding evidence",
+                _review_evidence(review, facts),
+            )
     return None
 
 
