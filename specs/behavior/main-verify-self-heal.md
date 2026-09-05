@@ -1,17 +1,17 @@
 # Main verify self-heal contract
 
 > **Status: Draft north-star contract.** This document defines the required convergence
-> behavior for a red local-target integration verify verdict. The implement tasks
-> (`gza-5778`, `gza-5856`, the checkpoint-TTL task, and the deterministic-red repair
-> task) realize this contract over time; until then, code/spec mismatches are behavior
-> findings, not license to weaken the contract.
+> behavior for configured local-target integration verify results that are not green. The
+> implement tasks (`gza-5778`, `gza-5856`, the checkpoint-TTL task, and the
+> deterministic-red repair task) realize this contract over time; until then, code/spec
+> mismatches are behavior findings, not license to weaken the contract.
 
 ## What this owns
 
 This document owns one question:
 
-- When the shared local-target integration verify gate goes red, how must automation
-  recover or escalate so the pipeline still converges?
+- When the shared local-target integration verify gate is not green, how must automation
+  classify, recover, or escalate so the pipeline still converges?
 
 It does **not** own:
 
@@ -21,26 +21,41 @@ It does **not** own:
   mechanics. Those live in [watch-supervisor.md](watch-supervisor.md).
 
 This file is the north-star contract that those two documents must apply whenever the
-local-target verify gate is not green.
+local-target verify gate is not green. It owns the closed classification-first taxonomy
+for target verify outcomes. Its deterministic-red remediation requirements apply only to
+code-red verdicts.
 
 ## Terms
 
-- **Red verdict** — any configured local-target integration verify result whose status is
-  not `passed`.
+- **Red verdict** — a configured local-target integration verify result that ran against
+  the target code and produced failing code evidence. A red verdict is distinct from
+  merge-blocking unavailable evidence, launch-failure exceptions, and no-gate exceptions.
+- **Merge-blocking verify unavailability** — a configured local-target integration verify
+  result that could not safely establish code verdict evidence because exact-tree
+  freshness, execution budget, schema-runtime compatibility, or control-plane
+  compatibility was unavailable. It fails closed for merge actions that require current
+  verify evidence, but it is not a red verdict.
+- **Launch failure exception** — a configured local-target integration verify phase or
+  tool could not be launched because the local environment is misconfigured. It is
+  operator-visible and non-red, but it does not halt merges.
+- **No-gate exception** — no `verify_command` is configured. Automation may persist a
+  visible unavailable checkpoint with `exit_status="not configured"`, but it does not halt
+  merges and is not red.
 - **Checkpoint** — the durable recorded result reused to decide whether more merges onto
   the canonical local target are allowed.
-- **Merge freeze** — the state where automation halts further merges onto the canonical
-  local target because the checkpoint is red or freshness is unproven.
+- **Merge freeze** — the state where automation halts merge actions onto the canonical
+  local target because current target-verify evidence is red or merge-blocking
+  unavailable.
 - **Launch stall** — downstream work stops launching or making progress for reasons that
   are only an artifact of the merge freeze rather than the work's own state.
 
 ## Contract
 
-### MV1 — Red verify state MUST converge
+### MV1 — Non-green verify state MUST converge
 
 A configured local-target integration verify gate MUST NOT leave the system in an
-unbounded freeze. A merge freeze MAY stop further merges onto the canonical local target,
-but it MUST always converge by one of these bounded outcomes:
+unbounded non-green state. A merge freeze MAY stop further merges onto the canonical local
+target, but it MUST always converge by one of these bounded outcomes:
 
 1. the gate reruns and turns green;
 2. the gate reruns and confirms a deterministic red, which then enters bounded repair
@@ -48,6 +63,34 @@ but it MUST always converge by one of these bounded outcomes:
 3. the gate becomes a visible human-required condition with an explicit bounded reason.
 
 A merge stall MUST NOT convert into a launch stall.
+
+The target verify classifier MUST assign exactly one of these classes before lifecycle or
+watch assigns remediation identity. The table is closed: every merge-blocking
+unavailable class has a durable attention identity, and automation MUST NOT substitute a
+different reason slug without changing this contract and the lifecycle reason table.
+Malformed target-verify evidence, including legacy watch output rendered as `unknown`,
+maps to `control-plane-unavailable` because automation cannot safely establish the
+control-plane proof needed to trust the evidence shape.
+
+| Class | Halt policy | Durable attention identity | Owning document | Lifecycle `verify_fix` eligibility | Red-main `system-main-verify` eligibility |
+|-------|-------------|----------------------------|-----------------|------------------------------------|-------------------------------------------|
+| `passed` | does not halt; may satisfy current verify evidence | none | this document | ineligible | ineligible |
+| `red` | merge-blocking; follows MV2-MV5 | `main-integration-verify-red` | this document | ineligible for target-level red-main evidence | eligible after bounded confirmation |
+| `schema-runtime-skew` | merge-blocking unavailable evidence | `main-integration-verify-schema-runtime-skew` | [shared-schema-isolation.md](shared-schema-isolation.md) | ineligible | ineligible |
+| `freshness-unavailable` | merge-blocking unavailable evidence | `main-integration-verify-freshness-unavailable` | this document | ineligible | ineligible |
+| `budget-unavailable` | merge-blocking unavailable evidence | `main-integration-verify-budget-unavailable` | this document | ineligible | ineligible |
+| `control-plane-unavailable` | merge-blocking unavailable evidence, including malformed/`unknown` target evidence | `main-integration-verify-control-plane-unavailable` | this document | ineligible | ineligible |
+| `launch-failed` | non-red, non-halting exception | `main-integration-verify-launch-failed` | this document | ineligible | ineligible |
+| `not-configured` | non-red, non-halting exception | none | this document | ineligible | ineligible |
+
+Lifecycle source-verify handling MAY have its own `verify_fix` lane for ordinary
+pre-review branch verify red evidence, but the target-level classifier above MUST NOT be
+used to create, reuse, run, requeue, or consume attempts for that lifecycle lane. In
+particular, `schema-runtime-skew` reaches unavailable attention directly and is
+ineligible for both lifecycle `verify_fix` and red-main `system-main-verify` remediation.
+Merge-blocking unavailable classes halt only merge actions that require current target
+verify evidence for the affected target lane. They MUST NOT halt unrelated lifecycle work,
+healthy project runtimes, or merge actions that do not depend on the unavailable evidence.
 
 ### MV2 — Red verdicts MUST be re-verified before automation acts on them
 
@@ -123,6 +166,14 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   condition that names the missing or non-runnable tool and tells the operator to fix
   the environment rather than the code. That condition MUST NOT mark main red, MUST NOT
   halt merges, and MUST NOT create or reuse a code-remediation task.
+- Schema-runtime skew, as defined by
+  [shared-schema-isolation.md](shared-schema-isolation.md), is **not** a deterministic
+  red. Automation MUST surface it as an unavailable environment/control-plane condition
+  with fail-closed evidence. It MUST NOT mark main red, MUST NOT create or reuse a
+  `system-main-verify` code-remediation task, MUST NOT start or extend `red_since`,
+  MUST NOT increment consecutive-red evidence, and MUST NOT claim that the canonical
+  local target regressed. It remains merge-blocking for actions that require current
+  verify evidence until the runtime/schema compatibility problem is cleared.
 - Remediation task dedup is by failure identity, not by watch cycle. That identity is
   the normalized failure signature only. The exact local-target tree fingerprint from
   the bounded rerun evidence remains prompt context and freshness evidence, but it MUST

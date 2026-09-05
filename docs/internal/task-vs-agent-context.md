@@ -42,7 +42,9 @@ In Docker, the worktree is mounted as `/workspace`. So any file copied into the 
 
 Before provider launch, the host runner copies the live task DB into the worktree as `.gza/gza.db` under the scoped project root using SQLite's backup API. This gives agents a consistent point-in-time view of task state.
 
-Standard task snapshots are then `chmod 0444`. Reads succeed from inside the worktree, while writes fail with SQLite read-only I/O errors (`attempt to write a readonly database` / similar). Rebase task workspaces are the narrow exception: their task DB snapshot stays writable so `/gza-rebase` flows can refresh local merge truth without tripping SQLite on the copied `gza.db`. Plain default-branch `uv run gza unmerged` therefore still requires a writable snapshot; live-target views such as `uv run gza unmerged --target BRANCH` remain read-only.
+Standard task snapshots are then `chmod 0444`. Reads succeed from inside the worktree, while writes fail with SQLite read-only I/O errors (`attempt to write a readonly database` / similar). Rebase task workspaces are the narrow exception: their task DB snapshot stays writable so `/gza-rebase` flows can refresh local merge truth without tripping SQLite on the copied `gza.db`. The writable rebase snapshot is still isolated; writes are not copied back to the live task DB. Plain default-branch `uv run gza unmerged` therefore still requires a writable snapshot; live-target views such as `uv run gza unmerged --target BRANCH` remain read-only.
+
+Verify subprocesses use a separate disposable writable task DB copy for each verify attempt. The copy is fresh per attempt, so a rerun never inherits SQLite mutations from an earlier failed verify command, and the host control plane records only explicit verify result evidence after the subprocess exits.
 
 Any host-side DB updates that happen after snapshot creation are not reflected in the worktree snapshot for that run.
 

@@ -555,7 +555,12 @@ epoch.
   normally and return non-zero.
   Setup, unsupported-action, execution-before-persistence, or persistence failures
   that leave no newly selected current result MUST return non-zero and label any old
-  verdict as pre-existing evidence.
+	  verdict as pre-existing evidence.
+- Schema-runtime skew evidence, as defined by
+  [shared-schema-isolation.md](shared-schema-isolation.md), MUST route directly to
+  unavailable operator attention. Lifecycle MUST NOT create, reuse, run, requeue, or
+  consume attempts for a lifecycle `verify_fix` based on schema-runtime skew, even when
+  the skew is observed while acquiring ordinary pre-review verify evidence.
 - If the current pre-review verify gate is unavailable and lifecycle cannot safely route
   through `verify_fix`, it MUST park with `verify-unavailable`. If that same unavailable
   state persists after one completed same-epoch `verify_fix`, it MUST park with
@@ -899,15 +904,27 @@ failure *and* actionable merge/review work remains eligible for the latter.
   the live local-target checkout cannot produce an exact tree fingerprint for that
   freshness proof, automation MUST fail closed instead of reusing `HEAD` equality alone:
   it MUST rerun the verify gate, and if exact-tree freshness still cannot be established
-  it MUST persist an operator-visible unavailable proof state that halts merges for the
-  cycle. More generally, if that target-level verify is not `passed`,
-  automation MUST halt further merges for the cycle and surface one durable
-  needs-attention signal with reason `main-integration-verify-red` that names the failing
-  local target SHA and, when structured phase output exists, the failing phase. Projects
-  must apply the convergence contract in
-  [main-verify-self-heal.md](main-verify-self-heal.md) when that red state is reused,
-  refreshed, repaired, or escalated. Projects
-  with no configured
+  it MUST persist an operator-visible unavailable proof state that blocks merge actions
+  requiring current target verify evidence for the affected target lane. More generally,
+  if that target-level verify is not `passed`, automation MUST
+  apply the target verify classifier owned by
+  [main-verify-self-heal.md](main-verify-self-heal.md) before halting merges or assigning a
+  remediation identity. A red verdict MUST halt further merges for the cycle and surface
+  one durable needs-attention signal with reason `main-integration-verify-red` that names
+  the failing local target SHA and, when structured phase output exists, the failing
+  phase. Schema-runtime skew MUST block only merge actions that require current target
+  verify evidence for the affected target lane, and MUST surface as non-red unavailable
+  evidence with reason `main-integration-verify-schema-runtime-skew`; it MUST NOT route
+  through `main-integration-verify-red`, red-main remediation, `red_since`, or
+  consecutive-red evidence. Other merge-blocking unavailable classes, including malformed
+  or `unknown` target evidence mapped to `control-plane-unavailable`, MUST use the same
+  halt scope and surface their corresponding non-red operator-visible reasons from the
+  target verify classifier:
+  `main-integration-verify-freshness-unavailable`,
+  `main-integration-verify-budget-unavailable`, or
+  `main-integration-verify-control-plane-unavailable`. Launch failures MUST surface
+  `main-integration-verify-launch-failed` without halting merges or creating code
+  remediation. Projects with no configured
   `verify_command` are an explicit no-gate exception: they MAY persist an `unavailable`
   checkpoint with `exit_status="not configured"` for visibility, but that checkpoint MUST
   NOT halt merges or emit the red-main attention signal.
@@ -1411,6 +1428,10 @@ is a spec change. The accompanying human message is free text.
 | `review-verdict-needs-manual-attention` | needs_discussion | §6 verdict unclassifiable, or `APPROVED_WITH_FOLLOWUPS` with zero parsed follow-ups |
 | `review-needs-manual-creation` | needs_discussion | §8 implementation-owned lineage requires review, no review exists, `advance_create_reviews` off |
 | `main-integration-verify-red` | needs_discussion | §8 local target verify failed after target HEAD changed; halt further merges until it is green again |
+| `main-integration-verify-schema-runtime-skew` | needs_discussion | §8 local target verify could not produce code evidence because the verify runtime and database schema are incompatible; halt only merge actions that require current verify evidence until the runtime/schema skew is cleared |
+| `main-integration-verify-freshness-unavailable` | needs_discussion | §8 local target verify could not prove exact current target-tree freshness; halt only merge actions that require current verify evidence until freshness can be proven |
+| `main-integration-verify-budget-unavailable` | needs_discussion | §8 local target verify could not produce code evidence within the bounded execution budget and did not yield failed-code phase evidence; halt only merge actions that require current verify evidence until the budget condition is cleared |
+| `main-integration-verify-control-plane-unavailable` | needs_discussion | §8 local target verify could not produce code evidence because required control-plane state, capability, compatibility proof, or malformed/`unknown` target evidence made the result untrustworthy; halt only merge actions that require current verify evidence until that proof is available |
 | `main-integration-verify-launch-failed` | needs_discussion | §8 local target verify tool could not launch because the environment is misconfigured; surface operator attention without marking main red, halting merges, or creating code remediation |
 | `automatic-recovery-disabled` | HumanParked | §7 recovery attempt budget = 0 |
 | `retry-limit-reached` | HumanParked | §7 recovery attempts exhausted or terminal manual-review recovery stop |

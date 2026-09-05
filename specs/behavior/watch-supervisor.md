@@ -327,6 +327,14 @@ and dispatch stops only when aggregate capacity or eligible heads are exhausted.
     defined by this spec and
     [main-verify-self-heal.md](main-verify-self-heal.md). It MUST NOT suppress worker
     dispatch for that remediation lane merely because ordinary merges are held.
+  - `verify-environment-unavailable`: config is valid and the lease remains owned, but
+    the configured local-target verify gate cannot produce code verdict evidence because
+    exact-tree freshness, execution budget, schema-runtime compatibility, or control-plane
+    compatibility is unavailable. The runtime MUST fail closed for merge actions that
+    require that evidence and MUST surface an operator-visible reason, but it MUST NOT
+    enter `main-red/merge-held`, create red-main remediation identity, or suppress healthy
+    project runtimes. Launch failures and no-gate projects are the non-halting exceptions
+    defined by [main-verify-self-heal.md](main-verify-self-heal.md).
   - `locally-capped` or launch-capacity blocked: config is valid and the lease remains
     owned, but the project-local launch permit or local cap has no launch capacity. The
     runtime MAY observe and reconcile existing live/starting work, but MUST expose no new
@@ -480,7 +488,9 @@ Each watch cycle MUST execute these phases in order:
    merge-halting reruns MUST use the same total-attempt count and concise rerun lines,
    and those rerun lines MUST describe the preceding evidence truthfully: `red` only for
    an actual failed gate verdict, `unavailable` for unavailable freshness or environment
-   evidence, and `unknown` for malformed evidence. Completion
+   evidence, and `unknown` for malformed evidence. Malformed or `unknown` evidence MUST
+   then classify as `control-plane-unavailable` under the closed target verify classifier.
+   Completion
    output MUST include the verdict, the target/SHA, elapsed time, and the performed
    attempt count when a suite ran;
    red completions MUST also name the failing phase when structured phase evidence exists.
@@ -489,32 +499,53 @@ Each watch cycle MUST execute these phases in order:
    suppressed; under `--yes`, watch MUST still keep structured checkpoint, start, rerun,
    warning, completion, and attention stdout visible.
    Independently of tree change, a configured-gate checkpoint that is not `passed` MUST
-   expire after a bounded configured TTL and be rerun on that cadence so red/unavailable
-   results cannot persist indefinitely on an unchanged target tree. If the current
-   default-branch checkout cannot produce an exact tree fingerprint before or after that
-   verify, watch MUST treat freshness as unproven instead of reusing `HEAD` equality
-   alone; it MUST halt further merges for the current cycle and surface one visible
-   durable attention row explaining that exact-tree freshness could not be proven. That
+   expire after a bounded configured TTL and be rerun on that cadence so red and
+   unavailable results cannot persist indefinitely on an unchanged target tree. If the
+   current default-branch checkout cannot produce an exact tree fingerprint before or after
+   that verify, watch MUST treat freshness as unproven instead of reusing `HEAD` equality
+   alone; it MUST block merge actions that require current target verify evidence for the
+   affected target lane and surface one visible durable attention row explaining that
+   exact-tree freshness could not be proven. That
    persisted row MUST NOT embed a target SHA; watch may render a SHA-bearing
    `merges halted` freshness message only after proving the recorded SHA still matches
    the current local target HEAD. More generally, if that verify is not `passed`, watch
-   MUST first perform the bounded
-   rerun-before-halt sequence owned by
-   [main-verify-self-heal.md](main-verify-self-heal.md). A flaky red that turns green in
-   that sequence MUST clear the halt for the current cycle and MUST create or reuse
-   exactly one active de-flake remediation attempt for that failure identity. A deterministic
-   red that stays red across the full bounded sequence MUST halt further merges for the
-   current cycle, MUST create or reuse exactly one active fix-remediation attempt for that
-   failure identity, and MUST emit one visible durable attention row with reason
-   `main-integration-verify-red` naming the failing target SHA only while that SHA still
-   matches the current local target HEAD and, when structured phase output exists, the
-   failing phase. If the local target HEAD advances before the attention summary is
-   rendered, watch MUST NOT assert that the recorded SHA is still red or that merges are
-   currently halted based only on that stale red evidence. The convergence requirements
-   for how that red state self-heals or escalates over time are owned by
-   [main-verify-self-heal.md](main-verify-self-heal.md). If no `verify_command` is
-   configured for the project, that is an explicit no-gate
-   exception: watch MAY record an `unavailable` checkpoint with
+   MUST apply the target verify classifier owned by
+   [main-verify-self-heal.md](main-verify-self-heal.md) before assigning remediation
+   identity or halting merges. Actual
+   failed gate verdicts MUST first perform the bounded rerun-before-halt sequence owned
+   by [main-verify-self-heal.md](main-verify-self-heal.md). A flaky red that turns green
+   in that sequence MUST clear the halt for the current cycle and MUST create or reuse
+   exactly one active de-flake remediation attempt for that failure identity. A
+   deterministic red that stays red across the full bounded sequence MUST halt further
+   merges for the current cycle, MUST create or reuse exactly one active
+   fix-remediation attempt for that failure identity, and MUST emit one visible durable
+   attention row with reason `main-integration-verify-red` naming the failing target SHA
+   only while that SHA still matches the current local target HEAD and, when structured
+   phase output exists, the failing phase. If the local target HEAD advances before the
+   attention summary is rendered, watch MUST NOT assert that the recorded SHA is still
+   red or that merges are currently halted based only on that stale red evidence. A
+   schema-runtime skew result MUST instead be recorded and rendered as unavailable
+   environment/control-plane evidence as specified by
+   [shared-schema-isolation.md](shared-schema-isolation.md): it MUST emit
+   `main-integration-verify-schema-runtime-skew`, and it MUST fail closed for merge
+   actions that require current target verify evidence in the affected target lane, but
+   it MUST NOT emit `main-integration-verify-red`, MUST NOT create or reuse
+   `system-main-verify` remediation, MUST NOT start or extend red-main duration, and MUST
+   NOT contribute consecutive-red alert evidence. Freshness, budget, and control-plane
+   unavailable results, including malformed or `unknown` target evidence, MUST use the
+   same halt scope and emit their stable non-red attention reasons from
+   [main-verify-self-heal.md](main-verify-self-heal.md):
+   `main-integration-verify-freshness-unavailable`,
+   `main-integration-verify-budget-unavailable`, or
+   `main-integration-verify-control-plane-unavailable`. They MUST NOT halt unrelated
+   work or healthy project runtimes. They MUST NOT create or reuse `system-main-verify`
+   remediation or contribute red-main evidence. The convergence
+   requirements for how red and unavailable non-green states self-heal or escalate over
+   time are owned by [main-verify-self-heal.md](main-verify-self-heal.md). A launch-failed
+   result MUST emit `main-integration-verify-launch-failed` operator attention but MUST
+   NOT halt merges. If no
+   `verify_command` is configured for the project, that is an explicit no-gate exception:
+   watch MAY record an `unavailable` checkpoint with
    `exit_status="not configured"` but MUST NOT halt merges or emit red-main attention for it.
    Watch MAY persist a completed failed-recovery scan marker for the current target branch,
    but that marker is authoritative only when it proves the target head and every active
