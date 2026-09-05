@@ -2020,6 +2020,7 @@ def _normalize_incomplete_result_rows(
     """Re-root incomplete rows on the implementation that owns the merge unit."""
     recovery_preview_entries_by_task_id = recovery_preview_entries_by_task_id or {}
     normalized_rows: list[_TaskRow | _LineageRow] = []
+    seen_owner_task_ids: set[str] = set()
     changed = False
 
     for row in result.rows:
@@ -2034,6 +2035,14 @@ def _normalize_incomplete_result_rows(
             explicit_subject = _resolve_incomplete_explicit_subject_task(store, action, row)
             owner_task = resolve_subject_task(store, action, row, fallback_task=owner_task)
             stale_fallback_action = owner_task.id != row.owner_task.id and explicit_subject is None
+        if owner_task.id is not None and owner_task.id in seen_owner_task_ids:
+            # Distinct raw lineage rows can re-root onto the same subject task
+            # (e.g. two different unresolved reasons pointing at one owner).
+            # Keep only the first row so it isn't shown twice.
+            changed = True
+            continue
+        if owner_task.id is not None:
+            seen_owner_task_ids.add(owner_task.id)
         merge_units_by_task_id: dict[str, MergeUnit] = {}
         for task in (owner_task, *row.members, *row.unresolved_tasks):
             if task is None or task.id is None or task.id in merge_units_by_task_id:
