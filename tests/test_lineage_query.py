@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import platform
 import subprocess
@@ -687,6 +688,61 @@ def test_query_lineage_owner_rows_tag_filter_excludes_owner_when_only_member_mat
     )
     assert tuple(preload.call_args.kwargs["branch_names"]) == ()
     determine.assert_not_called()
+
+
+def test_query_lineage_owner_rows_profile_classified_counter_counts_filtered_failed_candidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GZA_PROFILE", "1")
+    metrics_module = importlib.import_module("gza.metrics")
+    with metrics_module._STATE.lock:  # noqa: SLF001
+        metrics_module._STATE.counters.clear()  # noqa: SLF001
+        metrics_module._STATE.latencies.clear()  # noqa: SLF001
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    matching = store.add("Alpha failed candidate", task_type="implement", tags=("alpha",))
+    matching.status = "failed"
+    matching.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    matching.failure_reason = "TEST_FAILURE"
+    store.update(matching)
+
+    resolved = store.add("Alpha resolved failed candidate", task_type="implement", tags=("alpha",))
+    resolved.status = "failed"
+    resolved.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    resolved.failure_reason = "TEST_FAILURE"
+    store.update(resolved)
+    resolved_recovery = store.add(
+        "Alpha resolved failed candidate",
+        task_type="implement",
+        based_on=resolved.id,
+        tags=("alpha",),
+    )
+    resolved_recovery.status = "completed"
+    resolved_recovery.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    resolved_recovery.recovery_origin = "retry"
+    store.update(resolved_recovery)
+
+    unrelated = store.add("Beta failed candidate", task_type="implement", tags=("beta",))
+    unrelated.status = "failed"
+    unrelated.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    unrelated.failure_reason = "TEST_FAILURE"
+    store.update(unrelated)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, tags=("alpha",), include_skipped=True, max_recovery_attempts=1),
+    )
+    snapshot = metrics_module.snapshot()
+
+    assert [row.owner_task.id for row in rows] == [matching.id]
+    assert snapshot.counters[
+        metrics_module.MetricKey("gza_lineage_owner_failed_tasks_seen_total")
+    ] == 3
+    assert snapshot.counters[
+        metrics_module.MetricKey("gza_lineage_owner_failed_tasks_classified_total")
+    ] == 1
 
 
 def _add_unmerged_tag_pruning_owner(

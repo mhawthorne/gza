@@ -1957,10 +1957,11 @@ def _query_lineage_owner_rows_with_context(
                 historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
             )
         )
-        metrics.incr("gza_lineage_owner_failed_tasks_classified_total", value=len(read_context.failed_tasks()))
+        metrics.incr("gza_lineage_owner_failed_tasks_seen_total", value=len(read_context.failed_tasks()))
         visible_failed_tasks = [
             task for task in list_failed_tasks_for_recovery(store, read_context=read_context) if task.id is not None
         ]
+        metrics.incr("gza_lineage_owner_failed_tasks_classified_total", value=len(visible_failed_tasks))
         visible_failed_ids = {task.id for task in visible_failed_tasks if task.id is not None}
         visible_failed_order = {
             task.id: index for index, task in enumerate(visible_failed_tasks) if task.id is not None
