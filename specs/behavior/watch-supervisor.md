@@ -555,8 +555,16 @@ Each watch cycle MUST execute these phases in order:
    When a scan invalidates a unit previously classified as `empty` or `redundant`, watch
    MUST reclassify that unit against the scan's target snapshot instead of preserving the
    stale terminal no-work state.
-   Incomplete reconciliation, missing head/base proof, or classifier exceptions MUST keep
-   the previous marker and force the ordinary live fail-closed recovery classification path.
+   Incomplete reconciliation, missing head/base proof, classifier exceptions, malformed
+   content-equivalence output, merge-tree conflicts, and Git failures while proving otherwise
+   resolvable source/target content MUST keep the previous marker and force the ordinary live
+   fail-closed recovery classification path. The only unprovable exception is a genuinely
+   unresolvable recorded content ref: if the recorded source head or target object needed for
+   a prior terminal `merged`, `unmerged`, `empty`, or `redundant` unit no longer resolves, watch
+   MAY advance the scan marker for the current target without repeatedly attempting impossible
+   content proof. A missing source branch by itself is not that exception when the recorded
+   source head still resolves; source-head invalidation still fails closed unless the recorded
+   object-level proof is impossible.
    Only a current complete marker MAY let failed-task discovery reuse DB-backed
    classifications instead of per-lineage Git probes.
    For this supervisor-owned remediation lane, dedup is by failure identity: normalized

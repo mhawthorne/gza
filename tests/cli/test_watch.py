@@ -818,16 +818,23 @@ def _make_watch_git() -> Git:
             if ref == "main"
             else "watchtestsourcesha"
             if ref.startswith("feature/watch-")
+            else ref
+            if ref.endswith("-head") or ref.startswith("target-")
             else None
         )
     )
-    git.resolve_refs = MagicMock(  # type: ignore[method-assign]
-        side_effect=lambda refs, **_kwargs: {
-            ref: sha
-            for ref in refs
-            if (sha := git.rev_parse_if_exists(ref)) is not None
-        }
-    )
+    def resolve_refs(refs: object, **_kwargs: object) -> dict[str, str]:
+        resolved: dict[str, str] = {}
+        for ref in refs:  # type: ignore[union-attr]
+            ref_name = str(ref)
+            sha = git.rev_parse_if_exists(ref_name)
+            if sha is None and (ref_name.endswith("-head") or ref_name.startswith("target-")):
+                sha = ref_name
+            if sha is not None:
+                resolved[ref_name] = sha
+        return resolved
+
+    git.resolve_refs = MagicMock(side_effect=resolve_refs)  # type: ignore[method-assign]
     git.worktree_list = MagicMock(return_value=[{"path": str(git.repo_dir)}])  # type: ignore[method-assign]
     git.can_merge = MagicMock(return_value=True)  # type: ignore[method-assign]
     git.is_merged = MagicMock(return_value=False)  # type: ignore[method-assign]
@@ -1271,7 +1278,9 @@ def test_watch_failed_recovery_scan_same_target_reclassifies_rewritten_empty_uni
     git = _make_watch_git()
     git.is_merged = MagicMock(return_value=False)  # type: ignore[method-assign]
     git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
-        side_effect=lambda ref: "rewritten-empty-head" if ref == task.branch else "target-head" if ref == "main" else None
+        side_effect=lambda ref: (
+            "rewritten-empty-head" if ref == task.branch else "target-head" if ref == "main" else None
+        )
     )
     git.merge_base = MagicMock(return_value="target-head")  # type: ignore[method-assign]
     git.count_commits_ahead = MagicMock(return_value=1)  # type: ignore[method-assign]
@@ -1330,7 +1339,9 @@ def test_watch_failed_recovery_scan_same_target_reclassifies_rewritten_redundant
     git = _make_watch_git()
     git.is_merged = MagicMock(return_value=True)  # type: ignore[method-assign]
     git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
-        side_effect=lambda ref: "rewritten-landed-head" if ref == task.branch else "target-head" if ref == "main" else None
+        side_effect=lambda ref: (
+            "rewritten-landed-head" if ref == task.branch else "target-head" if ref == "main" else None
+        )
     )
     git.count_commits_ahead_checked = MagicMock(return_value=1)  # type: ignore[method-assign]
 
@@ -1420,7 +1431,9 @@ def test_watch_failed_recovery_scan_proven_merged_classifier_exception_keeps_pre
     git = _make_watch_git()
     git.is_merged = MagicMock(return_value=True)  # type: ignore[method-assign]
     git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
-        side_effect=lambda ref: "rewritten-landed-head" if ref == task.branch else "target-head" if ref == "main" else None
+        side_effect=lambda ref: (
+            "rewritten-landed-head" if ref == task.branch else "target-head" if ref == "main" else None
+        )
     )
     git.count_commits_ahead_checked = MagicMock(side_effect=RuntimeError("ahead proof unavailable"))  # type: ignore[method-assign]
     record_marker = MagicMock(side_effect=AssertionError("incomplete proof must not record scan marker"))
@@ -1470,7 +1483,9 @@ def test_watch_failed_recovery_scan_proven_merged_unknown_refinement_keeps_previ
     git = _make_watch_git()
     git.is_merged = MagicMock(return_value=True)  # type: ignore[method-assign]
     git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
-        side_effect=lambda ref: "rewritten-empty-head" if ref == task.branch else "target-head" if ref == "main" else None
+        side_effect=lambda ref: (
+            "rewritten-empty-head" if ref == task.branch else "target-head" if ref == "main" else None
+        )
     )
     git.count_commits_ahead_checked = MagicMock(return_value=0)  # type: ignore[method-assign]
     git.is_ancestor = MagicMock(return_value=False)  # type: ignore[method-assign]
@@ -1525,7 +1540,9 @@ def test_watch_failed_recovery_scan_incomplete_no_work_reclassification_keeps_pr
     git = _make_watch_git()
     git.is_merged = MagicMock(return_value=False)  # type: ignore[method-assign]
     git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
-        side_effect=lambda ref: "rewritten-empty-head" if ref == task.branch else "target-head" if ref == "main" else None
+        side_effect=lambda ref: (
+            "rewritten-empty-head" if ref == task.branch else "target-head" if ref == "main" else None
+        )
     )
     git.merge_base = MagicMock(return_value=None)  # type: ignore[method-assign]
     git.count_commits_ahead = MagicMock(return_value=None)  # type: ignore[method-assign]
@@ -1614,13 +1631,7 @@ def test_failed_branch_without_merge_unit_keeps_live_landed_classification_under
     git.branch_exists = MagicMock(return_value=True)  # type: ignore[method-assign]
     git.is_merged = MagicMock(return_value=True)  # type: ignore[method-assign]
     git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
-        side_effect=lambda ref: (
-            "source-head"
-            if ref == failed.branch
-            else "target-current"
-            if ref == "main"
-            else None
-        )
+        side_effect=lambda ref: "source-head" if ref == failed.branch else "target-current" if ref == "main" else None
     )
 
     live_candidates, _ = watch_module.discover_parked_tasks(
@@ -1984,6 +1995,295 @@ def test_watch_failed_recovery_scan_moved_target_detects_content_equivalent_land
     assert db_candidate_ids == live_candidate_ids
 
 
+def test_watch_failed_recovery_scan_moved_target_records_marker_for_unprovable_dead_branch(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_watch_scan_task(store, "feature/watch-dead-terminal-proof")
+    assert task.id is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, head_sha="source-head", base_sha="target-old")
+    store.set_merge_unit_state(unit.id, "empty")
+    _record_current_watch_failed_recovery_scan(store, target_branch="main", target_sha="target-old")
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "target-new" if ref == "main" else None
+    )
+    git.resolve_refs = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda refs, **_kwargs: {
+            ref: "target-new" for ref in refs if str(ref) == "target-new"
+        }
+    )
+    git.content_equivalent_refs_on_target = MagicMock(return_value={"source-head": None})  # type: ignore[method-assign]
+
+    with caplog.at_level("DEBUG", logger="gza.cli.watch"):
+        assert _watch_failed_recovery_scan_is_current(
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="target-new",
+        )
+        assert _watch_failed_recovery_scan_is_current(
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="target-new",
+        )
+
+    marker = store.get_watch_failed_recovery_scan_state(target_branch="main")
+    assert marker is not None and marker.target_sha == "target-new"
+    refreshed = store.get_merge_unit(unit.id)
+    assert refreshed is not None
+    assert refreshed.state == "empty"
+    assert refreshed.base_sha == "target-new"
+    git.content_equivalent_refs_on_target.assert_not_called()
+    assert "recorded content ref unavailable" in caplog.text
+    assert "incomplete; keeping previous marker" not in caplog.text
+
+
+def test_watch_failed_recovery_scan_moved_target_dead_head_does_not_poison_live_peer(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    dead = _completed_watch_scan_task(store, "feature/watch-dead-peer")
+    live = _completed_watch_scan_task(store, "feature/watch-live-peer")
+    assert dead.id is not None and live.id is not None
+    dead_unit = store.resolve_merge_unit_for_task(dead.id)
+    live_unit = store.resolve_merge_unit_for_task(live.id)
+    assert dead_unit is not None and live_unit is not None
+    store.refresh_merge_unit_head(dead_unit.id, head_sha="dead-head", base_sha="target-old")
+    store.refresh_merge_unit_head(live_unit.id, head_sha="live-head", base_sha="stable-base")
+    store.set_merge_unit_state(dead_unit.id, "empty")
+    store.set_merge_unit_state(live_unit.id, "unmerged")
+    _record_current_watch_failed_recovery_scan(store, target_branch="main", target_sha="target-old")
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: (
+            "target-new"
+            if ref == "main" or ref == "target-new"
+            else "live-head"
+            if ref == live.branch or ref == "live-head"
+            else None
+        )
+    )
+    git.resolve_refs = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda refs, **_kwargs: {
+            ref: "live-head" if str(ref) == live.branch else str(ref)
+            for ref in refs
+            if str(ref) in {str(live.branch), "live-head", "target-new"}
+        }
+    )
+    git.content_equivalent_refs_on_target = MagicMock(return_value={"live-head": True})  # type: ignore[method-assign]
+    git.patch_equivalent_commits_present_on_target = MagicMock(return_value={})  # type: ignore[method-assign]
+    git.is_merged = MagicMock(return_value=False)  # type: ignore[method-assign]
+
+    with caplog.at_level("DEBUG", logger="gza.cli.watch"):
+        assert _watch_failed_recovery_scan_is_current(
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="target-new",
+        )
+
+    refreshed_dead = store.get_merge_unit(dead_unit.id)
+    refreshed_live = store.get_merge_unit(live_unit.id)
+    assert refreshed_dead is not None and refreshed_live is not None
+    assert refreshed_dead.state == "empty"
+    assert refreshed_dead.base_sha == "target-new"
+    assert refreshed_live.state == "merged"
+    assert refreshed_live.merge_source == "external"
+    assert refreshed_live.base_sha == "target-new"
+    marker = store.get_watch_failed_recovery_scan_state(target_branch="main")
+    assert marker is not None and marker.target_sha == "target-new"
+    git.content_equivalent_refs_on_target.assert_called_once_with(["live-head"], "target-new")
+    assert "recorded content ref unavailable" in caplog.text
+    assert "incomplete; keeping previous marker" not in caplog.text
+
+    assert _watch_failed_recovery_scan_is_current(
+        store=store,
+        git=git,
+        target_branch="main",
+        target_sha="target-new",
+    )
+    git.content_equivalent_refs_on_target.assert_called_once_with(["live-head"], "target-new")
+
+
+def test_watch_failed_recovery_scan_moved_target_missing_source_with_recorded_head_keeps_marker(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_watch_scan_task(store, "feature/watch-missing-source-resolvable-object")
+    assert task.id is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, head_sha="source-head", base_sha="target-old")
+    store.set_merge_unit_state(unit.id, "empty")
+    _record_current_watch_failed_recovery_scan(store, target_branch="main", target_sha="target-old")
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: (
+            "target-new"
+            if ref == "main" or ref == "target-new"
+            else "source-head"
+            if ref == "source-head"
+            else None
+        )
+    )
+    git.content_equivalent_refs_on_target = MagicMock(return_value={"source-head": True})  # type: ignore[method-assign]
+
+    with caplog.at_level("DEBUG", logger="gza.cli.watch"):
+        assert not _watch_failed_recovery_scan_is_current(
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="target-new",
+        )
+
+    marker = store.get_watch_failed_recovery_scan_state(target_branch="main")
+    assert marker is not None and marker.target_sha == "target-old"
+    refreshed = store.get_merge_unit(unit.id)
+    assert refreshed is not None
+    assert refreshed.state == "empty"
+    assert refreshed.base_sha == "target-old"
+    git.content_equivalent_refs_on_target.assert_not_called()
+    assert "source-head proof unavailable" in caplog.text
+    assert "incomplete; keeping previous marker" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("merge_tree_results", "expected_calls"),
+    [
+        ([{"source-head": None}, {"source-head": "target-tree"}], 2),
+        ([GitError("merge-tree unavailable"), {"source-head": "target-tree"}], 2),
+    ],
+)
+def test_watch_failed_recovery_scan_moved_target_unknown_content_keeps_marker_and_retries(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    merge_tree_results: list[object],
+    expected_calls: int,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_watch_scan_task(store, "feature/watch-live-ambiguous-content")
+    assert task.id is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, head_sha="source-head", base_sha="target-old")
+    store.set_merge_unit_state(unit.id, "empty")
+    _record_current_watch_failed_recovery_scan(store, target_branch="main", target_sha="target-old")
+
+    git = _make_watch_git()
+
+    def resolve_refs(refs: object, peel: str = "commit") -> dict[str, str | None]:
+        ref_tuple = tuple(str(ref) for ref in refs)  # type: ignore[arg-type]
+        if peel == "commit":
+            values = {
+                "feature/watch-live-ambiguous-content": "source-head",
+                "source-head": "source-head",
+                "target-new": "target-new",
+            }
+        elif peel == "tree":
+            values = {"target-new": "target-tree"}
+        else:
+            raise AssertionError(f"unexpected peel={peel!r}")
+        return {ref: values.get(ref) for ref in ref_tuple}
+
+    git.resolve_refs = MagicMock(side_effect=resolve_refs)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "target-new" if ref == "main" else None
+    )
+    git.merge_tree_result_trees = MagicMock(side_effect=merge_tree_results)  # type: ignore[method-assign]
+    git.content_equivalent_refs_on_target = (  # type: ignore[method-assign]
+        lambda source_refs, target_ref: Git.content_equivalent_refs_on_target(git, source_refs, target_ref)
+    )
+
+    with caplog.at_level("DEBUG", logger="gza.cli.watch"):
+        assert not _watch_failed_recovery_scan_is_current(
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="target-new",
+        )
+
+    marker = store.get_watch_failed_recovery_scan_state(target_branch="main")
+    assert marker is not None and marker.target_sha == "target-old"
+    assert "content-equivalence proof unavailable" in caplog.text
+    assert "incomplete; keeping previous marker" in caplog.text
+
+    assert _watch_failed_recovery_scan_is_current(
+        store=store,
+        git=git,
+        target_branch="main",
+        target_sha="target-new",
+    )
+    marker = store.get_watch_failed_recovery_scan_state(target_branch="main")
+    assert marker is not None and marker.target_sha == "target-new"
+    assert git.merge_tree_result_trees.call_count == expected_calls
+
+
+def test_watch_failed_recovery_scan_moved_target_reopens_empty_unit_when_content_unlands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_watch_scan_task(store, "feature/watch-empty-content-unlands")
+    assert task.id is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, head_sha="source-head", base_sha="stable-base")
+    store.set_merge_unit_state(unit.id, "empty")
+    _record_current_watch_failed_recovery_scan(store, target_branch="main", target_sha="target-old")
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "source-head" if ref == task.branch else "target-new" if ref == "main" else None
+    )
+    git.content_equivalent_refs_on_target = MagicMock(return_value={"source-head": False})  # type: ignore[method-assign]
+
+    def content_missing_reconcile(*_args: object, **_kwargs: object) -> list[BranchSyncResult]:
+        return [
+            BranchSyncResult(
+                branch=task.branch or "",
+                task_ids=(task.id or "",),
+                merge_status="unmerged",
+                head_sha="source-head",
+                base_sha="target-new",
+                reconciled=True,
+                actions=["restored missing content"],
+            )
+        ]
+
+    monkeypatch.setattr(watch_module, "reconcile_branch_merge_truth", content_missing_reconcile)
+
+    assert _watch_failed_recovery_scan_is_current(
+        store=store,
+        git=git,
+        target_branch="main",
+        target_sha="target-new",
+    )
+
+    refreshed = store.get_merge_unit(unit.id)
+    assert refreshed is not None
+    assert refreshed.state == "unmerged"
+    assert refreshed.head_sha == "source-head"
+    assert refreshed.base_sha == "target-new"
+    marker = store.get_watch_failed_recovery_scan_state(target_branch="main")
+    assert marker is not None and marker.target_sha == "target-new"
+    git.content_equivalent_refs_on_target.assert_called_once_with(["source-head"], "target-new")
+
+
 def test_watch_failed_recovery_scan_target_snapshot_mismatch_keeps_marker_non_authoritative(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2002,13 +2302,7 @@ def test_watch_failed_recovery_scan_target_snapshot_mismatch_keeps_marker_non_au
     git = _make_watch_git()
     git.content_equivalent_refs_on_target = MagicMock(return_value={"source-head": True})  # type: ignore[method-assign]
     git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
-        side_effect=lambda ref: (
-            "source-head"
-            if ref == task.branch
-            else "target-newer"
-            if ref == "main"
-            else None
-        )
+        side_effect=lambda ref: "source-head" if ref == task.branch else "target-newer" if ref == "main" else None
     )
 
     def mixed_snapshot_reconcile(*_args: object, **kwargs: object) -> list[BranchSyncResult]:
@@ -2279,7 +2573,9 @@ def test_watch_failed_recovery_scan_current_marker_still_rechecks_open_pr_blank_
     git.is_merged = MagicMock(return_value=False)  # type: ignore[method-assign]
     git.merge_base = MagicMock(return_value="base-current")  # type: ignore[method-assign]
     git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
-        side_effect=lambda ref: "phantom-head-live" if ref == phantom.branch else "target-current" if ref == "main" else None
+        side_effect=lambda ref: (
+            "phantom-head-live" if ref == phantom.branch else "target-current" if ref == "main" else None
+        )
     )
 
     assert _watch_failed_recovery_scan_is_current(
@@ -3634,8 +3930,9 @@ def test_cmd_watch_multi_project_registry_id_selector_reaches_runtime_constructi
     with (
         patch("gza.db._is_canonical_project_checkout", return_value=True),
         patch("gza.cli.watch.Git", side_effect=lambda *_args, **_kwargs: _make_watch_git()),
-        patch("gza.cli.watch.run_watch_supervisor_fleet_cycle", side_effect=fleet_cycle_with_real_construction)
-        as fleet_cycle,
+        patch(
+            "gza.cli.watch.run_watch_supervisor_fleet_cycle", side_effect=fleet_cycle_with_real_construction
+        ) as fleet_cycle,
         patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
     ):
         rc = cmd_watch(args)
@@ -12525,9 +12822,7 @@ def test_supervisor_launch_budget_retargets_live_recovery_reservation_to_child_w
         result = budget.dispatch_recovery_candidate(runtime_a, recovery_candidate, max_iterations=1)
 
     assert result.status == "live"
-    assert [(reservation.runtime_key, reservation.task_id) for reservation in budget.reservations] == [
-        ("a", child.id)
-    ]
+    assert [(reservation.runtime_key, reservation.task_id) for reservation in budget.reservations] == [("a", child.id)]
     assert budget.occupancy.provisional_reservations == 1
     assert budget.dispatch_pending_candidate(runtime_b, pending_candidate, max_iterations=1).status == (
         "global_capacity_blocked"
@@ -12765,7 +13060,9 @@ def test_supervisor_launch_budget_releases_recovery_reservation_without_live_pro
     assert budget.occupancy.slots == 0
 
 
-@pytest.mark.parametrize("settle_status", [watch_module._DispatchSettleStatus.LIVE, watch_module._DispatchSettleStatus.NO_LIVE_PROOF])
+@pytest.mark.parametrize(
+    "settle_status", [watch_module._DispatchSettleStatus.LIVE, watch_module._DispatchSettleStatus.NO_LIVE_PROOF]
+)
 def test_watch_project_runtime_recovery_dispatch_routes_needs_rebase_through_shared_executor(
     tmp_path: Path,
     settle_status: object,
@@ -14125,7 +14422,9 @@ def test_watch_supervisor_fleet_cycle_emits_one_deferred_blocker_count_per_runti
             ),
             patch.object(WatchProjectRuntime, "recovery_dispatch_head", autospec=True, return_value=None),
             patch.object(WatchProjectRuntime, "pending_dispatch_head", autospec=True, return_value=None),
-            patch("gza.cli.watch._run_watch_main_integration_verify", return_value=SimpleNamespace(merges_halted=False)),
+            patch(
+                "gza.cli.watch._run_watch_main_integration_verify", return_value=SimpleNamespace(merges_halted=False)
+            ),
         ):
             result, _lease_set = run_watch_supervisor_fleet_cycle(
                 anchor_store=runtime_a.store,
@@ -22288,8 +22587,7 @@ def test_watch_cycle_logs_cycle_accounting_line(tmp_path: Path) -> None:
         )
 
     assert (
-        "INFO      cycle accounting: running=0 pending=2 blocked=1 parked=0 recovery=0 other=0"
-        in log_path.read_text()
+        "INFO      cycle accounting: running=0 pending=2 blocked=1 parked=0 recovery=0 other=0" in log_path.read_text()
     )
 
 
@@ -29158,7 +29456,9 @@ def test_watch_cycle_isolated_batch_candidate_only_containment_waits_for_candida
     git.branch_exists = MagicMock(side_effect=lambda branch: branch in {task.branch for task in tasks})  # type: ignore[method-assign]
     git.is_merged = MagicMock(return_value=False)  # type: ignore[method-assign]
     git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
-        side_effect=lambda ref: "source-sha" if ref in {task.branch for task in tasks} else "target-before" if ref == "main" else None
+        side_effect=lambda ref: (
+            "source-sha" if ref in {task.branch for task in tasks} else "target-before" if ref == "main" else None
+        )
     )
     merge_git = MagicMock(name="candidate_containment_git")
     merge_git.repo_dir = config.main_checkout_integration_path
@@ -29169,8 +29469,8 @@ def test_watch_cycle_isolated_batch_candidate_only_containment_waits_for_candida
     merge_git.rev_parse_if_exists.side_effect = lambda ref: (
         "source-sha" if ref in {task.branch for task in tasks} else "candidate-head" if ref == "main" else None
     )
-    merge_git.is_merged.side_effect = (
-        lambda source_ref, _target_ref=None, **_kwargs: str(source_ref).endswith(str(tasks[1].branch))
+    merge_git.is_merged.side_effect = lambda source_ref, _target_ref=None, **_kwargs: str(source_ref).endswith(
+        str(tasks[1].branch)
     )
 
     merge_single_task_ids: list[str] = []
@@ -29367,7 +29667,9 @@ def test_watch_cycle_isolated_batch_post_materialization_authority_race_preserve
                 newer_output = _watch_capped_review_output("B2", verdict="NEEDS_DISCUSSION")
             elif race == "spec-coherence-unknown":
                 newer_output = "## Review\n\nVerdict: BANANA\n\n## Notes\n\nUnparseable for lifecycle authority.\n"
-            newer = store.add(f"Spec coherence review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+            newer = store.add(
+                f"Spec coherence review {task.id}", task_type="review", depends_on=task.id, based_on=task.id
+            )
             assert newer.id is not None
             assert task.id is not None
             newer.status = "completed"
@@ -29912,7 +30214,10 @@ def test_watch_cycle_isolated_batch_source_move_during_second_materialization_pr
     log_path = tmp_path / ".gza" / "watch.log"
 
     with (
-        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=lambda *args, **_kwargs: staged_entries[args[3].id]),
+        patch(
+            "gza.cli.watch._stage_isolated_merge_action",
+            side_effect=lambda *args, **_kwargs: staged_entries[args[3].id],
+        ),
         patch(
             "gza.cli.watch.check_candidate_integration_verify",
             return_value=_candidate_verify_check(tmp_path, tree_fingerprint="fp-candidate", head_sha="candidate-head"),
@@ -30312,7 +30617,11 @@ def test_watch_cycle_isolated_batch_checkpoint_failure_recovers_as_missing_proof
     target_reads = ["target-before", "target-after"]
     git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
         side_effect=lambda ref: (
-            target_reads.pop(0) if ref == "main" and target_reads else "target-after" if ref == "main" else "watchtestsourcesha"
+            target_reads.pop(0)
+            if ref == "main" and target_reads
+            else "target-after"
+            if ref == "main"
+            else "watchtestsourcesha"
         )
     )
     merge_git = MagicMock(name="isolated_batch_git")
@@ -39725,8 +40034,7 @@ def test_watch_cycle_replaces_buffered_main_verify_red_with_exhausted_after_reme
     # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert any(
-        "main verify remediation exhausted for phase:functional after 2/2 attempts" in message
-        for message in messages
+        "main verify remediation exhausted for phase:functional after 2/2 attempts" in message for message in messages
     )
     assert any("human intervention required" in message for message in messages)
     assert any("main verify RED at `feedfacecafe`" not in message for message in messages)
@@ -59978,7 +60286,10 @@ def test_main_verify_attention_summary_renders_current_unknown_status_as_unknown
     # The roundup repeats the per-task message; the log current attention state
     # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
-    assert any("main verify evidence unknown for current HEAD; unrecognized verify status `mystery`" in message for message in messages)
+    assert any(
+        "main verify evidence unknown for current HEAD; unrecognized verify status `mystery`" in message
+        for message in messages
+    )
     assert any("feedfacecafe" not in message for message in messages)
     assert any("main verify RED" not in message for message in messages)
     assert any("RED" not in message for message in messages)
@@ -60108,7 +60419,10 @@ def test_main_verify_attention_summary_surfaces_launch_failure_without_alert_mes
     # The roundup repeats the per-task message; the log current attention state
     # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
-    assert any("main verify misconfigured - verify command launch failed; fix the environment, not the code" in message for message in messages)
+    assert any(
+        "main verify misconfigured - verify command launch failed; fix the environment, not the code" in message
+        for message in messages
+    )
     assert any("feedfacecafe" not in message for message in messages)
     assert any("RED" not in message for message in messages)
     assert any("merges halted" not in message for message in messages)
@@ -60149,7 +60463,10 @@ def test_main_verify_attention_summary_sanitizes_launch_failure_with_legacy_red_
     # The roundup repeats the per-task message; the log current attention state
     # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
-    assert any("main verify misconfigured - verify command launch failed; fix the environment, not the code" in message for message in messages)
+    assert any(
+        "main verify misconfigured - verify command launch failed; fix the environment, not the code" in message
+        for message in messages
+    )
     assert any("feedfacecafe" not in message for message in messages)
     assert any("main verify RED" not in message for message in messages)
     assert any("merges halted" not in message for message in messages)
