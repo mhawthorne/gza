@@ -89,6 +89,7 @@ from gza.review_scope import build_spec_coherence_review_scope, declares_resolut
 from gza.review_tasks import (
     CappedReviewBlockerMaterializationError,
     build_capped_review_blocker_prompt,
+    build_deferred_blocker_prompt_prefix,
     build_followup_prompt,
     create_or_reuse_capped_review_blocker_task,
     format_blocker_finding_context,
@@ -1326,7 +1327,10 @@ def _landing_authorization(**overrides: Any) -> MergeLandingAuthorization:
         "reviewed_head": "source-sha",
         "review_mode": "plain_full",
         "review_verdict": "CHANGES_REQUESTED",
-        "blocker_identities": ('{"class":"out_of_scope","deferrable":true,"finding_id":"B1"}',),
+        "blocker_identities": (
+            '{"class":"out_of_scope","deferrable":true,"finding_id":"B1",'
+            '"fingerprint":"blocker:a","source":"review:testproject-2"}',
+        ),
         "blocker_fingerprints": ("blocker:a",),
         "followup_identities": ('{"finding":"F1","review":"testproject-2"}',),
         "followup_fingerprints": ("followup:a",),
@@ -1339,6 +1343,31 @@ def _landing_authorization(**overrides: Any) -> MergeLandingAuthorization:
     }
     values.update(overrides)
     return MergeLandingAuthorization(**values)
+
+
+def _landing_blocker_identity(review_id: str, finding_id: str = "B1", fingerprint: str = "blocker:a") -> str:
+    return (
+        '{"class":"out_of_scope","deferrable":true,'
+        f'"finding_id":"{finding_id}","fingerprint":"{fingerprint}",'
+        f'"source":"review:{review_id}"'
+        "}"
+    )
+
+
+def _deferred_blocker_task(store: Any, impl: DbTask, review_id: str, finding_id: str = "B1", **kwargs: Any) -> DbTask:
+    assert impl.id is not None
+    values = {
+        "task_type": "implement",
+        "based_on": review_id,
+        "depends_on": impl.id,
+        "urgent": True,
+        "create_pr": True,
+    }
+    values.update(kwargs)
+    return store.add(
+        build_deferred_blocker_prompt_prefix(review_id, impl.id, finding_id) + " fix it",
+        **values,
+    )
 
 
 @pytest.mark.parametrize(
@@ -1470,7 +1499,7 @@ def test_manual_merge_boundary_stable_landing_authorization_materializes_before_
     task = _completed_merge_task(store, "Stable landing authorization", "feature/landing-auth")
     assert task.id is not None
     assert store.get_or_create_merge_unit_for_task(task) is not None
-    blocker = store.add("Deferred blocker", task_type="implement", depends_on=task.id, create_pr=True, urgent=True)
+    blocker = _deferred_blocker_task(store, task, "testproject-2", "B1")
     followup = store.add("Follow-up", task_type="implement", depends_on=task.id)
     authorized = _landing_authorization(owner_task_id=task.id)
     order: list[str] = []
@@ -1514,6 +1543,186 @@ def test_manual_merge_boundary_stable_landing_authorization_materializes_before_
     assert len(artifacts) == 1
     assert artifacts[0].metadata["authorization"]["judgment_artifact_id"] == "artifact-1"
     assert artifacts[0].metadata["authorization"]["judgment_key"] == "judge-key"
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_finding_ids", "materialized"),
+    [
+        ("empty", ("B1",), lambda store, task, review_id: ([], [])),
+        ("partial", ("B1", "B2"), lambda store, task, review_id: ([_deferred_blocker_task(store, task, review_id, "B1")], [])),
+        ("wrong_identity", ("B1",), lambda store, task, review_id: ([_deferred_blocker_task(store, task, review_id, "B2")], [])),
+        ("non_urgent", ("B1",), lambda store, task, review_id: ([_deferred_blocker_task(store, task, review_id, "B1", urgent=False)], [])),
+        ("non_pr", ("B1",), lambda store, task, review_id: ([_deferred_blocker_task(store, task, review_id, "B1", create_pr=False)], [])),
+    ],
+)
+def test_manual_merge_boundary_refuses_incomplete_guarded_deferred_blockers_before_merge(
+    tmp_path: Path,
+    scenario: str,
+    expected_finding_ids: tuple[str, ...],
+    materialized: Any,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_merge_task(store, f"Guarded deferred {scenario}", "feature/landing-auth")
+    assert task.id is not None
+    assert store.get_or_create_merge_unit_for_task(task) is not None
+    review_id = "testproject-2"
+    blocker_identities = tuple(
+        _landing_blocker_identity(review_id, finding_id, f"blocker:{finding_id.lower()}")
+        for finding_id in expected_finding_ids
+    )
+    authorized = _landing_authorization(
+        owner_task_id=task.id,
+        review_id=review_id,
+        blocker_identities=blocker_identities,
+        blocker_fingerprints=tuple(f"blocker:{finding_id.lower()}" for finding_id in expected_finding_ids),
+    )
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(side_effect=AssertionError("merge must not run without exact deferred blocker set")),
+        rev_parse_if_exists=MagicMock(
+            side_effect=lambda ref: {
+                task.branch: authorized.source_sha,
+                "main": authorized.target_sha,
+            }.get(ref)
+        ),
+    )
+    hooks = replace(
+        _manual_merge_service_hooks(),
+        load_landing_authorization=lambda: authorized,
+        materialize_deferred_blockers=lambda _task: materialized(store, task, review_id),
+        materialize_followups=MagicMock(side_effect=AssertionError("follow-ups must not materialize after deferred refusal")),
+    )
+    request = replace(
+        _manual_merge_service_request(tmp_path, store, git, task, merge_source="manual_land_escalated"),
+        landing_authorization=authorized,
+        authorized_source_ref_sha=authorized.source_sha,
+        expected_preflight_target_sha=authorized.target_sha,
+    )
+    store.set_merge_unit_state = MagicMock(side_effect=AssertionError("state must not change"))  # type: ignore[method-assign]
+
+    result = execute_manual_merge(request, hooks)
+
+    assert result.status == "deferred_blocker_materialization_failed"
+    assert "guarded deferred blocker materialization did not match authorization" in (result.block_reason or "")
+    git.merge.assert_not_called()
+
+
+def test_manual_merge_boundary_accepts_exact_guarded_deferred_blocker_set_before_merge(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_merge_task(store, "Guarded exact deferred set", "feature/landing-auth")
+    assert task.id is not None
+    assert store.get_or_create_merge_unit_for_task(task) is not None
+    review_id = "testproject-2"
+    authorized = _landing_authorization(
+        owner_task_id=task.id,
+        review_id=review_id,
+        blocker_identities=(
+            _landing_blocker_identity(review_id, "B1", "blocker:b1"),
+            _landing_blocker_identity(review_id, "B2", "blocker:b2"),
+        ),
+        blocker_fingerprints=("blocker:b1", "blocker:b2"),
+    )
+    order: list[str] = []
+    blockers = [
+        _deferred_blocker_task(store, task, review_id, "B1"),
+        _deferred_blocker_task(store, task, review_id, "B2"),
+    ]
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(side_effect=lambda *_args, **_kwargs: order.append("merge")),
+        rev_parse_if_exists=MagicMock(
+            side_effect=lambda ref: {
+                task.branch: authorized.source_sha,
+                "main": authorized.target_sha,
+            }.get(ref)
+        ),
+    )
+    hooks = replace(
+        _manual_merge_service_hooks(),
+        load_landing_authorization=lambda: authorized,
+        materialize_deferred_blockers=lambda _task: order.append("deferred") or ([blockers[0]], [blockers[1]]),
+        materialize_followups=lambda _task: order.append("followups") or ([], []),
+    )
+    request = replace(
+        _manual_merge_service_request(tmp_path, store, git, task, merge_source="manual_land_escalated"),
+        landing_authorization=authorized,
+        authorized_source_ref_sha=authorized.source_sha,
+        expected_preflight_target_sha=authorized.target_sha,
+    )
+
+    result = execute_manual_merge(request, hooks)
+
+    assert result.status == "merged"
+    assert order == ["deferred", "followups", "merge"]
+
+
+def test_manual_merge_boundary_refuses_guarded_review_race_empty_materialization_before_merge(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_merge_task(store, "Guarded review race", "feature/landing-auth")
+    assert task.id is not None
+    assert store.get_or_create_merge_unit_for_task(task) is not None
+    review = store.add("Current review", task_type="review", based_on=task.id, depends_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(review)
+    authorized = _landing_authorization(
+        owner_task_id=task.id,
+        review_id=review.id,
+        blocker_identities=(_landing_blocker_identity(review.id, "B1", "blocker:b1"),),
+        blocker_fingerprints=("blocker:b1",),
+    )
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(side_effect=AssertionError("merge must not run after review race")),
+        rev_parse_if_exists=MagicMock(
+            side_effect=lambda ref: {
+                task.branch: authorized.source_sha,
+                "main": authorized.target_sha,
+            }.get(ref)
+        ),
+    )
+
+    def materialize_after_review_race(_task: DbTask) -> tuple[list[DbTask], list[DbTask]]:
+        review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        store.update(review)
+        return ([], [])
+
+    hooks = replace(
+        _manual_merge_service_hooks(),
+        load_landing_authorization=lambda: authorized,
+        materialize_deferred_blockers=materialize_after_review_race,
+        materialize_followups=MagicMock(side_effect=AssertionError("follow-ups must not materialize after review race")),
+    )
+    request = replace(
+        _manual_merge_service_request(tmp_path, store, git, task, merge_source="manual_land_escalated"),
+        landing_authorization=authorized,
+        authorized_source_ref_sha=authorized.source_sha,
+        expected_preflight_target_sha=authorized.target_sha,
+    )
+    store.set_merge_unit_state = MagicMock(side_effect=AssertionError("state must not change"))  # type: ignore[method-assign]
+
+    result = execute_manual_merge(request, hooks)
+
+    assert result.status == "deferred_blocker_materialization_failed"
+    git.merge.assert_not_called()
 
 
 def _make_preload_recording_git(
@@ -16898,7 +17107,6 @@ def test_cmd_advance_all_tasks_default_dry_run_skips_deferred_prerequisite_recon
 
     fake_git = _make_read_session_reconciliation_git(tmp_path, failed.branch)
     before = _durable_preview_snapshot(store)
-    row = _failed_recovery_owner_row(failed)
 
     with (
         patch("gza.cli.git_ops.get_store", return_value=store),

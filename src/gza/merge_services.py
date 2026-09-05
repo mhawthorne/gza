@@ -15,7 +15,11 @@ from .db import MERGE_SOURCE_MANUAL, MERGE_SOURCE_MANUAL_FORCE, SqliteTaskStore,
 from .git import Git, GitError, ResolvedMergeSourceRef
 from .merge_state import resolve_task_merge_source
 from .review_scope import declares_spec_coherence_review_mode
-from .review_tasks import CappedReviewBlockerMaterializationError, FollowupMaterializationError
+from .review_tasks import (
+    CappedReviewBlockerMaterializationError,
+    FollowupMaterializationError,
+    extract_deferred_blocker_prompt_parts,
+)
 from .review_verdict import ReviewFinding, get_review_content, get_review_report, summarize_review_blockers
 
 
@@ -654,6 +658,14 @@ def execute_manual_merge(
                     block_reason=block_reason,
                 )
             created_deferred_blockers, reused_deferred_blockers = deferred_blockers
+            deferred_refusal = _validate_landing_deferred_blocker_materialization(
+                request,
+                hooks,
+                created_deferred_blockers,
+                reused_deferred_blockers,
+            )
+            if deferred_refusal is not None:
+                return deferred_refusal
             if not request.pre_materialized_deferred_blockers_printed:
                 hooks.print_deferred_blockers(request.merge_subject, deferred_blockers)
             if not request.no_followups:
@@ -878,6 +890,100 @@ def _validate_landing_authorization_before_side_effects(
             repr(current),
         )
     return None
+
+
+def _validate_landing_deferred_blocker_materialization(
+    request: ManualMergeExecutionRequest,
+    hooks: ManualMergeExecutionHooks,
+    created: list[DbTask],
+    reused: list[DbTask],
+) -> ManualMergeExecutionResult | None:
+    authorization = request.landing_authorization
+    if authorization is None or "defer-review-blockers" not in authorization.allowed_overrides:
+        return None
+    expected = _authorized_deferred_blocker_identities(authorization)
+    actual: dict[tuple[str, str, str], DbTask] = {}
+    mismatches: list[str] = []
+    for task in (*created, *reused):
+        identity = _materialized_deferred_blocker_identity(task)
+        if identity is None:
+            mismatches.append(f"{task.id or '<unknown>'}:identity")
+            continue
+        if identity in actual:
+            mismatches.append(f"{task.id or '<unknown>'}:duplicate")
+            continue
+        actual[identity] = task
+        if task.task_type != "implement":
+            mismatches.append(f"{task.id or '<unknown>'}:task_type")
+        if task.based_on != identity[1]:
+            mismatches.append(f"{task.id or '<unknown>'}:based_on")
+        if task.depends_on != identity[2]:
+            mismatches.append(f"{task.id or '<unknown>'}:depends_on")
+        if task.urgent is not True:
+            mismatches.append(f"{task.id or '<unknown>'}:urgent")
+        if task.create_pr is not True:
+            mismatches.append(f"{task.id or '<unknown>'}:create_pr")
+    if not expected or set(actual) != expected or mismatches:
+        missing = sorted(expected - set(actual))
+        unexpected = sorted(set(actual) - expected)
+        parts: list[str] = []
+        if not expected:
+            parts.append("no complete authorized blocker identity")
+        if missing:
+            parts.append(f"missing {len(missing)} authorized blocker task(s)")
+        if unexpected:
+            parts.append(f"unexpected {len(unexpected)} blocker task(s)")
+        if mismatches:
+            parts.append("task property mismatch: " + ", ".join(sorted(mismatches)))
+        block_reason = (
+            "guarded deferred blocker materialization did not match authorization"
+            + (": " + "; ".join(parts) if parts else "")
+            + "; source remains unmerged"
+        )
+        hooks.emit(f"Error: {block_reason}")
+        return ManualMergeExecutionResult(
+            rc=1,
+            status="deferred_blocker_materialization_failed",
+            block_reason=block_reason,
+            created_deferred_blockers=created,
+            reused_deferred_blockers=reused,
+            created_followups=[],
+            reused_followups=[],
+        )
+    return None
+
+
+def _authorized_deferred_blocker_identities(
+    authorization: MergeLandingAuthorization,
+) -> set[tuple[str, str, str]]:
+    expected: set[tuple[str, str, str]] = set()
+    if not authorization.review_id:
+        return expected
+    for raw in authorization.blocker_identities:
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return set()
+        if not isinstance(payload, dict):
+            return set()
+        finding_id = payload.get("finding_id")
+        source = payload.get("source")
+        if not isinstance(finding_id, str) or not finding_id.strip():
+            return set()
+        if source != f"review:{authorization.review_id}":
+            return set()
+        expected.add((finding_id.strip(), authorization.review_id, authorization.owner_task_id))
+    return expected
+
+
+def _materialized_deferred_blocker_identity(task: DbTask) -> tuple[str, str, str] | None:
+    parts = extract_deferred_blocker_prompt_parts(task.prompt)
+    if parts is None:
+        return None
+    finding_id, review_task_id, impl_task_id = parts
+    if not finding_id or not review_task_id or not impl_task_id:
+        return None
+    return finding_id, review_task_id, impl_task_id
 
 
 def _persist_landing_merge_authorization_audit(

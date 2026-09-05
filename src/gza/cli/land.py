@@ -327,12 +327,12 @@ def _landing_plan_context(store: Any, owner_task: Any) -> str:
 def _current_landing_authorization(coordinator: Any, identity: Any, decision: Any, *, policy: str) -> Any:
     from gza.landing import (
         LandBlocked,
-        LandingJudgment,
         LandingPolicyName,
         LandRequest,
         evaluate_landing_policy,
         landing_merge_authorization_from_facts,
     )
+    from gza.landing_judge import landing_judgment_from_artifact
 
     landing_policy = cast(LandingPolicyName, policy)
     inspect_policy_facts = coordinator.inspect_policy_facts
@@ -350,10 +350,60 @@ def _current_landing_authorization(coordinator: Any, identity: Any, decision: An
     if decision.allowed_overrides:
         if not decision.judgment_artifact_id or not decision.judgment_key:
             return None
+        review = facts.review
+        verify = facts.verify
+        if review is None or verify is None or not review.review_id:
+            return None
+        review_task = coordinator.store.get(review.review_id)
+        if review_task is None:
+            return None
+        try:
+            evidence = _landing_judge_evidence(
+                coordinator.store,
+                coordinator.config,
+                coordinator.git,
+                current_identity,
+                facts,
+                review_task,
+            )
+            from gza.landing_judge import LandingJudgeBlockerIdentity, LandingJudgeIdentity
+
+            judge_identity = LandingJudgeIdentity(
+                implementation_id=current_identity.owner_task_id,
+                merge_unit_id=current_identity.merge_unit_id,
+                review_id=review.review_id,
+                reviewed_head=review.reviewed_head,
+                source_head=current_identity.source_sha,
+                target_head=current_identity.target_sha,
+                verify_identity=evidence["verify_identity"],
+                authoritative_scope_identity=evidence["authoritative_scope_identity"],
+                adjudication_artifact_identities=facts.adjudication_fingerprints,
+                adjudication_content_identity=evidence["adjudication_content_identity"],
+                blocker_identities=tuple(
+                    LandingJudgeBlockerIdentity(blocker.finding_id, blocker.fingerprint or "")
+                    for blocker in facts.open_blockers
+                ),
+                decision_context_digest=evidence["context"].digest,
+            )
+            if judge_identity.key != decision.judgment_key:
+                return None
+            artifact = coordinator.store.get_artifact(int(decision.judgment_artifact_id), task_id=current_identity.owner_task_id)
+            if artifact is None:
+                return None
+            judgment = landing_judgment_from_artifact(
+                artifact,
+                store=coordinator.store,
+                identity=judge_identity,
+                expected_blocker_ids=tuple(blocker.finding_id for blocker in facts.open_blockers),
+            )
+            if judgment is None:
+                return None
+        except (TypeError, ValueError):
+            return None
         refreshed_decision = evaluate_landing_policy(
             policy="guarded",
             facts=facts,
-            judge=lambda: LandingJudgment("LAND", artifact_id=decision.judgment_artifact_id, key=decision.judgment_key),
+            judge=lambda: judgment,
         )
     else:
         refreshed_decision = evaluate_landing_policy(policy=landing_policy, facts=facts, judge=None)

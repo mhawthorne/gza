@@ -629,6 +629,21 @@ class LandingCoordinator:
         deferred_ids = tuple(task.id or "" for task in (*created_deferred, *reused_deferred))
         followup_ids = tuple(task.id or "" for task in (*created_followups, *reused_followups))
 
+        if merge_result.rc != 0 or merge_result.status != "merged":
+            reason_code: LandBlockedReasonCode = (
+                "materialization-or-persistence-failed"
+                if merge_result.status
+                in {"deferred_blocker_materialization_failed", "merge_side_effect_materialization_failed"}
+                else "merge-failed"
+            )
+            blocked = LandBlocked(
+                reason_code,
+                merge_result.block_reason or f"shared merge execution stopped with status {merge_result.status}",
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha, *deferred_ids, *followup_ids),
+            )
+            steps.append(LandStep(_phase_for_block(blocked), "blocked", blocked.fact, blocked=blocked))
+            return self._blocked_result(request, identity, steps, blocked)
+
         if escalated:
             if "defer-review-blockers" in decision.allowed_overrides and not deferred_ids:
                 blocked = LandBlocked(
@@ -665,21 +680,6 @@ class LandingCoordinator:
                     "no follow-up or deferred blocker materialization is required",
                 )
             )
-
-        if merge_result.rc != 0 or merge_result.status != "merged":
-            reason_code: LandBlockedReasonCode = (
-                "materialization-or-persistence-failed"
-                if merge_result.status
-                in {"deferred_blocker_materialization_failed", "merge_side_effect_materialization_failed"}
-                else "merge-failed"
-            )
-            blocked = LandBlocked(
-                reason_code,
-                merge_result.block_reason or f"shared merge execution stopped with status {merge_result.status}",
-                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha, *deferred_ids, *followup_ids),
-            )
-            steps.append(LandStep(_phase_for_block(blocked), "blocked", blocked.fact, blocked=blocked))
-            return self._blocked_result(request, identity, steps, blocked)
 
         steps.append(
             LandStep(
