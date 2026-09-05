@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from .branch_publication import load_branch_publication_state
 from .config import Config, ConfigError
@@ -29,6 +29,7 @@ from .lifecycle_completion import merge_state_is_terminal_for_lifecycle, task_is
 from .log_paths import ops_log_path_for
 from .merge_state import (
     BranchMergeClassification,
+    MergeBranchState,
     classify_branch_merge_state_for_target,
     resolve_task_merge_source,
     resolve_task_merge_state_for_target,
@@ -95,6 +96,9 @@ _UNRESOLVED_RECOVERY_TERMINAL_STATUSES = frozenset({"failed", "dropped"})
 _UNRESOLVED_RECOVERY_ATTENTION_REASON = "newer-recovery-descendant-needs-attention"
 _MERGED_TARGET_RESOLUTION_TYPES = frozenset({"review", "improve", "rebase"})
 _MERGEABLE_EXECUTION_STATUSES = frozenset({"completed", "unmerged"})
+_DB_AUTHORITATIVE_BRANCH_STATES: frozenset[MergeBranchState] = frozenset(
+    {"merged", "unmerged", "empty", "redundant", "unknown"}
+)
 _DESCENDANT_SUPERSEDED_REASONS: tuple[tuple[str, str, str], ...] = (
     ("completed", "recovery_already_completed", "recovery descendant already completed"),
     ("in_progress", "recovery_already_running", "recovery descendant already in progress"),
@@ -207,6 +211,7 @@ class _MergeContext:
     existing_branches: frozenset[str] | None = None
     resolution_error: str | None = None
     live_unmerged_recheck: bool = False
+    recovery_scan_db_authoritative: bool = False
     branch_resolution: FailedTaskBranchClassificationCache = field(default_factory=dict)
     repository_inspection_warnings: list[str] = field(default_factory=list)
     _warning_keys: set[str] = field(default_factory=set)
@@ -1620,6 +1625,84 @@ def _classification_proves_contributed_landing(classification: BranchMergeClassi
     return classification.state == "merged" and classification.reason in _AFFIRMATIVE_LANDED_BRANCH_REASONS
 
 
+def _db_authoritative_branch_unit_for_task(
+    store: SqliteTaskStore,
+    failed_task: DbTask,
+    *,
+    target_branch: str,
+    leaf_merge_unit: MergeUnit | None,
+) -> MergeUnit | None:
+    if not failed_task.branch:
+        return None
+    if (
+        leaf_merge_unit is not None
+        and leaf_merge_unit.target_branch == target_branch
+        and leaf_merge_unit.source_branch == failed_task.branch
+        and merge_unit_is_active(leaf_merge_unit)
+    ):
+        return leaf_merge_unit
+    if not store.supports_watch_failed_recovery_scans():
+        return None
+    matches = [
+        unit
+        for unit in store.list_watch_failed_recovery_scan_units(target_branch=target_branch)
+        if unit.source_branch == failed_task.branch and merge_unit_is_active(unit)
+    ]
+    if not matches:
+        return None
+    owned = [unit for unit in matches if unit.owner_task_id == failed_task.id]
+    return (owned or matches)[-1]
+
+
+def _db_authoritative_branch_classification(
+    unit: MergeUnit,
+    failed_task: DbTask,
+    *,
+    target_branch: str,
+) -> BranchMergeClassification:
+    state = effective_no_work_merge_state(failed_task, unit.state)
+    if state not in _DB_AUTHORITATIVE_BRANCH_STATES:
+        state = "unknown"
+    state = cast(MergeBranchState, state)
+    reason = "content-equivalent-with-commits" if state == "merged" else f"db-authoritative-scan-{state}"
+    return BranchMergeClassification(
+        state=state,
+        reason=reason,
+        source_ref=unit.source_branch,
+        target_ref=target_branch,
+        source_sha=unit.head_sha,
+        target_sha=unit.base_sha,
+    )
+
+
+def _db_authoritative_branch_suppression(
+    store: SqliteTaskStore,
+    failed_task: DbTask,
+    *,
+    target_branch: str | None,
+    leaf_merge_unit: MergeUnit | None,
+    merge_context: _MergeContext | None,
+    read_context: RecoveryReadContext | None = None,
+) -> FailedTaskSuppressionState | None:
+    if merge_context is None or not merge_context.recovery_scan_db_authoritative or target_branch is None:
+        return None
+    unit = _db_authoritative_branch_unit_for_task(
+        store,
+        failed_task,
+        target_branch=target_branch,
+        leaf_merge_unit=leaf_merge_unit,
+    )
+    if unit is None:
+        return None
+    return _classify_failed_task_branch_suppression_from_classification(
+        store,
+        failed_task,
+        _db_authoritative_branch_classification(unit, failed_task, target_branch=target_branch),
+        merge_context=merge_context,
+        read_context=read_context,
+    )
+
+
 def _classify_failed_task_branch_suppression_from_classification(
     store: SqliteTaskStore,
     failed_task: DbTask,
@@ -1673,7 +1756,6 @@ def classify_failed_task_landed_same_unit_suppression(
     """
     if failed_task.id is None or failed_task.status != "failed":
         return "visible"
-
     if leaf_merge_unit is None:
         leaf_merge_unit = (
             read_context.resolve_merge_unit_for_task(failed_task.id)
@@ -1735,6 +1817,16 @@ def classify_failed_task_landed_same_unit_suppression(
             return "visible"
         if failed_task.has_commits is None:
             return "visible"
+        authoritative_suppression = _db_authoritative_branch_suppression(
+            store,
+            failed_task,
+            target_branch=owner_target,
+            leaf_merge_unit=leaf_merge_unit,
+            merge_context=merge_context,
+            read_context=read_context,
+        )
+        if authoritative_suppression is not None:
+            return authoritative_suppression
         if (
             git is not None
             and failed_task.branch
@@ -1776,6 +1868,16 @@ def classify_failed_task_landed_same_unit_suppression(
     if leaf_targets_owner and not leaf_has_own_merge_unit:
         if failed_task.has_commits is None:
             return "visible"
+        authoritative_suppression = _db_authoritative_branch_suppression(
+            store,
+            failed_task,
+            target_branch=owner_target,
+            leaf_merge_unit=leaf_merge_unit,
+            merge_context=merge_context,
+            read_context=read_context,
+        )
+        if authoritative_suppression is not None:
+            return authoritative_suppression
         if (
             git is not None
             and failed_task.branch
@@ -1813,6 +1915,17 @@ def classify_failed_task_landed_same_unit_suppression(
         if _task_has_explicit_no_work_without_resumable_execution(failed_task):
             return "suppressed_no_work"
         return "visible"
+
+    authoritative_suppression = _db_authoritative_branch_suppression(
+        store,
+        failed_task,
+        target_branch=owner_target,
+        leaf_merge_unit=leaf_merge_unit,
+        merge_context=merge_context,
+        read_context=read_context,
+    )
+    if authoritative_suppression is not None:
+        return authoritative_suppression
 
     if (
         git is not None
@@ -1870,7 +1983,14 @@ def build_merge_context_from_git(git: Git, target_branch: str | None) -> _MergeC
     should use this instead of _load_merge_context so no ambient Config.load(discover=True)
     or Git() construction occurs.
     """
-    merge_context = _MergeContext(git=git, default_branch=target_branch, live_unmerged_recheck=True)
+    merge_context = _MergeContext(
+        git=git,
+        default_branch=target_branch,
+        live_unmerged_recheck=True,
+        recovery_scan_db_authoritative=getattr(git, "_gza_recovery_scan_db_authoritative", False) is True,
+    )
+    if merge_context.recovery_scan_db_authoritative:
+        return merge_context
     try:
         merge_context.existing_branches = frozenset(git.local_branch_names())
     except (GitError, OSError, ValueError) as exc:
@@ -2148,6 +2268,32 @@ def _is_resolved_by_landed_lineage(
     target_branch: str | None = None
     if task.branch and not _is_resumable_timeout_implementation(task):
         target_branch = _effective_merge_target_branch(store, merge_context=merge_context)
+
+    if (
+        merge_context.recovery_scan_db_authoritative
+        and target_branch is not None
+        and task.branch
+        and task.task_type not in _MERGED_TARGET_RESOLUTION_TYPES
+    ):
+        resolved_merge_unit = (
+            read_context.resolve_merge_unit_for_task(task.id)
+            if read_context is not None
+            else store.resolve_merge_unit_for_task(task.id)
+        )
+        unit = _db_authoritative_branch_unit_for_task(
+            store,
+            task,
+            target_branch=target_branch,
+            leaf_merge_unit=resolved_merge_unit,
+        )
+        if unit is not None:
+            classification = _db_authoritative_branch_classification(unit, task, target_branch=target_branch)
+            if _classification_proves_contributed_landing(classification):
+                return True
+            if merge_state_is_terminal_for_lifecycle(classification.state):
+                return False
+            if task.has_commits:
+                return False
 
     if (
         merge_context.git is not None
@@ -2664,6 +2810,22 @@ def _failed_task_requires_operator_recovery(
             read_context=read_context,
         ):
             return merge_state
+        if merge_context.recovery_scan_db_authoritative:
+            if merge_state is not None:
+                return merge_state
+            if task.branch:
+                try:
+                    target_branch = _resolve_merge_context_target_branch(store, merge_context)
+                except MergeTargetResolutionError:
+                    return None
+                unit = _db_authoritative_branch_unit_for_task(
+                    store,
+                    task,
+                    target_branch=target_branch,
+                    leaf_merge_unit=None,
+                )
+                if unit is not None:
+                    return effective_no_work_merge_state(task, unit.state)
         if (
             (merge_state is None or (merge_state == "unmerged" and merge_context.live_unmerged_recheck))
             and merge_context.git is not None
@@ -2965,32 +3127,43 @@ def decide_failed_task_recovery(
         )
         if read_context is not None and read_context.merge_context is None:
             read_context.merge_context = _mc
-        if _mc.git is not None:
-            try:
-                target_branch: str | None = _resolve_merge_context_target_branch(store, _mc)
-            except MergeTargetResolutionError as exc:
+        try:
+            target_branch: str | None = _resolve_merge_context_target_branch(store, _mc)
+        except MergeTargetResolutionError as exc:
+            if _mc.recovery_scan_db_authoritative:
+                target_branch = None
+            else:
                 logger.warning(
                     "recovery: could not determine merge target for live branch probe of %s: %s",
                     task.branch,
                     exc,
                 )
                 target_branch = None
-            if target_branch:
-                try:
-                    live_state = resolve_task_merge_state_for_target(
-                        store=store,
-                        task=task,
-                        git=_mc.git,
-                        target_branch=target_branch,
-                    )
-                    if live_state is not None:
-                        merge_state = live_state
-                except (GitError, MergeTargetResolutionError) as exc:
-                    logger.warning(
-                        "recovery: live merge-state probe failed for branch %s: %s",
-                        task.branch,
-                        exc,
-                    )
+        if _mc.recovery_scan_db_authoritative and target_branch:
+            unit = _db_authoritative_branch_unit_for_task(
+                store,
+                task,
+                target_branch=target_branch,
+                leaf_merge_unit=None,
+            )
+            if unit is not None:
+                merge_state = effective_no_work_merge_state(task, unit.state)
+        elif _mc.git is not None and target_branch:
+            try:
+                live_state = resolve_task_merge_state_for_target(
+                    store=store,
+                    task=task,
+                    git=_mc.git,
+                    target_branch=target_branch,
+                )
+                if live_state is not None:
+                    merge_state = live_state
+            except (GitError, MergeTargetResolutionError) as exc:
+                logger.warning(
+                    "recovery: live merge-state probe failed for branch %s: %s",
+                    task.branch,
+                    exc,
+                )
     if merge_state in {"empty", "redundant"}:
         empty_recovery_state = _classify_empty_task_recovery_state(
             store,

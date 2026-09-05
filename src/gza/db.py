@@ -216,6 +216,16 @@ _MAIN_VERIFY_REMEDIATION_CONSUMED_TASK_IDS_REQUIRED_COLUMNS: tuple[str, ...] = (
     "task_id",
     "consumed_at",
 )
+_WATCH_FAILED_RECOVERY_SCAN_BASE_COLUMNS: tuple[str, ...] = (
+    "project_id",
+    "target_branch",
+    "target_sha",
+    "scanned_at",
+)
+_WATCH_FAILED_RECOVERY_SCANS_REQUIRED_COLUMNS: tuple[str, ...] = (
+    *_WATCH_FAILED_RECOVERY_SCAN_BASE_COLUMNS,
+    "unit_fingerprint",
+)
 
 # Legacy base36 alphabet used only by v25 migration helpers.
 _B36_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -2246,6 +2256,16 @@ class WatchRecoveryBackoff:
 
 
 @dataclass(frozen=True)
+class WatchFailedRecoveryScanState:
+    """Persisted target-head and unit-proof marker for watch failed-task recovery scans."""
+
+    target_branch: str
+    target_sha: str
+    unit_fingerprint: str = ""
+    scanned_at: datetime | None = None
+
+
+@dataclass(frozen=True)
 class MainVerifyRemediationAttemptState:
     """Persisted attempt ledger for one main-verify remediation identity."""
 
@@ -2975,6 +2995,15 @@ CREATE TABLE IF NOT EXISTS provider_usage_failures (
     last_error_reason TEXT NOT NULL,
     last_error_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS watch_failed_recovery_scans (
+    project_id TEXT NOT NULL,
+    target_branch TEXT NOT NULL,
+    target_sha TEXT NOT NULL,
+    unit_fingerprint TEXT NOT NULL DEFAULT '',
+    scanned_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, target_branch)
+);
 """
 
 # Migration from v69 to v70: branch/status task lookup for scoped landed-evidence
@@ -2986,8 +3015,20 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project_based_on
     ON tasks(project_id, based_on);
 """
 
+# Migration from v70 to v71: unit-granular proof for watch failed-recovery scans.
+MIGRATION_V70_TO_V71 = """
+CREATE TABLE IF NOT EXISTS watch_failed_recovery_scans (
+    project_id TEXT NOT NULL,
+    target_branch TEXT NOT NULL,
+    target_sha TEXT NOT NULL,
+    scanned_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, target_branch)
+);
+ALTER TABLE watch_failed_recovery_scans ADD COLUMN unit_fingerprint TEXT NOT NULL DEFAULT '';
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 70
+SCHEMA_VERSION = 71
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -3832,6 +3873,7 @@ _QUERY_ONLY_REQUIRED_PARKED_TASK_REARM_COLUMNS: tuple[str, ...] = (
     "last_auto_attempt_at",
     "last_auto_attempt_target_sha",
 )
+_QUERY_ONLY_REQUIRED_WATCH_FAILED_RECOVERY_SCAN_COLUMNS: tuple[str, ...] = _WATCH_FAILED_RECOVERY_SCANS_REQUIRED_COLUMNS
 _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "project_id",
     "id",
@@ -3923,6 +3965,7 @@ _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
         68,
         69,
         70,
+        71,
     }
 )
 
@@ -4335,6 +4378,19 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
             raise RuntimeError(
                 "Auto-migration to v64 incomplete: missing required column "
                 f"main_verify_remediation_consumed_task_ids.{missing_columns[0]}"
+            )
+    if target_version >= 71:
+        if not _table_exists(conn, "watch_failed_recovery_scans"):
+            raise RuntimeError("Auto-migration to v71 incomplete: missing required table watch_failed_recovery_scans")
+        missing_columns = _missing_required_columns(
+            conn,
+            "watch_failed_recovery_scans",
+            _WATCH_FAILED_RECOVERY_SCANS_REQUIRED_COLUMNS,
+        )
+        if missing_columns:
+            raise RuntimeError(
+                "Auto-migration to v71 incomplete: missing required column "
+                f"watch_failed_recovery_scans.{missing_columns[0]}"
             )
 
 
@@ -5017,6 +5073,39 @@ def _ensure_required_auto_migration_artifacts(
                 "main_verify_remediation_consumed_task_ids: missing required column "
                 f"{missing_columns[0]}. Use a writable database to repair the v64 schema."
             )
+    if target_version >= 71:
+        if not _table_exists(conn, "watch_failed_recovery_scans"):
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS watch_failed_recovery_scans (
+                        project_id TEXT NOT NULL,
+                        target_branch TEXT NOT NULL,
+                        target_sha TEXT NOT NULL,
+                        unit_fingerprint TEXT NOT NULL DEFAULT '',
+                        scanned_at TEXT NOT NULL,
+                        PRIMARY KEY(project_id, target_branch)
+                    )
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    return
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required table "
+                    "watch_failed_recovery_scans: use a writable database."
+                ) from exc
+        missing_columns = _missing_required_columns(
+            conn,
+            "watch_failed_recovery_scans",
+            _WATCH_FAILED_RECOVERY_SCANS_REQUIRED_COLUMNS,
+        )
+        if missing_columns:
+            raise SchemaIntegrityError(
+                "Schema integrity check failed for required table "
+                "watch_failed_recovery_scans: missing required column "
+                f"{missing_columns[0]}. Use a writable database to repair the v71 schema."
+            )
 
 
 SCHEMA = """
@@ -5383,6 +5472,8 @@ SCHEMA += (
     + MIGRATION_V55_TO_V56  # watch_recovery_backoffs
     + MIGRATION_V57_TO_V58  # parked_task_rearms
     + MIGRATION_V61_TO_V62  # project_leases
+    + MIGRATION_V69_TO_V70  # scoped landed-evidence and based_on lookup indexes
+    + MIGRATION_V70_TO_V71  # watch_failed_recovery_scans
 )
 
 # Migration from v1 to v2
@@ -5701,6 +5792,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (68, MIGRATION_V67_TO_V68),
     (69, MIGRATION_V68_TO_V69),
     (70, MIGRATION_V69_TO_V70),
+    (71, MIGRATION_V70_TO_V71),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -5990,6 +6082,13 @@ class SqliteTaskStore:
             return self._query_only_supports_parked_task_rearms()
         with self._connect() as conn:
             return _table_exists(conn, "parked_task_rearms")
+
+    def supports_watch_failed_recovery_scans(self) -> bool:
+        """Return whether failed-recovery target scan markers are available."""
+        if self._open_mode == "query_only":
+            return self._query_only_supports_watch_failed_recovery_scans()
+        with self._connect() as conn:
+            return _table_exists(conn, "watch_failed_recovery_scans")
 
     def supports_task_artifacts(self) -> bool:
         """Return whether task artifact storage is available."""
@@ -6716,6 +6815,7 @@ class SqliteTaskStore:
             "provider_usage_fetches",
             "provider_usage_samples",
             "provider_usage_failures",
+            "watch_failed_recovery_scans",
         )
         self._query_only_table_exists = {table: _table_exists(conn, table) for table in tables}
         self._query_only_columns = {
@@ -6866,6 +6966,12 @@ class SqliteTaskStore:
                     "Query-only DB open detected missing required table parked_task_rearms; "
                     "parked-task manual rearm state will be unavailable."
                 )
+        if not self._query_only_supports_watch_failed_recovery_scans():
+            if self._query_only_table_exists.get("watch_failed_recovery_scans", False):
+                self._startup_warnings.append(
+                    "Query-only DB open detected incomplete watch_failed_recovery_scans schema; "
+                    "watch failed-recovery scan cache will be unavailable."
+                )
         run_steps_issue = self._query_only_run_steps_warning()
         if run_steps_issue is not None:
             self._startup_warnings.append(run_steps_issue)
@@ -6958,6 +7064,15 @@ class SqliteTaskStore:
         return self._query_only_table_exists.get("parked_task_rearms", False) and all(
             self._query_only_has_column("parked_task_rearms", column)
             for column in _QUERY_ONLY_REQUIRED_PARKED_TASK_REARM_COLUMNS
+        )
+
+    def _query_only_supports_watch_failed_recovery_scans(self) -> bool:
+        """Return True when query-only reads can safely use failed-recovery scan markers."""
+        if self._open_mode != "query_only":
+            return True
+        return self._query_only_table_exists.get("watch_failed_recovery_scans", False) and all(
+            self._query_only_has_column("watch_failed_recovery_scans", column)
+            for column in _QUERY_ONLY_REQUIRED_WATCH_FAILED_RECOVERY_SCAN_COLUMNS
         )
 
     def _query_only_supports_run_steps(self) -> bool:
@@ -10284,6 +10399,19 @@ class SqliteTaskStore:
             updated_at=_parse_db_timestamp(row["updated_at"]),
         )
 
+    def _row_to_watch_failed_recovery_scan_state(
+        self,
+        row: sqlite3.Row | None,
+    ) -> WatchFailedRecoveryScanState | None:
+        if row is None:
+            return None
+        return WatchFailedRecoveryScanState(
+            target_branch=str(row["target_branch"]),
+            target_sha=str(row["target_sha"]),
+            unit_fingerprint=str(row["unit_fingerprint"]) if "unit_fingerprint" in row.keys() else "",
+            scanned_at=_parse_db_timestamp(row["scanned_at"]),
+        )
+
     def _row_to_main_verify_remediation_attempt_state(
         self,
         row: sqlite3.Row | None,
@@ -11524,6 +11652,81 @@ class SqliteTaskStore:
                     updated_at,
                 ),
             )
+
+    def get_watch_failed_recovery_scan_state(
+        self,
+        *,
+        target_branch: str,
+    ) -> WatchFailedRecoveryScanState | None:
+        """Fetch the last completed failed-recovery scan marker for a target branch."""
+        if not self.supports_watch_failed_recovery_scans():
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM watch_failed_recovery_scans
+                WHERE project_id = ? AND target_branch = ?
+                """,
+                (self._project_id, target_branch),
+            ).fetchone()
+        return self._row_to_watch_failed_recovery_scan_state(row)
+
+    def record_watch_failed_recovery_scan(
+        self,
+        *,
+        target_branch: str,
+        target_sha: str,
+        unit_fingerprint: str = "",
+        scanned_at: datetime | None = None,
+    ) -> WatchFailedRecoveryScanState | None:
+        """Persist the completed failed-recovery scan marker for a target branch."""
+        if not self.supports_watch_failed_recovery_scans():
+            return None
+        completed_at = _format_db_timestamp(scanned_at or datetime.now(UTC))
+        assert completed_at is not None
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO watch_failed_recovery_scans(
+                    project_id,
+                    target_branch,
+                    target_sha,
+                    unit_fingerprint,
+                    scanned_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, target_branch)
+                DO UPDATE SET
+                    target_sha = excluded.target_sha,
+                    unit_fingerprint = excluded.unit_fingerprint,
+                    scanned_at = excluded.scanned_at
+                """,
+                (self._project_id, target_branch, target_sha, unit_fingerprint, completed_at),
+            )
+        return self.get_watch_failed_recovery_scan_state(target_branch=target_branch)
+
+    def list_watch_failed_recovery_scan_units(
+        self,
+        *,
+        target_branch: str,
+    ) -> list[MergeUnit]:
+        """Return active units relevant to failed-recovery scan proof."""
+        if not self.supports_merge_units():
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM merge_units
+                WHERE project_id = ?
+                  AND target_branch = ?
+                  AND {active_merge_unit_where_sql("merge_units")}
+                ORDER BY updated_at ASC, id ASC
+                """,
+                (self._project_id, target_branch),
+            ).fetchall()
+        return [unit for row in rows if (unit := self._row_to_merge_unit(row)) is not None]
 
     def get_main_verify_remediation_attempt_state(
         self,

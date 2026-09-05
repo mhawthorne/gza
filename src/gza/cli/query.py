@@ -525,7 +525,15 @@ def _best_effort_backfill_show_rebase_provenance(config: Config) -> _ShowRebaseP
             target_branch=target_branch,
         )
         return _ShowRebaseProvenanceBackfillOutcome()
-    except (GitError, ManualMigrationRequired, OSError, SchemaIntegrityError, ValueError, sqlite3.Error) as exc:
+    except (ManualMigrationRequired, SchemaIntegrityError, sqlite3.Error) as exc:
+        return _ShowRebaseProvenanceBackfillOutcome(
+            warning=(
+                "Warning: Could not repair changed-diff rebase provenance or dependent resolution-review metadata "
+                f"repair before lifecycle rendering: "
+                f"{exc}. Lifecycle may reflect stale or partially repaired resolution metadata."
+            )
+        )
+    except (GitError, OSError, ValueError) as exc:
         return _ShowRebaseProvenanceBackfillOutcome(
             warning=(
                 "Warning: Could not complete changed-diff rebase provenance or dependent resolution-review metadata "

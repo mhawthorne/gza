@@ -1318,6 +1318,30 @@ class Git:
             raise GitError("git merge-tree --stdin returned extra records")
         return {source_ref: trees[source_ref] for source_ref in requested}
 
+    def content_equivalent_refs_on_target(
+        self,
+        source_refs: Iterable[str],
+        target_ref: str,
+    ) -> dict[str, bool | None]:
+        """Return whether each source ref's net content is already in ``target_ref``."""
+        requested = self._ordered_unique(source_refs)
+        if not requested:
+            return {}
+
+        target_tree = self.resolve_refs((target_ref,), peel="tree").get(target_ref)
+        if target_tree is None:
+            return {source_ref: None for source_ref in requested}
+
+        result: dict[str, bool | None] = {}
+        try:
+            merged_trees = self.merge_tree_result_trees(target_ref, requested)
+        except GitError:
+            return {source_ref: None for source_ref in requested}
+        for source_ref in requested:
+            merged_tree = merged_trees.get(source_ref)
+            result[source_ref] = None if merged_tree is None else merged_tree == target_tree
+        return result
+
     def reachable_commit_shas(self, ref: str, *, first_parent: bool = False) -> frozenset[str]:
         """Return commit ids reachable from ``ref`` in one read-only walk."""
         args = ["rev-list"]

@@ -7,6 +7,7 @@ import functools
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import signal
@@ -59,6 +60,7 @@ from ..db import (
     ExecutionProjectSelector,
     MainVerifyRemediationAttemptState,
     ManualMigrationRequired,
+    MergeUnit,
     SchemaIntegrityError,
     SqliteTaskStore,
     Task as DbTask,
@@ -156,7 +158,13 @@ from ..runner import (
 from ..runtime_context import RuntimeExecutionContext
 from ..source_followup import collect_non_dropped_implement_source_ids
 from ..status_ops import apply_manual_task_status
-from ..sync_ops import reconcile_task_branch_merge_truth
+from ..sync_ops import (
+    BranchCohort,
+    _git_reconcile_update,
+    _persist_branch_updates,
+    reconcile_branch_merge_truth,
+    reconcile_task_branch_merge_truth,
+)
 from ..task_query import (
     ScopedTagScopeGap,
     TaskQueryPresets,
@@ -297,6 +305,8 @@ from .git_ops import (
     is_pre_promotion_merge_refusal_status,
 )
 from .query import _resolve_incomplete_owner_task
+
+logger = logging.getLogger(__name__)
 
 _WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
 _WATCH_PARKED_LINEAGE_POLICY: Literal["skip"] = "skip"
@@ -14341,6 +14351,301 @@ def _analyze_watch_cycle(
         )
 
 
+def _watch_failed_recovery_scan_is_current(
+    *,
+    store: SqliteTaskStore,
+    git: Git,
+    target_branch: str,
+    target_sha: str | None,
+) -> bool:
+    """Refresh target-movement invalidation state for failed-recovery scans."""
+    if not target_sha:
+        return False
+    if not store.supports_watch_failed_recovery_scans():
+        return False
+    marker = store.get_watch_failed_recovery_scan_state(target_branch=target_branch)
+    units = store.list_watch_failed_recovery_scan_units(
+        target_branch=target_branch,
+    )
+    incomplete_reasons: list[str] = []
+    current_fingerprint = _watch_failed_recovery_scan_unit_fingerprint(units)
+    target_unchanged = marker is not None and marker.target_sha == target_sha
+    if marker is None:
+        stale_units = list(units)
+        merged_proof_by_branch: dict[str, bool] = {}
+    elif not target_unchanged:
+        stale_units, merged_proof_by_branch = _watch_failed_recovery_scan_target_moved_units(
+            git=git,
+            units=units,
+            target_branch=target_branch,
+            target_sha=target_sha,
+            incomplete_reasons=incomplete_reasons,
+        )
+    elif marker.unit_fingerprint != current_fingerprint:
+        stale_units = list(units)
+        merged_proof_by_branch = {}
+    else:
+        stale_units = _watch_failed_recovery_scan_source_changed_units(
+            git=git,
+            units=units,
+            target_branch=target_branch,
+            incomplete_reasons=incomplete_reasons,
+        )
+        merged_proof_by_branch = {}
+        if not stale_units and not incomplete_reasons:
+            return True
+
+    if stale_units:
+        stale_unit_ids = {unit.id for unit in stale_units}
+        cohorts = _watch_failed_recovery_scan_cohorts(store, stale_units)
+        results = reconcile_branch_merge_truth(
+            git,
+            cohorts,
+            target_branch=target_branch,
+            include_diff_stats=False,
+            preserve_recorded_merged=False,
+            proof_target_ref=target_sha,
+            target_sha=target_sha,
+            merged_proof_by_branch=merged_proof_by_branch,
+        )
+        for cohort, result in zip(cohorts, results, strict=True):
+            proof_errors: list[str] = []
+            if result.skipped_reason is not None:
+                proof_errors.append(
+                    f"branch '{cohort.branch}' recovery reconciliation skipped: {result.skipped_reason}"
+                )
+            if result.head_sha is None or result.base_sha is None:
+                proof_errors.append(
+                    f"branch '{cohort.branch}' recovery reconciliation lacked durable head/base proof"
+                )
+            elif result.base_sha != target_sha:
+                proof_errors.append(
+                    f"branch '{cohort.branch}' recovery reconciliation used target snapshot "
+                    f"'{result.base_sha}' instead of current cycle snapshot '{target_sha}'"
+                )
+            result.errors.extend(proof_errors)
+        _persist_branch_updates(
+            store,
+            cohorts,
+            results,
+            [_git_reconcile_update(result) for result in results],
+            target_branch,
+            sync_completed_at=datetime.now(UTC),
+        )
+        for cohort, result in zip(cohorts, results, strict=True):
+            if result.errors:
+                incomplete_reasons.append(
+                    f"branch '{cohort.branch}' failed recovery reconciliation: {'; '.join(result.errors)}"
+                )
+        for unit, result in zip(stale_units, results, strict=True):
+            if not (unit.state == "merged" and unit.merge_source is None and unit.pr_state == "open"):
+                continue
+            if result.head_sha is not None or result.base_sha is not None:
+                store.refresh_merge_unit_head(unit.id, result.head_sha, result.base_sha)
+            if result.ok and (result.merge_status != "merged" or "marked merged" not in result.actions):
+                repaired_state = result.merge_status if result.merge_status != "merged" else "unmerged"
+                store.set_merge_unit_state(unit.id, repaired_state or "unmerged")
+    else:
+        stale_unit_ids = set()
+    if marker is not None and not target_unchanged and not incomplete_reasons:
+        for unit in units:
+            if unit.id in stale_unit_ids or unit.head_sha is None or unit.base_sha == target_sha:
+                continue
+            try:
+                store.refresh_merge_unit_head(unit.id, unit.head_sha, target_sha)
+            except Exception as exc:
+                incomplete_reasons.append(
+                    f"branch '{unit.source_branch}' failed to persist current target proof: {exc}"
+                )
+    if stale_units or (marker is not None and not target_unchanged):
+        units = store.list_watch_failed_recovery_scan_units(target_branch=target_branch)
+        current_fingerprint = _watch_failed_recovery_scan_unit_fingerprint(units)
+    if incomplete_reasons:
+        logger.warning(
+            "watch failed-recovery scan for target %s at %s incomplete; keeping previous marker: %s",
+            target_branch,
+            target_sha,
+            "; ".join(incomplete_reasons),
+        )
+        return False
+    store.record_watch_failed_recovery_scan(
+        target_branch=target_branch,
+        target_sha=target_sha,
+        unit_fingerprint=current_fingerprint,
+    )
+    return True
+
+
+def _watch_failed_recovery_scan_cohorts(store: SqliteTaskStore, units: Sequence[MergeUnit]) -> list[BranchCohort]:
+    return [
+        BranchCohort(
+            branch=str(unit.source_branch),
+            tasks=tuple(store.list_tasks_for_merge_unit(unit.id)),
+            merge_unit_id=str(unit.id),
+            merge_unit_state=(
+                "unmerged"
+                if unit.state == "merged" and unit.merge_source is None and unit.pr_state == "open"
+                else str(unit.state)
+            ),
+            merge_unit_target_branch=unit.target_branch,
+            merge_unit_head_sha=unit.head_sha,
+            merge_unit_base_sha=unit.base_sha,
+        )
+        for unit in units
+    ]
+
+
+def _watch_failed_recovery_scan_resolve_refs(
+    *,
+    git: Git,
+    units: Sequence[MergeUnit],
+) -> Mapping[str, str | None]:
+    refs = sorted({str(unit.source_branch) for unit in units})
+    return git.resolve_refs(refs)
+
+
+def _watch_failed_recovery_scan_source_changed_units(
+    *,
+    git: Git,
+    units: Sequence[MergeUnit],
+    target_branch: str,
+    incomplete_reasons: list[str],
+) -> list[MergeUnit]:
+    if not units:
+        return []
+    try:
+        resolved = _watch_failed_recovery_scan_resolve_refs(git=git, units=units)
+    except GitError as exc:
+        incomplete_reasons.append(
+            f"batched source-head proof unavailable for target '{target_branch}': {exc}"
+        )
+        return []
+    stale_units: list[MergeUnit] = []
+    for unit in units:
+        if unit.head_sha is None:
+            stale_units.append(unit)
+            continue
+        current_head = resolved.get(str(unit.source_branch))
+        if current_head is None:
+            incomplete_reasons.append(
+                f"branch '{unit.source_branch}' source-head proof unavailable against '{target_branch}'"
+            )
+            continue
+        if current_head != unit.head_sha:
+            stale_units.append(unit)
+    return stale_units
+
+
+def _watch_failed_recovery_scan_target_moved_units(
+    *,
+    git: Git,
+    units: Sequence[MergeUnit],
+    target_branch: str,
+    target_sha: str,
+    incomplete_reasons: list[str],
+) -> tuple[list[MergeUnit], dict[str, bool]]:
+    source_changed = _watch_failed_recovery_scan_source_changed_units(
+        git=git,
+        units=units,
+        target_branch=target_branch,
+        incomplete_reasons=incomplete_reasons,
+    )
+    stale_by_id = {unit.id: unit for unit in source_changed}
+    unchanged_candidates: list[MergeUnit] = []
+    for unit in units:
+        if unit.id in stale_by_id:
+            continue
+        if unit.head_sha is None or unit.base_sha is None:
+            stale_by_id[unit.id] = unit
+            continue
+        if unit.state == "merged" and unit.merge_source is None and unit.pr_state == "open":
+            stale_by_id[unit.id] = unit
+            continue
+        if unit.state in {"merged", "unmerged", "empty", "redundant"}:
+            unchanged_candidates.append(unit)
+            continue
+        stale_by_id[unit.id] = unit
+    merged_proof_by_branch: dict[str, bool] = {}
+    if unchanged_candidates:
+        content_equivalent = getattr(git, "content_equivalent_refs_on_target", None)
+        if not callable(content_equivalent):
+            incomplete_reasons.append(
+                f"batched content-equivalence proof unavailable for target '{target_branch}'"
+            )
+        else:
+            try:
+                content_presence = content_equivalent(
+                    [str(unit.head_sha) for unit in unchanged_candidates if unit.head_sha is not None],
+                    target_sha,
+                )
+            except Exception as exc:
+                incomplete_reasons.append(
+                    f"batched content-equivalence proof unavailable for target '{target_branch}': {exc}"
+                )
+            else:
+                for unit in unchanged_candidates:
+                    present = content_presence.get(str(unit.head_sha))
+                    if present is None:
+                        incomplete_reasons.append(
+                            f"branch '{unit.source_branch}' content-equivalence proof unavailable against '{target_branch}'"
+                        )
+                    elif unit.state == "unmerged" and present:
+                        stale_by_id[unit.id] = unit
+                        merged_proof_by_branch[str(unit.source_branch)] = True
+                    elif unit.state == "merged" and not present:
+                        stale_by_id[unit.id] = unit
+                        merged_proof_by_branch[str(unit.source_branch)] = False
+                    elif unit.state in {"empty", "redundant"} and not present:
+                        stale_by_id[unit.id] = unit
+                        merged_proof_by_branch[str(unit.source_branch)] = False
+    return list(stale_by_id.values()), merged_proof_by_branch
+
+
+def _watch_failed_recovery_scan_unit_fingerprint(units: Sequence[object]) -> str:
+    """Return stable unit-level proof fingerprint for an authoritative recovery scan."""
+    payload = [
+        {
+            "id": getattr(unit, "id", None),
+            "source_branch": getattr(unit, "source_branch", None),
+            "target_branch": getattr(unit, "target_branch", None),
+            "state": getattr(unit, "state", None),
+            "owner_task_id": getattr(unit, "owner_task_id", None),
+            "head_sha": getattr(unit, "head_sha", None),
+            "base_sha": getattr(unit, "base_sha", None),
+            "merge_source": getattr(unit, "merge_source", None),
+            "pr_state": getattr(unit, "pr_state", None),
+            "superseded_by_unit_id": getattr(unit, "superseded_by_unit_id", None),
+        }
+        for unit in sorted(
+            units,
+            key=lambda item: (
+                str(getattr(item, "source_branch", "")),
+                str(getattr(item, "target_branch", "")),
+                str(getattr(item, "id", "")),
+            ),
+        )
+    ]
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+@contextlib.contextmanager
+def _watch_recovery_scan_authoritative_git(git: Git, enabled: bool) -> Iterator[None]:
+    previous = getattr(git, "_gza_recovery_scan_db_authoritative", None)
+    if enabled:
+        setattr(git, "_gza_recovery_scan_db_authoritative", True)
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                delattr(git, "_gza_recovery_scan_db_authoritative")
+            except AttributeError:
+                pass
+        else:
+            setattr(git, "_gza_recovery_scan_db_authoritative", previous)
+
+
 def _evaluate_blind_parked_auto_rearm(
     *,
     config: Config,
@@ -14365,14 +14670,25 @@ def _evaluate_blind_parked_auto_rearm(
         effective_scoped_owner_ids=scoped_owner_ids,
     )
     cooldown = timedelta(hours=policy.cooldown_hours)
-    candidates, _stale_cleared = discover_parked_tasks(
-        store,
-        config=config,
-        git=git,
-        target_branch=target_branch,
-        task_ids=scoped_owner_ids or (),
-        selector_kinds=_selector_kinds_from_selectors(scope_selectors),
+    scan_current = (
+        False
+        if scoped_task_ids is not None
+        else _watch_failed_recovery_scan_is_current(
+            store=store,
+            git=git,
+            target_branch=target_branch,
+            target_sha=target_sha,
+        )
     )
+    with _watch_recovery_scan_authoritative_git(git, scan_current):
+        candidates, _stale_cleared = discover_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch=target_branch,
+            task_ids=scoped_owner_ids or (),
+            selector_kinds=_selector_kinds_from_selectors(scope_selectors),
+        )
     scoped_owner_id_set = frozenset(scoped_owner_ids or ())
     scope_kind_by_effective_id = (
         {selector.effective_owner_id: selector.scope_kind for selector in scope_selectors}
