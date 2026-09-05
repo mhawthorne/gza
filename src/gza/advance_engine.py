@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -133,8 +133,12 @@ from gza.review_verdict import (
     summarize_review_blockers,
 )
 from gza.review_verify_state import (
+    VERIFY_GATE_ARTIFACT_KIND,
+    VERIFY_GATE_ARTIFACT_SCHEMA_VERSION,
     MergeUnitVerifyEvidenceSelection,
     VerifyGateDecision,
+    _artifact_verify_epoch,
+    _artifact_verify_result,
     make_verify_epoch,
     resolve_verify_gate_decision,
     select_current_merge_unit_verify_evidence,
@@ -166,6 +170,11 @@ from gza.verify_fix_outcome import (
     inspect_legacy_review_scope_completion_outcome,
     inspect_verify_fix_completion_outcome,
 )
+from gza.verify_gate_preflight import (
+    VerifyGatePreflightProvenance,
+    captured_at_to_preflight_value,
+    parse_verify_gate_preflight_provenance,
+)
 
 NEEDS_ATTENTION_LABEL = "Needs attention"
 PARK_REASON_IMPROVE_NO_OP = "improve-no-op"
@@ -178,6 +187,7 @@ PARK_REASON_VERIFY_FAILED_NEEDS_FIX = "verify-failed-needs-fix"
 PARK_REASON_VERIFY_FIX_FAILED = "verify-fix-failed"
 PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE = "verify-fix-proof-unavailable"
 PARK_REASON_VERIFY_BASE_FRESHNESS_UNVERIFIED = "verify-base-freshness-unverified"
+PARK_REASON_VERIFY_GATE_PROOF_UNAVAILABLE = "verify-gate-proof-unavailable"
 PARK_REASON_VERIFY_UNAVAILABLE = "verify-unavailable"
 PARK_REASON_VERIFY_UNAVAILABLE_AFTER_FIX = "verify-unavailable-after-fix"
 PARK_REASON_REVIEW_BLOCKER_ADJUDICATION_NEEDED = "review-blocker-adjudication-needed"
@@ -229,6 +239,7 @@ WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS = frozenset(
         PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID,
         PARK_REASON_VERIFY_FIX_FAILED,
         PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+        PARK_REASON_VERIFY_GATE_PROOF_UNAVAILABLE,
         PARK_REASON_VERIFY_UNAVAILABLE,
         PARK_REASON_VERIFY_UNAVAILABLE_AFTER_FIX,
         PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES,
@@ -308,6 +319,33 @@ class PostMergeRebaseState:
     warning: str | None = None
     rebase_target_missing_merge_unit: bool = False
     resolved_merge_state: str | None = None
+
+
+@dataclass(frozen=True)
+class TargetTipProof:
+    """Tri-state proof for lifecycle paths that may insert a same-branch rebase."""
+
+    state: Literal["contains", "lacks", "unavailable"]
+    diagnostic: str | None = None
+
+
+@dataclass(frozen=True)
+class CompletedPreflightConsumption:
+    """Proof that a completed rebase already consumed a red verify-gate preflight."""
+
+    state: Literal["consumed", "not_consumed", "unavailable"]
+    diagnostic: str | None = None
+    matched_rebase: DbTask | None = None
+
+
+@dataclass(frozen=True)
+class SameBranchRebaseFacts:
+    """DB-only same-branch rebase descendants that may preempt git proof work."""
+
+    pending_or_running: DbTask | None = None
+    failed: DbTask | None = None
+    latest_completed: DbTask | None = None
+    all_children: tuple[DbTask, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -483,6 +521,7 @@ class AdvanceContext:
     rebase_pending_or_running: DbTask | None = None
     rebase_failed: DbTask | None = None
     latest_completed_rebase: DbTask | None = None
+    completed_same_branch_rebases: tuple[DbTask, ...] = ()
     rebase_failure_streak: RebaseFailureStreak | None = None
     rebase_invalidates_review: bool = False
     review_invalidated_by_progress: bool = False
@@ -3556,13 +3595,56 @@ def _strict_scope_unverified_action(ctx: AdvanceContext) -> dict[str, Any]:
     )
 
 
-def _branch_contains_target_tip(ctx: AdvanceContext) -> bool:
+def _target_tip_proof(ctx: AdvanceContext) -> TargetTipProof:
     state = ctx.post_merge_rebase_state
     if state is None:
-        return False
-    return (
+        return TargetTipProof(
+            state="unavailable",
+            diagnostic="post-merge rebase state is unavailable",
+        )
+    if (
         bool(getattr(state, "rebase_resolution_proved", False))
         or getattr(state, "target_is_ancestor_of_branch", None) is True
+    ):
+        return TargetTipProof(state="contains")
+    if getattr(state, "target_is_ancestor_of_branch", None) is False:
+        return TargetTipProof(state="lacks")
+    return TargetTipProof(
+        state="unavailable",
+        diagnostic=getattr(state, "warning", None) or "target-tip ancestry proof is unavailable",
+    )
+
+
+def _branch_contains_target_tip(ctx: AdvanceContext) -> bool:
+    return _target_tip_proof(ctx).state == "contains"
+
+
+def _verify_gate_proof_unavailable_action(
+    ctx: AdvanceContext,
+    *,
+    owner_task: DbTask,
+    current_epoch: Any,
+    proof: TargetTipProof,
+    phase: str,
+) -> dict[str, Any]:
+    diagnostic = proof.diagnostic or "target-tip proof is unavailable"
+    return _with_red_verify_gate_metadata(
+        ctx,
+        with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": (
+                    "SKIP: verify-gate preflight cannot prove whether branch "
+                    f"'{owner_task.branch or 'unknown'}' contains target tip '{ctx.target_branch}'. "
+                    f"Proof failure: {diagnostic}"
+                ),
+                "verify_epoch": current_epoch,
+                "proof_diagnostic": diagnostic,
+            },
+            reason=PARK_REASON_VERIFY_GATE_PROOF_UNAVAILABLE,
+            subject_task_id=owner_task.id,
+        ),
+        phase=phase,
     )
 
 
@@ -4216,9 +4298,16 @@ def _review_automation_blocked_by_missing_local_merge_source(ctx: AdvanceContext
     """Return whether pre-review verify/review automation must park for local source repair."""
     if not _is_implementation_owned_lineage(ctx):
         return False
-    if not ctx.requires_review:
-        return False
     if not _missing_local_merge_source_requires_manual_resolution(ctx):
+        return False
+    if (
+        getattr(ctx.config, "on_max_cycles", "park") == "merge_and_defer"
+        and ctx.latest_completed_review is not None
+        and ctx.review_verdict == "CHANGES_REQUESTED"
+        and ctx.completed_review_cycles >= ctx.max_review_cycles
+    ):
+        return True
+    if not ctx.requires_review:
         return False
     action = ctx.closing_review_action
     if action is not None:
@@ -4298,6 +4387,7 @@ def _red_verify_gate_proof(ctx: AdvanceContext, *, phase: str) -> dict[str, Any]
     result_epoch = make_verify_epoch(
         reviewed_branch=result.reviewed_branch,
         reviewed_head_sha=result.reviewed_head_sha,
+        reviewed_tree_sha=result.reviewed_tree_sha,
         verify_command=result.command,
         verify_timeout_seconds=decision.current_epoch.verify_timeout_seconds,
         verify_timeout_grace_seconds=decision.current_epoch.verify_timeout_grace_seconds,
@@ -4308,6 +4398,7 @@ def _red_verify_gate_proof(ctx: AdvanceContext, *, phase: str) -> dict[str, Any]
         "phase": phase,
         "reviewed_branch": result.reviewed_branch,
         "reviewed_head_sha": result.reviewed_head_sha,
+        "reviewed_tree_sha": result.reviewed_tree_sha,
         "verify_command": result.command,
         "source_task_id": result.source_task_id,
         "source_task_type": result.source_task_type,
@@ -6226,6 +6317,24 @@ def _pre_review_verify_fix_required(ctx: AdvanceContext) -> bool:
     return decision is not None and decision.state in {"failed", "unavailable"}
 
 
+def _red_verify_gate_active_rebase_preempts_git_context(ctx: AdvanceContext) -> bool:
+    """Return whether a same-branch active rebase can skip red-gate planning before ancestry."""
+    if ctx.rebase_pending_or_running is None:
+        return False
+    decision = getattr(ctx, "verify_gate_decision", None)
+    if decision is None or decision.state != "failed":
+        return False
+    return _pre_review_verify_fix_required(ctx) or _verify_gate_blocks_merge(ctx)
+
+
+def _red_verify_gate_active_rebase_action(ctx: AdvanceContext) -> dict[str, Any]:
+    try:
+        phase = "pre_merge" if _verify_gate_blocks_merge(ctx) else "pre_review"
+    except AttributeError:
+        phase = "pre_review"
+    return _pre_review_verify_fix_action(ctx, phase=phase)
+
+
 def _merge_unit_verify_evidence_reconciliation_candidate(
     ctx: AdvanceContext,
 ) -> MergeUnitVerifyEvidenceSelection | None:
@@ -6524,6 +6633,148 @@ def _verify_budget_exceeded_action(ctx: AdvanceContext, *, phase: str, owner_tas
     return _with_red_verify_gate_metadata(ctx, action, phase=phase)
 
 
+def _completed_rebase_consumed_current_red_verify_epoch(
+    ctx: AdvanceContext,
+    *,
+    completed_rebases: Sequence[DbTask],
+    decision: VerifyGateDecision,
+    owner_task: DbTask,
+) -> CompletedPreflightConsumption:
+    result = decision.lookup.result
+    current_epoch = decision.current_epoch
+    if result is None or current_epoch is None or decision.state != "failed":
+        return CompletedPreflightConsumption(state="not_consumed")
+    expected_head = current_epoch.reviewed_head_sha
+    if not expected_head:
+        return CompletedPreflightConsumption(state="not_consumed")
+    target_state = ctx.post_merge_rebase_state
+    expected_target_tip = target_state.target_tip_sha if target_state is not None else None
+    if not expected_target_tip:
+        return CompletedPreflightConsumption(state="not_consumed")
+    if owner_task.id is None:
+        return CompletedPreflightConsumption(state="not_consumed")
+    branch_name = current_epoch.reviewed_branch or owner_task.branch
+    if not branch_name:
+        return CompletedPreflightConsumption(state="not_consumed")
+    # Search every completed same-branch rebase, not just the most recent one:
+    # a later unrelated or non-matching completion must not hide an earlier
+    # rebase whose provenance already proved this exact red epoch.
+    ordered_candidates = sorted(
+        completed_rebases,
+        key=lambda t: t.completed_at or datetime.min,
+        reverse=True,
+    )
+    for candidate in ordered_candidates:
+        provenance = parse_verify_gate_preflight_provenance(candidate.review_scope)
+        if provenance is None:
+            continue
+        if not _verify_gate_preflight_provenance_matches_current(
+            provenance,
+            owner_task=owner_task,
+            current_epoch=current_epoch,
+            target_branch=ctx.target_branch,
+            target_tip_sha=expected_target_tip,
+        ):
+            continue
+        try:
+            live_head = ctx.git.rev_parse_if_exists(branch_name)
+        except (GitError, OSError) as exc:
+            return CompletedPreflightConsumption(
+                state="unavailable", diagnostic=str(exc), matched_rebase=candidate
+            )
+        if live_head != expected_head:
+            return CompletedPreflightConsumption(state="not_consumed", matched_rebase=candidate)
+        return CompletedPreflightConsumption(state="consumed", matched_rebase=candidate)
+    return CompletedPreflightConsumption(state="not_consumed")
+
+
+def _verify_gate_preflight_provenance_matches_current(
+    provenance: VerifyGatePreflightProvenance,
+    *,
+    owner_task: DbTask,
+    current_epoch: Any,
+    target_branch: str,
+    target_tip_sha: str,
+) -> bool:
+    if owner_task.id is None:
+        return False
+    if provenance.owner_task_id != owner_task.id:
+        return False
+    if provenance.reviewed_branch != (current_epoch.reviewed_branch or owner_task.branch):
+        return False
+    if provenance.reviewed_head_sha != current_epoch.reviewed_head_sha:
+        return False
+    # verify_command/timeout/grace are recorded provenance only, not consumption
+    # identity: the canonical verify epoch is defined solely by reviewed branch
+    # and head, so config drift after a same-head preflight must not reopen it.
+    return provenance.target_branch == target_branch and provenance.target_tip_sha == target_tip_sha
+
+
+def _verify_gate_preflight_payload(
+    ctx: AdvanceContext,
+    *,
+    owner_task: DbTask,
+    current_epoch: Any,
+) -> dict[str, Any] | None:
+    result = getattr(getattr(ctx, "verify_gate_decision", None), "lookup", None)
+    result = getattr(result, "result", None)
+    target_state = ctx.post_merge_rebase_state
+    target_tip_sha = target_state.target_tip_sha if target_state is not None else None
+    reviewed_branch = current_epoch.reviewed_branch or owner_task.branch
+    if owner_task.id is None or not reviewed_branch or not target_tip_sha:
+        return None
+    provenance = VerifyGatePreflightProvenance(
+        owner_task_id=owner_task.id,
+        reviewed_branch=reviewed_branch,
+        reviewed_head_sha=current_epoch.reviewed_head_sha,
+        verify_command=current_epoch.verify_command,
+        verify_timeout_seconds=current_epoch.verify_timeout_seconds,
+        verify_timeout_grace_seconds=current_epoch.verify_timeout_grace_seconds,
+        target_branch=ctx.target_branch,
+        target_tip_sha=target_tip_sha,
+        failed_captured_at=captured_at_to_preflight_value(
+            getattr(result, "captured_at", None)
+        ),
+    )
+    return {
+        "owner_task_id": provenance.owner_task_id,
+        "reviewed_branch": provenance.reviewed_branch,
+        "reviewed_head_sha": provenance.reviewed_head_sha,
+        "verify_command": provenance.verify_command,
+        "verify_timeout_seconds": provenance.verify_timeout_seconds,
+        "verify_timeout_grace_seconds": provenance.verify_timeout_grace_seconds,
+        "target_branch": provenance.target_branch,
+        "target_tip_sha": provenance.target_tip_sha,
+        "failed_captured_at": provenance.failed_captured_at,
+    }
+
+
+def _verify_gate_epoch_failed_before(
+    store: SqliteTaskStore,
+    *,
+    owner_task: DbTask,
+    current_epoch: Any,
+    before_or_at: datetime,
+) -> bool:
+    if owner_task.id is None:
+        return False
+    for artifact in store.list_artifacts(owner_task.id, kind=VERIFY_GATE_ARTIFACT_KIND):
+        metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
+        if metadata is None or metadata.get("schema_version") != VERIFY_GATE_ARTIFACT_SCHEMA_VERSION:
+            continue
+        result = _artifact_verify_result(metadata)
+        artifact_epoch = _artifact_verify_epoch(metadata)
+        if result is None or artifact_epoch is None:
+            continue
+        if result.status != "failed":
+            continue
+        if not verify_epoch_matches(expected=current_epoch, candidate=artifact_epoch):
+            continue
+        if _normalize_time(result.captured_at) <= before_or_at:
+            return True
+    return False
+
+
 def _pre_review_verify_fix_action(ctx: AdvanceContext, *, phase: str = "pre_review") -> dict[str, Any]:
     decision = getattr(ctx, "verify_gate_decision", None)
     owner_task = _verify_gate_owner_task(ctx)
@@ -6590,6 +6841,87 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext, *, phase: str = "pre_revi
 
     if _verify_gate_is_budget_only_timeout(decision):
         return _verify_budget_exceeded_action(ctx, phase=phase, owner_task=owner_task)
+
+    if decision.state == "failed":
+        if ctx.rebase_pending_or_running is not None:
+            return _with_red_verify_gate_metadata(
+                ctx,
+                {
+                    "type": "skip",
+                    "description": f"SKIP: rebase {_task_id(ctx.rebase_pending_or_running)} already in progress",
+                    "reason": "verify-gate-preflight-rebase",
+                    "active_rebase_task_id": ctx.rebase_pending_or_running.id,
+                    "verify_epoch": current_epoch,
+                },
+                phase=phase,
+            )
+
+        target_tip_proof = _target_tip_proof(ctx)
+        if target_tip_proof.state == "unavailable":
+            return _verify_gate_proof_unavailable_action(
+                ctx,
+                owner_task=owner_task,
+                current_epoch=current_epoch,
+                proof=target_tip_proof,
+                phase=phase,
+            )
+        if target_tip_proof.state == "lacks":
+            completed_same_branch_rebases = ctx.completed_same_branch_rebases
+            if completed_same_branch_rebases:
+                preflight_consumption = _completed_rebase_consumed_current_red_verify_epoch(
+                    ctx,
+                    completed_rebases=completed_same_branch_rebases,
+                    decision=decision,
+                    owner_task=owner_task,
+                )
+                if preflight_consumption.state == "unavailable":
+                    return _verify_gate_proof_unavailable_action(
+                        ctx,
+                        owner_task=owner_task,
+                        current_epoch=current_epoch,
+                        proof=TargetTipProof(
+                            state="unavailable",
+                            diagnostic=preflight_consumption.diagnostic,
+                        ),
+                        phase=phase,
+                    )
+                if preflight_consumption.state == "consumed":
+                    matched_rebase = preflight_consumption.matched_rebase
+                    return _with_red_verify_gate_metadata(
+                        ctx,
+                        with_needs_attention(
+                            {
+                                "type": "needs_discussion",
+                                "description": (
+                                    f"SKIP: completed preflight rebase {_task_id(matched_rebase)} did not advance "
+                                    f"the verify epoch head {current_epoch.reviewed_head_sha}; repair the branch or rebase "
+                                    "state before lifecycle can retry verify-fix routing"
+                                ),
+                                "rebase_task": matched_rebase,
+                                "verify_epoch": current_epoch,
+                            },
+                            reason="verify-gate-preflight-rebase",
+                            subject_task_id=owner_task.id,
+                        ),
+                        phase=phase,
+                    )
+            return _with_red_verify_gate_metadata(
+                ctx,
+                {
+                    "type": "needs_rebase",
+                    "description": "Rebase before verify_fix for red verify gate",
+                    "reason": "verify-gate-preflight-rebase",
+                    "rebase_parent_task_id": owner_task.id,
+                    "verify_epoch": current_epoch,
+                    "verify_owner_task": owner_task,
+                    "verify_gate_preflight": _verify_gate_preflight_payload(
+                        ctx,
+                        owner_task=owner_task,
+                        current_epoch=current_epoch,
+                    ),
+                },
+                phase=phase,
+            )
 
     existing = find_existing_verify_fix_task(
         ctx.store,
@@ -7276,6 +7608,34 @@ def _get_same_branch_rebase_descendants_for_root(store: SqliteTaskStore, root_ta
     ]
 
 
+def _resolve_same_branch_rebase_facts(store: SqliteTaskStore, root_task: DbTask) -> SameBranchRebaseFacts:
+    """Return DB-only same-branch rebase facts for lifecycle routing."""
+    rebase_children = tuple(_get_same_branch_rebase_descendants_for_root(store, root_task))
+    rebase_pending_or_running = next(
+        (c for c in rebase_children if c.status in {"pending", "in_progress"}),
+        None,
+    )
+    failed_rebases = [c for c in rebase_children if c.status == "failed"]
+    rebase_failed = max(failed_rebases, key=_task_event_time) if failed_rebases else None
+
+    completed_rebases = [
+        c
+        for c in rebase_children
+        if c.status == "completed" and c.completed_at is not None
+    ]
+    latest_completed_rebase = (
+        max(completed_rebases, key=lambda t: t.completed_at or datetime.min)
+        if completed_rebases
+        else None
+    )
+    return SameBranchRebaseFacts(
+        pending_or_running=rebase_pending_or_running,
+        failed=rebase_failed,
+        latest_completed=latest_completed_rebase,
+        all_children=rebase_children,
+    )
+
+
 def _build_base_advance_context(
     *,
     config: Any,
@@ -7732,6 +8092,7 @@ def _resolve_pre_closing_review_git_context(
         rebase_pending_or_running=rebase_pending_or_running,
         rebase_failed=rebase_failed,
         latest_completed_rebase=latest_completed_rebase,
+        completed_same_branch_rebases=tuple(completed_rebases),
         rebase_failure_streak=rebase_failure_streak,
         rebase_invalidates_review=rebase_invalidates_review,
         review_invalidated_by_progress=review_invalidated_by_progress,
@@ -8187,6 +8548,34 @@ def resolve_advance_context(
         capped_review_content_error=capped_review_content_error,
         capped_review_content_error_reason=capped_review_content_error_reason,
     )
+    rebase_facts = _resolve_same_branch_rebase_facts(
+        store,
+        review_root_task if review_root_task.task_type == "implement" else task,
+    )
+    ctx = replace(
+        ctx,
+        rebase_pending_or_running=rebase_facts.pending_or_running,
+        rebase_failed=rebase_facts.failed,
+        latest_completed_rebase=rebase_facts.latest_completed,
+        completed_same_branch_rebases=tuple(
+            child
+            for child in rebase_facts.all_children
+            if child.status == "completed" and child.completed_at is not None
+        ),
+    )
+    verify_owner_task = _verify_gate_owner_task(ctx)
+    if verify_owner_task is not None:
+        ctx = replace(
+            ctx,
+            verify_gate_decision=resolve_verify_gate_decision(
+                store,
+                verify_owner_task,
+                config=config,
+                git=git,
+            ),
+        )
+    if _red_verify_gate_active_rebase_preempts_git_context(ctx):
+        return ctx
     ctx = _resolve_pre_closing_review_git_context(
         ctx,
         config,
@@ -8964,6 +9353,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 else getattr(ctx.review_root_task, "id", ctx.task.id)
             ),
         ),
+    ),
+    AdvanceRule(
+        name="red_verify_gate_active_rebase_preempts_git_context",
+        matches=_red_verify_gate_active_rebase_preempts_git_context,
+        action=_red_verify_gate_active_rebase_action,
     ),
     AdvanceRule(
         name="review_automation_merge_source_requires_manual_resolution",

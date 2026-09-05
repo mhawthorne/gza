@@ -48,8 +48,12 @@ the resumed or retried execution is launched.
   the target) never satisfies R5 — it is governed by the no-work recovery predicate (§1),
   not by landed suppression. Durable recovery-scan caches MAY only bypass live Git for
   branch/task classifications proven at that same granularity; a target-tip marker alone
-  is not landed, no-work, or unmerged proof. This rule and `lifecycle-engine.md` §7
-  ("already landed") MUST stay in lockstep.
+  is not landed, no-work, or unmerged proof. The only bounded exception is a prior terminal
+  branch classification whose recorded source head or target object no longer resolves:
+  recovery MAY treat that recorded content proof as permanently unprovable and avoid
+  retrying it, but all other unknown, conflicted, malformed, or Git-error proof outcomes
+  MUST remain fail-closed and bypass the durable cache. This rule and `lifecycle-engine.md`
+  §7 ("already landed") MUST stay in lockstep.
 - **R7 — Tombstoned merge units are intentionally inactive, not recoverable winners.**
   A merge unit in state `dropped` or `superseded`, or one hidden behind
   `superseded_by_unit_id != NULL`, is an operator-declared losing unit. Shared active-unit

@@ -12611,6 +12611,7 @@ class TestIterateCommand:
         from gza.runner import _make_review_verify_result
 
         verify_calls: list[object] = []
+        mock_git.default_branch.return_value = "main"
         mock_git.current_branch.return_value = "main"
         mock_git.default_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
@@ -12624,6 +12625,7 @@ class TestIterateCommand:
             "HEAD": head_sha,
             "main": "base-head",
         }.get(ref)
+        mock_git.is_ancestor.return_value = True
         mock_git.worktree_add_existing.side_effect = (
             lambda path, ref, detach=False: Path(path).mkdir(parents=True, exist_ok=True) or Path(path)
         )
@@ -12655,6 +12657,7 @@ class TestIterateCommand:
         stack.enter_context(patch("gza.cli.get_store", return_value=store))
         stack.enter_context(patch("gza.cli.execution.Config.load", return_value=config))
         stack.enter_context(patch("gza.cli.execution.get_store", return_value=store))
+        stack.enter_context(patch("gza.cli.unstick.Config.load", return_value=config))
         stack.enter_context(patch("gza.cli.unstick.get_store", return_value=store))
         stack.enter_context(patch("gza.cli.Git", return_value=mock_git))
         stack.enter_context(patch("gza.cli.execution.Git", return_value=mock_git))
@@ -16162,6 +16165,7 @@ class TestIterateCommand:
             impl.branch: "head-1",
             "main": "base-1",
         }.get(ref)
+        mock_git.is_ancestor.return_value = True
 
         with (
             patch("gza.cli.Config.load", return_value=config),
@@ -16215,6 +16219,7 @@ class TestIterateCommand:
             impl.branch: "parked-head",
             "main": "base-head",
         }.get(ref)
+        mock_git.is_ancestor.return_value = True
 
         with (
             patch("gza.cli.Config.load", return_value=config),
@@ -16357,7 +16362,7 @@ class TestIterateCommand:
         output = capsys.readouterr().out
 
         assert result == 0
-        assert "[dry-run] First next action: needs_rebase - Rebase before verify_fix" in output
+        assert "[dry-run] First next action: needs_rebase - Rebase before verify_fix for red verify gate" in output
 
     def test_iterate_force_verify_fix_failed_stale_owner_runs_rebase_without_verify(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -17855,6 +17860,7 @@ class TestIterateCommand:
             impl.branch: "rearm-head",
             "main": "base-head",
         }.get(ref)
+        mock_git.is_ancestor.return_value = True
 
         with (
             patch("gza.cli.Config.load", return_value=config),
@@ -18472,6 +18478,7 @@ class TestIterateCommand:
             impl.branch: "advance-force-head",
             "main": "base-head",
         }.get(ref)
+        mock_git.is_ancestor.return_value = True
         snapshot = ConcurrencySnapshot(
             limit=1,
             running=0,
@@ -18862,6 +18869,7 @@ class TestIterateCommand:
             impl.branch: "improved-head",
             "main": "base-1",
         }.get(ref)
+        mock_git.is_ancestor.return_value = True
 
         with (
             patch("gza.cli.Config.load", return_value=config),
@@ -19327,6 +19335,7 @@ class TestIterateCommand:
             impl.branch: "failed-child-head",
             "main": "base-head",
         }.get(ref)
+        mock_git.is_ancestor.return_value = True
 
         with (
             patch("gza.cli.Config.load", return_value=config),
@@ -19345,6 +19354,7 @@ class TestIterateCommand:
                     "main": "base-head",
                 }.get(ref),
             ),
+            patch("gza.git.Git.is_ancestor", return_value=True),
         ):
             result = cmd_iterate(args)
 

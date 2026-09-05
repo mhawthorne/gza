@@ -51,6 +51,7 @@ from ..config import DEFAULT_WATCH_MAIN_VERIFY_REMEDIATION_MAX_ATTEMPTS, Config,
 from ..console import console, prompt_available_width, shorten_prompt
 from ..db import (
     MERGE_SOURCE_WATCH,
+    MERGE_UNIT_ACTIONABLE_STATES,
     DuplicateActiveChildError,
     ExecutionProjectActivationError,
     ExecutionProjectDisabled,
@@ -6638,6 +6639,123 @@ def _format_cycle_accounting_message(accounting: _CycleTaskAccounting) -> str:
     )
 
 
+@dataclass(frozen=True)
+class _CycleUnitAccounting:
+    """Disjoint per-cycle classification of every in-scope, unresolved unit of work.
+
+    A "unit" is a merge unit for implement-rooted lineages (review/improve/
+    fix/rebase/verify_fix members are folded into their unit, not counted
+    separately) or, for plan-rooted lineages that never produce a merge unit,
+    the plan/plan_review/plan_improve/explore chain itself. Each unit lands in
+    exactly one bucket, driven by its single current "live" task:
+
+    - running: the live task is in_progress.
+    - pending: the live task is pending and not blocked.
+    - blocked: the live task is pending and blocked on a dependency.
+    - recovery: the live task failed and the recovery engine will retry it
+      automatically (resume/retry/reconcile).
+    - parked: the live task failed and the recovery engine will not touch it
+      again without a human (or a future auto-rearm policy).
+    - other: residual bucket. Should stay at zero; nonzero means a unit's live
+      task landed in a state this classification did not anticipate.
+
+    Units resolved by a route other than their own live task (e.g. the work
+    landed under a different, already-merged unit) are excluded entirely,
+    mirroring ``should_hide_failed_recovery_decision`` at the task level.
+    """
+
+    running: int
+    pending: int
+    blocked: int
+    parked: int
+    recovery: int
+    other: int
+
+    @property
+    def total(self) -> int:
+        return self.running + self.pending + self.blocked + self.parked + self.recovery + self.other
+
+
+def _bucket_unit_live_task(
+    task: DbTask,
+    *,
+    store: SqliteTaskStore,
+    analysis: "_WatchCycleAnalysis",
+    max_recovery_attempts: int,
+) -> str | None:
+    """Classify one unit's live task into a _CycleUnitAccounting bucket, or None to exclude it."""
+    if task.status == "in_progress":
+        return "running"
+    if task.status == "pending":
+        return "blocked" if store.is_task_blocked(task)[0] else "pending"
+    if task.status == "failed":
+        decision = decide_failed_task_recovery(
+            store,
+            task,
+            max_recovery_attempts=max_recovery_attempts,
+            read_context=analysis.watch_read_context,
+        )
+        if should_hide_failed_recovery_decision(decision):
+            return None
+        if decision.action in {"resume", "retry", "reconcile"}:
+            return "recovery"
+        return "parked"
+    return "other"
+
+
+def _compute_cycle_unit_accounting(
+    *,
+    store: SqliteTaskStore,
+    analysis: "_WatchCycleAnalysis",
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    max_recovery_attempts: int,
+) -> _CycleUnitAccounting:
+    counts = {"running": 0, "pending": 0, "blocked": 0, "parked": 0, "recovery": 0, "other": 0}
+
+    for unit in store.list_active_merge_units_for_recovery_scope(
+        states=tuple(sorted(MERGE_UNIT_ACTIONABLE_STATES)),
+        tags=tags,
+        any_tag=any_tag,
+    ):
+        live_task = store.resolve_merge_unit_representative_task(
+            unit, require_actionable=True
+        ) or store.resolve_merge_unit_representative_task(unit, require_actionable=False)
+        if live_task is None:
+            counts["other"] += 1
+            continue
+        bucket = _bucket_unit_live_task(
+            live_task, store=store, analysis=analysis, max_recovery_attempts=max_recovery_attempts
+        )
+        if bucket is not None:
+            counts[bucket] += 1
+
+    for task in store.get_all():
+        if task.task_type not in {"plan", "plan_review", "plan_improve", "explore"}:
+            continue
+        if task.status in {"completed", "dropped"}:
+            continue
+        if not task_matches_tag_filters(task_tags=task.tags, tag_filters=tags, any_tag=any_tag):
+            continue
+        if task.id is not None and store.resolve_merge_unit_for_task(task.id) is not None:
+            continue  # already counted via its merge unit above
+        bucket = _bucket_unit_live_task(
+            task, store=store, analysis=analysis, max_recovery_attempts=max_recovery_attempts
+        )
+        if bucket is not None:
+            counts[bucket] += 1
+
+    return _CycleUnitAccounting(**counts)
+
+
+def _format_cycle_unit_accounting_message(accounting: _CycleUnitAccounting) -> str:
+    return (
+        f"unit accounting: running={accounting.running} pending={accounting.pending} "
+        f"blocked={accounting.blocked} parked={accounting.parked} "
+        f"recovery={accounting.recovery} other={accounting.other}"
+    )
+
+
 def _pending_runnable_tasks(
     store: SqliteTaskStore,
     *,
@@ -7903,6 +8021,7 @@ class _WatchCyclePlan:
     analysis: "_WatchCycleAnalysis"
     starting_worker_count: int = 0
     task_accounting: "_CycleTaskAccounting | None" = None
+    unit_accounting: "_CycleUnitAccounting | None" = None
 
 
 @dataclass(frozen=True)
@@ -9735,6 +9854,7 @@ class SupervisorLaunchBudget:
                     task=candidate.task,
                 )
             try:
+
                 def retarget_launch_reservation(launched_task_id: str) -> None:
                     nonlocal reservation
                     assert reservation is not None
@@ -11608,7 +11728,11 @@ class WatchProjectRuntime:
         max_recovery_attempts: int,
         dry_run: bool,
     ) -> _RecoveryDispatchPreflightResult:
-        if not self._candidate_belongs_to_runtime(candidate) or candidate.lane != "recovery" or candidate.task.id is None:
+        if (
+            not self._candidate_belongs_to_runtime(candidate)
+            or candidate.lane != "recovery"
+            or candidate.task.id is None
+        ):
             return _RecoveryDispatchPreflightResult(
                 task=candidate.task,
                 dispatchable=False,
@@ -12559,9 +12683,7 @@ class WatchProjectRuntime:
                     self.log.emit(
                         "SKIP",
                         f"{failed.id}: {detail}",
-                        dedupe_key=(
-                            f"recovery-{recovery_action_type}-duplicate:{failed.id}:{exc.active_child.id}"
-                        ),
+                        dedupe_key=(f"recovery-{recovery_action_type}-duplicate:{failed.id}:{exc.active_child.id}"),
                     )
                     self._exclude_recovery_dispatch_tasks_for_pass(
                         failed_task_id=str(failed.id),
@@ -14417,9 +14539,7 @@ def _watch_failed_recovery_scan_is_current(
                     f"branch '{cohort.branch}' recovery reconciliation skipped: {result.skipped_reason}"
                 )
             if result.head_sha is None or result.base_sha is None:
-                proof_errors.append(
-                    f"branch '{cohort.branch}' recovery reconciliation lacked durable head/base proof"
-                )
+                proof_errors.append(f"branch '{cohort.branch}' recovery reconciliation lacked durable head/base proof")
             elif result.base_sha != target_sha:
                 proof_errors.append(
                     f"branch '{cohort.branch}' recovery reconciliation used target snapshot "
@@ -14464,7 +14584,7 @@ def _watch_failed_recovery_scan_is_current(
         current_fingerprint = _watch_failed_recovery_scan_unit_fingerprint(units)
     if incomplete_reasons:
         reasons_block = "\n".join(f"  - {reason}" for reason in incomplete_reasons)
-        logger.debug(
+        logger.warning(
             "watch failed-recovery scan for target %s at %s incomplete; keeping previous marker:\n%s",
             target_branch,
             target_sha,
@@ -14507,6 +14627,16 @@ def _watch_failed_recovery_scan_resolve_refs(
     return git.resolve_refs(refs)
 
 
+def _watch_failed_recovery_scan_resolve_content_refs(
+    *,
+    git: Git,
+    units: Sequence[MergeUnit],
+    target_sha: str,
+) -> Mapping[str, str | None]:
+    refs = sorted({str(unit.head_sha) for unit in units if unit.head_sha is not None} | {target_sha})
+    return git.resolve_refs(refs)
+
+
 def _watch_failed_recovery_scan_source_changed_units(
     *,
     git: Git,
@@ -14519,9 +14649,23 @@ def _watch_failed_recovery_scan_source_changed_units(
     try:
         resolved = _watch_failed_recovery_scan_resolve_refs(git=git, units=units)
     except GitError as exc:
-        incomplete_reasons.append(
-            f"batched source-head proof unavailable for target '{target_branch}': {exc}"
+        incomplete_reasons.append(f"batched source-head proof unavailable for target '{target_branch}': {exc}")
+        return []
+    missing_terminal_units = [
+        unit
+        for unit in units
+        if unit.head_sha is not None
+        and resolved.get(str(unit.source_branch)) is None
+        and unit.state in {"merged", "unmerged", "empty", "redundant"}
+    ]
+    try:
+        resolved_recorded_heads = (
+            git.resolve_refs(sorted({str(unit.head_sha) for unit in missing_terminal_units}))
+            if missing_terminal_units
+            else {}
         )
+    except GitError as exc:
+        incomplete_reasons.append(f"batched recorded source-head proof unavailable for target '{target_branch}': {exc}")
         return []
     stale_units: list[MergeUnit] = []
     for unit in units:
@@ -14530,6 +14674,20 @@ def _watch_failed_recovery_scan_source_changed_units(
             continue
         current_head = resolved.get(str(unit.source_branch))
         if current_head is None:
+            if unit.state in {"merged", "unmerged", "empty", "redundant"}:
+                if resolved_recorded_heads.get(str(unit.head_sha)) is None:
+                    logger.debug(
+                        "watch failed-recovery scan treating branch %s as unchanged for target %s: "
+                        "recorded source head %s no longer resolves",
+                        unit.source_branch,
+                        target_branch,
+                        unit.head_sha,
+                    )
+                    continue
+                incomplete_reasons.append(
+                    f"branch '{unit.source_branch}' source-head proof unavailable against '{target_branch}'"
+                )
+                continue
             incomplete_reasons.append(
                 f"branch '{unit.source_branch}' source-head proof unavailable against '{target_branch}'"
             )
@@ -14547,34 +14705,77 @@ def _watch_failed_recovery_scan_target_moved_units(
     target_sha: str,
     incomplete_reasons: list[str],
 ) -> tuple[list[MergeUnit], dict[str, bool]]:
-    source_changed = _watch_failed_recovery_scan_source_changed_units(
-        git=git,
-        units=units,
-        target_branch=target_branch,
-        incomplete_reasons=incomplete_reasons,
-    )
-    stale_by_id = {unit.id: unit for unit in source_changed}
-    unchanged_candidates: list[MergeUnit] = []
+    if not units:
+        return [], {}
+    try:
+        resolved = _watch_failed_recovery_scan_resolve_refs(git=git, units=units)
+    except GitError as exc:
+        incomplete_reasons.append(f"batched source-head proof unavailable for target '{target_branch}': {exc}")
+        return [], {}
+
+    stale_by_id: dict[str, MergeUnit] = {}
+    terminal_candidates: list[MergeUnit] = []
+    current_head_by_unit_id: dict[str, str | None] = {}
     for unit in units:
-        if unit.id in stale_by_id:
-            continue
         if unit.head_sha is None or unit.base_sha is None:
             stale_by_id[unit.id] = unit
+            continue
+        current_head = resolved.get(str(unit.source_branch))
+        current_head_by_unit_id[unit.id] = current_head
+        if current_head is not None and current_head != unit.head_sha:
+            stale_by_id[unit.id] = unit
+            continue
+        if current_head is None and unit.state not in {"merged", "unmerged", "empty", "redundant"}:
+            incomplete_reasons.append(
+                f"branch '{unit.source_branch}' source-head proof unavailable against '{target_branch}'"
+            )
             continue
         if unit.state == "merged" and unit.merge_source is None and unit.pr_state == "open":
             stale_by_id[unit.id] = unit
             continue
         if unit.state in {"merged", "unmerged", "empty", "redundant"}:
-            unchanged_candidates.append(unit)
+            terminal_candidates.append(unit)
             continue
         stale_by_id[unit.id] = unit
     merged_proof_by_branch: dict[str, bool] = {}
+    unchanged_candidates: list[MergeUnit] = []
+    if terminal_candidates:
+        try:
+            resolved_content_refs = _watch_failed_recovery_scan_resolve_content_refs(
+                git=git,
+                units=terminal_candidates,
+                target_sha=target_sha,
+            )
+        except GitError as exc:
+            incomplete_reasons.append(
+                f"batched recorded content-ref proof unavailable for target '{target_branch}': {exc}"
+            )
+            return list(stale_by_id.values()), merged_proof_by_branch
+
+        target_resolved = resolved_content_refs.get(target_sha) is not None
+        for unit in terminal_candidates:
+            recorded_head_resolved = resolved_content_refs.get(str(unit.head_sha)) is not None
+            if not recorded_head_resolved or not target_resolved:
+                logger.debug(
+                    "watch failed-recovery scan treating branch %s as unchanged for target %s: "
+                    "recorded content ref unavailable for head %s or target %s",
+                    unit.source_branch,
+                    target_branch,
+                    unit.head_sha,
+                    target_sha,
+                )
+                continue
+            if current_head_by_unit_id.get(unit.id) is None:
+                incomplete_reasons.append(
+                    f"branch '{unit.source_branch}' source-head proof unavailable against '{target_branch}'"
+                )
+                continue
+            unchanged_candidates.append(unit)
+
     if unchanged_candidates:
         content_equivalent = getattr(git, "content_equivalent_refs_on_target", None)
         if not callable(content_equivalent):
-            incomplete_reasons.append(
-                f"batched content-equivalence proof unavailable for target '{target_branch}'"
-            )
+            incomplete_reasons.append(f"batched content-equivalence proof unavailable for target '{target_branch}'")
         else:
             try:
                 content_presence = content_equivalent(
@@ -14590,7 +14791,8 @@ def _watch_failed_recovery_scan_target_moved_units(
                     present = content_presence.get(str(unit.head_sha))
                     if present is None:
                         incomplete_reasons.append(
-                            f"branch '{unit.source_branch}' content-equivalence proof unavailable against '{target_branch}'"
+                            f"branch '{unit.source_branch}' content-equivalence proof unavailable "
+                            f"against '{target_branch}'"
                         )
                     elif unit.state == "unmerged" and present:
                         stale_by_id[unit.id] = unit
@@ -15647,6 +15849,17 @@ def _build_watch_cycle_plan(
             max_recovery_attempts=max_recovery_attempts,
         )
     )
+    unit_accounting = (
+        None
+        if scoped_owner_ids is not None
+        else _compute_cycle_unit_accounting(
+            store=store,
+            analysis=analysis,
+            tags=tags,
+            any_tag=any_tag,
+            max_recovery_attempts=max_recovery_attempts,
+        )
+    )
     return _WatchCyclePlan(
         running_task_ids=running_task_ids,
         anonymous_worker_count=anonymous_worker_count,
@@ -15658,6 +15871,7 @@ def _build_watch_cycle_plan(
         slots=slots,
         analysis=analysis,
         task_accounting=task_accounting,
+        unit_accounting=unit_accounting,
     )
 
 
@@ -15984,6 +16198,8 @@ def _run_cycle(
             )
             if plan.task_accounting is not None:
                 log.emit("INFO", _format_cycle_accounting_message(plan.task_accounting))
+            if plan.unit_accounting is not None:
+                log.emit("INFO", _format_cycle_unit_accounting_message(plan.unit_accounting))
             scope_message = _format_scope_message(tags, any_tag=any_tag, scoped_owner_ids=effective_scoped_owner_ids)
             if scope_message is not None:
                 log.emit("INFO", scope_message)

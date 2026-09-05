@@ -453,11 +453,11 @@ epoch.
   (`merge-source-needs-manual-resolution`) before any pre-review `verify_gate`,
   `create_review`, or `run_review` automation.
 - Missing or stale verify evidence for the current owner epoch MUST select `verify_gate`
-  first. Lifecycle MUST rerun verify before it creates a review for that source epoch.
-- Current red verify evidence before review MUST route into the `verify_fix` lane, not the
-  review/improve lane, unless it is a budget-only timeout. Lifecycle MUST create, reuse,
-  run, or wait on one same-branch `verify_fix` task keyed by the exact current verify
-  epoch and implementation owner.
+  first. Lifecycle MUST rerun verify before it creates a review for that head.
+- Current non-budget red verify evidence before review MUST route into the `verify_fix`
+  lane, not the review/improve lane, only after the preflight rebase guard below allows
+  it. Lifecycle MUST create, reuse, run, or wait on one same-branch `verify_fix` task
+  keyed by the exact current verify epoch and implementation owner.
 - If the current verify evidence has `failure_origin == "timeout"` and persisted phase
   diagnostics show no failed phase, lifecycle MUST park with
   `verify-budget-exceeded` instead of creating a `verify_fix`. The gate remains
@@ -490,6 +490,26 @@ epoch.
   decision with remaining attempts MUST dispatch/reuse the verify-fix retry; only
   non-retry decisions or exhausted retry attempts may park with `verify-failed-needs-fix`,
   and the park message MUST distinguish those cases.
+- Current non-budget red verify evidence before review MUST first prove that the
+  implementation branch contains the local target tip. A same-branch rebase that is
+  already pending or running MUST skip with reason `verify-gate-preflight-rebase` before
+  any ancestry, completed-rebase, or verify-fix routing. If local target-tip proof is
+  unavailable, lifecycle MUST fail closed with `needs_discussion`
+  (`verify-gate-proof-unavailable`) and surface the proof diagnostic without creating a
+  rebase or verify-fix task. If the branch is proven not to contain the target tip and no
+  same-branch rebase is active, lifecycle MUST select
+  `needs_rebase` with reason `verify-gate-preflight-rebase` instead of routing into
+  `verify_fix`. After that rebase changes the source head, lifecycle MUST reevaluate the
+  verify gate for the fresh epoch instead of emitting another rebase for the same stale
+  red evidence. If a completed preflight exists for the exact implementation-owner
+  verify epoch and the live source head still equals that red epoch while the branch
+  still lacks the target tip, lifecycle MUST fail closed instead of refreshing verify or
+  creating another same-epoch rebase, even if a later failed result artifact for that
+  same epoch is now newest. Once the branch contains the target tip and no same-branch
+  rebase is active, lifecycle MUST continue to same-epoch `verify_fix` creation or reuse.
+- If the current evidence is not a budget-only timeout and a same-epoch `verify_fix`
+  is already `pending`, lifecycle MUST `run_verify_fix`; if it is already
+  `in_progress`, lifecycle MUST `wait_verify_fix`.
 - If one same-epoch `verify_fix` attempt completed without source changes and the current
   red verify evidence is structurally classified as timeout-origin, lifecycle MUST rerun
   verification for the exact same head once before treating that `verify_fix` as
@@ -533,8 +553,9 @@ epoch.
   details, and MUST record the reconciliation itself as separate metadata. It MUST then
   reevaluate before routing red, missing, or unavailable owner evidence to verify-gate
   reruns, `verify_fix`, or park states. Legacy evidence without resolvable source
-  provenance MAY use an explicit safe fallback source, but valid source provenance MUST
-  NOT be rewritten to the artifact-holder row. Any no-merge-unit compatibility copy that
+  provenance MAY be copied only with explicit fallback metadata, and the copy MUST NOT
+  recompute historical tree identity from the receiving owner. Valid source provenance
+  MUST NOT be rewritten to the artifact-holder row. Any no-merge-unit compatibility copy that
   attaches canonical owner evidence to a prepared holder row MUST use the same
   provenance-preserving copy semantics.
 - If one same-epoch `verify_fix` attempt already completed and the latest current verify
@@ -846,7 +867,7 @@ failure *and* actionable merge/review work remains eligible for the latter.
   annotated `merge` action only when the review content is unchanged, the live source ref
   still equals the reviewed head, the deterministic persisted `BLOCKER` payload is
   validated, and current lifecycle-owned verify evidence is fresh and passing for that
-  same head. The executor MUST create or reuse every deferred-blocker task before
+  current source verify epoch. The executor MUST create or reuse every deferred-blocker task before
   promotion, already-merged mutation, or merge-unit finalization records success.
   Missing or stale verify evidence MUST run the normal pre-merge verify path before
   eligibility is reconsidered; spec-coherence reviews, red or unavailable verify gates,
@@ -979,9 +1000,39 @@ creation.
 ordinary lifecycle action selected by `advance` or `watch`. The command MUST accept one
 selected task, resolve it through canonical merge-unit membership to the unit owner,
 representative, local source ref, and canonical local target branch, and re-read that
-state after every mutating step. If authoritative merge-unit reconciliation proves the
-unit is already `merged`, `land` MUST finish idempotently without rebasing, reviewing,
-judging, deferring blockers, or merging again.
+state after every mutating step. Initial resolution and every later reconciliation MUST
+first handle the complete terminal-state branch before testing ordinary unmerged
+eligibility. The reconciliation boundary is explicit: if the active unit is already
+`merged`, writable and dry-run `land` MUST return that known terminal result without
+mutating merge state or running downstream landing activity. If the active unit is already
+`empty` or `redundant` and has no recorded head SHA, writable and dry-run `land` MUST
+return the stored terminal no-work result. If the active unit is already `empty` or
+`redundant` and has a recorded head SHA, writable and dry-run `land` MUST route it through
+the canonical recorded-head no-work validation defined in §8 before returning it as
+terminal. Valid proof that the recorded-head patch is represented on the target, or
+fail-closed unavailable proof, MAY return the stored terminal no-work result with no
+mutation. Positive proof that the recorded-head patch is missing MUST make writable
+`land` restore the unit to `unmerged`; dry-run MUST report that repair-needed nonterminal
+outcome without mutating. If canonical writable reconciliation of an active `unmerged`
+unit proves one of the three terminal states, it MAY persist exactly one merge-state
+transition from `unmerged` to the proven state; that terminal write MUST be bound to the
+durable merge-unit identity and live source/target heads used by the proof, and writable
+`land` MUST re-read and re-prove immediately before the atomic update. If that identity or
+either live head changed, the stale terminal write MUST be rejected or the fresh
+authoritative terminal state returned. After any attempted terminal write, the
+authoritative row MUST be refreshed and routed through the complete terminal-state branch
+before reporting persistence failure. Dry-run MUST remain query-only and MUST NOT perform
+the reconciliation mutation, even when the query result proves `merged`, `empty`, or
+`redundant`. Once a terminal result is known, `land` MUST NOT rebase, run a
+provider, run source verify, refresh post-merge target verify, run spec-coherence
+review, run code or resolution review, run a landing judgment, create or reuse
+follow-up/deferred tasks, materialize artifacts, mark merged, perform a git merge, or
+perform any merge-state mutation beyond the single allowed writable terminal
+reconciliation or recorded-head restoration to `unmerged`. The three terminal results are
+distinct: `merged` reports already-landed success, while `empty` and `redundant` report
+terminal no-work success and MUST NOT be described as landed, merged, or marked merged.
+Only after this terminal branch is excluded may continuing `land` require the unit's merge
+state to be exactly `unmerged`.
 
 Landing phase order is part of the safety contract. Writable `land` MUST execute or stop
 in this order, re-reading durable state between phases and after every source-head
@@ -1054,8 +1105,8 @@ proven from current state:
   ancestry/behind proof is unavailable, or the rebase fails, is unresolved, is superseded
   without exact target-tip containment proof, or still leaves the source unmergeable, the
   command MUST stop.
-- Current lifecycle verify evidence is green for the exact final live source head/tree
-  and current verify-gate identity. If evidence is absent or stale, writable `land` MUST
+- Current lifecycle verify evidence is green for the final live source verify epoch. If
+  evidence is absent or stale, writable `land` MUST
   run or exact-reuse the shared direct verify acquisition path when acquisition is
   enabled and identity proof is available. It MUST refuse only for an enumerated
   inability: verify acquisition disabled, source/epoch or active-work identity conflict,
@@ -1156,7 +1207,7 @@ unrepaired-provenance, and recovered/resumed rebase outcomes MUST NOT create, ru
 or wait on a code review or resolution review, and MUST NOT create or run a landing
 judgment. After any rebase or source-head-changing step, both `strict` and
 non-escalated `guarded` landing MUST obtain current canonical green lifecycle verify
-evidence for the exact final live source head/tree and current gate identity, satisfy all
+evidence for the final live source verify epoch, satisfy all
 other non-review prerequisites and final preflight rules, and then continue through
 ordinary no-review landing with `manual_land` provenance.
 
@@ -1261,7 +1312,13 @@ the resolved owner, local source, canonical target, current evidence known from 
 state, and the ordered conditional phases available before execution. Where a future fact
 requires executing a rebase, review, verify, judgment, task materialization, or merge, dry
 run MUST explicitly label that phase as conditional or unknown and MUST stop prediction at
-the first execution-required boundary instead of synthesizing later outcomes.
+the first execution-required boundary instead of synthesizing later outcomes. If the
+query-only state already proves the selected unit is `merged`, `empty`, or `redundant`,
+dry-run MUST report that known terminal state as the command's current outcome and MUST
+not cross the execution boundary to repair metadata, refresh checkpoints, create tasks,
+verify, review, judge, materialize, mark merged, or merge. Dry-run wording MUST preserve
+the same distinction as writable results: `empty` and `redundant` are terminal no-work,
+not landed success.
 
 Writable `land` MUST be bounded and idempotent. It MUST enforce a named, swappable
 per-invocation maximum-transition policy, `LandingTransitionLimitPolicy`, in addition to
@@ -1291,11 +1348,16 @@ required by the selected phase. Mismatched active work MUST fail closed without 
 duplicate tasks or launching a provider, and after any ownership change or active-work
 terminalization, `land` MUST re-resolve canonical merge-unit, source, target, review, and
 verify state before continuing. Exact matching rebase, review, judgment, and
-deferred-blocker artifacts MUST be reused; successful rerun after merge MUST reconcile
-and report the already-merged state without another merge. Already-merged reconciliation
-MUST still refresh or reuse the configured post-merge target checkpoint for the exact
-merged target tree and current gate identity before returning success, without rerunning
-earlier rebase, source-verify, review, judgment, or merge phases.
+deferred-blocker artifacts MUST be reused before a terminal result is known; successful
+rerun after a terminal result MUST reconcile and report that terminal state without
+another merge. Post-merge target verification belongs to the original successful merge
+path before `merged` is recorded. A later `land` invocation that enters with
+authoritative state `merged` MUST return the known already-landed terminal result
+without refreshing verification, reusing or materializing checkpoint evidence, rerunning
+earlier rebase/source-verify/review/judgment phases, creating tasks/artifacts, marking
+merged, or merging. Reconciliation to `empty` or `redundant` has no post-merge checkpoint
+because no merge occurred; it MUST return terminal no-work success without running the
+post-merge checkpoint and without reporting the unit as landed.
 
 Every pre-merge terminal refusal MUST be represented as one stable `LandBlocked` result
 with at least:
@@ -1431,6 +1493,8 @@ is a spec change. The accompanying human message is free text.
 | `closing-review-needs-manual-refresh` † | needs_discussion | §6/§8 closing-review requirement, manual refresh |
 | `verify-budget-exceeded` | needs_discussion | §5a verify gate timed out with no failed phase in persisted phase diagnostics |
 | `verify-failed-needs-fix` | needs_discussion | §5a verify gate is red before review can proceed, but lifecycle cannot safely create/continue the current `verify_fix` lane |
+| `verify-gate-proof-unavailable` | needs_discussion | §5a target-tip or live-head proof is unavailable while evaluating red verify-gate preflight; no rebase or verify-fix is created |
+| `verify-gate-preflight-rebase` | needs_discussion | §5a completed same-epoch verify-gate preflight rebase left the live source head at the same red verify epoch while the branch still lacks the target tip |
 | `verify-fix-failed` | needs_discussion | §5a current verify gate is still red after one completed same-epoch `verify_fix` |
 | `verify-unavailable` | needs_discussion | §5a verify gate is unavailable and lifecycle cannot safely route through `verify_fix` |
 | `verify-unavailable-after-fix` | needs_discussion | §5a verify gate remains unavailable after one completed same-epoch `verify_fix` |

@@ -44,10 +44,15 @@ The contract is defined over these concepts, independent of how they are stored.
   set of related tasks that together produce one mergeable change on one branch. This is
   the thing that has a lifecycle and a merge state. A work unit MUST have exactly one
   canonical merge target branch.
-- **Merge state of a work unit:** `unmerged` | `merged`. Authoritative answer to "has
-  this landed?" It MUST be decided from recorded lifecycle state, **not** from strict
-  git ancestry (a squash-merged branch fails ancestry but is merged). See the four
-  merge-state axes in `docs/internal/task-model-canonical.md`.
+- **Landing-relevant merge states of a work unit:** `unmerged`, plus terminal
+  `merged`, `empty`, and `redundant`. These are the states `gza land` handles before
+  entering or skipping landing activity. The exhaustive canonical merge-unit vocabulary
+  is owned by [lineage.md](lineage.md#merge-units--the-ownership-model) and also
+  includes `blocked`, `stale`, `dropped`, and `superseded`. Merge state MUST be decided
+  from recorded lifecycle state, **not** from strict git ancestry (a squash-merged branch
+  fails ancestry but is merged). `merged` means landed; `empty` and `redundant` mean
+  terminal no-work and MUST NOT be reported as landed. See the merge-unit buckets in
+  `docs/internal/task-model-canonical.md`.
 - **Review verdict** (on a completed `review` task): `APPROVED` |
   `APPROVED_WITH_FOLLOWUPS` | `CHANGES_REQUESTED` | `NEEDS_DISCUSSION`. Any other value
   is treated as *unknown* and escalates.
@@ -160,7 +165,7 @@ These hold across the whole machine; the detailed rules in
    - the **code-review gate**: a current, valid review whose verdict permits merge
      (`APPROVED` or `APPROVED_WITH_FOLLOWUPS`);
    - the **verify gate**: current runner-owned verify evidence for the current
-     implementation branch content/tree epoch and verify-gate identity, with
+     implementation branch content/tree epoch, with
      fail-closed exact-head fallback when Git tree identity is unavailable.
    When `require_review_before_merge=false` disables the review gate for that
    implementation-owned lineage, the verify gate remains mandatory and that no-review

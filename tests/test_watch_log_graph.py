@@ -138,6 +138,104 @@ def test_parse_log_leaves_legacy_parked_unknown_by_default(tmp_path: Path) -> No
     assert acct.parked == 4
 
 
+def test_parse_log_attaches_unit_accounting_to_its_cycle(tmp_path: Path) -> None:
+    """A ``unit accounting:`` line (emitted right after the task-level line)
+
+    populates Point.unit with the merge-unit-level counts; cycles with no such
+    line leave Point.unit as None rather than guessing or carrying forward.
+    """
+    module = _load_module()
+    log = tmp_path / "watch.log"
+    log.write_text(
+        "\n".join(
+            [
+                "10:00:00 WAKE      checking... (1 running, pending=2 runnable, blocked=3, 4 slots)",
+                "10:00:05 INFO      cycle accounting: running=1 pending=2 blocked=3 parked=4 recovery=5 other=6",
+                "10:00:06 INFO      unit accounting: running=1 pending=1 blocked=1 parked=2 recovery=1 other=0",
+                # No unit accounting line on this cycle - predates the feature.
+                "10:01:00 WAKE      checking... (0 running, pending=0 runnable, blocked=0, 4 slots)",
+                "10:01:05 INFO      cycle accounting: running=0 pending=0 blocked=0 parked=0 recovery=0 other=0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    points, _merges = module.parse_log(str(log), datetime(2026, 7, 8))
+
+    with_unit, without_unit = points
+    assert with_unit.unit is not None
+    assert (with_unit.unit.running, with_unit.unit.pending, with_unit.unit.blocked) == (1, 1, 1)
+    assert (with_unit.unit.parked, with_unit.unit.recovery, with_unit.unit.other) == (2, 1, 0)
+    assert without_unit.unit is None
+
+
+def test_select_view_defaults_to_units_when_available(tmp_path: Path) -> None:
+    module = _load_module()
+    log = tmp_path / "watch.log"
+    log.write_text(
+        "\n".join(
+            [
+                "10:00:00 WAKE      checking... (1 running, pending=2 runnable, blocked=3, 4 slots)",
+                "10:00:05 INFO      cycle accounting: running=1 pending=2 blocked=3 parked=4 recovery=5 other=6",
+                "10:00:06 INFO      unit accounting: running=9 pending=8 blocked=7 parked=6 recovery=5 other=0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    points, _merges = module.parse_log(str(log), datetime(2026, 7, 8))
+
+    display, label = module._select_view(points, task_level=False)
+
+    assert label == "merge units"
+    assert (display[0].running, display[0].parked) == (9, 6)
+
+
+def test_select_view_task_level_flag_shows_task_counts(tmp_path: Path) -> None:
+    module = _load_module()
+    log = tmp_path / "watch.log"
+    log.write_text(
+        "\n".join(
+            [
+                "10:00:00 WAKE      checking... (1 running, pending=2 runnable, blocked=3, 4 slots)",
+                "10:00:05 INFO      cycle accounting: running=1 pending=2 blocked=3 parked=4 recovery=5 other=6",
+                "10:00:06 INFO      unit accounting: running=9 pending=8 blocked=7 parked=6 recovery=5 other=0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    points, _merges = module.parse_log(str(log), datetime(2026, 7, 8))
+
+    display, label = module._select_view(points, task_level=True)
+
+    assert label == "tasks"
+    assert (display[0].running, display[0].parked) == (1, 4)
+
+
+def test_select_view_falls_back_to_tasks_when_no_unit_data(tmp_path: Path) -> None:
+    """A log from before unit accounting existed must not crash or go blank."""
+    module = _load_module()
+    log = tmp_path / "watch.log"
+    log.write_text(
+        "\n".join(
+            [
+                "10:00:00 WAKE      checking... (1 running, pending=2 runnable, blocked=3, 4 slots)",
+                "10:00:05 INFO      cycle accounting: running=1 pending=2 blocked=3 parked=4 recovery=5 other=6",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    points, _merges = module.parse_log(str(log), datetime(2026, 7, 8))
+
+    display, label = module._select_view(points, task_level=False)
+
+    assert "tasks" in label
+    assert (display[0].running, display[0].parked) == (1, 4)
+
+
 def test_parse_watch_logs_all_spans_archives_and_live_chronologically(
     tmp_path: Path,
 ) -> None:
@@ -393,6 +491,7 @@ def test_watch_loop_bounded_end_stops_after_family_advances_past_window(
             end=end,
             hours=24.0,
             legacy_attention=False,
+            task_level=False,
             markers=True,
             merge_band=module.MERGE_BAND_DEFAULT,
             merge_bucket="auto",

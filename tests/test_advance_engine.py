@@ -73,6 +73,10 @@ from gza.query import (
 from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance
 from gza.rebase_publish import REBASE_SUPERSEDED_COMPLETION_REASON
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
+from gza.verify_gate_preflight import (
+    VerifyGatePreflightProvenance,
+    append_verify_gate_preflight_provenance,
+)
 from gza.review_scope import (
     build_resolution_review_scope,
     build_spec_coherence_review_scope,
@@ -125,6 +129,7 @@ class _FakeGit:
         name_status_error_by_range: dict[str, Exception] | None = None,
         resolve_fresh_merge_source_ref_error: Exception | None = None,
         rev_parse_errors: dict[str, Exception] | None = None,
+        ancestor_errors: dict[tuple[str, str], Exception] | None = None,
         default_branch_name: str = "main",
         resolved_tree_shas: dict[str, str | None] | None = None,
         merge_base_by_ref: dict[tuple[str, str], str | None] | None = None,
@@ -148,6 +153,7 @@ class _FakeGit:
         self._name_status_error_by_range = name_status_error_by_range or {}
         self._resolve_fresh_merge_source_ref_error = resolve_fresh_merge_source_ref_error
         self._rev_parse_errors = rev_parse_errors or {}
+        self._ancestor_errors = ancestor_errors or {}
         self._default_branch_name = default_branch_name
         self._resolved_tree_shas = resolved_tree_shas or {}
         self._merge_base_by_ref = merge_base_by_ref or {}
@@ -203,6 +209,8 @@ class _FakeGit:
 
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         self.is_ancestor_calls.append((ancestor, descendant))
+        if (ancestor, descendant) in self._ancestor_errors:
+            raise self._ancestor_errors[(ancestor, descendant)]
         return self._ancestor_pairs.get((ancestor, descendant), False)
 
     def resolve_fresh_merge_source(self, branch: str):
@@ -773,6 +781,66 @@ def _add_completed_rebase(
     rebase.changed_diff = changed_diff
     store.update(rebase)
     return rebase
+
+
+def _add_matching_verify_gate_preflight_provenance(
+    store: SqliteTaskStore,
+    rebase: DbTask,
+    impl: DbTask,
+    *,
+    reviewed_head_sha: str = "verify-head",
+    target_tip_sha: str = "target-head",
+    target_branch: str = "main",
+) -> DbTask:
+    assert impl.id is not None
+    assert impl.branch is not None
+    rebase.review_scope = append_verify_gate_preflight_provenance(
+        rebase.review_scope,
+        VerifyGatePreflightProvenance(
+            owner_task_id=impl.id,
+            reviewed_branch=impl.branch,
+            reviewed_head_sha=reviewed_head_sha,
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            target_branch=target_branch,
+            target_tip_sha=target_tip_sha,
+            failed_captured_at="2026-07-06T12:05:00+00:00",
+        ),
+    )
+    store.update(rebase)
+    return rebase
+
+
+def _persist_failed_verify_gate(
+    store: SqliteTaskStore,
+    config: Config,
+    impl: DbTask,
+    *,
+    reviewed_head_sha: str = "verify-head",
+    captured_at: datetime = datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+    source_task: DbTask | None = None,
+) -> None:
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=source_task or impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=captured_at,
+            reviewed_branch=impl.branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_base_sha="base-head",
+            working_directory=str(config.project_dir),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
 
 
 def _add_rebase_diff_provenance(
@@ -3572,7 +3640,6 @@ def test_stale_review_with_review_requirement_disabled_merges(
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     config.require_review_before_merge = False
-    config.advance_create_reviews = True
 
     impl = _make_completed_unmerged_impl(
         store,
@@ -4071,6 +4138,7 @@ def test_noop_verify_fix_after_timeout_red_and_later_green_allows_merge(
             can_merge=True,
             existing_branches={impl.branch},
             ref_shas={impl.branch: "head-1", "main": "base-1"},
+            ancestor_pairs={("main", impl.branch): True},
         ),
         impl,
         "main",
@@ -4179,6 +4247,7 @@ def test_completed_timeout_verify_fix_legacy_planning_ignores_canonical_checkout
             can_merge=True,
             existing_branches={impl.branch},
             ref_shas={impl.branch: "head-1", "main": "base-1"},
+            ancestor_pairs={("main", impl.branch): True},
             status_entries=status_entries,
         ),
         impl,
@@ -4421,6 +4490,7 @@ def test_invalid_canonical_timeout_verify_fix_outcome_fails_closed_without_legac
             can_merge=True,
             existing_branches={impl.branch},
             ref_shas={impl.branch: "head-1", "main": "base-1"},
+            ancestor_pairs={("main", impl.branch): True},
             status_entries=set(),
         ),
         impl,
@@ -4521,6 +4591,7 @@ def test_completed_timeout_verify_fix_with_existing_rerun_red_artifact_parks_eve
             can_merge=True,
             existing_branches={impl.branch},
             ref_shas={impl.branch: "head-1", "main": "base-1"},
+            ancestor_pairs={("main", impl.branch): True},
         ),
         impl,
         "main",
@@ -4612,6 +4683,7 @@ def test_noop_verify_fix_after_real_verify_failure_still_parks(tmp_path: Path, m
             can_merge=True,
             existing_branches={impl.branch},
             ref_shas={impl.branch: "head-1", "main": "base-1"},
+            ancestor_pairs={("main", impl.branch): True},
         ),
         impl,
         "main",
@@ -5043,6 +5115,7 @@ def test_capped_review_candidate_with_missing_verify_runs_pre_merge_verify_befor
             can_merge=True,
             existing_branches={impl.branch},
             ref_shas={impl.branch: "current-sha", "main": "base-sha"},
+            ancestor_pairs={("main", impl.branch): True},
         ),
         impl,
         "main",
@@ -5132,6 +5205,7 @@ def test_capped_review_candidate_with_zero_parsed_blockers_stays_on_attention_pa
             can_merge=True,
             existing_branches={impl.branch},
             ref_shas={impl.branch: "current-sha", "main": "base-sha"},
+            ancestor_pairs={("main", impl.branch): True},
         ),
         impl,
         "main",
@@ -5166,6 +5240,7 @@ def test_capped_review_candidate_with_missing_report_stays_on_unavailable_attent
             can_merge=True,
             existing_branches={impl.branch},
             ref_shas={impl.branch: "current-sha", "main": "base-sha"},
+            ancestor_pairs={("main", impl.branch): True},
         ),
         impl,
         "main",
@@ -5203,7 +5278,12 @@ def test_capped_review_candidate_with_whitespace_report_stays_on_unavailable_att
     action = evaluate_advance_rules(
         config,
         store,
-        _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "current-sha"}),
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "current-sha", "main": "base-sha"},
+            ancestor_pairs={("main", impl.branch): True},
+        ),
         impl,
         "main",
     )
@@ -5269,7 +5349,12 @@ def test_capped_review_candidate_with_malformed_blocker_id_stays_on_attention_pa
     action = evaluate_advance_rules(
         config,
         store,
-        _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "current-sha"}),
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "current-sha", "main": "base-sha"},
+            ancestor_pairs={("main", impl.branch): True},
+        ),
         impl,
         "main",
     )
@@ -5307,7 +5392,12 @@ def test_capped_review_candidate_with_duplicate_blocker_ids_stays_on_attention_p
     action = evaluate_advance_rules(
         config,
         store,
-        _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "current-sha"}),
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "current-sha", "main": "base-sha"},
+            ancestor_pairs={("main", impl.branch): True},
+        ),
         impl,
         "main",
     )
@@ -5350,7 +5440,12 @@ def test_capped_review_candidate_with_summary_disagreement_stays_on_attention_pa
     action = evaluate_advance_rules(
         config,
         store,
-        _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "current-sha"}),
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "current-sha", "main": "base-sha"},
+            ancestor_pairs={("main", impl.branch): True},
+        ),
         impl,
         "main",
     )
@@ -5688,6 +5783,7 @@ def test_capped_review_missing_local_merge_source_needs_manual_resolution_before
             can_merge=True,
             assume_local_branch_exists=False,
             merge_source_result=(None, None),
+            ref_shas={"main": "base-sha"},
         ),
         impl,
         "main",
@@ -6174,6 +6270,7 @@ def test_capped_review_candidate_with_newer_red_verify_uses_pre_merge_verify_fix
             can_merge=True,
             existing_branches={impl.branch},
             ref_shas={impl.branch: "current-sha", "main": "base-sha"},
+            ancestor_pairs={("main", impl.branch): True},
         ),
         impl,
         "main",
@@ -6183,6 +6280,75 @@ def test_capped_review_candidate_with_newer_red_verify_uses_pre_merge_verify_fix
     assert action["verify_gate_phase"] == "pre_merge"
     assert action["verify_epoch"].reviewed_head_sha == "current-sha"
     assert action.get("max_cycles_merge_and_defer") is not True
+
+
+def test_capped_review_red_verify_missing_target_ref_parks_without_rebase_or_verify_fix(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 0
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/capped-review-red-verify-missing-target",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "current-sha"
+    review.output_content = _review_output_with_findings("CHANGES_REQUESTED", blockers=("B1",))
+    store.update(review)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 5, 10, 10, 10, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="current-sha",
+            reviewed_base_sha="base-sha",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: parse_review_report(review.output_content or ""),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "current-sha"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-gate-proof-unavailable"
+    assert action["verify_gate_phase"] == "pre_merge"
+    assert "missing local ref 'main'" in action["proof_diagnostic"]
+    assert action["type"] not in {"needs_rebase", "create_verify_fix"}
+    assert "verify_fix_task" not in action
 
 
 def test_merge_and_defer_stale_review_still_refreshes_before_capped_verify(
@@ -16482,6 +16648,18 @@ def test_noop_improve_limit_surfaces_branch_tip_probe_failure_and_skips_verify_a
     config = Config.load(tmp_path)
     config.verify_command = "uv run pytest tests/ -q"
     config.enforce_project_scope = False
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+
+    branch = "feat/transient-failed-rebase"
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = branch
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
 
     impl = _make_completed_unmerged_impl(
         store,
@@ -23283,6 +23461,7 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         "resolution_review_metadata_invalid",
         "pre_review_verify_fix",
         "review_freshness_probe_failed",
+        "red_verify_gate_active_rebase_preempts_git_context",
         "review_automation_merge_source_requires_manual_resolution",
         "stale_review_needs_manual_refresh",
         "failed_rebase_without_successful_review",
@@ -25324,7 +25503,11 @@ def test_pre_review_failed_verify_creates_verify_fix(tmp_path: Path) -> None:
         verify_timeout_grace_seconds=5.0,
         producer="test",
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -25393,7 +25576,7 @@ def _assert_needs_rebase_executes_rebase_without_verify_fix_worker(
     store: SqliteTaskStore,
     impl: DbTask,
     action: dict[str, object],
-) -> None:
+) -> DbTask:
     from gza.cli.advance_executor import AdvanceActionExecutionContext, execute_advance_action
 
     spawned: list[tuple[str, str]] = []
@@ -25429,6 +25612,7 @@ def _assert_needs_rebase_executes_rebase_without_verify_fix_worker(
     assert result.created_task is not None
     assert result.created_task.task_type == "rebase"
     assert spawned == [(result.created_task.id, "rebase")]
+    return result.created_task
 
 
 def test_pre_review_failed_verify_with_stale_base_routes_to_rebase(tmp_path: Path) -> None:
@@ -25460,10 +25644,10 @@ def test_pre_review_failed_verify_with_stale_base_routes_to_rebase(tmp_path: Pat
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "needs_rebase"
-    assert action["reason"] == "verify-fix-stale-base-rebase"
+    assert action["reason"] == "verify-gate-preflight-rebase"
     assert action["rebase_parent_task_id"] == impl.id
     assert action["verify_epoch"].reviewed_head_sha == "verify-head"
-    assert git.is_ancestor_calls[-1] == ("old-target-head", "current-target-head")
+    assert ("main", impl.branch) in git.is_ancestor_calls
 
 
 @pytest.mark.parametrize("existing_status", ["pending", "failed"])
@@ -25507,9 +25691,12 @@ def test_pre_review_stale_base_routes_to_rebase_before_existing_verify_fix_worke
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "needs_rebase"
-    assert action["reason"] == "verify-fix-stale-base-rebase"
+    assert action["reason"] == "verify-gate-preflight-rebase"
     assert action["rebase_parent_task_id"] == impl.id
-    _assert_needs_rebase_executes_rebase_without_verify_fix_worker(store, impl, action)
+    rebase_task = _assert_needs_rebase_executes_rebase_without_verify_fix_worker(store, impl, action)
+    rebase_task.status = "completed"
+    rebase_task.completed_at = datetime(2026, 7, 6, 12, 20, tzinfo=UTC)
+    store.update(rebase_task)
 
     _persist_pre_review_failed_verify(
         store,
@@ -25523,7 +25710,7 @@ def test_pre_review_stale_base_routes_to_rebase_before_existing_verify_fix_worke
     fresh_git = _FakeGit(
         can_merge=True,
         ref_shas={impl.branch: "rebased-head", "main": "current-target-head"},
-        ancestor_pairs={("current-target-head", "current-target-head"): True},
+        ancestor_pairs={("main", impl.branch): True},
     )
 
     fresh_action = evaluate_advance_rules(config, store, fresh_git, impl, "main")
@@ -25555,7 +25742,7 @@ def test_pre_review_failed_verify_with_current_base_creates_verify_fix(tmp_path:
     git = _FakeGit(
         can_merge=True,
         ref_shas={impl.branch: "verify-head", "main": "current-target-head"},
-        ancestor_pairs={("current-target-head", "current-target-head"): True},
+        ancestor_pairs={("main", impl.branch): True},
     )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
@@ -25610,9 +25797,8 @@ def test_pre_review_failed_verify_after_rebase_does_not_rebase_again_for_same_ep
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "create_verify_fix"
-    assert action["verify_epoch"].reviewed_head_sha == "verify-head"
-    assert git.is_ancestor_calls[-1] == ("old-target-head", "current-target-head")
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "verify-gate-preflight-rebase"
 
 
 @pytest.mark.parametrize(
@@ -25665,8 +25851,8 @@ def test_pre_review_failed_verify_rebase_target_mismatch_does_not_satisfy_stale_
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "needs_rebase"
-    assert action["reason"] == "verify-fix-stale-base-rebase"
-    assert git.is_ancestor_calls[-1] == ("old-target-head", "current-target-head")
+    assert action["reason"] == "verify-gate-preflight-rebase"
+    assert ("main", impl.branch) in git.is_ancestor_calls
 
 
 def test_pre_review_failed_verify_branchless_rebase_does_not_satisfy_stale_base_anti_loop(
@@ -25715,7 +25901,7 @@ def test_pre_review_failed_verify_branchless_rebase_does_not_satisfy_stale_base_
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "needs_rebase"
-    assert action["reason"] == "verify-fix-stale-base-rebase"
+    assert action["reason"] == "verify-gate-preflight-rebase"
 
 
 def test_pre_review_failed_verify_later_code_change_invalidates_stale_base_anti_loop(
@@ -25770,11 +25956,11 @@ def test_pre_review_failed_verify_later_code_change_invalidates_stale_base_anti_
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "needs_rebase"
-    assert action["reason"] == "verify-fix-stale-base-rebase"
+    assert action["reason"] == "verify-gate-preflight-rebase"
 
 
 @pytest.mark.parametrize(
-    ("case_name", "git_factory", "expected_detail"),
+    ("case_name", "git_factory", "expected_reason", "expected_detail"),
     [
         (
             "target_raises",
@@ -25783,7 +25969,8 @@ def test_pre_review_failed_verify_later_code_change_invalidates_stale_base_anti_
                 ref_shas={impl.branch: "verify-head"},
                 rev_parse_errors={"main": RuntimeError("target probe failed")},
             ),
-            "could not resolve target branch",
+            "verify-gate-proof-unavailable",
+            "failed to resolve local refs for post-merge rebase state",
         ),
         (
             "target_missing",
@@ -25791,29 +25978,36 @@ def test_pre_review_failed_verify_later_code_change_invalidates_stale_base_anti_
                 can_merge=True,
                 ref_shas={impl.branch: "verify-head", "main": None},
             ),
-            "did not resolve to a commit SHA",
+            "verify-gate-proof-unavailable",
+            "missing local ref 'main' for post-merge rebase state",
         ),
         (
             "ancestor_absent",
             lambda impl: _fake_git_without_ancestor(
                 ref_shas={impl.branch: "verify-head", "main": "current-target-head"}
             ),
-            "git ancestry probe is unavailable",
+            "verify-gate-proof-unavailable",
+            "git runtime cannot check ancestry for post-merge rebase state",
         ),
         (
             "ancestor_raises",
             lambda impl: _fake_git_with_raising_ancestor(
                 ref_shas={impl.branch: "verify-head", "main": "current-target-head"}
             ),
-            "could not prove whether verify base",
+            "verify-gate-proof-unavailable",
+            "failed to check post-merge ancestry for rebase state",
         ),
         (
             "unrelated",
             lambda impl: _FakeGit(
                 can_merge=True,
                 ref_shas={impl.branch: "verify-head", "main": "current-target-head"},
-                ancestor_pairs={("old-target-head", "current-target-head"): False},
+                ancestor_pairs={
+                    ("main", impl.branch): True,
+                    ("old-target-head", "current-target-head"): False,
+                },
             ),
+            "verify-base-freshness-unverified",
             "ancestry did not prove a stale-base relationship",
         ),
     ],
@@ -25822,6 +26016,7 @@ def test_pre_review_failed_verify_unproven_base_freshness_fails_closed(
     tmp_path: Path,
     case_name: str,
     git_factory,
+    expected_reason: str,
     expected_detail: str,
 ) -> None:
     store = _make_store(tmp_path)
@@ -25848,7 +26043,7 @@ def test_pre_review_failed_verify_unproven_base_freshness_fails_closed(
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "verify-base-freshness-unverified"
+    assert action["needs_attention_reason"] == expected_reason
     assert expected_detail in action["description"]
     assert "verify_fix_task" not in action
 
@@ -25930,7 +26125,11 @@ def test_pre_review_red_phase_verify_routes_to_verify_fix(
     validation = validate_verify_phase_evidence_from_metadata(artifacts[0].metadata)
     assert validation.state == PHASE_EVIDENCE_RED
     assert validation.failed_phase_names == ("unit",)
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -25988,7 +26187,11 @@ def test_pre_review_budget_timeout_routes_to_attention_without_verify_fix(tmp_pa
             "not_started_phase_names": ["functional"],
         },
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -26058,7 +26261,11 @@ def test_pre_review_budget_timeout_accepts_final_in_flight_phase_without_verify_
         producer="test",
         aggregate_details=aggregate_details,
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -26131,7 +26338,11 @@ def test_pre_review_cross_project_budget_timeout_accepts_lone_started_phase_with
         producer="test",
         aggregate_details=aggregate_details,
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -26235,7 +26446,11 @@ def test_pre_review_timeout_with_indeterminate_phase_evidence_does_not_use_budge
         producer="test",
         aggregate_details=aggregate_details,
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -26362,7 +26577,11 @@ def test_pre_review_legacy_scoped_timeout_contradictions_park_invalid_without_ve
         producer="test",
         aggregate_details=aggregate_details,
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -26436,7 +26655,11 @@ def test_pre_review_legacy_scoped_timeout_rejects_contradictory_phase_counts(
             ],
         },
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -26960,7 +27183,11 @@ def test_pre_review_cross_project_timeout_with_failed_child_phase_routes_to_veri
     validation = validate_verify_phase_evidence_from_metadata(artifacts[0].metadata)
     assert validation.state == PHASE_EVIDENCE_RED
     assert validation.failed_phase_names == ("services/foo:unit",)
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -27078,7 +27305,11 @@ def test_pre_review_failed_verify_reuses_pending_verify_fix_with_timeout_drift(t
         trigger_source="test",
     )
     assert created is True
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -27156,11 +27387,1311 @@ def test_pre_review_failed_verify_waits_for_in_progress_verify_fix_with_timeout_
     verify_fix.status = "in_progress"
     store.update(verify_fix)
     git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "wait_verify_fix"
     assert action["verify_fix_task"].id == verify_fix.id
+
+
+def test_pre_review_failed_verify_needs_rebase_when_branch_lacks_target_tip(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-stale",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "verify-gate-preflight-rebase"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action["verify_epoch"].reviewed_head_sha == "verify-head"
+
+
+def test_pre_review_failed_verify_missing_target_ref_parks_without_rebase_or_verify_fix(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-missing-target",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head"},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-gate-proof-unavailable"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert "missing local ref 'main'" in action["proof_diagnostic"]
+    assert action["type"] not in {"needs_rebase", "create_verify_fix"}
+    assert "verify_fix_task" not in action
+
+
+def test_pre_review_failed_verify_ancestry_error_parks_without_rebase_or_verify_fix(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-ancestry-error",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_errors={("main", impl.branch): RuntimeError("ancestry unavailable")},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-gate-proof-unavailable"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert "ancestry unavailable" in action["proof_diagnostic"]
+    assert action["type"] not in {"needs_rebase", "create_verify_fix"}
+    assert "verify_fix_task" not in action
+
+
+def test_pre_review_failed_verify_skips_rebase_when_same_branch_rebase_active(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-active-rebase",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    active_rebase = store.add("Active rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert active_rebase.id is not None
+    active_rebase.status = "pending"
+    active_rebase.branch = impl.branch
+    store.update(active_rebase)
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "skip"
+    assert action["reason"] == "verify-gate-preflight-rebase"
+    assert action["active_rebase_task_id"] == active_rebase.id
+    assert action["verify_gate_phase"] == "pre_review"
+
+
+def test_pre_review_failed_verify_active_rebase_preempts_completed_rebase_shortcut(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-active-and-completed-rebase",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 10, tzinfo=UTC),
+        changed_diff=False,
+    )
+    _add_matching_verify_gate_preflight_provenance(store, rebase, impl)
+    active_rebase = store.add("Active rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert active_rebase.id is not None
+    active_rebase.status = "pending"
+    active_rebase.branch = impl.branch
+    store.update(active_rebase)
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "skip"
+    assert action["reason"] == "verify-gate-preflight-rebase"
+    assert action["active_rebase_task_id"] == active_rebase.id
+    assert action["verify_gate_phase"] == "pre_review"
+    assert "verify_gate_explicit_refresh" not in action
+    assert "verify_fix_task" not in action
+
+
+def test_pre_review_failed_verify_active_rebase_preempts_up_to_date_verify_fix(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-active-rebase-up-to-date",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    active_rebase = store.add("Active rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert active_rebase.id is not None
+    active_rebase.status = "in_progress"
+    active_rebase.branch = impl.branch
+    store.update(active_rebase)
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "skip"
+    assert action["reason"] == "verify-gate-preflight-rebase"
+    assert action["active_rebase_task_id"] == active_rebase.id
+    assert action["verify_gate_phase"] == "pre_review"
+    assert "verify_gate_explicit_refresh" not in action
+    assert "verify_fix_task" not in action
+
+
+@pytest.mark.parametrize("phase", ["pre_review", "pre_merge"])
+@pytest.mark.parametrize("active_status", ["pending", "in_progress"])
+def test_failed_verify_active_rebase_preempts_target_tip_ancestry(
+    tmp_path: Path,
+    phase: str,
+    active_status: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/{phase}-verify-active-{active_status}",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    source_task = impl
+    if phase == "pre_merge":
+        review = _add_completed_review(store, impl, when=datetime(2026, 7, 6, 12, 3, tzinfo=UTC))
+        review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        store.update(review)
+        source_task = review
+    _persist_failed_verify_gate(
+        store,
+        config,
+        impl,
+        source_task=source_task,
+    )
+    active_rebase = store.add("Active rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert active_rebase.id is not None
+    active_rebase.status = active_status
+    active_rebase.branch = impl.branch
+    store.update(active_rebase)
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_errors={("main", impl.branch): AssertionError("ancestry should be preempted")},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "skip"
+    assert action["reason"] == "verify-gate-preflight-rebase"
+    assert action["active_rebase_task_id"] == active_rebase.id
+    assert action["verify_gate_phase"] == phase
+    assert git.is_ancestor_calls == []
+
+
+def test_pre_review_failed_verify_same_head_completed_rebase_fails_closed_without_loop(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-same-head-preflight",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    first_action = evaluate_advance_rules(config, store, git, impl, "main")
+    assert first_action["type"] == "needs_rebase"
+    assert first_action["reason"] == "verify-gate-preflight-rebase"
+
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 10, tzinfo=UTC),
+        changed_diff=False,
+    )
+    _add_matching_verify_gate_preflight_provenance(store, rebase, impl)
+    second_action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 15, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed again",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    third_action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert second_action["type"] == "needs_discussion"
+    assert second_action["needs_attention_reason"] == "verify-gate-preflight-rebase"
+    assert second_action["verify_gate_phase"] == "pre_review"
+    assert second_action["verify_epoch"].reviewed_head_sha == "verify-head"
+    assert "verify_gate_explicit_refresh" not in second_action
+    assert "verify_fix_task" not in second_action
+
+    assert third_action["type"] == "needs_discussion"
+    assert third_action["needs_attention_reason"] == "verify-gate-preflight-rebase"
+    assert third_action["verify_gate_phase"] == "pre_review"
+    assert third_action["verify_epoch"].reviewed_head_sha == "verify-head"
+    assert "verify_gate_explicit_refresh" not in third_action
+    assert "verify_fix_task" not in third_action
+
+
+@pytest.mark.parametrize(
+    "provenance_kwargs",
+    [
+        pytest.param(None, id="unrelated-completed-rebase"),
+        pytest.param({"target_branch": "release"}, id="different-target-branch"),
+        pytest.param({"target_tip_sha": "old-target-head"}, id="superseded-target-tip"),
+    ],
+)
+def test_pre_review_failed_verify_completed_rebase_without_matching_preflight_provenance_needs_rebase(
+    tmp_path: Path,
+    provenance_kwargs: dict[str, str] | None,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-wrong-preflight",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    _persist_failed_verify_gate(store, config, impl)
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 10, tzinfo=UTC),
+        changed_diff=False,
+    )
+    if provenance_kwargs is not None:
+        _add_matching_verify_gate_preflight_provenance(
+            store,
+            rebase,
+            impl,
+            **provenance_kwargs,
+        )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "verify-gate-preflight-rebase"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action["verify_epoch"].reviewed_head_sha == "verify-head"
+
+
+def test_pre_review_failed_verify_completed_rebase_head_probe_error_parks_without_rebase(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-preflight-head-error",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 10, tzinfo=UTC),
+        changed_diff=False,
+    )
+    _add_matching_verify_gate_preflight_provenance(store, rebase, impl)
+    class _CompletedPreflightProbeErrorGit(_FakeGit):
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            import inspect
+
+            callers = {frame.function for frame in inspect.stack()[1:4]}
+            if ref == impl.branch and "_completed_rebase_consumed_current_red_verify_epoch" in callers:
+                self.rev_parse_calls.append(ref)
+                raise OSError("live head probe failed")
+            return super().rev_parse_if_exists(ref)
+
+    git = _CompletedPreflightProbeErrorGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-gate-proof-unavailable"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert "live head probe failed" in action["proof_diagnostic"]
+    assert action["type"] != "needs_rebase"
+    assert "verify_fix_task" not in action
+
+
+def test_pre_review_failed_verify_historical_completed_rebase_does_not_suppress_preflight(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-historical-preflight",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 3, tzinfo=UTC),
+        changed_diff=False,
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed after old rebase",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "verify-gate-preflight-rebase"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action["verify_epoch"].reviewed_head_sha == "verify-head"
+
+
+def test_pre_review_unavailable_verify_on_stale_branch_parks_without_preflight_rebase(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-unavailable-stale",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="unavailable",
+            exit_status="unavailable",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="verify infrastructure unavailable",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-unavailable"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert "reason" not in action or action["reason"] != "verify-gate-preflight-rebase"
+    assert "verify_fix_task" not in action
+
+
+def test_pre_review_unavailable_verify_reuses_pending_verify_fix_before_stale_branch_guard(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-unavailable-pending-fix-stale",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="verify-head",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    artifact = store_command_output_artifact(
+        store,
+        impl,
+        config,
+        kind="verify_command_output",
+        producer="test",
+        label="verify_command_output",
+        output="pytest failed",
+        command=epoch.verify_command,
+        status="failed",
+        exit_status="1",
+        head_sha=epoch.reviewed_head_sha,
+        created_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+            artifact_path=artifact.path,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        output_artifact_id=artifact.id,
+        output_artifact_task_id=impl.id,
+        output_artifact_path=artifact.path,
+        producer="test",
+    )
+    verify_fix, created = create_or_reuse_verify_fix_task(
+        store,
+        config,
+        impl_task=impl,
+        based_on_task=impl,
+        verify_epoch=epoch,
+        trigger_source="test",
+    )
+    assert created is True
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="unavailable",
+            exit_status="unavailable",
+            captured_at=datetime(2026, 7, 6, 12, 10, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="verify infrastructure unavailable",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "run_verify_fix"
+    assert action["verify_fix_task"].id == verify_fix.id
+    assert action["verify_gate_phase"] == "pre_review"
+
+
+def test_pre_review_unavailable_verify_waits_for_in_progress_verify_fix_before_stale_branch_guard(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-unavailable-in-progress-fix-stale",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="verify-head",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    artifact = store_command_output_artifact(
+        store,
+        impl,
+        config,
+        kind="verify_command_output",
+        producer="test",
+        label="verify_command_output",
+        output="pytest failed",
+        command=epoch.verify_command,
+        status="failed",
+        exit_status="1",
+        head_sha=epoch.reviewed_head_sha,
+        created_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+            artifact_path=artifact.path,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        output_artifact_id=artifact.id,
+        output_artifact_task_id=impl.id,
+        output_artifact_path=artifact.path,
+        producer="test",
+    )
+    verify_fix, created = create_or_reuse_verify_fix_task(
+        store,
+        config,
+        impl_task=impl,
+        based_on_task=impl,
+        verify_epoch=epoch,
+        trigger_source="test",
+    )
+    assert created is True
+    verify_fix.status = "in_progress"
+    store.update(verify_fix)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="unavailable",
+            exit_status="unavailable",
+            captured_at=datetime(2026, 7, 6, 12, 10, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="verify infrastructure unavailable",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "wait_verify_fix"
+    assert action["verify_fix_task"].id == verify_fix.id
+    assert action["verify_gate_phase"] == "pre_review"
+
+
+def test_pre_review_failed_verify_rebase_head_advance_requests_fresh_verify_then_fix(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-fresh-rebased-head",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head-a",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    stale_git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head-a", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    first_action = evaluate_advance_rules(config, store, stale_git, impl, "main")
+    assert first_action["type"] == "needs_rebase"
+    assert first_action["verify_epoch"].reviewed_head_sha == "verify-head-a"
+
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 10, tzinfo=UTC),
+        changed_diff=False,
+    )
+    advanced_git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head-b", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+    second_action = evaluate_advance_rules(config, store, advanced_git, impl, "main")
+
+    assert second_action["type"] == "verify_gate"
+    assert second_action["verify_gate_phase"] == "pre_review"
+    assert second_action["verify_gate_state"] == "stale"
+    assert second_action["verify_gate_explicit_refresh"] is False
+
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 15, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head-b",
+            reviewed_base_sha="target-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed at rebased head",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    up_to_date_git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head-b", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
+    third_action = evaluate_advance_rules(config, store, up_to_date_git, impl, "main")
+
+    assert third_action["type"] == "create_verify_fix"
+    assert third_action["verify_gate_phase"] == "pre_review"
+    assert third_action["verify_epoch"].reviewed_head_sha == "verify-head-b"
+    assert third_action["based_on_task"].id == impl.id
+
+
+def test_pre_review_failed_verify_new_epoch_gets_one_preflight_then_parks(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-new-epoch-one-preflight",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head-a",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 10, tzinfo=UTC),
+        changed_diff=False,
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 15, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head-b",
+            reviewed_base_sha="target-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed at rebased head",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head-b", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    first_new_epoch_action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert first_new_epoch_action["type"] == "needs_rebase"
+    assert first_new_epoch_action["reason"] == "verify-gate-preflight-rebase"
+    assert first_new_epoch_action["verify_epoch"].reviewed_head_sha == "verify-head-b"
+
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 20, tzinfo=UTC),
+        changed_diff=False,
+    )
+    _add_matching_verify_gate_preflight_provenance(
+        store,
+        rebase,
+        impl,
+        reviewed_head_sha="verify-head-b",
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 25, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head-b",
+            reviewed_base_sha="target-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed again at rebased head",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+
+    second_new_epoch_action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert second_new_epoch_action["type"] == "needs_discussion"
+    assert second_new_epoch_action["needs_attention_reason"] == "verify-gate-preflight-rebase"
+    assert second_new_epoch_action["verify_gate_phase"] == "pre_review"
+    assert second_new_epoch_action["verify_epoch"].reviewed_head_sha == "verify-head-b"
+    assert "verify_fix_task" not in second_new_epoch_action
+
+
+def test_pre_review_matching_preflight_survives_verify_config_drift(tmp_path: Path) -> None:
+    """Command/timeout/grace drift after a same-head preflight must not reopen the epoch (B1)."""
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-config-drift",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 10, tzinfo=UTC),
+        changed_diff=False,
+    )
+    _add_matching_verify_gate_preflight_provenance(
+        store,
+        rebase,
+        impl,
+        reviewed_head_sha="verify-head",
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 15, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="target-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed at rebased head",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    # Drift verify command/timeout/grace after the matching preflight was recorded.
+    config.verify_command = "./bin/tests --slow"
+    config.autonomous_verify_timeout_seconds = 240
+    config.review_verify_timeout_grace_seconds = 10.0
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-gate-preflight-rebase"
+    assert action["verify_epoch"].reviewed_head_sha == "verify-head"
+    assert "verify_fix_task" not in action
+
+
+def test_pre_review_older_matching_preflight_survives_newer_unrelated_completed_rebase(
+    tmp_path: Path,
+) -> None:
+    """An unrelated later completion must not hide an earlier matching preflight (B2)."""
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-older-matching-preflight",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    matching_rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 10, tzinfo=UTC),
+        changed_diff=False,
+    )
+    _add_matching_verify_gate_preflight_provenance(
+        store,
+        matching_rebase,
+        impl,
+        reviewed_head_sha="verify-head",
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 15, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="target-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed at rebased head",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    # A later, unrelated same-branch rebase completes with no matching provenance.
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 20, tzinfo=UTC),
+        changed_diff=False,
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-gate-preflight-rebase"
+    assert action["verify_epoch"].reviewed_head_sha == "verify-head"
+    assert "verify_fix_task" not in action
+
+
+def test_pre_review_failed_verify_reruns_gate_after_preflight_rebase_lands(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-rebased",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 10, tzinfo=UTC),
+        changed_diff=False,
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head-b", "main": "target-head"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action["verify_gate_state"] == "stale"
+    assert action["verify_gate_explicit_refresh"] is False
 
 
 def test_pre_review_failed_verify_retries_failed_verify_fix_with_attempts_remaining(tmp_path: Path) -> None:
@@ -27236,7 +28767,100 @@ def test_pre_review_failed_verify_retries_failed_verify_fix_with_attempts_remain
     verify_fix.branch = impl.branch
     verify_fix.has_commits = True
     store.update(verify_fix)
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "retry"
+    assert action["failed_task"].id == verify_fix.id
+    assert action["verify_fix_task"].id == verify_fix.id
+    assert action["reason_code"] == "INFRASTRUCTURE_ERROR"
+    assert action["attempt_index"] == 1
+    assert action["attempt_limit"] == 2
+
+
+def test_pre_review_cross_project_placeholder_verify_pass_creates_closing_review(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.max_resume_attempts = 2
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-failed-verify-fix-retry",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    recorded_epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="verify-head",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=90,
+        verify_timeout_grace_seconds=None,
+    )
+    artifact = store_command_output_artifact(
+        store,
+        impl,
+        config,
+        kind="verify_command_output",
+        producer="test",
+        label="verify_command_output",
+        output="pytest failed",
+        command=recorded_epoch.verify_command,
+        status="failed",
+        exit_status="1",
+        head_sha=recorded_epoch.reviewed_head_sha,
+        created_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+            artifact_path=artifact.path,
+        ),
+        verify_timeout_seconds=recorded_epoch.verify_timeout_seconds,
+        verify_timeout_grace_seconds=recorded_epoch.verify_timeout_grace_seconds,
+        output_artifact_id=artifact.id,
+        output_artifact_task_id=impl.id,
+        output_artifact_path=artifact.path,
+        producer="test",
+    )
+    verify_fix, created = create_or_reuse_verify_fix_task(
+        store,
+        config,
+        impl_task=impl,
+        based_on_task=impl,
+        verify_epoch=recorded_epoch,
+        trigger_source="test",
+    )
+    assert created is True
+    verify_fix.status = "failed"
+    verify_fix.failure_reason = "INFRASTRUCTURE_ERROR"
+    verify_fix.branch = impl.branch
+    verify_fix.has_commits = True
+    store.update(verify_fix)
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -27334,7 +28958,11 @@ def test_pre_review_failed_verify_parks_failed_verify_fix_when_attempts_exhauste
     retry_child.has_commits = True
     retry_child.completed_at = datetime(2026, 7, 6, 12, 15, tzinfo=UTC)
     store.update(retry_child)
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -27418,7 +29046,11 @@ def test_pre_review_failed_verify_parks_manual_failed_verify_fix_without_exhaust
     verify_fix.branch = impl.branch
     verify_fix.has_commits = True
     store.update(verify_fix)
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -27500,7 +29132,11 @@ def test_pre_review_failed_verify_parks_after_completed_verify_fix_with_timeout_
     verify_fix.status = "completed"
     verify_fix.completed_at = datetime(2026, 7, 6, 12, 10, tzinfo=UTC)
     store.update(verify_fix)
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -27600,7 +29236,11 @@ def test_green_verify_at_current_head_clears_completed_verify_fix_red_gate(tmp_p
         verify_timeout_grace_seconds=5.0,
         producer="advance_verify_gate",
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -27800,7 +29440,11 @@ def test_new_failed_verify_at_current_head_keeps_completed_verify_fix_gate_red(t
         verify_timeout_grace_seconds=5.0,
         producer="advance_verify_gate",
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -27884,7 +29528,11 @@ def test_pre_review_verify_fix_failed_manual_rearm_describes_fresh_verify(tmp_pa
         attention_reason="verify-fix-failed",
         subject_task_id=impl.id,
     )
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "verify-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
+    )
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
@@ -27957,6 +29605,7 @@ def test_post_improve_failed_verify_routes_to_verify_fix_before_another_improve(
         can_merge=True,
         existing_branches={impl.branch},
         ref_shas={impl.branch: "improved-head", "main": "base-head"},
+        ancestor_pairs={("main", impl.branch): True},
     )
 
     ctx = resolve_advance_context(config, store, git, impl, "main")

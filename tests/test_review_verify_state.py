@@ -15,6 +15,7 @@ from gza.review_verify_state import (
     latest_verify_result_for_epoch,
     make_verify_epoch,
     owner_task_verify_epoch,
+    persist_recredited_verify_gate_artifact,
     persist_verify_gate_artifact,
     resolve_verify_gate_decision,
     resolve_verify_read_model,
@@ -234,6 +235,50 @@ def test_latest_verify_result_for_epoch_selects_same_tree_owner_artifact_after_c
     assert lookup.result is not None
     assert lookup.result.reviewed_head_sha == "head-1"
     assert lookup.result.reviewed_tree_sha == "tree-1"
+
+
+def test_recredited_verify_gate_artifact_preserves_original_reviewed_tree_sha(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = _config(tmp_path)
+    source_owner = store.add("Implement source owner", task_type="implement")
+    receiving_owner = store.add("Implement receiving owner", task_type="implement")
+    assert source_owner.id is not None
+    assert receiving_owner.id is not None
+    captured_at = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=source_owner,
+        source_task=source_owner,
+        result=_result(head_sha="old-head", tree_sha="tree-original", captured_at=captured_at),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+    source_artifact = store.list_artifacts(source_owner.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+    source_lookup = latest_verify_result_for_epoch(
+        store,
+        source_owner,
+        current_epoch=_epoch(head_sha="new-head", tree_sha="tree-original"),
+    )
+    assert source_lookup.result is not None
+
+    persist_recredited_verify_gate_artifact(
+        store,
+        config,
+        owner_task=receiving_owner,
+        evidence_holder_task=source_owner,
+        result=source_lookup.result,
+        source_metadata=source_artifact.metadata,
+        producer="advance_verify_gate_recredit",
+    )
+
+    recredited = store.list_artifacts(receiving_owner.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0].metadata
+    assert recredited is not None
+    assert recredited["verify_epoch"]["reviewed_head_sha"] == "old-head"
+    assert recredited["verify_epoch"]["reviewed_tree_sha"] == "tree-original"
+    assert recredited["result"]["reviewed_tree_sha"] == "tree-original"
 
 
 def test_latest_verify_result_for_epoch_keeps_legacy_head_only_artifact_stale_after_commit_rewrite(

@@ -3,7 +3,18 @@
 import re
 from pathlib import Path
 
+from gza.db import (
+    MERGE_UNIT_ACTIONABLE_STATES,
+    MERGE_UNIT_INACTIVE_TOMBSTONE_STATES,
+    MERGE_UNIT_LANDED_OR_NO_WORK_STATES,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
+CANONICAL_MERGE_UNIT_STATES = (
+    MERGE_UNIT_ACTIONABLE_STATES
+    | MERGE_UNIT_LANDED_OR_NO_WORK_STATES
+    | MERGE_UNIT_INACTIVE_TOMBSTONE_STATES
+)
 
 
 def _read(relative: str) -> str:
@@ -20,6 +31,10 @@ def _section(text: str, heading: str) -> str:
 
 def _squash(text: str) -> str:
     return re.sub(r"\s+", " ", text)
+
+
+def _merge_unit_states_claimed_by(text: str) -> set[str]:
+    return set(re.findall(r"`([^`]+)`", text)) & CANONICAL_MERGE_UNIT_STATES
 
 
 def test_landing_post_rebase_review_rules_are_scoped_to_review_enabled_lineages() -> None:
@@ -98,6 +113,29 @@ def test_landing_dry_run_requires_identity_evidence_phases_and_first_unknown_bou
     assert "MUST explicitly label that phase as conditional or unknown" in dry_run_and_bounds
     assert "instead of synthesizing later outcomes" in dry_run_and_bounds
     assert "without creating tasks, running providers, verifying, rebasing, or merging" in docs
+
+
+def test_overview_merge_state_model_agrees_with_lineage_contract() -> None:
+    overview = _read("specs/behavior/00-overview.md")
+    lineage = _read("specs/behavior/lineage.md")
+    vocabulary = _squash(_section(overview, "## Vocabulary (the data model, abstractly)"))
+    lineage_ownership = _squash(_section(lineage, "## Merge units & the ownership model"))
+
+    assert _merge_unit_states_claimed_by(lineage_ownership) == CANONICAL_MERGE_UNIT_STATES
+    assert _merge_unit_states_claimed_by(vocabulary) == CANONICAL_MERGE_UNIT_STATES
+
+
+def test_canonical_merge_unit_state_buckets_are_disjoint_and_complete() -> None:
+    bucketed = (
+        MERGE_UNIT_ACTIONABLE_STATES
+        | MERGE_UNIT_LANDED_OR_NO_WORK_STATES
+        | MERGE_UNIT_INACTIVE_TOMBSTONE_STATES
+    )
+
+    assert not (MERGE_UNIT_ACTIONABLE_STATES & MERGE_UNIT_LANDED_OR_NO_WORK_STATES)
+    assert not (MERGE_UNIT_ACTIONABLE_STATES & MERGE_UNIT_INACTIVE_TOMBSTONE_STATES)
+    assert not (MERGE_UNIT_LANDED_OR_NO_WORK_STATES & MERGE_UNIT_INACTIVE_TOMBSTONE_STATES)
+    assert bucketed == CANONICAL_MERGE_UNIT_STATES
 
 
 def test_landing_scope_and_dependency_proof_precede_rebase_and_are_recomputed() -> None:
