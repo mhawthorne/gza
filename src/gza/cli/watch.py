@@ -14463,11 +14463,12 @@ def _watch_failed_recovery_scan_is_current(
         units = store.list_watch_failed_recovery_scan_units(target_branch=target_branch)
         current_fingerprint = _watch_failed_recovery_scan_unit_fingerprint(units)
     if incomplete_reasons:
+        reasons_block = "\n".join(f"  - {reason}" for reason in incomplete_reasons)
         logger.warning(
-            "watch failed-recovery scan for target %s at %s incomplete; keeping previous marker: %s",
+            "watch failed-recovery scan for target %s at %s incomplete; keeping previous marker:\n%s",
             target_branch,
             target_sha,
-            "; ".join(incomplete_reasons),
+            reasons_block,
         )
         return False
     store.record_watch_failed_recovery_scan(
