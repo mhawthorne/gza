@@ -1209,6 +1209,39 @@ def test_resolve_task_merge_state_preserves_terminal_no_work_state_without_live_
     assert git.net_diff_calls == 0
 
 
+def test_classify_branch_merge_state_skips_net_diff_when_merge_base_is_source_head() -> None:
+    class _MergeBaseProofGit(_FakeGit):
+        def __init__(self) -> None:
+            super().__init__(
+                source_ref="feature/landed",
+                ref_shas={"feature/landed": "source-sha", "main": "target-sha"},
+                ahead_count=0,
+                merged=False,
+                net_diff=True,
+            )
+            self.net_diff_calls = 0
+
+        def merge_base(self, _source_ref: str, _target_branch: str) -> str:
+            return "source-sha"
+
+        def has_non_empty_source_diff_against_target(self, _source_ref: str, _target: str) -> bool | None:
+            self.net_diff_calls += 1
+            raise AssertionError("merge-base equal to source head already proves an empty three-dot diff")
+
+    git = _MergeBaseProofGit()
+
+    classification = classify_branch_merge_state_for_target(
+        git=git,
+        source_branch="feature/landed",
+        target_branch="main",
+        source_has_commits=True,
+    )
+
+    assert classification.state == "redundant"
+    assert classification.reason == "no-unique-commits-with-task-commits"
+    assert git.net_diff_calls == 0
+
+
 def test_resolve_task_merge_state_uses_recorded_head_when_source_ref_is_stale_ancestor(
     tmp_path: Path,
 ) -> None:

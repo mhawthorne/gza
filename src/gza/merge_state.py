@@ -588,6 +588,7 @@ def classify_branch_merge_state_for_target(
 
     unique_commits: int | None = None
     count_base_ref = target_branch
+    resolved_merge_base: str | None = None
     merge_base = getattr(git, "merge_base", None)
     if callable(merge_base):
         try:
@@ -615,12 +616,14 @@ def classify_branch_merge_state_for_target(
         unique_commits = 0
 
     if unique_commits == 0:
-        net_diff = _source_has_remaining_net_diff(
-            git,
-            source_ref,
-            target_branch,
-            on_warning=on_warning,
-        )
+        net_diff = False if resolved_merge_base is not None and resolved_merge_base == source_sha else None
+        if net_diff is None:
+            net_diff = _source_has_remaining_net_diff(
+                git,
+                source_ref,
+                target_branch,
+                on_warning=on_warning,
+            )
         if net_diff is True and source_has_commits is not False and not merged_proof:
             return BranchMergeClassification(
                 state="unmerged",

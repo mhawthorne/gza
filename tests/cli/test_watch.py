@@ -72510,7 +72510,25 @@ def _make_empty_merged_watch_git(tmp_path: Path, *, empty_branch: str) -> "Git":
         def resolve_refs(self, refs: object, *, peel: str = "commit") -> dict[str, str | None]:
             if not isinstance(refs, (tuple, list, set, frozenset)):
                 return {}
+            if peel == "tree":
+                return {str(ref): ("shared-tree" if str(ref) in {empty_branch, "main"} else None) for ref in refs}
             return {str(ref): ("shared-tip" if str(ref) in {empty_branch, "main"} else None) for ref in refs}
+
+        def merge_tree_result_trees(self, target_ref: str, source_refs: object) -> dict[str, str | None]:  # type: ignore[override]
+            if not isinstance(source_refs, (tuple, list, set, frozenset)):
+                return {}
+            return {
+                str(source_ref): (
+                    "shared-tree" if target_ref == "main" and str(source_ref) == empty_branch else "source-tree"
+                )
+                for source_ref in source_refs
+            }
+
+        def reachable_commit_shas(self, ref: str, *, first_parent: bool = False) -> frozenset[str]:  # type: ignore[override]
+            if ref != "main":
+                return frozenset()
+            del first_parent
+            return frozenset({"shared-tip"})
 
         def rev_parse_if_exists(self, ref: str) -> str | None:  # type: ignore[override]
             if ref in {empty_branch, "main"}:

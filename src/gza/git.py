@@ -360,7 +360,7 @@ class Git:
         check: bool,
         stdin: bytes | None = None,
     ) -> tuple[Any, ...]:
-        return (args, check, ("stdin-id", id(stdin)) if stdin is not None else None)
+        return (args, check, ("stdin-bytes", stdin) if stdin is not None else None)
 
     def _lookup_cached_value(self, key: tuple[Any, ...]) -> tuple[bool, Any]:
         with self._get_cache_lock():
@@ -1252,6 +1252,220 @@ class Git:
                 resolved[ref] = sha
 
         return {ref: resolved[ref] for ref in requested}
+
+    def merge_tree_result_trees(self, target_ref: str, source_refs: Iterable[str]) -> dict[str, str | None]:
+        """Return simulated merge result trees for many sources against one target."""
+        requested = self._ordered_unique(source_refs)
+        if not requested:
+            return {}
+
+        stdin = "".join(f"{target_ref} {source_ref}\n" for source_ref in requested).encode()
+        result = self._run_readonly_success_cached(
+            "merge-tree",
+            "--write-tree",
+            "--stdin",
+            check=False,
+            stdin=stdin,
+        )
+        if result.returncode != 0:
+            error_output = result.stderr or result.stdout
+            raise GitError(f"git merge-tree --write-tree --stdin failed:\n{error_output}")
+
+        fields = result.stdout.split("\0")
+        if fields and fields[-1] == "":
+            fields.pop()
+
+        trees: dict[str, str | None] = {}
+        index = 0
+        for source_ref in requested:
+            if index + 2 >= len(fields):
+                raise GitError("git merge-tree --stdin returned too few fields")
+            status = fields[index]
+            tree = fields[index + 1]
+            if status not in {"0", "1"}:
+                raise GitError(f"git merge-tree --stdin returned unexpected merge status: {status!r}")
+            if not tree:
+                raise GitError("git merge-tree --stdin returned an empty result tree")
+            index += 2
+            if status == "1":
+                if index >= len(fields) or fields[index] != "":
+                    raise GitError("git merge-tree --stdin returned malformed clean record")
+                trees[source_ref] = tree
+                index += 1
+                continue
+
+            while index < len(fields) and fields[index] != "":
+                index += 1
+            if index >= len(fields):
+                raise GitError("git merge-tree --stdin returned unterminated conflict file info")
+            index += 1
+
+            while index < len(fields) and fields[index] != "":
+                try:
+                    path_count = int(fields[index])
+                except ValueError as exc:
+                    raise GitError("git merge-tree --stdin returned malformed conflict messages") from exc
+                if path_count < 0:
+                    raise GitError("git merge-tree --stdin returned malformed conflict messages")
+                index += 1 + path_count + 2
+                if index > len(fields):
+                    raise GitError("git merge-tree --stdin returned truncated conflict messages")
+            if index >= len(fields):
+                raise GitError("git merge-tree --stdin returned unterminated conflict record")
+            trees[source_ref] = None
+            index += 1
+        if index != len(fields):
+            raise GitError("git merge-tree --stdin returned extra records")
+        return {source_ref: trees[source_ref] for source_ref in requested}
+
+    def reachable_commit_shas(self, ref: str, *, first_parent: bool = False) -> frozenset[str]:
+        """Return commit ids reachable from ``ref`` in one read-only walk."""
+        args = ["rev-list"]
+        if first_parent:
+            args.append("--first-parent")
+        args.append(ref)
+        result = self._run_readonly_success_cached(*args)
+        return frozenset(line.strip() for line in result.stdout.splitlines() if line.strip())
+
+    def ancestor_relationships(self, pairs: Iterable[tuple[str, str]]) -> dict[tuple[str, str], bool | None]:
+        """Return whether each ancestor commit is reachable from its descendant ref."""
+        requested = tuple(dict.fromkeys(pairs))
+        if not requested:
+            return {}
+
+        refs = self._ordered_unique(ref for pair in requested for ref in pair)
+        resolved_refs = self.resolve_refs(refs, peel="commit")
+        descendant_shas = self._ordered_unique(
+            sha for _ancestor, descendant in requested if (sha := resolved_refs.get(descendant)) is not None
+        )
+
+        result: dict[tuple[str, str], bool | None] = {}
+        for ancestor, descendant in requested:
+            ancestor_sha = resolved_refs.get(ancestor)
+            descendant_sha = resolved_refs.get(descendant)
+            if ancestor_sha is None or descendant_sha is None:
+                result[(ancestor, descendant)] = None
+            elif ancestor_sha == descendant_sha:
+                result[(ancestor, descendant)] = True
+            else:
+                result[(ancestor, descendant)] = False
+
+        unresolved_pairs = [
+            (ancestor, descendant)
+            for ancestor, descendant in requested
+            if result[(ancestor, descendant)] is False
+        ]
+        if not unresolved_pairs:
+            return result
+
+        walk = self._run_readonly_cached(
+            "rev-list",
+            "--parents",
+            *descendant_shas,
+            check=False,
+        )
+        if walk.returncode != 0:
+            for pair in unresolved_pairs:
+                result[pair] = None
+            return result
+
+        reachable_descendants_by_commit: dict[str, set[str]] = {}
+        for _ancestor, descendant in requested:
+            descendant_sha = resolved_refs.get(descendant)
+            if descendant_sha is not None:
+                reachable_descendants_by_commit.setdefault(descendant_sha, set()).add(descendant)
+
+        for line in walk.stdout.splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            commit_sha = fields[0]
+            labels = reachable_descendants_by_commit.setdefault(commit_sha, set())
+            for parent_sha in fields[1:]:
+                reachable_descendants_by_commit.setdefault(parent_sha, set()).update(labels)
+
+        for ancestor, descendant in unresolved_pairs:
+            ancestor_sha = resolved_refs.get(ancestor)
+            result[(ancestor, descendant)] = (
+                descendant in reachable_descendants_by_commit.get(ancestor_sha or "", set())
+                if ancestor_sha is not None
+                else None
+            )
+        return result
+
+    def patch_equivalent_commits_present_on_target(
+        self,
+        commits: Iterable[str],
+        target: str,
+    ) -> dict[str, bool | None]:
+        """Return whether each commit's reachable patch set is represented on target."""
+        requested = self._ordered_unique(commits)
+        if not requested:
+            return {}
+
+        resolved_refs = self.resolve_refs((*requested, target), peel="commit")
+        target_sha = resolved_refs.get(target)
+        result: dict[str, bool | None] = {}
+        commit_shas: list[str] = []
+        for commit in requested:
+            commit_sha = resolved_refs.get(commit)
+            if commit_sha is None or target_sha is None:
+                result[commit] = None
+            else:
+                result[commit] = True
+                commit_shas.append(commit_sha)
+
+        if not commit_shas or target_sha is None:
+            return result
+
+        missing = self._run_readonly_cached(
+            "rev-list",
+            "--cherry-pick",
+            "--right-only",
+            f"{target_sha}...{commit_shas[0]}",
+            *commit_shas[1:],
+            check=False,
+        )
+        if missing.returncode != 0:
+            for commit in requested:
+                if resolved_refs.get(commit) is not None:
+                    result[commit] = None
+            return result
+        missing_patch_shas = frozenset(line.strip() for line in missing.stdout.splitlines() if line.strip())
+        if not missing_patch_shas:
+            return result
+
+        walk = self._run_readonly_cached(
+            "rev-list",
+            "--parents",
+            *commit_shas,
+            check=False,
+        )
+        if walk.returncode != 0:
+            for commit in requested:
+                if resolved_refs.get(commit) is not None:
+                    result[commit] = None
+            return result
+
+        reachable_heads_by_commit: dict[str, set[str]] = {}
+        for commit in requested:
+            commit_sha = resolved_refs.get(commit)
+            if commit_sha is not None:
+                reachable_heads_by_commit.setdefault(commit_sha, set()).add(commit)
+
+        for line in walk.stdout.splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            commit_sha = fields[0]
+            labels = reachable_heads_by_commit.setdefault(commit_sha, set())
+            for parent_sha in fields[1:]:
+                reachable_heads_by_commit.setdefault(parent_sha, set()).update(labels)
+
+        for missing_sha in missing_patch_shas:
+            for commit in reachable_heads_by_commit.get(missing_sha, set()):
+                result[commit] = False
+        return result
 
     def merge_base(self, ref1: str, ref2: str) -> str:
         """Return the merge-base commit SHA for two refs."""

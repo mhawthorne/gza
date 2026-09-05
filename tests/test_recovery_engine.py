@@ -23,6 +23,7 @@ from gza.recovery_engine import (
     _build_recovery_chain_snapshot,
     _is_resolved_by_landed_lineage,
     _MergeContext,
+    classify_failed_task_landed_same_unit_suppression,
     classify_failure_reason,
     decide_failed_task_recovery,
     empty_task_requires_recovery,
@@ -2415,7 +2416,7 @@ def test_is_resolved_by_landed_lineage_caches_branch_merge_classification(tmp_pa
 
     assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is True
     assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is True
-    assert git.branch_exists_calls == 2
+    assert git.branch_exists_calls == 0
     assert git.is_merged_calls == 1
     assert git.count_commits_ahead_checked_calls == 1
 
@@ -6331,6 +6332,1143 @@ class _MinimalRecoveryGit(Git):
     def resolve_fresh_merge_source(self, branch: str, **_kwargs: object):  # type: ignore[override]
         from gza.git import ResolvedMergeSourceRef
         return ResolvedMergeSourceRef(None)
+
+
+def test_landed_suppression_classification_matches_with_preloaded_branch_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = "feature/landed-owner"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        head_sha="same-landed",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    cases = (
+        ("feature/missing-leaf", "merged", "visible"),
+        ("feature/landed-leaf", "merged", "suppressed_landed"),
+        ("feature/empty-leaf", "empty", "suppressed_no_work"),
+        ("feature/unmerged-leaf", "unmerged", "visible"),
+    )
+    failed_tasks: list[Task] = []
+    for branch, _state, _expected in cases:
+        failed = store.add(f"Failed {branch}", task_type="review", based_on=owner.id)
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "WORKER_DIED"
+        failed.branch = branch
+        failed.has_commits = branch != "feature/empty-leaf"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+        store.attach_task_to_merge_unit(failed.id, owner_unit.id, "review")
+        failed_tasks.append(failed)
+
+    states_by_branch = {branch: state for branch, state, _expected in cases}
+
+    def classify_by_branch(**kwargs: object) -> BranchMergeClassification:
+        source_ref = str(kwargs["source_ref"])
+        state = states_by_branch[source_ref]
+        return BranchMergeClassification(
+            state=state,  # type: ignore[arg-type]
+            reason="content-equivalent-with-commits" if state == "merged" else f"{state}-proof",
+            source_ref=source_ref,
+            target_ref=str(kwargs["target_branch"]),
+            source_sha=f"{source_ref}-sha",
+            target_sha="target-sha",
+        )
+
+    monkeypatch.setattr(recovery_engine, "classify_branch_merge_state_for_target", classify_by_branch)
+
+    git = _MinimalRecoveryGit(
+        branches=frozenset({"main", str(owner.branch), "feature/landed-leaf", "feature/empty-leaf", "feature/unmerged-leaf"})
+    )
+    baseline_context = _MergeContext(git=git, default_branch="main", existing_branches=None)
+    preloaded_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=frozenset({"main", str(owner.branch), "feature/landed-leaf", "feature/empty-leaf", "feature/unmerged-leaf"}),
+    )
+
+    for failed, (_branch, _state, expected) in zip(failed_tasks, cases, strict=True):
+        baseline = classify_failed_task_landed_same_unit_suppression(
+            store,
+            failed,
+            completed_owner=owner,
+            owner_merge_unit=owner_unit,
+            leaf_merge_unit=owner_unit,
+            git=git,
+            target_branch="main",
+            merge_context=baseline_context,
+        )
+        optimized = classify_failed_task_landed_same_unit_suppression(
+            store,
+            failed,
+            completed_owner=owner,
+            owner_merge_unit=owner_unit,
+            leaf_merge_unit=owner_unit,
+            git=git,
+            target_branch="main",
+            merge_context=preloaded_context,
+        )
+        assert optimized == baseline == expected
+
+
+def test_later_clean_landed_preload_matches_per_branch_after_conflicted_record(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = "feature/parser-owner"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        head_sha="owner-head",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    conflicted = store.add("Conflicted failed review", task_type="review", based_on=owner.id)
+    assert conflicted.id is not None
+    conflicted.status = "failed"
+    conflicted.failure_reason = "WORKER_DIED"
+    conflicted.branch = "feature/parser-conflict"
+    conflicted.has_commits = True
+    conflicted.completed_at = datetime.now(UTC)
+    store.update(conflicted)
+
+    landed = store.add("Landed failed review", task_type="review", based_on=owner.id)
+    assert landed.id is not None
+    landed.status = "failed"
+    landed.failure_reason = "WORKER_DIED"
+    landed.branch = "feature/parser-landed"
+    landed.has_commits = True
+    landed.completed_at = datetime.now(UTC)
+    store.update(landed)
+
+    class _MixedMergeTreeGit(_MinimalRecoveryGit):
+        def __init__(self) -> None:
+            super().__init__(
+                branches=frozenset(
+                    {
+                        "main",
+                        str(owner.branch),
+                        "feature/parser-conflict",
+                        "feature/parser-landed",
+                    }
+                )
+            )
+            self.batch_invocations = 0
+            self._commit_refs = {
+                "main": "target-sha",
+                str(owner.branch): "owner-sha",
+                "feature/parser-conflict": "conflict-sha",
+                "feature/parser-landed": "landed-sha",
+            }
+
+        def resolve_fresh_merge_source(self, branch: str, **_kwargs: object):  # type: ignore[override]
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch)
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:  # type: ignore[override]
+            return self._commit_refs.get(ref)
+
+        def resolve_refs(self, refs: object, peel: str = "commit") -> dict[str, str | None]:  # type: ignore[override]
+            ref_tuple = tuple(refs)  # type: ignore[arg-type]
+            if peel == "commit":
+                return {ref: self._commit_refs.get(str(ref)) for ref in ref_tuple}
+            if peel == "tree":
+                return {ref: "target-tree" if str(ref) == "main" else f"{ref}-tree" for ref in ref_tuple}
+            raise AssertionError(f"unexpected peel={peel!r}")
+
+        def merge_tree_result_trees(self, target_ref: str, source_refs: object) -> dict[str, str | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            return Git.merge_tree_result_trees(self, target_ref, source_refs)  # type: ignore[arg-type]
+
+        def _run(self, *args: object, **kwargs: object):  # type: ignore[override]
+            assert args == ("merge-tree", "--write-tree", "--stdin")
+            assert kwargs.get("stdin") == b"main feature/parser-conflict\nmain feature/parser-landed\n"
+            stdout = (
+                "0\0conflict-tree\0"
+                "100644 base 1\tfile.txt\0"
+                "100644 ours 2\tfile.txt\0"
+                "100644 theirs 3\tfile.txt\0"
+                "\0"
+                "1\0file.txt\0Auto-merging\0Auto-merging file.txt\n\0"
+                "1\0file.txt\0CONFLICT (contents)\0CONFLICT (content): Merge conflict in file.txt\n\0"
+                "\0"
+                "1\0target-tree\0"
+                "\0"
+            )
+            return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+        def reachable_commit_shas(self, ref: str, *, first_parent: bool = False) -> frozenset[str]:  # type: ignore[override]
+            assert ref == "main"
+            return frozenset({"target-sha"})
+
+        def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:  # type: ignore[override]
+            return branch == "feature/parser-landed" and into == "main"
+
+        def count_commits_ahead(self, source_ref: str, base_ref: str) -> int | None:  # type: ignore[override]
+            return 1 if base_ref == "main" else None
+
+    git = _MixedMergeTreeGit()
+    baseline_context = _MergeContext(git=git, default_branch="main", existing_branches=None)
+    preloaded_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=git.local_branch_names(),
+    )
+
+    for task, expected in ((conflicted, "visible"), (landed, "suppressed_landed")):
+        baseline = classify_failed_task_landed_same_unit_suppression(
+            store,
+            task,
+            completed_owner=owner,
+            owner_merge_unit=owner_unit,
+            leaf_merge_unit=None,
+            git=git,
+            target_branch="main",
+            merge_context=baseline_context,
+        )
+        assert baseline == expected
+
+    read_context = _read_context_for_store(store)
+    read_context.merge_context = preloaded_context
+    visible = list_failed_tasks_for_recovery(store, read_context=read_context)
+
+    assert {task.id for task in visible} == {conflicted.id}
+    assert git.batch_invocations == 1
+
+    for task, expected in ((conflicted, "visible"), (landed, "suppressed_landed")):
+        optimized = classify_failed_task_landed_same_unit_suppression(
+            store,
+            task,
+            completed_owner=owner,
+            owner_merge_unit=owner_unit,
+            leaf_merge_unit=None,
+            git=git,
+            target_branch="main",
+            merge_context=preloaded_context,
+            classification_cache=preloaded_context.branch_resolution,
+        )
+        assert optimized == expected
+
+
+def test_batch_branch_classification_cache_separates_same_shaped_stdin_batches(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+
+    class _CachedBatchGit(Git):
+        def __init__(self) -> None:
+            super().__init__(tmp_path)
+            self.merge_tree_calls = 0
+            self._commit_refs = {
+                "main": "target-sha",
+                "feature/a": "a-sha",
+                "feature/b": "b-sha",
+                "feature/c": "c-sha",
+                "feature/d": "d-sha",
+            }
+
+        def resolve_refs(self, refs: object, peel: str = "commit") -> dict[str, str | None]:  # type: ignore[override]
+            ref_tuple = tuple(refs)  # type: ignore[arg-type]
+            if peel == "commit":
+                return {ref: self._commit_refs.get(str(ref)) for ref in ref_tuple}
+            if peel == "tree":
+                return {ref: "target-tree" if str(ref) == "main" else f"{ref}-tree" for ref in ref_tuple}
+            raise AssertionError(f"unexpected peel={peel!r}")
+
+        def _run(self, *args: object, **kwargs: object):  # type: ignore[override]
+            assert args == ("merge-tree", "--write-tree", "--stdin")
+            self.merge_tree_calls += 1
+            stdin = kwargs.get("stdin")
+            if stdin == b"main feature/a\nmain feature/b\n":
+                stdout = "1\0target-tree\0" "\0" "1\0target-tree\0" "\0"
+            elif stdin == b"main feature/c\nmain feature/d\n":
+                stdout = "1\0c-net-tree\0" "\0" "1\0d-net-tree\0" "\0"
+            else:
+                raise AssertionError(f"unexpected stdin={stdin!r}")
+            return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+        def reachable_commit_shas(self, ref: str, *, first_parent: bool = False) -> frozenset[str]:  # type: ignore[override]
+            assert ref == "main"
+            return frozenset({"target-sha"})
+
+    git = _CachedBatchGit()
+    first_requests = (
+        recovery_engine._FailedTaskBranchClassificationPreload("feature/a", "main", None, True),
+        recovery_engine._FailedTaskBranchClassificationPreload("feature/b", "main", None, True),
+    )
+    second_requests = (
+        recovery_engine._FailedTaskBranchClassificationPreload("feature/c", "main", None, True),
+        recovery_engine._FailedTaskBranchClassificationPreload("feature/d", "main", None, True),
+    )
+
+    with git.cached():
+        first = recovery_engine._batch_classify_failed_task_branch_merge_states(git=git, requests=first_requests)
+        second = recovery_engine._batch_classify_failed_task_branch_merge_states(git=git, requests=second_requests)
+        second_repeat = recovery_engine._batch_classify_failed_task_branch_merge_states(git=git, requests=second_requests)
+
+    assert {classification.state for classification in first.values()} == {"merged"}
+    assert {classification.state for classification in second.values()} == {"unmerged"}
+    assert {
+        source_ref: classification.state
+        for source_ref, classification in zip(
+            (request.source_ref for request in second_requests),
+            second_repeat.values(),
+            strict=True,
+        )
+    } == {"feature/c": "unmerged", "feature/d": "unmerged"}
+    assert git.merge_tree_calls == 2
+
+
+def test_list_failed_tasks_for_recovery_does_not_probe_each_absent_landed_suppression_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = "feature/many-owner"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        head_sha="owner-head",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed_ids: list[str] = []
+    for index in range(8):
+        failed = store.add(f"Failed missing branch {index}", task_type="review", based_on=owner.id)
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "WORKER_DIED"
+        failed.branch = f"feature/missing-landed-leaf-{index}"
+        failed.has_commits = True
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+        store.attach_task_to_merge_unit(failed.id, owner_unit.id, "review")
+        failed_ids.append(failed.id)
+
+    def _must_not_live_classify(**_kwargs: object) -> BranchMergeClassification:
+        raise AssertionError("absent failed branches should be filtered before live merge classification")
+
+    monkeypatch.setattr(recovery_engine, "classify_branch_merge_state_for_target", _must_not_live_classify)
+
+    class _CountingGit(_MinimalRecoveryGit):
+        def __init__(self) -> None:
+            super().__init__(branches=frozenset({"main", str(owner.branch)}))
+            self.git_invocations = 0
+
+        def _run(self, *_args: object, **_kwargs: object):  # type: ignore[override]
+            self.git_invocations += 1
+            raise AssertionError("no per-failed-task git subprocess should be needed")
+
+    git = _CountingGit()
+
+    failed = list_failed_tasks_for_recovery(store, git=git, target_branch="main")
+
+    assert {task.id for task in failed} == set(failed_ids)
+    assert git.git_invocations == 0
+
+
+def test_list_failed_tasks_for_recovery_bulk_classifies_present_landed_suppression_branches(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = "feature/bulk-owner"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        head_sha="owner-head",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    def _make_failed(
+        prompt: str,
+        *,
+        branch: str,
+        has_commits: bool,
+        same_branch: bool = False,
+        shared_unit: bool = False,
+    ) -> Task:
+        failed = store.add(prompt, task_type="review", based_on=owner.id, same_branch=same_branch)
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "WORKER_DIED"
+        failed.branch = branch
+        failed.has_commits = has_commits
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+        if shared_unit:
+            store.attach_task_to_merge_unit(failed.id, owner_unit.id, "review")
+        return failed
+
+    same_branch_landed = _make_failed(
+        "same-branch landed leaf",
+        branch=str(owner.branch),
+        has_commits=True,
+        same_branch=True,
+    )
+    shared_empty = _make_failed(
+        "shared empty leaf",
+        branch="feature/bulk-shared-empty",
+        has_commits=False,
+        shared_unit=True,
+    )
+    distinct_landed = _make_failed("distinct landed leaf", branch="feature/bulk-landed", has_commits=True)
+    distinct_redundant = _make_failed("distinct redundant leaf", branch="feature/bulk-redundant", has_commits=True)
+    distinct_unmerged = _make_failed("distinct unmerged leaf", branch="feature/bulk-unmerged", has_commits=True)
+    missing_ref = _make_failed("missing branch leaf", branch="feature/bulk-missing", has_commits=True)
+
+    for index in range(10):
+        _make_failed(f"extra distinct landed leaf {index}", branch=f"feature/bulk-landed-{index}", has_commits=True)
+
+    class _BulkClassifyingGit(_MinimalRecoveryGit):
+        def __init__(self) -> None:
+            branches = frozenset(
+                {
+                    "main",
+                    str(owner.branch),
+                    "feature/bulk-shared-empty",
+                    "feature/bulk-landed",
+                    "feature/bulk-redundant",
+                    "feature/bulk-unmerged",
+                    *(f"feature/bulk-landed-{index}" for index in range(10)),
+                }
+            )
+            super().__init__(branches=branches)
+            self.batch_invocations = 0
+            self.per_branch_invocations = 0
+            self._commit_refs = {
+                "main": "target",
+                str(owner.branch): "same-landed",
+                "feature/bulk-shared-empty": "empty-mainline",
+                "feature/bulk-landed": "landed",
+                "feature/bulk-redundant": "redundant-mainline",
+                "feature/bulk-unmerged": "unmerged",
+                **{f"feature/bulk-landed-{index}": f"landed-{index}" for index in range(10)},
+            }
+            self._tree_refs = {"main": "target-tree"}
+
+        def _run(self, *_args: object, **_kwargs: object):  # type: ignore[override]
+            self.per_branch_invocations += 1
+            raise AssertionError("bulk preloading should avoid per-branch Git subprocesses")
+
+        def resolve_refs(self, refs: object, peel: str = "commit") -> dict[str, str | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            ref_tuple = tuple(refs)  # type: ignore[arg-type]
+            if peel == "commit":
+                return {ref: self._commit_refs.get(str(ref)) for ref in ref_tuple}
+            if peel == "tree":
+                return {ref: self._tree_refs.get(str(ref), f"{ref}-tree") for ref in ref_tuple}
+            raise AssertionError(f"unexpected peel={peel!r}")
+
+        def merge_tree_result_trees(self, target_ref: str, source_refs: object) -> dict[str, str | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            assert target_ref == "main"
+            trees: dict[str, str | None] = {}
+            for source_ref in source_refs:  # type: ignore[union-attr]
+                source = str(source_ref)
+                trees[source] = "source-tree" if source == "feature/bulk-unmerged" else "target-tree"
+            return trees
+
+        def reachable_commit_shas(self, ref: str, *, first_parent: bool = False) -> frozenset[str]:  # type: ignore[override]
+            self.batch_invocations += 1
+            assert ref == "main"
+            first_parent_commits = {"target", "empty-mainline", "redundant-mainline"}
+            side_branch_commits = {"same-landed", "landed", *(f"landed-{index}" for index in range(10))}
+            if first_parent:
+                return frozenset(first_parent_commits)
+            return frozenset(first_parent_commits | side_branch_commits)
+
+    git = _BulkClassifyingGit()
+    merge_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=git.local_branch_names(),
+    )
+    read_context = _read_context_for_store(store)
+    read_context.merge_context = merge_context
+
+    failed = list_failed_tasks_for_recovery(store, read_context=read_context)
+
+    assert {task.id for task in failed} == {distinct_unmerged.id, missing_ref.id}
+    assert git.per_branch_invocations <= 5
+    assert git.batch_invocations <= 7
+    total_invocations_after_list = git.batch_invocations + git.per_branch_invocations
+    assert total_invocations_after_list <= 10
+
+    expected = {
+        same_branch_landed.id: "suppressed_landed",
+        shared_empty.id: "suppressed_no_work",
+        distinct_landed.id: "suppressed_landed",
+        distinct_redundant.id: "suppressed_no_work",
+        distinct_unmerged.id: "visible",
+        missing_ref.id: "visible",
+    }
+    for task in (
+        same_branch_landed,
+        shared_empty,
+        distinct_landed,
+        distinct_redundant,
+        distinct_unmerged,
+        missing_ref,
+    ):
+        assert task.id is not None
+        before = git.batch_invocations
+        assert (
+            classify_failed_task_landed_same_unit_suppression(
+                store,
+                task,
+                completed_owner=owner,
+                owner_merge_unit=owner_unit,
+                leaf_merge_unit=read_context.resolve_merge_unit_for_task(task.id),
+                git=git,
+                target_branch="main",
+                merge_context=merge_context,
+                read_context=read_context,
+                classification_cache=merge_context.branch_resolution,
+            )
+            == expected[task.id]
+        )
+        assert git.batch_invocations == before
+    assert git.batch_invocations + git.per_branch_invocations == total_invocations_after_list
+
+
+def test_list_failed_tasks_for_recovery_bulk_classifies_present_implementation_branches_without_resolution_fanout(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    tasks: list[Task] = []
+    for index in range(12):
+        task = store.add(f"Failed implementation {index}", task_type="implement")
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "WORKER_DIED"
+        task.branch = f"feature/bulk-implement-{index}"
+        task.has_commits = True
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+        tasks.append(task)
+
+    class _BulkImplementationGit(_MinimalRecoveryGit):
+        def __init__(self) -> None:
+            super().__init__(branches=frozenset({"main", *(str(task.branch) for task in tasks)}))
+            self.batch_invocations = 0
+            self.branch_resolution_invocations = 0
+            self._commit_refs = {
+                "main": "target-sha",
+                **{str(task.branch): f"source-{index}" for index, task in enumerate(tasks)},
+            }
+
+        def branch_exists(self, branch: str) -> bool:  # type: ignore[override]
+            self.branch_resolution_invocations += 1
+            return super().branch_exists(branch)
+
+        def _run(self, *args: object, **_kwargs: object):  # type: ignore[override]
+            if args and args[0] == "show-ref":
+                self.branch_resolution_invocations += 1
+            raise AssertionError(f"unexpected per-branch Git subprocess: {args!r}")
+
+        def resolve_refs(self, refs: object, peel: str = "commit") -> dict[str, str | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            ref_tuple = tuple(refs)  # type: ignore[arg-type]
+            if peel == "commit":
+                return {ref: self._commit_refs.get(str(ref)) for ref in ref_tuple}
+            if peel == "tree":
+                return {ref: "target-tree" if str(ref) == "main" else f"{ref}-tree" for ref in ref_tuple}
+            raise AssertionError(f"unexpected peel={peel!r}")
+
+        def merge_tree_result_trees(self, target_ref: str, source_refs: object) -> dict[str, str | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            assert target_ref == "main"
+            return {
+                str(source_ref): ("target-tree" if int(str(source_ref).rsplit("-", 1)[1]) % 2 == 0 else "net-tree")
+                for source_ref in source_refs  # type: ignore[union-attr]
+            }
+
+        def reachable_commit_shas(self, ref: str, *, first_parent: bool = False) -> frozenset[str]:  # type: ignore[override]
+            self.batch_invocations += 1
+            assert ref == "main"
+            return frozenset({"target-sha"})
+
+    baseline_git = _BulkImplementationGit()
+    expected_visible_ids = {
+        task.id
+        for index, task in enumerate(tasks)
+        if index % 2 == 1
+    }
+
+    git = _BulkImplementationGit()
+    merge_context = _MergeContext(git=git, default_branch="main", existing_branches=git.local_branch_names())
+    read_context = _read_context_for_store(store)
+    read_context.merge_context = merge_context
+
+    visible = list_failed_tasks_for_recovery(store, read_context=read_context)
+
+    assert {task.id for task in visible} == expected_visible_ids
+    assert git.branch_resolution_invocations == 0
+    assert git.batch_invocations <= 5
+
+
+def test_bulk_landed_suppression_reuses_shared_unit_recorded_head_cache_identity(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = "feature/shared-head-owner"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        head_sha="owner-recorded-head",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    leaves: list[Task] = []
+    for index in range(12):
+        leaf = store.add(f"Failed shared-unit review {index}", task_type="review", based_on=owner.id)
+        assert leaf.id is not None
+        leaf.status = "failed"
+        leaf.failure_reason = "WORKER_DIED"
+        leaf.branch = f"feature/shared-head-leaf-{index}"
+        leaf.has_commits = True
+        leaf.completed_at = datetime.now(UTC)
+        store.update(leaf)
+        store.attach_task_to_merge_unit(leaf.id, owner_unit.id, "review")
+        leaves.append(leaf)
+
+    class _SharedHeadGit(_MinimalRecoveryGit):
+        def __init__(self) -> None:
+            branches = frozenset(
+                {
+                    "main",
+                    str(owner.branch),
+                    *(str(leaf.branch) for leaf in leaves),
+                }
+            )
+            super().__init__(branches=branches)
+            self.batch_invocations = 0
+            self.per_branch_invocations = 0
+            self._commit_refs = {
+                "main": "target-sha",
+                str(owner.branch): "owner-recorded-head",
+                **{str(leaf.branch): f"leaf-{index}-sha" for index, leaf in enumerate(leaves)},
+            }
+            self._target_reachable = frozenset({"target-sha"})
+
+        def resolve_fresh_merge_source(self, branch: str, **_kwargs: object):  # type: ignore[override]
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch)
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:  # type: ignore[override]
+            return self._commit_refs.get(ref)
+
+        def is_ancestor(self, ancestor: str, descendant: str) -> bool:  # type: ignore[override]
+            self.per_branch_invocations += 1
+            return ancestor == "owner-recorded-head" and descendant.startswith("feature/shared-head-leaf-")
+
+        def count_commits_ahead(self, source_ref: str, base_ref: str) -> int | None:  # type: ignore[override]
+            return 1 if base_ref == "main" and source_ref.startswith("feature/shared-head-leaf-") else None
+
+        def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:  # type: ignore[override]
+            self.per_branch_invocations += 1
+            return into == "main" and branch.startswith("feature/shared-head-leaf-")
+
+        def resolve_refs(self, refs: object, peel: str = "commit") -> dict[str, str | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            ref_tuple = tuple(refs)  # type: ignore[arg-type]
+            if peel == "commit":
+                return {ref: self._commit_refs.get(str(ref)) for ref in ref_tuple}
+            if peel == "tree":
+                return {ref: "target-tree" if str(ref) == "main" else f"{ref}-tree" for ref in ref_tuple}
+            raise AssertionError(f"unexpected peel={peel!r}")
+
+        def merge_tree_result_trees(self, target_ref: str, source_refs: object) -> dict[str, str | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            assert target_ref == "main"
+            return {str(source_ref): "target-tree" for source_ref in source_refs}  # type: ignore[union-attr]
+
+        def reachable_commit_shas(self, ref: str, *, first_parent: bool = False) -> frozenset[str]:  # type: ignore[override]
+            self.batch_invocations += 1
+            assert ref == "main"
+            return frozenset({"target-sha", "owner-recorded-head"}) if first_parent else self._target_reachable
+
+        def ancestor_relationships(self, pairs: object) -> dict[tuple[str, str], bool | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            return {
+                (ancestor, descendant): ancestor == "owner-recorded-head" and descendant.startswith("feature/shared-head-leaf-")
+                for ancestor, descendant in pairs  # type: ignore[union-attr]
+            }
+
+        def patch_equivalent_commits_present_on_target(self, commits: object, target: str) -> dict[str, bool | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            assert target == "main"
+            return {str(commit): False for commit in commits}  # type: ignore[union-attr]
+
+    baseline_git = _SharedHeadGit()
+    baseline_context = _MergeContext(git=baseline_git, default_branch="main", existing_branches=None)
+    expected_by_id = {
+        leaf.id: classify_failed_task_landed_same_unit_suppression(
+            store,
+            leaf,
+            completed_owner=owner,
+            owner_merge_unit=owner_unit,
+            leaf_merge_unit=owner_unit,
+            git=baseline_git,
+            target_branch="main",
+            merge_context=baseline_context,
+        )
+        for leaf in leaves
+    }
+    assert set(expected_by_id.values()) == {"suppressed_landed"}
+
+    git = _SharedHeadGit()
+    merge_context = _MergeContext(git=git, default_branch="main", existing_branches=git.local_branch_names())
+    read_context = _read_context_for_store(store)
+    read_context.merge_context = merge_context
+
+    assert list_failed_tasks_for_recovery(store, read_context=read_context) == []
+    total_invocations_after_preload = git.batch_invocations + git.per_branch_invocations
+    assert git.batch_invocations <= 7
+    assert git.per_branch_invocations == 0
+
+    for leaf in leaves:
+        assert leaf.id is not None
+        assert (
+            classify_failed_task_landed_same_unit_suppression(
+                store,
+                leaf,
+                completed_owner=owner,
+                owner_merge_unit=owner_unit,
+                leaf_merge_unit=read_context.resolve_merge_unit_for_task(leaf.id),
+                git=git,
+                target_branch="main",
+                merge_context=merge_context,
+                read_context=read_context,
+                classification_cache=merge_context.branch_resolution,
+            )
+            == expected_by_id[leaf.id]
+        )
+    assert git.batch_invocations + git.per_branch_invocations == total_invocations_after_preload
+
+
+def test_batch_branch_classification_handles_stale_recorded_heads_without_per_task_fallback(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    tasks: list[Task] = []
+    requests: list[recovery_engine._FailedTaskBranchClassificationPreload] = []
+    for index in range(10):
+        task = store.add(f"Recorded-head branch {index}", task_type="review")
+        assert task.id is not None
+        task.status = "failed"
+        task.branch = f"feature/recorded-head-{index}"
+        task.has_commits = True
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+        tasks.append(task)
+        requests.append(
+            recovery_engine._FailedTaskBranchClassificationPreload(
+                source_ref=str(task.branch),
+                target_branch="main",
+                recorded_head_sha=f"recorded-{index}",
+                source_has_commits=True,
+            )
+        )
+
+    class _RecordedHeadGit(_MinimalRecoveryGit):
+        def __init__(self) -> None:
+            super().__init__(branches=frozenset({"main", *(str(task.branch) for task in tasks)}))
+            self.batch_invocations = 0
+            self._target_reachable = frozenset({"target-sha"})
+            self._target_patch_present = frozenset(f"recorded-{index}" for index in range(0, 10, 2))
+            self._commit_refs = {
+                "main": "target-sha",
+                **{str(task.branch): f"source-{index}" for index, task in enumerate(tasks)},
+                **{f"recorded-{index}": f"recorded-{index}" for index in range(10)},
+            }
+
+        def resolve_fresh_merge_source(self, branch: str, **_kwargs: object):  # type: ignore[override]
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch)
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:  # type: ignore[override]
+            return self._commit_refs.get(ref)
+
+        def is_patch_equivalent_commit_present_on_target(self, commit: str, target: str) -> bool | None:  # type: ignore[override]
+            assert target == "main"
+            return commit in self._target_patch_present
+
+        def is_ancestor(self, ancestor: str, descendant: str) -> bool:  # type: ignore[override]
+            assert ancestor.startswith("recorded-")
+            assert descendant.startswith("feature/recorded-head-")
+            return False
+
+        def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:  # type: ignore[override]
+            assert into == "main"
+            return branch.endswith(("0", "2", "4", "6", "8"))
+
+        def count_commits_ahead(self, source_ref: str, base_ref: str) -> int | None:  # type: ignore[override]
+            return 1 if base_ref == "main" else None
+
+        def resolve_refs(self, refs: object, peel: str = "commit") -> dict[str, str | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            ref_tuple = tuple(refs)  # type: ignore[arg-type]
+            if peel == "commit":
+                return {ref: self._commit_refs.get(str(ref)) for ref in ref_tuple}
+            if peel == "tree":
+                return {ref: "target-tree" if str(ref) == "main" else f"{ref}-tree" for ref in ref_tuple}
+            raise AssertionError(f"unexpected peel={peel!r}")
+
+        def merge_tree_result_trees(self, target_ref: str, source_refs: object) -> dict[str, str | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            assert target_ref == "main"
+            return {
+                str(source_ref): ("target-tree" if str(source_ref).endswith(("0", "2", "4", "6", "8")) else "net-tree")
+                for source_ref in source_refs  # type: ignore[union-attr]
+            }
+
+        def reachable_commit_shas(self, ref: str, *, first_parent: bool = False) -> frozenset[str]:  # type: ignore[override]
+            self.batch_invocations += 1
+            assert ref == "main"
+            return frozenset({"target-sha"}) if first_parent else self._target_reachable
+
+        def ancestor_relationships(self, pairs: object) -> dict[tuple[str, str], bool | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            return {(ancestor, descendant): self.is_ancestor(ancestor, descendant) for ancestor, descendant in pairs}  # type: ignore[union-attr]
+
+        def patch_equivalent_commits_present_on_target(self, commits: object, target: str) -> dict[str, bool | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            assert target == "main"
+            return {str(commit): self.is_patch_equivalent_commit_present_on_target(str(commit), target) for commit in commits}  # type: ignore[union-attr]
+
+    ordinary_git = _RecordedHeadGit()
+    ordinary = [
+        recovery_engine._classify_failed_task_branch_merge_state_for_target(
+            git=ordinary_git,
+            failed_task=task,
+            target_branch="main",
+            recorded_head_sha=f"recorded-{index}",
+            source_has_commits=True,
+        )
+        for index, task in enumerate(tasks)
+    ]
+
+    batch_git = _RecordedHeadGit()
+    batched = recovery_engine._batch_classify_failed_task_branch_merge_states(
+        git=batch_git,
+        requests=tuple(requests),
+    )
+
+    assert [(item.state, item.reason) for item in batched.values()] == [
+        (item.state, item.reason) for item in ordinary
+    ]
+    assert batch_git.batch_invocations <= 7
+
+
+def test_bulk_landed_suppression_matches_patch_equivalent_recorded_head_not_target_reachable(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = "feature/patch-owner"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        head_sha="recorded-patch-head",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    leaves: list[Task] = []
+    for index in range(10):
+        leaf = store.add(f"Patch-equivalent failed review {index}", task_type="review", based_on=owner.id)
+        assert leaf.id is not None
+        leaf.status = "failed"
+        leaf.failure_reason = "WORKER_DIED"
+        leaf.branch = f"feature/patch-leaf-{index}"
+        leaf.has_commits = True
+        leaf.completed_at = datetime.now(UTC)
+        store.update(leaf)
+        store.attach_task_to_merge_unit(leaf.id, owner_unit.id, "review")
+        leaves.append(leaf)
+
+    class _PatchEquivalentRecordedHeadGit(_MinimalRecoveryGit):
+        def __init__(self) -> None:
+            super().__init__(branches=frozenset({"main", str(owner.branch), *(str(leaf.branch) for leaf in leaves)}))
+            self.batch_invocations = 0
+            self.per_branch_invocations = 0
+            self._commit_refs = {
+                "main": "target-sha",
+                "recorded-patch-head": "recorded-patch-head",
+                str(owner.branch): "owner-sha",
+                **{str(leaf.branch): f"patch-source-{index}" for index, leaf in enumerate(leaves)},
+            }
+
+        def resolve_fresh_merge_source(self, branch: str, **_kwargs: object):  # type: ignore[override]
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch)
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:  # type: ignore[override]
+            return self._commit_refs.get(ref)
+
+        def is_ancestor(self, ancestor: str, descendant: str) -> bool:  # type: ignore[override]
+            self.per_branch_invocations += 1
+            assert ancestor == "recorded-patch-head"
+            assert descendant.startswith("feature/patch-leaf-")
+            return False
+
+        def is_patch_equivalent_commit_present_on_target(self, commit: str, target: str) -> bool | None:  # type: ignore[override]
+            self.per_branch_invocations += 1
+            assert commit == "recorded-patch-head"
+            assert target == "main"
+            return True
+
+        def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:  # type: ignore[override]
+            self.per_branch_invocations += 1
+            return into == "main" and branch.startswith("feature/patch-leaf-")
+
+        def count_commits_ahead(self, source_ref: str, base_ref: str) -> int | None:  # type: ignore[override]
+            return 1 if base_ref == "main" and source_ref.startswith("feature/patch-leaf-") else None
+
+        def resolve_refs(self, refs: object, peel: str = "commit") -> dict[str, str | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            ref_tuple = tuple(refs)  # type: ignore[arg-type]
+            if peel == "commit":
+                return {ref: self._commit_refs.get(str(ref)) for ref in ref_tuple}
+            if peel == "tree":
+                return {ref: "target-tree" if str(ref) == "main" else f"{ref}-tree" for ref in ref_tuple}
+            raise AssertionError(f"unexpected peel={peel!r}")
+
+        def merge_tree_result_trees(self, target_ref: str, source_refs: object) -> dict[str, str | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            assert target_ref == "main"
+            return {str(source_ref): "target-tree" for source_ref in source_refs}  # type: ignore[union-attr]
+
+        def reachable_commit_shas(self, ref: str, *, first_parent: bool = False) -> frozenset[str]:  # type: ignore[override]
+            self.batch_invocations += 1
+            assert ref == "main"
+            return frozenset({"target-sha"})
+
+        def ancestor_relationships(self, pairs: object) -> dict[tuple[str, str], bool | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            return {(ancestor, descendant): False for ancestor, descendant in pairs}  # type: ignore[union-attr]
+
+        def patch_equivalent_commits_present_on_target(self, commits: object, target: str) -> dict[str, bool | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            assert target == "main"
+            return {str(commit): str(commit) == "recorded-patch-head" for commit in commits}  # type: ignore[union-attr]
+
+    baseline_git = _PatchEquivalentRecordedHeadGit()
+    baseline_context = _MergeContext(git=baseline_git, default_branch="main", existing_branches=None)
+    expected_by_id = {
+        leaf.id: classify_failed_task_landed_same_unit_suppression(
+            store,
+            leaf,
+            completed_owner=owner,
+            owner_merge_unit=owner_unit,
+            leaf_merge_unit=owner_unit,
+            git=baseline_git,
+            target_branch="main",
+            merge_context=baseline_context,
+        )
+        for leaf in leaves
+    }
+    assert set(expected_by_id.values()) == {"suppressed_landed"}
+
+    git = _PatchEquivalentRecordedHeadGit()
+    merge_context = _MergeContext(git=git, default_branch="main", existing_branches=git.local_branch_names())
+    read_context = _read_context_for_store(store)
+    read_context.merge_context = merge_context
+
+    assert list_failed_tasks_for_recovery(store, read_context=read_context) == []
+    assert git.batch_invocations <= 7
+    assert git.per_branch_invocations == 0
+
+
+def test_bulk_landed_suppression_isolates_unrelated_merge_tree_source(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = "feature/poison-owner"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        head_sha="owner-poison-head",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    leaves: list[Task] = []
+    for index in range(12):
+        leaf = store.add(f"Failed poisoned batch review {index}", task_type="review", based_on=owner.id)
+        assert leaf.id is not None
+        leaf.status = "failed"
+        leaf.failure_reason = "WORKER_DIED"
+        leaf.branch = "feature/poison-unrelated" if index == 5 else f"feature/poison-leaf-{index}"
+        leaf.has_commits = True
+        leaf.completed_at = datetime.now(UTC)
+        store.update(leaf)
+        leaves.append(leaf)
+
+    clean_indexes = {0, 2, 4, 6, 8, 10}
+    poison_branch = "feature/poison-unrelated"
+
+    class _PoisonedBatchGit(_MinimalRecoveryGit):
+        def __init__(self) -> None:
+            super().__init__(branches=frozenset({"main", str(owner.branch), *(str(leaf.branch) for leaf in leaves)}))
+            self.batch_invocations = 0
+            self.per_branch_invocations = 0
+            self._commit_refs = {
+                "main": "target-sha",
+                str(owner.branch): "owner-poison-head",
+                **{str(leaf.branch): f"poison-source-{index}" for index, leaf in enumerate(leaves)},
+            }
+
+        def resolve_fresh_merge_source(self, branch: str, **_kwargs: object):  # type: ignore[override]
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch)
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:  # type: ignore[override]
+            return self._commit_refs.get(ref)
+
+        def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:  # type: ignore[override]
+            if into != "main" or branch == poison_branch:
+                return False
+            index = int(branch.rsplit("-", 1)[1])
+            return index in clean_indexes
+
+        def count_commits_ahead(self, source_ref: str, base_ref: str) -> int | None:  # type: ignore[override]
+            return 1 if base_ref == "main" else None
+
+        def resolve_refs(self, refs: object, peel: str = "commit") -> dict[str, str | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            ref_tuple = tuple(refs)  # type: ignore[arg-type]
+            if peel == "commit":
+                return {ref: self._commit_refs.get(str(ref)) for ref in ref_tuple}
+            if peel == "tree":
+                return {ref: "target-tree" if str(ref) == "main" else f"{ref}-tree" for ref in ref_tuple}
+            raise AssertionError(f"unexpected peel={peel!r}")
+
+        def merge_tree_result_trees(self, target_ref: str, source_refs: object) -> dict[str, str | None]:  # type: ignore[override]
+            self.batch_invocations += 1
+            sources = tuple(str(source_ref) for source_ref in source_refs)  # type: ignore[union-attr]
+            if poison_branch in sources:
+                raise GitError("fatal: refusing to merge unrelated histories")
+            trees: dict[str, str | None] = {}
+            for source in sources:
+                index = int(source.rsplit("-", 1)[1])
+                trees[source] = "target-tree" if index in clean_indexes else None
+            return trees
+
+        def reachable_commit_shas(self, ref: str, *, first_parent: bool = False) -> frozenset[str]:  # type: ignore[override]
+            self.batch_invocations += 1
+            assert ref == "main"
+            return frozenset({"target-sha"})
+
+    baseline_git = _PoisonedBatchGit()
+    baseline_context = _MergeContext(git=baseline_git, default_branch="main", existing_branches=None)
+    expected_by_id = {
+        leaf.id: classify_failed_task_landed_same_unit_suppression(
+            store,
+            leaf,
+            completed_owner=owner,
+            owner_merge_unit=owner_unit,
+            leaf_merge_unit=None,
+            git=baseline_git,
+            target_branch="main",
+            merge_context=baseline_context,
+        )
+        for leaf in leaves
+    }
+
+    git = _PoisonedBatchGit()
+    merge_context = _MergeContext(git=git, default_branch="main", existing_branches=git.local_branch_names())
+    read_context = _read_context_for_store(store)
+    read_context.merge_context = merge_context
+
+    visible = list_failed_tasks_for_recovery(store, read_context=read_context)
+
+    assert {task.id for task in visible} == {
+        leaf.id for leaf in leaves if expected_by_id[leaf.id] == "visible"
+    }
+    assert git.batch_invocations <= 13
+    assert git.per_branch_invocations == 0
+
+    total_invocations_after_preload = git.batch_invocations + git.per_branch_invocations
+    for leaf in leaves:
+        assert leaf.id is not None
+        assert (
+            classify_failed_task_landed_same_unit_suppression(
+                store,
+                leaf,
+                completed_owner=owner,
+                owner_merge_unit=owner_unit,
+                leaf_merge_unit=read_context.resolve_merge_unit_for_task(leaf.id),
+                git=git,
+                target_branch="main",
+                merge_context=merge_context,
+                read_context=read_context,
+                classification_cache=merge_context.branch_resolution,
+            )
+            == expected_by_id[leaf.id]
+        )
+    assert git.batch_invocations + git.per_branch_invocations == total_invocations_after_preload
 
 
 @pytest.mark.parametrize("leaf_order", ("landed_first", "recoverable_first"))

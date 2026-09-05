@@ -2533,6 +2533,89 @@ class TestGitCached:
             stdin=b"main^{tree}\nmissing^{tree}\n",
         )
 
+    def test_merge_tree_result_trees_parses_conflicted_record_before_clean_record(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        stdout = (
+            "0\0conflict-tree\0"
+            "100644 base 1\tfile.txt\0"
+            "100644 ours 2\tfile.txt\0"
+            "100644 theirs 3\tfile.txt\0"
+            "\0"
+            "1\0file.txt\0Auto-merging\0Auto-merging file.txt\n\0"
+            "1\0file.txt\0CONFLICT (contents)\0CONFLICT (content): Merge conflict in file.txt\n\0"
+            "\0"
+            "1\0clean-tree\0"
+            "\0"
+        )
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=stdout, stderr="")
+
+            result = git.merge_tree_result_trees("main", ["feature/conflicts", "feature/clean"])
+
+        assert result == {"feature/conflicts": None, "feature/clean": "clean-tree"}
+        mock_run.assert_called_once_with(
+            "merge-tree",
+            "--write-tree",
+            "--stdin",
+            check=False,
+            stdin=b"main feature/conflicts\nmain feature/clean\n",
+        )
+
+    def test_merge_tree_result_trees_rejects_extra_stdin_records(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="1\0requested-tree\0" "\0" "1\0extra-tree\0" "\0",
+                stderr="",
+            )
+
+            with pytest.raises(GitError, match="extra records"):
+                git.merge_tree_result_trees("main", ["feature/requested"])
+
+    def test_merge_tree_result_trees_cache_uses_stdin_content(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="1\0a-tree\0" "\0" "1\0b-tree\0" "\0", stderr=""),
+                MagicMock(returncode=0, stdout="1\0c-tree\0" "\0" "1\0d-tree\0" "\0", stderr=""),
+            ]
+
+            with git.cached():
+                first = git.merge_tree_result_trees("main", ["feature/a", "feature/b"])
+                second = git.merge_tree_result_trees("main", ["feature/c", "feature/d"])
+                second_repeat = git.merge_tree_result_trees("main", ["feature/c", "feature/d"])
+
+        assert first == {"feature/a": "a-tree", "feature/b": "b-tree"}
+        assert second == {"feature/c": "c-tree", "feature/d": "d-tree"}
+        assert second_repeat == second
+        assert mock_run.call_count == 2
+        assert mock_run.call_args_list == [
+            call(
+                "merge-tree",
+                "--write-tree",
+                "--stdin",
+                check=False,
+                stdin=b"main feature/a\nmain feature/b\n",
+            ),
+            call(
+                "merge-tree",
+                "--write-tree",
+                "--stdin",
+                check=False,
+                stdin=b"main feature/c\nmain feature/d\n",
+            ),
+        ]
+
     def test_resolve_refs_raises_for_batch_failure(self, tmp_path: Path) -> None:
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()

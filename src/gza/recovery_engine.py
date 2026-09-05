@@ -120,6 +120,7 @@ PrerequisiteUnmergedReconciliation = Literal[
 EmptyTaskRecoveryState = Literal["requires_recovery", "moot", "resolved"]
 FailedTaskSuppressionState = Literal["visible", "suppressed_landed", "suppressed_no_work"]
 FailedTaskBranchClassificationCache = dict[tuple[str | None, str | None, str, bool | None], BranchMergeClassification]
+_BranchClassificationCacheKey = tuple[str | None, str | None, str, bool | None]
 
 _AFFIRMATIVE_LANDED_BRANCH_REASONS = frozenset(
     {
@@ -209,6 +210,28 @@ class _MergeContext:
     branch_resolution: FailedTaskBranchClassificationCache = field(default_factory=dict)
     repository_inspection_warnings: list[str] = field(default_factory=list)
     _warning_keys: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class _FailedTaskBranchClassificationPreload:
+    source_ref: str
+    target_branch: str
+    recorded_head_sha: str | None
+    source_has_commits: bool | None
+
+
+def _failed_task_branch_classification_cache_key(
+    *,
+    source_ref: str | None,
+    recorded_head_sha: str | None,
+    target_branch: str,
+    source_has_commits: bool | None,
+) -> _BranchClassificationCacheKey:
+    return (source_ref, recorded_head_sha, target_branch, source_has_commits)
+
+
+def _recorded_head_sha_for_failed_leaf(leaf_merge_unit: MergeUnit | None) -> str | None:
+    return leaf_merge_unit.head_sha if leaf_merge_unit is not None else None
 
 
 def _record_repository_inspection_warning(
@@ -1048,6 +1071,7 @@ def is_resolved_by_merged_target(
             target_branch=target_branch,
             merge_context=resolved_merge_context,
             read_context=read_context,
+            classification_cache=resolved_merge_context.branch_resolution if resolved_merge_context is not None else None,
         )
         != "visible"
     )
@@ -1060,10 +1084,17 @@ def _classify_failed_task_branch_merge_state_for_target(
     target_branch: str,
     recorded_head_sha: str | None,
     source_has_commits: bool | None,
+    source_ref: str | None = None,
     classification_cache: FailedTaskBranchClassificationCache | None = None,
 ) -> BranchMergeClassification:
-    source_ref = resolve_task_merge_source(git, failed_task.branch).ref if failed_task.branch else None
-    cache_key = (source_ref, recorded_head_sha, target_branch, source_has_commits)
+    if source_ref is None:
+        source_ref = resolve_task_merge_source(git, failed_task.branch).ref if failed_task.branch else None
+    cache_key = _failed_task_branch_classification_cache_key(
+        source_ref=source_ref,
+        recorded_head_sha=recorded_head_sha,
+        target_branch=target_branch,
+        source_has_commits=source_has_commits,
+    )
     if classification_cache is not None and cache_key in classification_cache:
         return classification_cache[cache_key]
     merged_proof: bool | None = None
@@ -1084,6 +1115,503 @@ def _classify_failed_task_branch_merge_state_for_target(
     if classification_cache is not None:
         classification_cache[cache_key] = classification
     return classification
+
+
+def _cache_failed_task_branch_classification(
+    classification_cache: FailedTaskBranchClassificationCache,
+    *,
+    source_ref: str,
+    target_branch: str,
+    recorded_head_sha: str | None,
+    source_has_commits: bool | None,
+    classification: BranchMergeClassification,
+) -> None:
+    classification_cache[
+        _failed_task_branch_classification_cache_key(
+            source_ref=source_ref,
+            recorded_head_sha=recorded_head_sha,
+            target_branch=target_branch,
+            source_has_commits=source_has_commits,
+        )
+    ] = classification
+
+
+def _merge_tree_result_trees_fail_closed_partitioned(
+    git: Git,
+    target_branch: str,
+    source_refs: tuple[str, ...],
+) -> tuple[dict[str, str | None], frozenset[str]]:
+    if not source_refs:
+        return {}, frozenset()
+    try:
+        return git.merge_tree_result_trees(target_branch, source_refs), frozenset()
+    except GitError:
+        if len(source_refs) == 1:
+            return {}, frozenset(source_refs)
+        midpoint = len(source_refs) // 2
+        left_trees, left_failed = _merge_tree_result_trees_fail_closed_partitioned(
+            git,
+            target_branch,
+            source_refs[:midpoint],
+        )
+        right_trees, right_failed = _merge_tree_result_trees_fail_closed_partitioned(
+            git,
+            target_branch,
+            source_refs[midpoint:],
+        )
+        return {**left_trees, **right_trees}, left_failed | right_failed
+
+
+def _batch_source_contains_recorded_heads(
+    git: Git,
+    requests: tuple[_FailedTaskBranchClassificationPreload, ...],
+    *,
+    resolved_refs: dict[str, str | None],
+) -> dict[_FailedTaskBranchClassificationPreload, bool | None]:
+    requests_with_recorded_heads = tuple(request for request in requests if request.recorded_head_sha)
+    if not requests_with_recorded_heads:
+        return {}
+
+    result: dict[_FailedTaskBranchClassificationPreload, bool | None] = {}
+    unresolved: list[tuple[str, str]] = []
+    for request in requests_with_recorded_heads:
+        assert request.recorded_head_sha is not None
+        source_sha = resolved_refs.get(request.source_ref)
+        if source_sha is None:
+            result[request] = None
+        elif source_sha == request.recorded_head_sha:
+            result[request] = True
+        else:
+            unresolved.append((request.recorded_head_sha, request.source_ref))
+
+    if unresolved:
+        contains_recorded_heads = git.ancestor_relationships(unresolved)
+        for request in requests_with_recorded_heads:
+            if request in result:
+                continue
+            assert request.recorded_head_sha is not None
+            result[request] = contains_recorded_heads.get((request.recorded_head_sha, request.source_ref))
+    return result
+
+
+def _batch_recorded_heads_have_remaining_net_diff(
+    git: Git,
+    requests: tuple[_FailedTaskBranchClassificationPreload, ...],
+) -> dict[_FailedTaskBranchClassificationPreload, bool | None]:
+    requests_with_recorded_heads = tuple(request for request in requests if request.recorded_head_sha)
+    if not requests_with_recorded_heads:
+        return {}
+
+    result: dict[_FailedTaskBranchClassificationPreload, bool | None] = {}
+    for target_branch in dict.fromkeys(request.target_branch for request in requests_with_recorded_heads):
+        target_requests = tuple(request for request in requests_with_recorded_heads if request.target_branch == target_branch)
+        patch_presence = git.patch_equivalent_commits_present_on_target(
+            tuple(request.recorded_head_sha for request in target_requests if request.recorded_head_sha),
+            target_branch,
+        )
+        for request in target_requests:
+            assert request.recorded_head_sha is not None
+            present = patch_presence.get(request.recorded_head_sha)
+            result[request] = None if present is None else not present
+    return result
+
+
+def _recorded_head_guard_classification_from_batch(
+    request: _FailedTaskBranchClassificationPreload,
+    *,
+    source_sha: str | None,
+    target_sha: str | None,
+    source_contains_recorded_heads: dict[_FailedTaskBranchClassificationPreload, bool | None],
+    recorded_heads_have_remaining_net_diff: dict[_FailedTaskBranchClassificationPreload, bool | None],
+) -> BranchMergeClassification | None:
+    if not request.recorded_head_sha:
+        return None
+
+    if source_contains_recorded_heads.get(request) is True:
+        return None
+
+    remaining_net_diff = recorded_heads_have_remaining_net_diff.get(request)
+    if remaining_net_diff is True:
+        return BranchMergeClassification(
+            state="unmerged",
+            reason="recorded-head-has-net-diff",
+            source_ref=request.source_ref,
+            target_ref=request.target_branch,
+            source_sha=source_sha,
+            target_sha=target_sha,
+        )
+    if remaining_net_diff is None:
+        return BranchMergeClassification(
+            state="unknown",
+            reason="recorded-head-diff-unavailable",
+            source_ref=request.source_ref,
+            target_ref=request.target_branch,
+            source_sha=source_sha,
+            target_sha=target_sha,
+        )
+    return None
+
+
+def _batch_classify_failed_task_branch_merge_states(
+    *,
+    git: Git,
+    requests: tuple[_FailedTaskBranchClassificationPreload, ...],
+) -> dict[_FailedTaskBranchClassificationPreload, BranchMergeClassification]:
+    if not requests:
+        return {}
+
+    source_refs = tuple(dict.fromkeys(request.source_ref for request in requests))
+    target_branches = tuple(dict.fromkeys(request.target_branch for request in requests))
+    resolved_refs = git.resolve_refs((*source_refs, *target_branches), peel="commit")
+    target_trees = git.resolve_refs(target_branches, peel="tree")
+
+    merge_trees_by_target: dict[str, dict[str, str | None]] = {}
+    failed_merge_tree_sources_by_target: dict[str, frozenset[str]] = {}
+    for target_branch in target_branches:
+        source_refs_for_target = tuple(
+            request.source_ref
+            for request in requests
+            if request.target_branch == target_branch and resolved_refs.get(request.source_ref) is not None
+        )
+        merge_trees, failed_merge_tree_sources = _merge_tree_result_trees_fail_closed_partitioned(
+            git,
+            target_branch,
+            source_refs_for_target,
+        )
+        merge_trees_by_target[target_branch] = merge_trees
+        failed_merge_tree_sources_by_target[target_branch] = failed_merge_tree_sources
+    reachable_by_target = {target_branch: git.reachable_commit_shas(target_branch) for target_branch in target_branches}
+    first_parent_by_target = {
+        target_branch: git.reachable_commit_shas(target_branch, first_parent=True) for target_branch in target_branches
+    }
+    source_contains_recorded_heads = _batch_source_contains_recorded_heads(
+        git,
+        requests,
+        resolved_refs=resolved_refs,
+    )
+    recorded_heads_have_remaining_net_diff = _batch_recorded_heads_have_remaining_net_diff(git, requests)
+
+    classifications: dict[_FailedTaskBranchClassificationPreload, BranchMergeClassification] = {}
+    for request in requests:
+        source_sha = resolved_refs.get(request.source_ref)
+        target_sha = resolved_refs.get(request.target_branch)
+        if source_sha is None:
+            classifications[request] = BranchMergeClassification(
+                state="unknown",
+                reason="missing-source-ref",
+                source_ref=request.source_ref,
+                target_ref=request.target_branch,
+                source_sha=None,
+                target_sha=target_sha,
+            )
+            continue
+        if target_sha is None:
+            classifications[request] = BranchMergeClassification(
+                state="unknown",
+                reason="missing-target-ref",
+                source_ref=request.source_ref,
+                target_ref=request.target_branch,
+                source_sha=source_sha,
+                target_sha=None,
+            )
+            continue
+        target_tree = target_trees.get(request.target_branch)
+        merged_tree = merge_trees_by_target.get(request.target_branch, {}).get(request.source_ref)
+        if request.source_ref in failed_merge_tree_sources_by_target.get(request.target_branch, frozenset()):
+            classifications[request] = BranchMergeClassification(
+                state="unknown",
+                reason="merge-tree-proof-unavailable",
+                source_ref=request.source_ref,
+                target_ref=request.target_branch,
+                source_sha=source_sha,
+                target_sha=target_sha,
+            )
+            continue
+        merged_proof = target_tree is not None and merged_tree == target_tree
+        source_reachable_from_target = source_sha == target_sha or source_sha in reachable_by_target[request.target_branch]
+        source_on_first_parent = source_sha in first_parent_by_target[request.target_branch]
+        recorded_head_guard_classification = _recorded_head_guard_classification_from_batch(
+            request,
+            source_sha=source_sha,
+            target_sha=target_sha,
+            source_contains_recorded_heads=source_contains_recorded_heads,
+            recorded_heads_have_remaining_net_diff=recorded_heads_have_remaining_net_diff,
+        )
+
+        if source_reachable_from_target:
+            if recorded_head_guard_classification is not None:
+                classifications[request] = recorded_head_guard_classification
+                continue
+            if (
+                source_sha != target_sha
+                and merged_proof
+                and not source_on_first_parent
+                and request.source_has_commits is not False
+            ):
+                classifications[request] = BranchMergeClassification(
+                    state="merged",
+                    reason="merged-side-branch-no-unique-commits",
+                    source_ref=request.source_ref,
+                    target_ref=request.target_branch,
+                    source_sha=source_sha,
+                    target_sha=target_sha,
+                )
+                continue
+            if request.source_has_commits is True:
+                state: Literal["redundant", "empty"] = "redundant"
+                reason = "no-unique-commits-with-task-commits"
+            elif request.source_has_commits is False:
+                state = "empty"
+                reason = "no-task-commits"
+            else:
+                state = "empty"
+                reason = "no-unique-commits"
+            classifications[request] = BranchMergeClassification(
+                state=state,
+                reason=reason,
+                source_ref=request.source_ref,
+                target_ref=request.target_branch,
+                source_sha=source_sha,
+                target_sha=target_sha,
+            )
+            continue
+
+        if merged_proof:
+            if recorded_head_guard_classification is not None:
+                classifications[request] = recorded_head_guard_classification
+                continue
+            classifications[request] = BranchMergeClassification(
+                state="merged",
+                reason="content-equivalent-with-commits",
+                source_ref=request.source_ref,
+                target_ref=request.target_branch,
+                source_sha=source_sha,
+                target_sha=target_sha,
+            )
+            continue
+
+        classifications[request] = BranchMergeClassification(
+            state="unmerged",
+            reason="not-equivalent",
+            source_ref=request.source_ref,
+            target_ref=request.target_branch,
+            source_sha=source_sha,
+            target_sha=target_sha,
+        )
+
+    return classifications
+
+
+def _failed_task_local_source_ref(
+    failed_task: DbTask,
+    *,
+    git: Git | None,
+    merge_context: _MergeContext | None = None,
+) -> str | None:
+    """Return a proven local source ref for a failed task without per-branch git probes."""
+    if not failed_task.branch:
+        return None
+    if merge_context is None or merge_context.git is not git or merge_context.existing_branches is None:
+        return None
+    if failed_task.branch not in merge_context.existing_branches:
+        return None
+    return failed_task.branch
+
+
+def _failed_task_branch_absent_in_context(
+    failed_task: DbTask,
+    *,
+    git: Git | None,
+    merge_context: _MergeContext | None = None,
+) -> bool:
+    return (
+        failed_task.branch is not None
+        and merge_context is not None
+        and merge_context.git is git
+        and merge_context.existing_branches is not None
+        and failed_task.branch not in merge_context.existing_branches
+    )
+
+
+def _failed_task_branch_classification_request(
+    failed_task: DbTask,
+    *,
+    git: Git | None,
+    target_branch: str | None,
+    source_has_commits: bool | None,
+    recorded_head_sha: str | None,
+    merge_context: _MergeContext,
+) -> _FailedTaskBranchClassificationPreload | None:
+    if git is None or target_branch is None or not failed_task.branch:
+        return None
+    if _failed_task_branch_absent_in_context(failed_task, git=git, merge_context=merge_context):
+        return None
+    source_ref = _failed_task_local_source_ref(failed_task, git=git, merge_context=merge_context)
+    if source_ref is None:
+        return None
+    cache_key = _failed_task_branch_classification_cache_key(
+        source_ref=source_ref,
+        recorded_head_sha=recorded_head_sha,
+        target_branch=target_branch,
+        source_has_commits=source_has_commits,
+    )
+    if cache_key in merge_context.branch_resolution:
+        return None
+    return _FailedTaskBranchClassificationPreload(
+        source_ref=source_ref,
+        target_branch=target_branch,
+        recorded_head_sha=recorded_head_sha,
+        source_has_commits=source_has_commits,
+    )
+
+
+def _preload_failed_task_branch_classifications(
+    store: SqliteTaskStore,
+    failed_tasks: list[DbTask],
+    *,
+    merge_context: _MergeContext,
+    read_context: RecoveryReadContext | None = None,
+) -> None:
+    git = merge_context.git
+    if git is None or merge_context.existing_branches is None:
+        return
+
+    requests: list[_FailedTaskBranchClassificationPreload] = []
+
+    def _append_request(
+        failed_task: DbTask,
+        *,
+        target_branch: str | None,
+        source_has_commits: bool | None,
+        recorded_head_sha: str | None,
+    ) -> None:
+        request = _failed_task_branch_classification_request(
+            failed_task,
+            git=git,
+            target_branch=target_branch,
+            source_has_commits=source_has_commits,
+            recorded_head_sha=recorded_head_sha,
+            merge_context=merge_context,
+        )
+        if request is not None:
+            requests.append(request)
+
+    default_target_branch = _effective_merge_target_branch(store, merge_context=merge_context)
+    for failed_task in failed_tasks:
+        if failed_task.id is None or failed_task.status != "failed":
+            continue
+
+        if failed_task.task_type not in _MERGED_TARGET_RESOLUTION_TYPES:
+            if failed_task.branch and not _is_resumable_timeout_implementation(failed_task):
+                resolved_merge_unit = (
+                    read_context.resolve_merge_unit_for_task(failed_task.id)
+                    if read_context is not None
+                    else store.resolve_merge_unit_for_task(failed_task.id)
+                )
+                persisted_state = None
+                if (
+                    resolved_merge_unit is not None
+                    and resolved_merge_unit.target_branch == default_target_branch
+                    and resolved_merge_unit.owner_task_id == failed_task.id
+                ):
+                    persisted_state = effective_no_work_merge_state(failed_task, resolved_merge_unit.state)
+                if persisted_state not in {"merged", "unmerged", "empty", "redundant"}:
+                    _append_request(
+                        failed_task,
+                        target_branch=default_target_branch,
+                        source_has_commits=failed_task.has_commits,
+                        recorded_head_sha=_recorded_head_sha_for_failed_leaf(resolved_merge_unit),
+                    )
+            continue
+
+        completed_owner = _resolve_merged_target_task(store, failed_task, read_context=read_context)
+        if completed_owner is None or completed_owner.id is None:
+            continue
+        owner_merge_unit = (
+            read_context.resolve_merge_unit_for_task(completed_owner.id)
+            if read_context is not None
+            else store.resolve_merge_unit_for_task(completed_owner.id)
+        )
+        leaf_merge_unit = (
+            read_context.resolve_merge_unit_for_task(failed_task.id)
+            if read_context is not None
+            else store.resolve_merge_unit_for_task(failed_task.id)
+        )
+        if owner_merge_unit is not None:
+            owner_landed = owner_merge_unit.state == "merged"
+            owner_target = owner_merge_unit.target_branch
+        else:
+            owner_landed = completed_owner.status == "completed" and task_is_merged(
+                store,
+                completed_owner,
+                read_context=read_context,
+            )
+            owner_target = default_target_branch
+        if not owner_landed or owner_target is None:
+            continue
+
+        leaf_has_own_merge_unit = leaf_merge_unit is not None and leaf_merge_unit.owner_task_id == failed_task.id
+        leaf_targets_owner = (
+            leaf_merge_unit is not None
+            and leaf_merge_unit.target_branch is not None
+            and leaf_merge_unit.target_branch == owner_target
+        )
+        recorded_head_sha = _recorded_head_sha_for_failed_leaf(leaf_merge_unit)
+
+        if failed_task.same_branch:
+            if failed_task.branch and completed_owner.branch and failed_task.branch != completed_owner.branch:
+                continue
+            if failed_task.has_commits is None:
+                continue
+            _append_request(
+                failed_task,
+                target_branch=owner_target,
+                source_has_commits=failed_task.has_commits,
+                recorded_head_sha=recorded_head_sha,
+            )
+            continue
+
+        if leaf_targets_owner and not leaf_has_own_merge_unit:
+            if failed_task.has_commits is None:
+                continue
+            _append_request(
+                failed_task,
+                target_branch=owner_target,
+                source_has_commits=failed_task.has_commits,
+                recorded_head_sha=recorded_head_sha,
+            )
+            continue
+
+        _append_request(
+            failed_task,
+            target_branch=owner_target,
+            source_has_commits=failed_task.has_commits,
+            recorded_head_sha=recorded_head_sha,
+        )
+
+    unique_requests = tuple(dict.fromkeys(requests))
+    if not unique_requests:
+        return
+    try:
+        classifications = _batch_classify_failed_task_branch_merge_states(git=git, requests=unique_requests)
+    except Exception as exc:
+        _record_repository_inspection_warning(
+            merge_context,
+            key="bulk-branch-classification",
+            message=_branch_reachability_warning(
+                f"failed to bulk classify failed-task branches against merge targets: {exc}"
+            ),
+        )
+        return
+    for request, classification in classifications.items():
+        _cache_failed_task_branch_classification(
+            merge_context.branch_resolution,
+            source_ref=request.source_ref,
+            target_branch=request.target_branch,
+            recorded_head_sha=request.recorded_head_sha,
+            source_has_commits=request.source_has_commits,
+            classification=classification,
+        )
 
 
 def _classification_proves_contributed_landing(classification: BranchMergeClassification) -> bool:
@@ -1207,14 +1735,21 @@ def classify_failed_task_landed_same_unit_suppression(
             return "visible"
         if failed_task.has_commits is None:
             return "visible"
-        if git is not None and failed_task.branch and owner_target:
+        if (
+            git is not None
+            and failed_task.branch
+            and owner_target
+            and not _failed_task_branch_absent_in_context(failed_task, git=git, merge_context=merge_context)
+        ):
+            source_ref = _failed_task_local_source_ref(failed_task, git=git, merge_context=merge_context)
             try:
                 classification = _classify_failed_task_branch_merge_state_for_target(
                     git=git,
                     failed_task=failed_task,
                     target_branch=owner_target,
                     source_has_commits=failed_task.has_commits,
-                    recorded_head_sha=leaf_merge_unit.head_sha if leaf_merge_unit is not None else None,
+                    recorded_head_sha=_recorded_head_sha_for_failed_leaf(leaf_merge_unit),
+                    source_ref=source_ref,
                     classification_cache=classification_cache,
                 )
             except Exception as exc:
@@ -1241,14 +1776,21 @@ def classify_failed_task_landed_same_unit_suppression(
     if leaf_targets_owner and not leaf_has_own_merge_unit:
         if failed_task.has_commits is None:
             return "visible"
-        if git is not None and failed_task.branch and owner_target:
+        if (
+            git is not None
+            and failed_task.branch
+            and owner_target
+            and not _failed_task_branch_absent_in_context(failed_task, git=git, merge_context=merge_context)
+        ):
+            source_ref = _failed_task_local_source_ref(failed_task, git=git, merge_context=merge_context)
             try:
                 classification = _classify_failed_task_branch_merge_state_for_target(
                     git=git,
                     failed_task=failed_task,
                     target_branch=owner_target,
                     source_has_commits=failed_task.has_commits,
-                    recorded_head_sha=leaf_merge_unit.head_sha if leaf_merge_unit is not None else None,
+                    recorded_head_sha=_recorded_head_sha_for_failed_leaf(leaf_merge_unit),
+                    source_ref=source_ref,
                     classification_cache=classification_cache,
                 )
             except Exception as exc:
@@ -1272,14 +1814,21 @@ def classify_failed_task_landed_same_unit_suppression(
             return "suppressed_no_work"
         return "visible"
 
-    if git is not None and failed_task.branch and owner_target:
+    if (
+        git is not None
+        and failed_task.branch
+        and owner_target
+        and not _failed_task_branch_absent_in_context(failed_task, git=git, merge_context=merge_context)
+    ):
+        source_ref = _failed_task_local_source_ref(failed_task, git=git, merge_context=merge_context)
         try:
             classification = _classify_failed_task_branch_merge_state_for_target(
                 git=git,
                 failed_task=failed_task,
                 target_branch=owner_target,
                 source_has_commits=failed_task.has_commits,
-                recorded_head_sha=leaf_merge_unit.head_sha if leaf_merge_unit is not None else None,
+                recorded_head_sha=_recorded_head_sha_for_failed_leaf(leaf_merge_unit),
+                source_ref=source_ref,
                 classification_cache=classification_cache,
             )
         except Exception as exc:
@@ -1630,12 +2179,14 @@ def _is_resolved_by_landed_lineage(
                     return True
                 if persisted_state == "unmerged":
                     return False
+                source_ref = _failed_task_local_source_ref(task, git=merge_context.git, merge_context=merge_context)
                 branch_classification = _classify_failed_task_branch_merge_state_for_target(
                     git=merge_context.git,
                     failed_task=task,
                     target_branch=target_branch,
                     source_has_commits=task.has_commits,
-                    recorded_head_sha=resolved_merge_unit.head_sha if resolved_merge_unit is not None else None,
+                    recorded_head_sha=_recorded_head_sha_for_failed_leaf(resolved_merge_unit),
+                    source_ref=source_ref,
                     classification_cache=merge_context.branch_resolution,
                 )
                 branch_merge_state = branch_classification.state
@@ -1811,6 +2362,12 @@ def list_failed_tasks_for_recovery(
             for task in failed
             if task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized, any_tag=any_tag)
         ]
+    _preload_failed_task_branch_classifications(
+        store,
+        failed,
+        merge_context=merge_context,
+        read_context=read_context,
+    )
     failed = [task for task in failed if not is_chain_resolved_by_recovery(store, task, read_context=read_context)]
     failed = [
         task
@@ -2116,6 +2673,25 @@ def _failed_task_requires_operator_recovery(
                 target_branch = _resolve_merge_context_target_branch(store, merge_context)
             except MergeTargetResolutionError:
                 return None
+            if not _failed_task_branch_absent_in_context(task, git=merge_context.git, merge_context=merge_context):
+                resolved_merge_unit = (
+                    read_context.resolve_merge_unit_for_task(task.id)
+                    if read_context is not None and task.id is not None
+                    else store.resolve_merge_unit_for_task(task.id)
+                    if task.id is not None
+                    else None
+                )
+                source_ref = _failed_task_local_source_ref(task, git=merge_context.git, merge_context=merge_context)
+                if source_ref is not None:
+                    return _classify_failed_task_branch_merge_state_for_target(
+                        git=merge_context.git,
+                        failed_task=task,
+                        target_branch=target_branch,
+                        source_has_commits=task.has_commits,
+                        recorded_head_sha=_recorded_head_sha_for_failed_leaf(resolved_merge_unit),
+                        source_ref=source_ref,
+                        classification_cache=merge_context.branch_resolution,
+                    ).state
             return resolve_task_merge_state_for_target(
                 store=store,
                 task=task,
