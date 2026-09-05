@@ -96,7 +96,6 @@ from gza.cli.watch import (
     _collect_completed_transition_ids,
     _collect_live_running_state,
     _collect_unhandled_failures,
-    _compute_cycle_task_accounting,
     _compute_cycle_unit_accounting,
     _compute_failure_backoff_seconds,
     _count_live_workers,
@@ -22588,29 +22587,48 @@ def test_watch_cycle_logs_cycle_accounting_line(tmp_path: Path) -> None:
         )
 
     assert (
-        "INFO      cycle accounting: running=0 pending=2 blocked=1 parked=0 recovery=0 other=0" in log_path.read_text()
+        "INFO      unit accounting: running=0 pending=2 blocked=1 parked=0 recovery=0 other=0"
+        in log_path.read_text()
     )
 
 
-def test_compute_cycle_task_accounting_classifies_failed_tasks(tmp_path: Path) -> None:
-    """Failed tasks split into recovery (auto lane) and parked (manual skip)."""
+def test_compute_cycle_unit_accounting_classifies_failed_units(tmp_path: Path) -> None:
+    """A failed unit's live task splits into recovery (auto lane) or parked (manual skip)."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
     parked_task = store.add("Manual failure", task_type="implement")
+    assert parked_task.id is not None
     parked_task.status = "failed"
     parked_task.failure_reason = "TEST_FAILURE"
+    parked_task.branch = "feature/parked-slice"
     parked_task.completed_at = datetime.now(UTC)
     store.update(parked_task)
+    parked_unit = store.create_merge_unit(
+        source_branch=parked_task.branch,
+        target_branch="main",
+        owner_task_id=parked_task.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(parked_task.id, parked_unit.id, "owner")
 
     recovery_task = store.add("Retryable failure", task_type="implement")
+    assert recovery_task.id is not None
     recovery_task.status = "failed"
     recovery_task.failure_reason = "PROVIDER_UNAVAILABLE"
+    recovery_task.branch = "feature/recovery-slice"
     recovery_task.completed_at = datetime.now(UTC)
     store.update(recovery_task)
+    recovery_unit = store.create_merge_unit(
+        source_branch=recovery_task.branch,
+        target_branch="main",
+        owner_task_id=recovery_task.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(recovery_task.id, recovery_unit.id, "owner")
 
     analysis = SimpleNamespace(watch_read_context=RecoveryReadContext())
-    accounting = _compute_cycle_task_accounting(
+    accounting = _compute_cycle_unit_accounting(
         store=store,
         analysis=analysis,
         tags=None,
