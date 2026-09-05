@@ -20714,7 +20714,7 @@ def test_pre_dispatch_rebase_gate_preempts_clean_stale_create_review(
     assert action["deferred_action_type"] == "create_review"
 
 
-def test_pre_dispatch_rebase_gate_preempts_clean_stale_merge(
+def test_pre_dispatch_rebase_gate_skips_rebase_for_clean_stale_merge(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -20747,12 +20747,10 @@ def test_pre_dispatch_rebase_gate_preempts_clean_stale_merge(
         "main",
     )
 
-    assert action["type"] == "needs_rebase"
-    assert action["reason"] == "pre-dispatch-rebase"
-    assert action["deferred_action_type"] == "merge"
+    assert action["type"] == "merge"
 
 
-def test_pre_dispatch_rebase_gate_rebases_clean_stale_standalone_non_implement_merge(
+def test_pre_dispatch_rebase_gate_skips_rebase_for_clean_stale_standalone_non_implement_merge(
     tmp_path: Path,
 ) -> None:
     store = _make_store(tmp_path)
@@ -20776,9 +20774,7 @@ def test_pre_dispatch_rebase_gate_rebases_clean_stale_standalone_non_implement_m
         "main",
     )
 
-    assert action["type"] == "needs_rebase"
-    assert action["reason"] == "pre-dispatch-rebase"
-    assert action["deferred_action_type"] == "merge"
+    assert action["type"] == "merge"
 
 
 def test_pre_dispatch_rebase_gate_preserves_current_standalone_non_implement_merge(
@@ -20808,9 +20804,10 @@ def test_pre_dispatch_rebase_gate_preserves_current_standalone_non_implement_mer
     assert action["type"] == "merge"
 
 
-def test_pre_dispatch_rebase_gate_fails_closed_when_standalone_non_implement_behind_probe_unverified(
+def test_pre_dispatch_rebase_gate_merges_standalone_non_implement_when_behind_probe_unverified(
     tmp_path: Path,
 ) -> None:
+    """A merge action skips the freshness probe entirely (can_merge already proves it clean)."""
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     task = _make_completed_standalone_explore_merge_candidate(
@@ -20832,11 +20829,7 @@ def test_pre_dispatch_rebase_gate_fails_closed_when_standalone_non_implement_beh
         "main",
     )
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "pre-dispatch-target-freshness-unverified"
-    assert action["deferred_action_type"] == "merge"
-    assert action["diagnostic"] == "count_commits_behind returned no result"
-    assert action["subject_task_id"] == task.id
+    assert action["type"] == "merge"
 
 
 def test_pre_dispatch_rebase_gate_rebases_conflicting_standalone_non_implement_merge(
@@ -20964,7 +20957,7 @@ def test_current_verify_only_noop_recovery_still_proceeds(
     assert action["current_branch_head_sha"] == "same-head-sha"
 
 
-def test_recovered_green_verify_fix_rebases_before_reprojected_merge(
+def test_recovered_green_verify_fix_merges_directly_without_stale_rebase(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -21002,11 +20995,8 @@ def test_recovered_green_verify_fix_rebases_before_reprojected_merge(
         max_resume_attempts=1,
     )
 
-    assert ordinary_action["type"] == "needs_rebase"
-    assert ordinary_action["deferred_action_type"] == "merge"
-    assert recovered_action["type"] == "needs_rebase"
-    assert recovered_action["reason"] == "pre-dispatch-rebase"
-    assert recovered_action["deferred_action_type"] == "merge"
+    assert ordinary_action["type"] == "merge"
+    assert recovered_action["type"] == "merge"
 
 
 def test_manual_verify_gate_planning_rebases_before_forced_verify(tmp_path: Path) -> None:
@@ -27745,7 +27735,7 @@ def test_rebase_failure_circuit_breaker_wins_over_clean_mergeable_behind_tip(tmp
     assert action["rebase_failure_streak"]["attempts"] == 3
 
 
-def test_clean_mergeable_behind_rebase_failure_circuit_breaker_resets_after_review(
+def test_clean_mergeable_behind_merges_directly_despite_prior_failed_rebase_attempts(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -27791,9 +27781,7 @@ def test_clean_mergeable_behind_rebase_failure_circuit_breaker_resets_after_revi
         "main",
     )
 
-    assert action["type"] == "needs_rebase"
-    assert action["reason"] == "pre-dispatch-rebase"
-    assert action["deferred_action_type"] == "merge"
+    assert action["type"] == "merge"
 
 
 def test_non_stale_branch_keeps_existing_review_action(tmp_path: Path) -> None:

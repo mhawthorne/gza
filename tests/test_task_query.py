@@ -2482,7 +2482,7 @@ def test_incomplete_projection_uses_rebase_flow_for_mergeable_behind_branch(tmp_
     assert row.values["next_action_reason"] == "Rebase before run_review"
 
 
-def test_incomplete_projection_uses_rebase_flow_for_approved_behind_branch(tmp_path: Path) -> None:
+def test_incomplete_projection_merges_directly_for_approved_clean_behind_branch(tmp_path: Path) -> None:
     from tests.cli.conftest import make_store, setup_config
 
     setup_config(tmp_path)
@@ -2540,8 +2540,7 @@ def test_incomplete_projection_uses_rebase_flow_for_approved_behind_branch(tmp_p
 
     assert len(result.rows) == 1
     row = result.rows[0]
-    assert row.values["next_action"] == "needs_rebase"
-    assert row.values["next_action_reason"] == "Rebase before merge"
+    assert row.values["next_action"] == "merge"
 
 
 def test_merge_chain_unmerged_matches_legacy_unmerged_status(tmp_path: Path) -> None:
