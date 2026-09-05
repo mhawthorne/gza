@@ -36,6 +36,7 @@ def cmd_land(args: argparse.Namespace) -> int:
         terminal_result = land_terminal_state(
             store,
             LandRequest(task_id=task_id, policy=policy, dry_run=bool(args.dry_run)),
+            git=git,
             collaborators=LandingCollaborators(
                 reconcile_terminal_state=reconcile_terminal_merge_truth(git),
             ),

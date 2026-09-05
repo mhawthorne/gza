@@ -10,8 +10,10 @@ import pytest
 from gza.db import MergeUnit, SqliteTaskStore
 from gza.landing import (
     LandBlocked,
+    LandResult,
     LandingCollaborators,
     LandingCoordinator,
+    LandingPolicyFacts,
     LandingStore,
     LandRequest,
     LandTerminalResult,
@@ -19,6 +21,7 @@ from gza.landing import (
     TerminalProof,
     reconcile_terminal_merge_truth,
 )
+from gza.sync_ops import BranchSyncResult
 from tests.cli.conftest import invoke_gza, make_store, setup_config
 
 TERMINAL_STATES = ("merged", "empty", "redundant")
@@ -80,6 +83,7 @@ class TerminalProofGit:
         self,
         *,
         merged: bool = False,
+        branch_exists: bool = True,
         source_sha: str = "a" * 40,
         target_sha: str = "a" * 40,
         commits_ahead: int = 0,
@@ -89,6 +93,7 @@ class TerminalProofGit:
     ) -> None:
         self.calls: list[tuple[str, str]] = []
         self.merged = merged
+        self.branch_exists_result = branch_exists
         self.source_sha = source_sha
         self.target_sha = target_sha
         self.commits_ahead = commits_ahead
@@ -98,7 +103,7 @@ class TerminalProofGit:
 
     def branch_exists(self, branch: str) -> bool:
         self.calls.append(("branch_exists", branch))
-        return True
+        return self.branch_exists_result
 
     def is_merged(self, branch: str, into: str | None = None) -> bool:
         self.calls.append(("is_merged", f"{branch}->{into}"))
@@ -129,6 +134,14 @@ class TerminalProofGit:
     def is_patch_equivalent_commit_present_on_target(self, recorded_head_sha: str, target_branch: str) -> bool | None:
         self.calls.append(("is_patch_equivalent_commit_present_on_target", f"{recorded_head_sha}->{target_branch}"))
         return self.patch_present
+
+    def current_branch(self) -> str:
+        self.calls.append(("current_branch", ""))
+        return "main"
+
+    def has_changes(self, *, include_untracked: bool = False) -> bool:
+        self.calls.append(("has_changes", str(include_untracked)))
+        return False
 
 
 def _task_with_unit(
@@ -238,9 +251,10 @@ def test_land_initial_recorded_head_no_work_returns_terminal_when_patch_represen
     recorded_head = "c" * 40
     store, task_id, unit_id = _task_with_unit(tmp_path, state=state, has_commits=True, head_sha=recorded_head)
     counting_store = CountingStore(store)
-    collaborators = _collaborators(reconcile_terminal_merge_truth(TerminalProofGit(patch_present=True)))
+    proof_git = TerminalProofGit(patch_present=True)
+    collaborators = _collaborators(reconcile_terminal_merge_truth(proof_git))
 
-    result = LandingCoordinator(counting_store, collaborators=collaborators).land(
+    result = LandingCoordinator(counting_store, git=proof_git, collaborators=collaborators).land(
         LandRequest(task_id=task_id, dry_run=dry_run)
     )
 
@@ -270,9 +284,10 @@ def test_land_initial_recorded_head_no_work_missing_patch_repairs_only_writable(
         base_sha="e" * 40,
     )
     counting_store = CountingStore(store)
-    collaborators = _collaborators(reconcile_terminal_merge_truth(TerminalProofGit(patch_present=False)))
+    proof_git = TerminalProofGit(patch_present=False)
+    collaborators = _collaborators(reconcile_terminal_merge_truth(proof_git))
 
-    result = LandingCoordinator(counting_store, collaborators=collaborators).land(
+    result = LandingCoordinator(counting_store, git=proof_git, collaborators=collaborators).land(
         LandRequest(task_id=task_id, dry_run=dry_run)
     )
 
@@ -295,9 +310,10 @@ def test_land_initial_recorded_head_no_work_unavailable_proof_fails_closed_termi
 ) -> None:
     store, task_id, unit_id = _task_with_unit(tmp_path, state=state, has_commits=True, head_sha="f" * 40)
     counting_store = CountingStore(store)
-    collaborators = _collaborators(reconcile_terminal_merge_truth(TerminalProofGit(patch_present=None)))
+    proof_git = TerminalProofGit(patch_present=None)
+    collaborators = _collaborators(reconcile_terminal_merge_truth(proof_git))
 
-    result = LandingCoordinator(counting_store, collaborators=collaborators).land(
+    result = LandingCoordinator(counting_store, git=proof_git, collaborators=collaborators).land(
         LandRequest(task_id=task_id, dry_run=dry_run)
     )
 
@@ -307,6 +323,86 @@ def test_land_initial_recorded_head_no_work_unavailable_proof_fails_closed_termi
     assert result.dry_run is dry_run
     assert store.get_merge_unit(unit_id).state == state  # type: ignore[union-attr]
     assert counting_store.merge_unit_state_writes == []
+    collaborators.reconcile_terminal_state.assert_called_once()
+    _assert_zero_downstream_activity(collaborators)
+
+
+@pytest.mark.parametrize("state", NO_WORK_STATES)
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_land_initial_recorded_head_no_work_preserves_identity_when_live_topology_is_merged(
+    tmp_path: Path,
+    *,
+    state: Literal["empty", "redundant"],
+    dry_run: bool,
+) -> None:
+    recorded_head = "7" * 40
+    store, task_id, unit_id = _task_with_unit(tmp_path, state=state, has_commits=True, head_sha=recorded_head)
+    counting_store = CountingStore(store)
+    proof_git = TerminalProofGit(
+        merged=True,
+        source_sha="8" * 40,
+        target_sha="9" * 40,
+        commits_ahead=0,
+        net_diff=False,
+        on_first_parent=False,
+        patch_present=True,
+    )
+    collaborators = _collaborators(reconcile_terminal_merge_truth(proof_git))
+
+    result = LandingCoordinator(counting_store, git=proof_git, collaborators=collaborators).land(
+        LandRequest(task_id=task_id, dry_run=dry_run)
+    )
+
+    assert isinstance(result, LandTerminalResult)
+    assert result.outcome == state
+    assert result.dry_run is dry_run
+    assert store.get_merge_unit(unit_id).state == state  # type: ignore[union-attr]
+    assert counting_store.merge_unit_state_writes == []
+    assert ("is_merged", f"feature/{state}-{task_id}->main") in proof_git.calls
+    collaborators.reconcile_terminal_state.assert_called_once()
+    _assert_zero_downstream_activity(collaborators)
+
+
+@pytest.mark.parametrize(
+    ("patch_present", "dry_run", "expected_result", "expected_state"),
+    [
+        (True, False, "terminal", "empty"),
+        (True, True, "terminal", "empty"),
+        (False, False, "required-review-unavailable", "unmerged"),
+        (False, True, "recorded-head-repair-needed", "empty"),
+        (None, False, "terminal", "empty"),
+        (None, True, "terminal", "empty"),
+    ],
+)
+def test_land_initial_recorded_head_no_work_validates_absent_source_against_recorded_head(
+    tmp_path: Path,
+    *,
+    patch_present: bool | None,
+    dry_run: bool,
+    expected_result: str,
+    expected_state: str,
+) -> None:
+    recorded_head = "a" * 40
+    store, task_id, unit_id = _task_with_unit(tmp_path, state="empty", has_commits=True, head_sha=recorded_head)
+    counting_store = CountingStore(store)
+    proof_git = TerminalProofGit(branch_exists=False, patch_present=patch_present)
+    collaborators = _collaborators(reconcile_terminal_merge_truth(proof_git))
+
+    result = LandingCoordinator(counting_store, git=proof_git, collaborators=collaborators).land(
+        LandRequest(task_id=task_id, dry_run=dry_run)
+    )
+
+    if expected_result == "terminal":
+        assert isinstance(result, LandTerminalResult)
+        assert result.outcome == "empty"
+    else:
+        assert isinstance(result, LandBlocked)
+        assert result.reason_code == expected_result
+    assert store.get_merge_unit(unit_id).state == expected_state  # type: ignore[union-attr]
+    assert counting_store.merge_unit_state_writes == ([] if expected_state == "empty" else [(unit_id, "unmerged")])
+    assert ("branch_exists", f"feature/empty-{task_id}") in proof_git.calls
+    assert ("is_patch_equivalent_commit_present_on_target", f"{recorded_head}->main") in proof_git.calls
+    assert not any(call[0] == "is_merged" for call in proof_git.calls)
     collaborators.reconcile_terminal_state.assert_called_once()
     _assert_zero_downstream_activity(collaborators)
 
@@ -666,3 +762,81 @@ def test_land_cli_reconciles_unmerged_terminal_state_from_canonical_git_proof(
     assert any(call[0] == "count_commits_ahead" for call in proof_git.calls)
     if state == "merged":
         assert any(call[0] == "is_on_first_parent_history" for call in proof_git.calls)
+
+
+@pytest.mark.parametrize("state", NO_WORK_STATES)
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_land_run_reroutes_terminal_no_work_seen_after_coordinator_reresolution_through_shared_validator(
+    tmp_path: Path,
+    *,
+    state: Literal["empty", "redundant"],
+    dry_run: bool,
+) -> None:
+    recorded_head = "b" * 40
+    store, task_id, unit_id = _task_with_unit(tmp_path, state="unmerged", has_commits=True)
+    counting_store = CountingStore(store)
+    proof_git = TerminalProofGit(
+        merged=True,
+        source_sha="c" * 40,
+        target_sha="d" * 40,
+        commits_ahead=0,
+        net_diff=False,
+        on_first_parent=False,
+        patch_present=True,
+    )
+    collaborators = _collaborators(reconcile_terminal_merge_truth(proof_git))
+    reresolve_calls = 0
+
+    def _merge_truth(*args: Any, **kwargs: Any) -> BranchSyncResult:
+        return BranchSyncResult(
+            branch=f"feature/unmerged-{task_id}",
+            task_ids=(task_id,),
+            merge_status="unmerged",
+            head_sha="c" * 40,
+            base_sha="d" * 40,
+        )
+
+    def _facts(identity: Any) -> LandingPolicyFacts:
+        return LandingPolicyFacts(
+            task_id=identity.owner_task_id,
+            merge_unit_state=identity.merge_unit_state,
+            representative_status="completed",
+            has_active_merge_unit=True,
+            has_local_source=True,
+            target_matches_checkout=True,
+            dependency_ready=True,
+            project_scope_ok=True,
+            checkout_clean=True,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+        )
+
+    def _should_re_resolve(*_args: Any) -> bool:
+        nonlocal reresolve_calls
+        reresolve_calls += 1
+        unit = store.get_merge_unit(unit_id)
+        assert unit is not None
+        store.refresh_merge_unit_head(unit.id, head_sha=recorded_head)
+        store.set_merge_unit_state(unit.id, state)
+        return True
+
+    result = LandingCoordinator(
+        store=counting_store,
+        git=proof_git,
+        reconcile_merge_truth=_merge_truth,
+        inspect_policy_facts=_facts,
+        should_re_resolve=_should_re_resolve,
+        collaborators=collaborators,
+    ).run(LandRequest(task_id=task_id, dry_run=dry_run))
+
+    assert isinstance(result, LandResult)
+    assert result.blocked is None
+    assert result.terminal_outcome == state
+    assert result.already_merged is False
+    assert result.terminal_reconciled is False
+    assert reresolve_calls == 1
+    assert store.get_merge_unit(unit_id).state == state  # type: ignore[union-attr]
+    assert counting_store.merge_unit_state_writes == []
+    assert ("is_patch_equivalent_commit_present_on_target", f"{recorded_head}->main") in proof_git.calls
+    collaborators.reconcile_terminal_state.assert_called_once()
+    _assert_zero_downstream_activity(collaborators)
