@@ -110,6 +110,7 @@ from ..merge_services import (
     ManualMergeExecutionResult,
     ManualMergeExecutionStatus,
     MergeDeferredBlockerDecision as _MergeDeferredBlockerDecision,
+    MergeLandingAuthorization,
     ResolvedMergeSubject as _ResolvedMergeSubject,
     classify_manual_merge_blockers,
     execute_manual_merge,
@@ -1718,6 +1719,8 @@ def _merge_single_task(
     on_heartbeat: LongPhaseHeartbeat | None = None,
     before_irreversible_side_effect: Callable[[Mapping[str, Any] | None], "_MergeActionResult | None"] | None = None,
     resolved_subject: _ResolvedMergeSubject | None = None,
+    landing_authorization: MergeLandingAuthorization | None = None,
+    load_landing_authorization: Callable[[], MergeLandingAuthorization | None] | None = None,
 ) -> _MergeSingleTaskResult:
     """Merge a single task's branch."""
     option_error = _merge_option_relationship_error(args)
@@ -1928,6 +1931,19 @@ def _merge_single_task(
             effective_merge_source = manual_force_merge_source(merge_source)
             description = str(planned_action.get("description") or "merge is blocked")
             print(f"Warning: Forcing merge despite lifecycle gate: {description}")
+        elif (
+            landing_authorization is not None
+            and "defer-review-blockers" in landing_authorization.allowed_overrides
+            and materialize_side_effects
+            and _is_review_changes_requested_improve_action(
+                planned_action,
+                store=store,
+                merge_subject=merge_subject,
+            )
+        ):
+            effective_merge_source = merge_source
+            description = str(planned_action.get("description") or "merge is blocked")
+            print(f"Warning: Landing with guarded authorization despite lifecycle gate: {description}")
         elif is_red_verify_gate_family_action(planned_action):
             description = str(planned_action.get("description") or "verify gate proof is unavailable")
             action_type = str(planned_action.get("type") or "")
@@ -1971,7 +1987,9 @@ def _merge_single_task(
     if planned_action.get("type") in {"merge", "merge_with_followups"}:
         authorized_merge_action = dict(planned_action)
     authorized_source_ref_sha: str | None = None
-    if authorized_merge_action is not None and _merge_finalization_family_for_action(authorized_merge_action) is not None:
+    if landing_authorization is not None:
+        authorized_source_ref_sha = landing_authorization.source_sha
+    elif authorized_merge_action is not None and _merge_finalization_family_for_action(authorized_merge_action) is not None:
         try:
             authorized_source_ref_sha = _require_ref_sha_for_merge_finalization_proof(
                 git,
@@ -1991,7 +2009,9 @@ def _merge_single_task(
             )
     merge_preflight_target = merge_preflight_ref or current_branch
     expected_preflight_target_sha: str | None = None
-    if authorized_merge_action is not None and _merge_finalization_family_for_action(authorized_merge_action) is not None:
+    if landing_authorization is not None:
+        expected_preflight_target_sha = landing_authorization.target_sha
+    elif authorized_merge_action is not None and _merge_finalization_family_for_action(authorized_merge_action) is not None:
         try:
             expected_preflight_target_sha = _require_ref_sha_for_merge_finalization_proof(
                 git,
@@ -2075,6 +2095,7 @@ def _merge_single_task(
             pre_materialized_deferred_blockers=pregate_deferred_blockers,
             pre_materialized_deferred_blockers_printed=pregate_deferred_blockers_printed,
             process_monitor_factory=process_monitor_factory,
+            landing_authorization=landing_authorization,
         ),
         ManualMergeExecutionHooks(
             build_commit_message=_build_commit_message,
@@ -2092,12 +2113,19 @@ def _merge_single_task(
                 store,
                 config,
                 subject,
-                defer_blockers=getattr(args, "defer_blockers", False),
+                defer_blockers=(
+                    getattr(args, "defer_blockers", False)
+                    or (
+                        landing_authorization is not None
+                        and "defer-review-blockers" in landing_authorization.allowed_overrides
+                    )
+                ),
             ),
             print_deferred_blockers=_print_deferred_blocker_tasks,
             materialize_followups=lambda subject: _materialize_merge_followups(store, config, subject),
             print_followups=_print_followups,
             before_irreversible_side_effect=_run_before_irreversible_side_effect,
+            load_landing_authorization=load_landing_authorization,
         ),
     )
     coerced = _coerce_manual_merge_execution_result(result)

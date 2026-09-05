@@ -26,6 +26,7 @@ from gza.db import SqliteTaskStore, Task as DbTask, _task_is_actionable_merge_un
 from gza.dependency_preconditions import dependency_readiness
 from gza.merge_services import (
     ManualMergeExecutionResult,
+    MergeLandingAuthorization,
     ResolvedMergeSubject,
     check_manual_merge_preflight,
     resolve_merge_subject_query_only,
@@ -1995,6 +1996,47 @@ class LandingPolicyDecision:
         object.__setattr__(self, "judgment_key", judgment_refs[1] if judgment_refs else None)
         if not self.allowed and self.followup_materialization_identities:
             raise ValueError("denied landing policy decisions cannot carry follow-up materialization inputs")
+
+
+def landing_merge_authorization_from_facts(
+    *,
+    identity: LandingResolvedIdentity,
+    facts: LandingPolicyFacts,
+    decision: LandingPolicyDecision,
+) -> MergeLandingAuthorization:
+    """Build the exact merge-side authorization snapshot for landing."""
+
+    if not decision.allowed:
+        raise ValueError("denied landing decisions cannot authorize a merge")
+    if identity.source_ref is None or identity.source_sha is None or identity.target_sha is None:
+        raise ValueError("landing authorization requires exact source and target heads")
+    review = facts.review
+    verify = facts.verify
+    return MergeLandingAuthorization(
+        owner_task_id=identity.owner_task_id,
+        merge_unit_id=identity.merge_unit_id,
+        source_ref=identity.source_ref,
+        target_branch=identity.target_branch,
+        source_sha=identity.source_sha,
+        target_sha=identity.target_sha,
+        allowed_overrides=tuple(decision.allowed_overrides),
+        judgment_artifact_id=decision.judgment_artifact_id,
+        judgment_key=decision.judgment_key,
+        review_id=review.review_id if review is not None else None,
+        reviewed_head=review.reviewed_head if review is not None else None,
+        review_mode=review.mode if review is not None else None,
+        review_verdict=review.verdict if review is not None else None,
+        blocker_fingerprints=tuple(blocker.fingerprint for blocker in facts.open_blockers if blocker.fingerprint),
+        followup_fingerprints=tuple(
+            item.fingerprint_key for item in decision.followup_materialization_identities
+        ),
+        verify_epoch=verify.epoch if verify is not None else None,
+        verify_verdict=verify.status if verify is not None else None,
+        verify_gate_identity=verify.gate_identity if verify is not None else None,
+        verify_tree_fingerprint=verify.tree_fingerprint if verify is not None else None,
+        parked_reason=facts.parked_reason,
+        adjudication_fingerprints=facts.adjudication_fingerprints,
+    )
 
 
 @dataclass(frozen=True)

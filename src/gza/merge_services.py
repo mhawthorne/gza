@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any, Literal
 
 from gza.query import get_reviews_for_root
@@ -57,6 +59,39 @@ class ManualMergePreflightResult:
     block_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class MergeLandingAuthorization:
+    """Exact landing decision identity authorized before merge side effects."""
+
+    owner_task_id: str
+    merge_unit_id: str | None
+    source_ref: str
+    target_branch: str
+    source_sha: str
+    target_sha: str
+    allowed_overrides: tuple[str, ...] = ()
+    judgment_artifact_id: str | None = None
+    judgment_key: str | None = None
+    review_id: str | None = None
+    reviewed_head: str | None = None
+    review_mode: str | None = None
+    review_verdict: str | None = None
+    blocker_fingerprints: tuple[str, ...] = ()
+    followup_fingerprints: tuple[str, ...] = ()
+    verify_epoch: str | None = None
+    verify_verdict: str | None = None
+    verify_gate_identity: str | None = None
+    verify_tree_fingerprint: str | None = None
+    parked_reason: str | None = None
+    adjudication_fingerprints: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "allowed_overrides", tuple(sorted(set(self.allowed_overrides))))
+        object.__setattr__(self, "blocker_fingerprints", tuple(sorted(set(self.blocker_fingerprints))))
+        object.__setattr__(self, "followup_fingerprints", tuple(sorted(set(self.followup_fingerprints))))
+        object.__setattr__(self, "adjudication_fingerprints", tuple(sorted(set(self.adjudication_fingerprints))))
+
+
 ManualMergeExecutionStatus = Literal[
     "merged",
     "already_merged",
@@ -78,6 +113,7 @@ ManualMergeExecutionStatus = Literal[
     "isolated_post_promotion_proof_persistence_failed",
     "isolated_post_promotion_rollback_failed",
     "isolated_promotion_rollback_failed_target_uncertain",
+    "landing_authorization_changed",
     "max_cycle_lifecycle_authority_changed",
     "merge_cleanup_failed",
     "merge_conflict",
@@ -123,6 +159,7 @@ class ManualMergeExecutionRequest:
     pre_materialized_deferred_blockers_printed: bool = False
     pending_squash_reconcile: Any = None
     process_monitor_factory: Any = None
+    landing_authorization: MergeLandingAuthorization | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +175,7 @@ class ManualMergeExecutionHooks:
     print_followups: Callable[[DbTask, tuple[list[DbTask], list[DbTask]]], None]
     emit: Callable[[str], None] = print
     before_irreversible_side_effect: Callable[[DbTask], ManualMergeExecutionResult | None] | None = None
+    load_landing_authorization: Callable[[], MergeLandingAuthorization | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -584,6 +622,9 @@ def execute_manual_merge(
     reused_deferred_blockers: list[DbTask] = []
     created_followups: list[DbTask] = []
     reused_followups: list[DbTask] = []
+    authorization_refusal = _validate_landing_authorization_before_side_effects(request, hooks)
+    if authorization_refusal is not None:
+        return authorization_refusal
     if hooks.before_irreversible_side_effect is not None:
         side_effect_result = hooks.before_irreversible_side_effect(request.merge_subject)
         if side_effect_result is not None:
@@ -607,6 +648,9 @@ def execute_manual_merge(
             if not request.no_followups:
                 created_followups, reused_followups = hooks.materialize_followups(request.merge_subject)
                 hooks.print_followups(request.merge_subject, (created_followups, reused_followups))
+            audit_refusal = _persist_landing_merge_authorization_audit(request, hooks)
+            if audit_refusal is not None:
+                return audit_refusal
         except Exception as exc:
             if isinstance(exc, FollowupMaterializationError):
                 created_followups.extend(exc.created)
@@ -773,6 +817,121 @@ def execute_manual_merge(
             status="merge_failed",
             block_reason=f"merge failed: {exc}",
         )
+
+
+def _validate_landing_authorization_before_side_effects(
+    request: ManualMergeExecutionRequest,
+    hooks: ManualMergeExecutionHooks,
+) -> ManualMergeExecutionResult | None:
+    authorization = request.landing_authorization
+    if authorization is None:
+        return None
+    rev_parse_if_exists = getattr(request.git, "rev_parse_if_exists", None)
+    current_source_sha = rev_parse_if_exists(request.merge_source_ref) if callable(rev_parse_if_exists) else None
+    current_target_sha = rev_parse_if_exists(request.merge_preflight_target) if callable(rev_parse_if_exists) else None
+    if current_source_sha != authorization.source_sha:
+        return _landing_authorization_refusal(
+            hooks,
+            "landing source head changed after authorization",
+            authorization.source_sha,
+            current_source_sha,
+        )
+    if current_target_sha != authorization.target_sha:
+        return _landing_authorization_refusal(
+            hooks,
+            "landing target head changed after authorization",
+            authorization.target_sha,
+            current_target_sha,
+        )
+    if hooks.load_landing_authorization is None:
+        return _landing_authorization_refusal(
+            hooks,
+            "landing authorization current-evidence loader is unavailable",
+            "present",
+            None,
+        )
+    try:
+        current = hooks.load_landing_authorization()
+    except Exception as exc:
+        return _landing_authorization_refusal(
+            hooks,
+            f"landing authorization current evidence is unavailable: {exc}",
+            "available",
+            None,
+        )
+    if current != authorization:
+        return _landing_authorization_refusal(
+            hooks,
+            "landing authorization changed before merge side effects",
+            repr(authorization),
+            repr(current),
+        )
+    return None
+
+
+def _persist_landing_merge_authorization_audit(
+    request: ManualMergeExecutionRequest,
+    hooks: ManualMergeExecutionHooks,
+) -> ManualMergeExecutionResult | None:
+    authorization = request.landing_authorization
+    if authorization is None:
+        return None
+    task_id = request.merge_subject.id
+    if task_id is None:
+        return _landing_authorization_refusal(
+            hooks,
+            "landing authorization audit cannot identify merge subject",
+            "task ID",
+            None,
+        )
+    payload = {
+        "kind": "landing_merge_authorization",
+        "authorization": authorization.__dict__,
+        "merge_source": request.merge_source,
+        "merge_unit_id": request.merge_unit_id,
+    }
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = sha256(body.encode()).hexdigest()
+    try:
+        request.store.add_artifact(
+            task_id,
+            kind="landing_merge_authorization",
+            label="landing_merge_authorization",
+            path=f".gza/artifacts/{task_id}/landing-merge-authorization-{digest}.json",
+            content_type="application/json",
+            byte_size=len(body.encode()),
+            sha256=digest,
+            producer="gza.merge_services",
+            status="authorized",
+            head_sha=authorization.source_sha,
+            metadata=payload,
+        )
+    except Exception as exc:
+        return _landing_authorization_refusal(
+            hooks,
+            f"landing authorization audit persistence failed: {exc}",
+            "persisted",
+            None,
+        )
+    return None
+
+
+def _landing_authorization_refusal(
+    hooks: ManualMergeExecutionHooks,
+    reason: str,
+    expected: str | None,
+    actual: str | None,
+) -> ManualMergeExecutionResult:
+    block_reason = (
+        f"{reason}; expected {expected or 'unavailable'}, got {actual or 'unavailable'}; "
+        "source remains unmerged"
+    )
+    hooks.emit(f"Error: {block_reason}")
+    return ManualMergeExecutionResult(
+        rc=1,
+        status="landing_authorization_changed",
+        block_reason=block_reason,
+    )
 
 
 def mark_merge_subject_merged(
