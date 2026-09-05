@@ -506,28 +506,35 @@ def _draw_merges(ax, merges, bucket="hour", labels="auto", band=MERGE_BAND_DEFAU
         """(rows_needed for horizontal fit, uniform row height px) for a box set."""
         total_px = sum(2 * b[2] for b in bxs) + gap_px * (len(bxs) - 1)
         rows_needed = max(1, math.ceil(total_px / usable_px)) if usable_px else 1
-        # Always alternate at least 2 rows when there's more than one box, even if
-        # one row would technically fit them all: staggering "one higher, one
-        # lower" lets nearby-in-time boxes sit closer together horizontally
-        # instead of being pushed apart along a single row, where a wide box can
-        # shove a later-in-time neighbour far enough right that its leader line
-        # reads as pointing backward in time.
-        if len(bxs) > 1:
-            rows_needed = max(rows_needed, 2)
+        # Stagger to >=2 rows only when some adjacent-in-time boxes would
+        # actually need to be spread apart on a single row - that's exactly
+        # the case where a wide box can shove a later-in-time neighbour far
+        # enough right that its leader line reads as pointing backward in
+        # time. Well-separated boxes stay on one row, as before, so this
+        # doesn't inflate the height estimate (and wrongly downgrade the
+        # auto ids/count choice to counts) for the common, non-clustered case.
+        if len(bxs) > 1 and rows_needed == 1:
+            desired = [b[1] for b in bxs]
+            would_overlap = any(
+                desired[i + 1] - desired[i] < bxs[i][2] + bxs[i + 1][2] + gap_px
+                for i in range(len(bxs) - 1)
+            )
+            if would_overlap:
+                rows_needed = 2
         row_h = max((b[4] for b in bxs), default=1) * line_px + 12
         return rows_needed, row_h
 
-    def vpx(rows_needed, row_h):
-        """Vertical pixels a layout wants: rows_needed rows, each row_h tall."""
-        return rows_needed * (row_h + gap_px)
-
-    # Resolve auto label mode: prefer ids only if the id boxes genuinely fit inside the
-    # capped band (a single day's box can be dozens of ids tall — taller than the whole
-    # band — in which case we must fall back to counts, not silently overflow).
+    # Resolve auto label mode: prefer ids unless even a single row of them can't
+    # fit the capped band at all (e.g. a bucket with dozens of ids stacked in
+    # one box, taller than the whole band). More boxes than fit across the
+    # available rows is NOT a reason to fall back to counts - that overflow is
+    # already handled below by keeping only as many boxes as fit and dropping
+    # the rest (with a note), which is far more useful than showing no ids at
+    # all just because the full set didn't fit.
     mode = labels
     if mode == "auto":
-        rn, rh = layout(build("ids"))
-        mode = "ids" if band_budget_px and vpx(rn, rh) <= band_budget_px else "count"
+        _rn, rh = layout(build("ids"))
+        mode = "ids" if band_budget_px and rh + gap_px <= band_budget_px else "count"
 
     boxes = build(mode)
     rows_needed, row_h = layout(boxes)
