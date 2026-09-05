@@ -480,8 +480,34 @@ class LandingCoordinator:
         *,
         persist_reconciliation: bool,
     ) -> LandingResolvedIdentity | LandBlocked:
+        target_branch: str | None = None
         try:
-            target_branch = self._default_target_branch()
+            selected_task = self.store.get(request.task_id)
+            if selected_task is None:
+                return LandBlocked(
+                    "identity-proof-unavailable",
+                    "selected task does not resolve to a landing merge unit",
+                    _evidence_refs(request.task_id),
+                )
+            if selected_task.id is not None:
+                selected_unit = self.store.resolve_merge_unit_for_task(selected_task.id)
+                if selected_unit is not None:
+                    target_branch = _normalize_optional_identity(selected_unit.target_branch)
+                    if target_branch is None:
+                        return LandBlocked(
+                            "identity-proof-unavailable",
+                            "selected task is attached to a merge unit without a canonical target branch",
+                            _evidence_refs(request.task_id, selected_unit.id),
+                        )
+        except Exception as exc:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                _exception_fact("selected task merge-unit identity is unavailable", exc),
+                _evidence_refs(request.task_id),
+            )
+        try:
+            if target_branch is None:
+                target_branch = self._default_target_branch()
         except Exception as exc:
             return LandBlocked(
                 "identity-proof-unavailable",

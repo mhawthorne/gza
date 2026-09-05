@@ -2313,6 +2313,33 @@ def _completed_impl(store: SqliteTaskStore, prompt: str, branch: str) -> Task:
     return refreshed
 
 
+def _completed_impl_with_stored_unit(
+    store: SqliteTaskStore,
+    prompt: str,
+    branch: str,
+    *,
+    target_branch: str,
+) -> tuple[Task, Any]:
+    task = store.add(prompt, task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    task.branch = branch
+    store.update(task)
+    unit = store.create_merge_unit(
+        source_branch=branch,
+        target_branch=target_branch,
+        owner_task_id=task.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    return refreshed, unit
+
+
 def _sqlite_task_snapshot(store: SqliteTaskStore) -> tuple[tuple[Any, ...], ...]:
     with store._connect() as conn:
         rows = conn.execute(
@@ -2367,6 +2394,53 @@ def test_landing_coordinator_resolves_owner_descendant_and_review_to_canonical_u
     assert result.source_ref == "feature/landing"
     assert result.target_branch == "main"
     assert result.steps[0].status == "completed"
+
+
+@pytest.mark.parametrize("selection", ("owner", "descendant", "review"))
+def test_landing_coordinator_uses_stored_unit_target_when_default_discovery_fails(
+    tmp_path,
+    selection: str,
+) -> None:
+    store = _coordinator_store(tmp_path)
+    owner, unit = _completed_impl_with_stored_unit(
+        store,
+        "stored target owner",
+        "feature/stored-target",
+        target_branch="release",
+    )
+    assert owner.id is not None
+    descendant = store.add("stored target descendant", task_type="implement", based_on=owner.id, same_branch=True)
+    store.mark_completed(descendant, has_commits=True, branch="feature/stored-target")
+    review = store.add("stored target review", task_type="review", depends_on=descendant.id, based_on=descendant.id)
+    assert descendant.id is not None and review.id is not None
+    store.attach_task_to_merge_unit(descendant.id, unit.id, "member")
+    store.attach_task_to_merge_unit(review.id, unit.id, "review")
+
+    def fail_default_target(*, strict: bool) -> str:
+        assert strict is True
+        raise RuntimeError("default target unavailable")
+
+    setattr(store, "default_merge_target", fail_default_target)
+    git = _LandingSourceGit(
+        {"feature/stored-target": "source-a", "release": "target-a"},
+        current_branch="release",
+        local_branches={"feature/stored-target"},
+        ancestors={("target-a", "source-a")},
+    )
+
+    selected_id = {
+        "owner": owner.id,
+        "descendant": descendant.id,
+        "review": review.id,
+    }[selection]
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=selected_id, dry_run=True))
+
+    assert result.blocked is None
+    assert result.owner_task_id == descendant.id
+    assert result.source_ref == "feature/stored-target"
+    assert result.target_branch == "release"
+    assert result.steps[0].status == "completed"
+    assert any(step.phase == "verify" and step.status == "conditional" for step in result.steps)
 
 
 def test_landing_coordinator_keeps_sibling_merge_units_isolated(tmp_path) -> None:
@@ -2616,7 +2690,14 @@ def test_landing_coordinator_dry_run_has_zero_mutations(tmp_path) -> None:
 
 def test_landing_coordinator_strict_target_resolution_failure_returns_typed_block(tmp_path) -> None:
     store = _coordinator_store(tmp_path)
-    impl = _completed_impl(store, "target failure", "feature/target")
+    impl = store.add("target failure", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    impl.has_commits = True
+    impl.merge_status = "unmerged"
+    impl.branch = "feature/target"
+    store.update(impl)
     assert impl.id is not None
 
     def fail_default_target(*, strict: bool) -> str:
@@ -2806,7 +2887,17 @@ def test_landing_coordinator_exception_facts_render_as_one_sentence(
     expected_reason: str,
 ) -> None:
     store = _coordinator_store(tmp_path)
-    impl = _completed_impl(store, f"{failure_site} exception", f"feature/{failure_site}")
+    if failure_site == "target-resolution":
+        impl = store.add(f"{failure_site} exception", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.completed_at = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        impl.branch = f"feature/{failure_site}"
+        store.update(impl)
+    else:
+        impl = _completed_impl(store, f"{failure_site} exception", f"feature/{failure_site}")
     assert impl.id is not None
     diagnostic = f"{failure_site} failed. secondary diagnostic\nthird line"
 
