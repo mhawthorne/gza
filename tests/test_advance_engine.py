@@ -36,6 +36,7 @@ from gza.advance_engine import (
     count_completed_review_cycles,
     evaluate_advance_rules,
     failed_recovery_decision_to_action,
+    format_needs_attention_entry,
     get_action_subject_task_id,
     needs_attention_recommended_next_step,
     pending_merge_finalization_action,
@@ -22787,6 +22788,41 @@ def test_review_unknown_verdict_uses_reviewed_task_as_subject(tmp_path: Path, mo
     assert action["subject_task_id"] == impl.id
     assert review.id is not None
     assert action["review_task"].id == review.id
+
+
+def test_format_needs_attention_entry_hints_override_for_non_passing_review(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The needs-attention display line for a non-passing review verdict must
+    name the force-approve override command, not just the bare reason code."""
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/review-verdict-hint",
+        when=datetime(2026, 5, 15, 9, 0, tzinfo=UTC),
+    )
+    _add_completed_review(store, impl, when=datetime(2026, 5, 15, 10, 0, tzinfo=UTC))
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="SOMETHING_ELSE",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+    assert action["needs_attention_reason"] == "review-verdict-needs-manual-attention"
+
+    line = format_needs_attention_entry(impl, prompt="test prompt", action=action)
+    assert "non-passing review" in line
+    assert f"scripts/review_state.py {impl.id} --force-approve" in line
 
 
 def test_review_unknown_verdict_subject_is_implement_when_evaluated_from_improve_leaf(

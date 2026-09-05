@@ -4358,6 +4358,9 @@ def is_red_verify_gate_family_action(action: Mapping[str, Any]) -> bool:
     return action_type == "needs_discussion" and get_needs_attention_reason(action) == PARK_REASON_VERIFY_FIX_FAILED
 
 
+_NON_PASSING_REVIEW_NEEDS_ATTENTION_REASONS = frozenset({"review-verdict-needs-manual-attention"})
+
+
 def format_needs_attention_entry(task: DbTask, *, prompt: str, action: Mapping[str, Any]) -> str:
     """Render a stable needs-attention line shared by advance/watch/iterate."""
     description = str(action.get("description", "")).strip()
@@ -4366,7 +4369,14 @@ def format_needs_attention_entry(task: DbTask, *, prompt: str, action: Mapping[s
     reason = get_needs_attention_reason(action) or "needs-attention"
     task_id = task.id or "unknown"
     task_type = task.task_type or "task"
-    return f'{task_id} {task_type} "{prompt}" reason={reason} {description}'
+    line = f'{task_id} {task_type} "{prompt}" reason={reason} {description}'
+    if reason in _NON_PASSING_REVIEW_NEEDS_ATTENTION_REASONS:
+        line += (
+            f" -- blocked by a non-passing review; to override, run "
+            f"`scripts/review_state.py {task_id} --force-approve \"<reason>\"` "
+            f"and re-run advance"
+        )
+    return line
 
 
 def format_needs_attention_entry_for_display(
