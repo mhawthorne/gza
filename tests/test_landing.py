@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime
+from hashlib import sha256
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -12,6 +15,7 @@ from gza.db import SqliteTaskStore, Task
 from gza.landing import (
     LANDING_PHASES,
     LandBlocked,
+    LandingCoordinator,
     LandingFollowupFinding,
     LandingFollowupMaterializationIdentity,
     LandingJudgeVerdict,
@@ -26,6 +30,7 @@ from gza.landing import (
     LandingSpecCoherenceEvidence,
     LandingSpecCoherenceFingerprint,
     LandingStateFingerprint,
+    LandingTransitionLimitPolicy,
     LandingVerifyEvidence,
     LandPostMergeVerifyFailure,
     LandRequest,
@@ -38,6 +43,7 @@ from gza.landing import (
     inspect_current_landing_verify_evidence,
     run_landing_post_rebase_review_transition,
 )
+from gza.review_scope import build_spec_coherence_review_scope
 from gza.review_scope import build_resolution_review_scope
 from gza.review_tasks import DuplicateReviewError
 from gza.review_verify_state import (
@@ -54,6 +60,7 @@ from gza.runner import (
     ReviewVerifyResult,
     _persist_lifecycle_verify_execution,
 )
+from gza.sync_ops import BranchSyncResult
 
 TREE_A = "a" * 64
 TREE_B = "b" * 64
@@ -2209,11 +2216,1407 @@ def test_land_result_carries_typed_blocking_fact_and_terminal_sentence() -> None
 
 
 class _FakeGit:
-    def __init__(self, heads: dict[str, str]) -> None:
+    def __init__(
+        self,
+        heads: dict[str, str],
+        *,
+        current_branch: str = "main",
+        dirty: bool = False,
+        merged_refs: set[tuple[str, str]] | None = None,
+        ancestors: set[tuple[str, str]] | None = None,
+        can_merge_refs: set[tuple[str, str]] | None = None,
+        name_status: str = "",
+    ) -> None:
         self.heads = heads
+        self._current_branch = current_branch
+        self.dirty = dirty
+        self.merged_refs = merged_refs or set()
+        self.ancestors = ancestors or set()
+        self.can_merge_refs = can_merge_refs
+        self.name_status = name_status
+        self.merge_calls: list[tuple[str, str | None]] = []
+        self.mutation_calls: list[str] = []
 
     def rev_parse_if_exists(self, ref: str) -> str | None:
         return self.heads.get(ref)
+
+    def current_branch(self) -> str:
+        return self._current_branch
+
+    def has_changes(self, include_untracked: bool = False) -> bool:
+        assert include_untracked is False
+        return self.dirty
+
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        return (ancestor, descendant) in self.ancestors
+
+    def can_merge(self, branch: str, into: str | None = None) -> bool:
+        target = into or self._current_branch
+        if self.can_merge_refs is None:
+            return True
+        return (branch, target) in self.can_merge_refs
+
+    def get_diff_name_status(self, revision_range: str, *, check: bool = True) -> str:
+        assert check is True
+        return self.name_status
+
+    def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
+        del use_cherry
+        target = into or self._current_branch
+        self.merge_calls.append((branch, target))
+        return (branch, target) in self.merged_refs
+
+    def merge(self, *_args: object, **_kwargs: object) -> None:
+        self.mutation_calls.append("merge")
+
+
+class _LandingSourceGit(_FakeGit):
+    def __init__(self, heads: dict[str, str], *, local_branches: set[str], **kwargs: Any) -> None:
+        super().__init__(heads, **kwargs)
+        self.local_branches = local_branches
+
+    def branch_exists(self, branch: str) -> bool:
+        return branch in self.local_branches
+
+    def ref_exists(self, ref: str) -> bool:
+        return ref in self.heads
+
+
+def _coordinator_store(tmp_path) -> SqliteTaskStore:
+    return SqliteTaskStore(tmp_path / "test.db")
+
+
+def _set_landing_subdir_project_boundary(config: Config, tmp_path) -> None:
+    from gza.runner import ProjectBoundary
+
+    repo_root = tmp_path
+    project_dir = tmp_path / "services" / "foo"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    config.project_dir = project_dir
+    config.enforce_project_scope = True
+    setattr(
+        config,
+        "_project_boundary_cache",
+        ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        ),
+    )
+
+
+def _completed_impl(store: SqliteTaskStore, prompt: str, branch: str) -> Task:
+    task = store.add(prompt, task_type="implement")
+    store.mark_completed(task, has_commits=True, branch=branch)
+    refreshed = store.get(task.id or "")
+    assert refreshed is not None
+    return refreshed
+
+
+def _sqlite_task_snapshot(store: SqliteTaskStore) -> tuple[tuple[Any, ...], ...]:
+    with store._connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, status, task_type, branch, merge_status, merged_at, completion_reason
+            FROM tasks
+            ORDER BY id
+            """
+        ).fetchall()
+    return tuple(tuple(row) for row in rows)
+
+
+def _sqlite_merge_unit_snapshot(store: SqliteTaskStore) -> tuple[tuple[Any, ...], ...]:
+    with store._connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, source_branch, target_branch, state, owner_task_id, merged_at, merge_source
+            FROM merge_units
+            ORDER BY id
+            """
+        ).fetchall()
+    return tuple(tuple(row) for row in rows)
+
+
+def _assert_single_terminal_sentence(blocked: LandBlocked, task_id: str) -> None:
+    sentence = blocked.terminal_sentence(task_id)
+    assert "\n" not in sentence
+    assert sentence.startswith(f"Cannot land {task_id}: ")
+    assert sentence.endswith(".")
+    assert sentence.count(".") == 1
+
+
+def test_landing_coordinator_resolves_owner_descendant_and_review_to_canonical_unit(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    owner = _completed_impl(store, "owner", "feature/landing")
+    retry = store.add("retry", task_type="implement", based_on=owner.id, same_branch=True)
+    store.mark_completed(retry, has_commits=True, branch="feature/landing")
+    review = store.add("review", task_type="review", based_on=retry.id)
+    assert retry.id is not None and review.id is not None
+    unit = store.get_or_create_merge_unit_for_task(retry)
+    assert unit is not None
+    store.attach_task_to_merge_unit(review.id, unit.id, "review")
+    git = _LandingSourceGit(
+        {"feature/landing": "source-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "source-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=review.id, dry_run=True))
+
+    assert result.owner_task_id == retry.id
+    assert result.source_ref == "feature/landing"
+    assert result.target_branch == "main"
+    assert result.steps[0].status == "completed"
+
+
+def test_landing_coordinator_keeps_sibling_merge_units_isolated(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    first = _completed_impl(store, "first", "feature/first")
+    second = _completed_impl(store, "second", "feature/second")
+    first_unit = store.get_or_create_merge_unit_for_task(first)
+    second_unit = store.get_or_create_merge_unit_for_task(second)
+    assert first_unit is not None and second_unit is not None and first.id is not None
+    git = _LandingSourceGit(
+        {
+            "feature/first": "source-first",
+            "feature/second": "source-second",
+            "main": "target-a",
+        },
+        local_branches={"feature/first", "feature/second"},
+        ancestors={("target-a", "source-first"), ("target-a", "source-second")},
+    )
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=first.id, dry_run=True))
+
+    assert result.owner_task_id == first.id
+    assert result.source_ref == "feature/first"
+    assert result.steps[0].evidence_refs
+    assert second_unit.id not in result.steps[0].evidence_refs
+
+
+def test_landing_coordinator_missing_local_source_fails_closed(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "missing source", "feature/missing")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None and impl.id is not None
+    git = _LandingSourceGit({"main": "target-a"}, local_branches=set())
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=impl.id, dry_run=True))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "identity-proof-unavailable"
+    assert result.blocked.terminal_sentence(impl.id).startswith(f"Cannot land {impl.id}: ")
+
+
+def test_landing_coordinator_dirty_checkout_precedes_rebase_or_verify(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "dirty", "feature/dirty")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None and impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/dirty": "source-a", "main": "target-a"},
+        local_branches={"feature/dirty"},
+        dirty=True,
+    )
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "dirty-checkout"
+    assert [step.phase for step in result.steps] == ["resolve", "resolve"]
+
+
+@pytest.mark.parametrize("case", ("dependency", "scope_violation", "scope_inspection_failure"))
+def test_landing_coordinator_dirty_checkout_does_not_mask_higher_priority_identity_facts(
+    tmp_path,
+    case: str,
+) -> None:
+    store = _coordinator_store(tmp_path)
+    config: Config | None = None
+    if case == "dependency":
+        dependency = _completed_impl(store, "dependency", "feature/dependency")
+        impl = store.add("dependent", task_type="implement", depends_on=dependency.id)
+        store.mark_completed(impl, has_commits=True, branch="feature/dependent")
+        branch = "feature/dependent"
+        name_status = ""
+    else:
+        config = Config(project_dir=tmp_path, project_name="scope-project")
+        _set_landing_subdir_project_boundary(config, tmp_path)
+        impl = _completed_impl(store, f"dirty {case}", f"feature/{case}")
+        branch = f"feature/{case}"
+        name_status = (
+            "M\tservices/bar/app.py\n"
+            if case == "scope_violation"
+            else "M\tservices/foo/app.py\n"
+        )
+    refreshed = store.get(impl.id or "")
+    assert refreshed is not None and refreshed.id is not None
+    before_tasks = _sqlite_task_snapshot(store)
+    before_units = _sqlite_merge_unit_snapshot(store)
+
+    class ScopeFailureGit(_LandingSourceGit):
+        def get_diff_name_status(self, revision_range: str, *, check: bool = True) -> str:
+            if case == "scope_inspection_failure":
+                raise RuntimeError("diff inspection failed. secondary diagnostic")
+            return super().get_diff_name_status(revision_range, check=check)
+
+    git = ScopeFailureGit(
+        {branch: "source-a", "main": "target-a"},
+        local_branches={branch},
+        ancestors={("target-a", "source-a")},
+        dirty=True,
+        name_status=name_status,
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(
+        LandRequest(task_id=refreshed.id, dry_run=True)
+    )
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "identity-proof-unavailable"
+    sentence = result.blocked.terminal_sentence(refreshed.id)
+    assert "\n" not in sentence
+    assert sentence.startswith(f"Cannot land {refreshed.id}: ")
+    assert sentence.endswith(".")
+    assert _sqlite_task_snapshot(store) == before_tasks
+    assert _sqlite_merge_unit_snapshot(store) == before_units
+    assert git.mutation_calls == []
+
+
+def test_landing_coordinator_reconciles_already_landed_through_merge_truth(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "already landed", "feature/already")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None and impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/already": "source-a", "main": "target-a"},
+        local_branches={"feature/already"},
+        merged_refs={("feature/already", "main")},
+        ancestors={("target-a", "source-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=impl.id))
+    refreshed_unit = store.get_merge_unit(unit.id)
+
+    assert result.already_merged is True
+    assert result.blocked is None
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "merged"
+
+
+@pytest.mark.parametrize("dry_run", (False, True))
+@pytest.mark.parametrize("reconcile_case", ("git_error", "unknown_classification"))
+def test_landing_coordinator_refuses_stale_legacy_merged_without_current_target_proof(
+    tmp_path,
+    dry_run: bool,
+    reconcile_case: str,
+) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, f"stale legacy {reconcile_case}", f"feature/{reconcile_case}")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None and impl.id is not None
+    impl.merge_status = "merged"
+    store.update(impl)
+    before_tasks = _sqlite_task_snapshot(store)
+    before_units = _sqlite_merge_unit_snapshot(store)
+    git = _LandingSourceGit(
+        {f"feature/{reconcile_case}": "source-a", "main": "target-a"},
+        local_branches={f"feature/{reconcile_case}"},
+        ancestors={("target-a", "source-a")},
+    )
+    persist_calls: list[bool] = []
+
+    def stale_reconcile(*_args: Any, **kwargs: Any) -> BranchSyncResult:
+        persist_calls.append(bool(kwargs.get("persist")))
+        result = BranchSyncResult(
+            branch=f"feature/{reconcile_case}",
+            task_ids=(impl.id or "",),
+            merge_status="merged",
+            reconciled=True,
+            head_sha="source-a",
+            base_sha="target-a",
+        )
+        if reconcile_case == "git_error":
+            result.errors.append("git is_merged failed")
+        else:
+            result.warnings.append("classification unknown; preserved existing merge state")
+        return result
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        reconcile_merge_truth=stale_reconcile,
+    ).run(LandRequest(task_id=impl.id, dry_run=dry_run))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "identity-proof-unavailable"
+    assert result.already_merged is False
+    assert persist_calls == [False]
+    assert _sqlite_task_snapshot(store) == before_tasks
+    assert _sqlite_merge_unit_snapshot(store) == before_units
+
+
+def test_landing_coordinator_reports_persisted_merged_unit_after_source_ref_deleted(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "already landed deleted source", "feature/deleted")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None and impl.id is not None
+    store.set_merge_unit_state(unit.id, "merged")
+    git = _LandingSourceGit({"main": "target-a"}, local_branches=set())
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=impl.id))
+
+    assert result.already_merged is True
+    assert result.blocked is None
+    assert [step.phase for step in result.steps] == ["resolve", "merge"]
+    assert git.mutation_calls == []
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE task_type IN ('rebase', 'review', 'improve')").fetchone()[0] == 0
+
+
+def test_landing_coordinator_reports_persisted_merged_unit_with_non_actionable_representative(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "already landed failed representative", "feature/landed")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None and impl.id is not None
+    store.set_merge_unit_state(unit.id, "merged")
+    impl.status = "failed"
+    store.update(impl)
+    git = _LandingSourceGit({"feature/landed": "source-a", "main": "target-a"}, local_branches={"feature/landed"})
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=impl.id))
+
+    assert result.already_merged is True
+    assert result.blocked is None
+    assert [step.phase for step in result.steps] == ["resolve", "merge"]
+    assert git.mutation_calls == []
+
+
+def test_landing_coordinator_dry_run_has_zero_mutations(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "dry run", "feature/dry")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None and impl.id is not None
+    before_tasks = _sqlite_task_snapshot(store)
+    before_units = _sqlite_merge_unit_snapshot(store)
+    git = _LandingSourceGit(
+        {"feature/dry": "source-a", "main": "target-a"},
+        local_branches={"feature/dry"},
+        ancestors=set(),
+    )
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=impl.id, dry_run=True))
+
+    assert result.blocked is None
+    assert any(step.phase == "rebase" and step.status == "conditional" for step in result.steps)
+    assert _sqlite_task_snapshot(store) == before_tasks
+    assert _sqlite_merge_unit_snapshot(store) == before_units
+    assert git.mutation_calls == []
+
+
+def test_landing_coordinator_strict_target_resolution_failure_returns_typed_block(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "target failure", "feature/target")
+    assert impl.id is not None
+
+    def fail_default_target(*, strict: bool) -> str:
+        assert strict is True
+        raise RuntimeError("target unavailable\nsecondary diagnostic")
+
+    setattr(store, "default_merge_target", fail_default_target)
+    git = _LandingSourceGit({"feature/target": "source-a", "main": "target-a"}, local_branches={"feature/target"})
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "identity-proof-unavailable"
+    _assert_single_terminal_sentence(result.blocked, impl.id)
+
+
+def test_landing_coordinator_has_changes_failure_returns_dirty_checkout(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "cleanliness failure", "feature/dirty-proof")
+    assert impl.id is not None
+
+    class FailingCleanGit(_LandingSourceGit):
+        def has_changes(self, include_untracked: bool = False) -> bool:
+            raise RuntimeError("status failed\nwith diagnostic")
+
+    git = FailingCleanGit(
+        {"feature/dirty-proof": "source-a", "main": "target-a"},
+        local_branches={"feature/dirty-proof"},
+    )
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "dirty-checkout"
+    _assert_single_terminal_sentence(result.blocked, impl.id)
+
+
+def test_landing_coordinator_merge_truth_failure_returns_typed_identity_block(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "merge truth failure", "feature/truth")
+    assert impl.id is not None
+    git = _LandingSourceGit({"feature/truth": "source-a", "main": "target-a"}, local_branches={"feature/truth"})
+
+    def fail_reconcile(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("reconcile failed\nmore detail")
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        reconcile_merge_truth=fail_reconcile,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "identity-proof-unavailable"
+    _assert_single_terminal_sentence(result.blocked, impl.id)
+
+
+def test_landing_coordinator_merge_truth_failure_precedes_dirty_checkout_when_both_fail(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "cleanliness and truth failure", "feature/dirty-and-truth")
+    assert impl.id is not None
+
+    class FailingCleanGit(_LandingSourceGit):
+        def has_changes(self, include_untracked: bool = False) -> bool:
+            raise RuntimeError("status failed")
+
+    git = FailingCleanGit(
+        {"feature/dirty-and-truth": "source-a", "main": "target-a"},
+        local_branches={"feature/dirty-and-truth"},
+    )
+
+    def fail_reconcile(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("reconcile failed")
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        reconcile_merge_truth=fail_reconcile,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "identity-proof-unavailable"
+    _assert_single_terminal_sentence(result.blocked, impl.id)
+
+
+@pytest.mark.parametrize("select", ("review", "owner"))
+def test_landing_coordinator_rejects_non_actionable_fallback_representative(tmp_path, select: str) -> None:
+    store = _coordinator_store(tmp_path)
+    branch = "feature/b1-fallback"
+    impl = store.add("failed implement", task_type="implement")
+    store.mark_failed(impl, has_commits=True, branch=branch)
+    assert impl.id is not None
+    review = store.add("completed review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    store.mark_completed(review, has_commits=True, branch=branch)
+    assert review.id is not None
+
+    git = _LandingSourceGit({branch: "source-a", "main": "target-a"}, local_branches={branch})
+
+    task_id = review.id if select == "review" else impl.id
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=task_id, dry_run=True))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "identity-proof-unavailable"
+
+
+def test_landing_coordinator_ancestry_failure_preserves_unavailable_proof(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "ancestry failure", "feature/ancestry")
+    assert impl.id is not None
+
+    class FailingAncestryGit(_LandingSourceGit):
+        def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+            raise RuntimeError("cannot inspect ancestry\nnot a required rebase proof")
+
+    git = FailingAncestryGit(
+        {"feature/ancestry": "source-a", "main": "target-a"},
+        local_branches={"feature/ancestry"},
+    )
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "rebase-or-conflict"
+    assert "ancestry proof is unavailable" in result.blocked.fact
+    assert "task-backed rebase execution is required" not in result.blocked.fact
+    _assert_single_terminal_sentence(result.blocked, impl.id)
+
+
+def test_landing_coordinator_manual_preflight_failure_returns_typed_rebase_block(monkeypatch, tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "preflight failure", "feature/preflight")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/preflight": "source-a", "main": "target-a"},
+        local_branches={"feature/preflight"},
+        ancestors={("target-a", "source-a")},
+    )
+
+    def fail_preflight(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("preflight failed\nmore detail")
+
+    monkeypatch.setattr("gza.landing.check_manual_merge_preflight", fail_preflight)
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "rebase-or-conflict"
+    _assert_single_terminal_sentence(result.blocked, impl.id)
+
+
+def test_landing_coordinator_late_dirty_preflight_keeps_dirty_checkout_precedence(monkeypatch, tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "late dirty", "feature/late-dirty")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/late-dirty": "source-a", "main": "target-a"},
+        local_branches={"feature/late-dirty"},
+        ancestors={("target-a", "source-a")},
+    )
+    monkeypatch.setattr(
+        "gza.landing.check_manual_merge_preflight",
+        lambda *_args, **_kwargs: SimpleNamespace(ok=False, status="dirty_checkout"),
+    )
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "dirty-checkout"
+    _assert_single_terminal_sentence(result.blocked, impl.id)
+
+
+@pytest.mark.parametrize(
+    ("failure_site", "expected_reason"),
+    (
+        ("target-resolution", "identity-proof-unavailable"),
+        ("subject-resolution", "identity-proof-unavailable"),
+        ("cleanliness", "dirty-checkout"),
+        ("reconciliation", "identity-proof-unavailable"),
+        ("ancestry", "rebase-or-conflict"),
+        ("preflight", "rebase-or-conflict"),
+    ),
+)
+def test_landing_coordinator_exception_facts_render_as_one_sentence(
+    monkeypatch,
+    tmp_path,
+    failure_site: str,
+    expected_reason: str,
+) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, f"{failure_site} exception", f"feature/{failure_site}")
+    assert impl.id is not None
+    diagnostic = f"{failure_site} failed. secondary diagnostic\nthird line"
+
+    git: Any = _LandingSourceGit(
+        {f"feature/{failure_site}": "source-a", "main": "target-a"},
+        local_branches={f"feature/{failure_site}"},
+        ancestors={("target-a", "source-a")},
+    )
+    coordinator_kwargs: dict[str, Any] = {}
+
+    if failure_site == "target-resolution":
+        def fail_default_target(*, strict: bool) -> str:
+            assert strict is True
+            raise RuntimeError(diagnostic)
+
+        setattr(store, "default_merge_target", fail_default_target)
+    elif failure_site == "subject-resolution":
+        def fail_subject(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError(diagnostic)
+
+        coordinator_kwargs["resolve_subject"] = fail_subject
+    elif failure_site == "cleanliness":
+        class FailingCleanGit(_LandingSourceGit):
+            def has_changes(self, include_untracked: bool = False) -> bool:
+                raise RuntimeError(diagnostic)
+
+        git = FailingCleanGit(
+            {"feature/cleanliness": "source-a", "main": "target-a"},
+            local_branches={"feature/cleanliness"},
+            ancestors={("target-a", "source-a")},
+        )
+    elif failure_site == "reconciliation":
+        def fail_reconcile(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError(diagnostic)
+
+        coordinator_kwargs["reconcile_merge_truth"] = fail_reconcile
+    elif failure_site == "ancestry":
+        class FailingAncestryGit(_LandingSourceGit):
+            def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+                raise RuntimeError(diagnostic)
+
+        git = FailingAncestryGit(
+            {"feature/ancestry": "source-a", "main": "target-a"},
+            local_branches={"feature/ancestry"},
+        )
+    elif failure_site == "preflight":
+        monkeypatch.setattr(
+            "gza.landing.check_manual_merge_preflight",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(diagnostic)),
+        )
+
+    result = LandingCoordinator(store=store, git=git, **coordinator_kwargs).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == expected_reason
+    assert "secondary diagnostic" not in result.blocked.terminal_sentence(impl.id)
+    _assert_single_terminal_sentence(result.blocked, impl.id)
+
+
+def test_landing_coordinator_dry_run_reuses_current_verify_and_review_evidence(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "dry evidence", "feature/landing")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None and impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="APPROVED")
+    before_tasks = _sqlite_task_snapshot(store)
+    before_units = _sqlite_merge_unit_snapshot(store)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(LandRequest(task_id=impl.id, dry_run=True))
+
+    summaries = {step.phase: step.summary for step in result.steps}
+    statuses = {step.phase: step.status for step in result.steps}
+    assert statuses["verify"] == "completed"
+    assert "passed for gate" in summaries["verify"]
+    assert statuses["post_rebase_review"] == "completed"
+    assert f"review {review.id} is APPROVED" in summaries["post_rebase_review"]
+    assert statuses["merge"] == "conditional"
+    assert _sqlite_task_snapshot(store) == before_tasks
+    assert _sqlite_merge_unit_snapshot(store) == before_units
+    assert git.mutation_calls == []
+
+
+def test_landing_coordinator_strict_dry_run_never_advertises_judge_for_changes_requested(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "strict changes requested", "feature/landing")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None and impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(
+        LandRequest(task_id=impl.id, policy="strict", dry_run=True)
+    )
+
+    assert all(step.phase != "judge" for step in result.steps)
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "nondeferrable-blocker"
+
+
+def test_landing_coordinator_dry_run_uses_merge_unit_attached_code_review_evidence(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "merge-unit review", "feature/landing")
+    sibling = store.add("sibling", task_type="implement", based_on=impl.id, same_branch=True)
+    store.mark_completed(sibling, has_commits=True, branch="feature/landing")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None and impl.id is not None and sibling.id is not None
+    store.attach_task_to_merge_unit(sibling.id, unit.id, "member")
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    _persist_lifecycle_verify_for_landing(store, config, sibling)
+    review = store.add("merge-unit attached review", task_type="review", depends_on=sibling.id, based_on=sibling.id)
+    review.status = "completed"
+    review.completed_at = datetime(2026, 8, 26, 12, 30, tzinfo=UTC)
+    review.review_verify_head_sha = "head-a"
+    review.output_content = _review_report("APPROVED")
+    store.update(review)
+    store.attach_task_to_merge_unit(review.id or "", unit.id, "review")
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(LandRequest(task_id=impl.id, dry_run=True))
+
+    statuses = {step.phase: step.status for step in result.steps}
+    summaries = {step.phase: step.summary for step in result.steps}
+    fingerprint = LandingStateFingerprint.from_facts(
+        LandingCoordinator(store=store, git=git, config=config)._landing_policy_facts(
+            LandingCoordinator(store=store, git=git, config=config)._resolve_identity(
+                LandRequest(task_id=impl.id), persist_reconciliation=False
+            )
+        )
+    )
+    assert statuses["post_rebase_review"] == "completed"
+    assert f"review {review.id} is APPROVED" in summaries["post_rebase_review"]
+    assert fingerprint.review.review_id == review.id
+
+
+def test_landing_coordinator_dry_run_uses_automatic_review_recovery_descendant(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "review recovery", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    failed = _completed_full_review(store, impl, head="old-head", verdict="APPROVED")
+    retry = store.add("review retry", task_type="review", based_on=failed.id, recovery_origin="retry")
+    retry.status = "completed"
+    retry.completed_at = datetime(2026, 8, 26, 12, 30, tzinfo=UTC)
+    retry.review_verify_head_sha = "head-a"
+    retry.output_content = _review_report("APPROVED")
+    store.update(retry)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+
+    result = coordinator.run(LandRequest(task_id=impl.id, dry_run=True))
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    fingerprint = LandingStateFingerprint.from_facts(coordinator._landing_policy_facts(identity))
+
+    statuses = {step.phase: step.status for step in result.steps}
+    assert statuses["post_rebase_review"] == "completed"
+    assert fingerprint.review.review_id == retry.id
+
+
+def test_landing_coordinator_dry_run_uses_merge_unit_attached_spec_review_evidence(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    config.spec_coherence.enabled = True
+    config.spec_coherence.paths = ("specs/behavior/**",)
+    impl = _completed_impl(store, "spec merge-unit review", "feature/landing")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None and impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    _completed_full_review(store, impl, head="head-a", verdict="APPROVED")
+    spec_review = _completed_spec_review(
+        store,
+        impl,
+        head="head-a",
+        changed_paths=("specs/behavior/lifecycle-engine.md",),
+        verdict="APPROVED",
+        completed_at=datetime(2026, 8, 26, 12, 30, tzinfo=UTC),
+    )
+    store.attach_task_to_merge_unit(spec_review.id or "", unit.id, "review")
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+        name_status="M\tspecs/behavior/lifecycle-engine.md\n",
+    )
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+
+    result = coordinator.run(LandRequest(task_id=impl.id, dry_run=True))
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    fingerprint = LandingStateFingerprint.from_facts(coordinator._landing_policy_facts(identity))
+
+    statuses = {step.phase: step.status for step in result.steps}
+    assert statuses["spec_coherence"] == "completed"
+    assert fingerprint.spec_coherence.task_or_artifact_id == spec_review.id
+
+
+def test_landing_coordinator_fingerprint_uses_provider_resolved_rebase_retry_descendant(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "rebase retry", "feature/rebase-retry")
+    assert impl.id is not None
+    first = store.add("failed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    first.status = "failed"
+    first.branch = "feature/rebase-retry"
+    store.update(first)
+    retry = store.add("retry rebase", task_type="rebase", based_on=first.id, same_branch=True, recovery_origin="retry")
+    store.mark_completed(retry, has_commits=True, branch="feature/rebase-retry", changed_diff=False)
+    artifact = _persist_landing_rebase_outcome(store, retry, impl)
+    git = _LandingSourceGit(
+        {"feature/rebase-retry": "source-a", "main": "target-a"},
+        local_branches={"feature/rebase-retry"},
+        ancestors={("target-a", "source-a")},
+    )
+    coordinator = LandingCoordinator(store=store, git=git)
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+
+    fingerprint = LandingStateFingerprint.from_facts(coordinator._landing_policy_facts(identity))
+
+    assert fingerprint.rebase.outcome_id == str(artifact.id)
+    assert fingerprint.rebase.resolution_kind == "provider_resolved"
+    assert fingerprint.rebase.attempted_source_head == "source-before"
+    assert fingerprint.rebase.attempted_target_head == "target-a"
+
+
+def test_landing_coordinator_dry_run_stops_at_stale_verify_before_review(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "stale verify", "feature/stale-verify")
+    assert impl.id is not None
+    _completed_full_review(store, impl, head="source-a", verdict="APPROVED")
+    git = _LandingSourceGit(
+        {"feature/stale-verify": "source-a", "main": "target-a"},
+        local_branches={"feature/stale-verify"},
+        ancestors={("target-a", "source-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=impl.id, dry_run=True))
+
+    assert any(step.phase == "verify" and step.status == "conditional" for step in result.steps)
+    assert all(step.phase != "post_rebase_review" for step in result.steps)
+
+
+def test_landing_coordinator_dry_run_stops_at_stale_review_after_green_verify(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "stale review", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    _completed_full_review(store, impl, head="old-head", verdict="APPROVED")
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(LandRequest(task_id=impl.id, dry_run=True))
+
+    statuses = {step.phase: step.status for step in result.steps}
+    assert statuses["verify"] == "completed"
+    assert statuses["post_rebase_review"] == "conditional"
+    assert "review" not in {step.phase for step in result.steps if step.phase == "merge"}
+
+
+def test_landing_coordinator_repeated_fingerprint_returns_bounded_without_later_policy_simulation(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "repeat bounded", "feature/repeat-bounded")
+    assert impl.id is not None
+    before_tasks = _sqlite_task_snapshot(store)
+    before_units = _sqlite_merge_unit_snapshot(store)
+    git = _LandingSourceGit(
+        {"feature/repeat-bounded": "source-a", "main": "target-a"},
+        local_branches={"feature/repeat-bounded"},
+        ancestors={("target-a", "source-a")},
+    )
+    facts = _green_facts(
+        review=_review(verdict="CHANGES_REQUESTED"),
+        open_blockers=(_blocker("B1", deferrable=True, blocker_class="out_of_scope"),),
+        parked_reason="review-max-cycles-reached",
+    )
+    calls = 0
+
+    def inspect(_identity: Any) -> LandingPolicyFacts:
+        nonlocal calls
+        calls += 1
+        return facts
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        inspect_policy_facts=inspect,
+        should_re_resolve=lambda *_args: True,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "bounded-attempt-exhausted"
+    assert "revisited the same decision state" in result.blocked.fact
+    assert "judge" not in result.blocked.fact
+    assert calls == 2
+    assert _sqlite_task_snapshot(store) == before_tasks
+    assert _sqlite_merge_unit_snapshot(store) == before_units
+    assert git.mutation_calls == []
+    _assert_single_terminal_sentence(result.blocked, impl.id)
+
+
+def test_landing_coordinator_transition_cap_returns_bounded_without_later_policy_simulation(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "cap bounded", "feature/cap-bounded")
+    assert impl.id is not None
+    before_tasks = _sqlite_task_snapshot(store)
+    before_units = _sqlite_merge_unit_snapshot(store)
+    git = _LandingSourceGit(
+        {"feature/cap-bounded": "source-a", "main": "target-a"},
+        local_branches={"feature/cap-bounded"},
+        ancestors={("target-a", "source-a")},
+    )
+    facts = [
+        _green_facts(
+            review=_review(verdict="CHANGES_REQUESTED", review_id="gza-200"),
+            open_blockers=(_blocker("B1", deferrable=True, blocker_class="out_of_scope"),),
+            parked_reason="review-max-cycles-reached",
+        ),
+        _green_facts(
+            review=_review(verdict="CHANGES_REQUESTED", review_id="gza-201"),
+            open_blockers=(_blocker("B1", deferrable=True, blocker_class="out_of_scope"),),
+            parked_reason="review-max-cycles-reached",
+        ),
+    ]
+    calls = 0
+
+    def inspect(_identity: Any) -> LandingPolicyFacts:
+        nonlocal calls
+        value = facts[calls]
+        calls += 1
+        return value
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        transition_limit=LandingTransitionLimitPolicy(max_transitions=1),
+        inspect_policy_facts=inspect,
+        should_re_resolve=lambda *_args: True,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "bounded-attempt-exhausted"
+    assert "transition limit was exhausted" in result.blocked.fact
+    assert "judge" not in result.blocked.fact
+    assert calls == 2
+    assert _sqlite_task_snapshot(store) == before_tasks
+    assert _sqlite_merge_unit_snapshot(store) == before_units
+    assert git.mutation_calls == []
+
+
+def test_landing_coordinator_dry_run_blocks_unresolved_dependency_from_store(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    dependency = _completed_impl(store, "dependency", "feature/dependency")
+    impl = store.add("dependent", task_type="implement", depends_on=dependency.id)
+    store.mark_completed(impl, has_commits=True, branch="feature/dependent")
+    refreshed = store.get(impl.id or "")
+    assert refreshed is not None and refreshed.id is not None
+    git = _LandingSourceGit(
+        {"feature/dependent": "source-a", "main": "target-a"},
+        local_branches={"feature/dependent"},
+        ancestors={("target-a", "source-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=refreshed.id, dry_run=True))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "identity-proof-unavailable"
+    assert any("dependency" in ref for ref in result.blocked.evidence_refs)
+    assert git.mutation_calls == []
+
+
+def test_landing_coordinator_dry_run_blocks_uninspectable_scope_from_shared_inspector(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = Config(project_dir=tmp_path, project_name="scope-project")
+    config.enforce_project_scope = True
+    impl = _completed_impl(store, "scoped", "feature/scoped")
+    assert impl.id is not None
+
+    class FailingDiffGit(_LandingSourceGit):
+        def get_diff_name_status(self, revision_range: str, *, check: bool = True) -> str:
+            raise RuntimeError("diff read failed. secondary diagnostic")
+
+    git = FailingDiffGit(
+        {"feature/scoped": "source-a", "main": "target-a"},
+        local_branches={"feature/scoped"},
+        ancestors={("target-a", "source-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(LandRequest(task_id=impl.id, dry_run=True))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "identity-proof-unavailable"
+    assert any("project-scope" in ref for ref in result.blocked.evidence_refs)
+    assert git.mutation_calls == []
+
+
+def test_landing_coordinator_dry_run_requires_spec_review_for_spec_triggering_paths(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    config.spec_coherence.enabled = True
+    config.spec_coherence.paths = ("specs/behavior/**",)
+    impl = _completed_impl(store, "spec change", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    _completed_full_review(store, impl, head="head-a", verdict="APPROVED")
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+        name_status="M\tspecs/behavior/lifecycle-engine.md\n",
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(LandRequest(task_id=impl.id, dry_run=True))
+
+    statuses = {step.phase: step.status for step in result.steps}
+    assert result.blocked is None
+    assert statuses["spec_coherence"] == "conditional"
+    assert "post_rebase_review" not in statuses
+    assert git.mutation_calls == []
+
+
+def test_landing_coordinator_dry_run_skips_disabled_code_review_and_reaches_merge_boundary(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    config.require_review_before_merge = False
+    impl = _completed_impl(store, "review disabled", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(LandRequest(task_id=impl.id, dry_run=True))
+
+    statuses = {step.phase: step.status for step in result.steps}
+    assert result.blocked is None
+    assert statuses["post_rebase_review"] == "skipped"
+    assert statuses["judge"] == "skipped"
+    assert statuses["merge"] == "conditional"
+    assert git.mutation_calls == []
+
+
+def test_landing_coordinator_dry_run_skips_historical_failed_spec_review_for_non_spec_diff(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    config.spec_coherence.enabled = True
+    config.spec_coherence.paths = ("specs/behavior/**",)
+    impl = _completed_impl(store, "non spec diff", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    _completed_full_review(store, impl, head="head-a", verdict="APPROVED")
+    failed_spec = _completed_spec_review(
+        store,
+        impl,
+        head="head-a",
+        changed_paths=("specs/behavior/lifecycle-engine.md",),
+        verdict="CHANGES_REQUESTED",
+    )
+    failed_spec.status = "failed"
+    store.update(failed_spec)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+        name_status="M\tsrc/gza/landing.py\n",
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(LandRequest(task_id=impl.id, dry_run=True))
+
+    statuses = {step.phase: step.status for step in result.steps}
+    assert result.blocked is None
+    assert statuses["spec_coherence"] == "skipped"
+    assert statuses["merge"] == "conditional"
+    assert git.mutation_calls == []
+
+
+@pytest.mark.parametrize("terminal_case", ("failed", "malformed"))
+def test_landing_coordinator_terminal_spec_evidence_blocks_at_spec_phase(tmp_path, terminal_case: str) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    config.spec_coherence.enabled = True
+    config.spec_coherence.paths = ("specs/behavior/**",)
+    impl = _completed_impl(store, f"terminal spec {terminal_case}", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    _completed_full_review(store, impl, head="head-a", verdict="APPROVED")
+    spec_review = _completed_spec_review(
+        store,
+        impl,
+        head="head-a",
+        changed_paths=("specs/behavior/lifecycle-engine.md",),
+        verdict="APPROVED" if terminal_case == "failed" else "CHANGES_REQUESTED",
+    )
+    if terminal_case == "failed":
+        spec_review.status = "failed"
+        spec_review.output_content = ""
+    else:
+        spec_review.output_content = "not a parseable review"
+    store.update(spec_review)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+        name_status="M\tspecs/behavior/lifecycle-engine.md\n",
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(LandRequest(task_id=impl.id, dry_run=True))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "required-review-unavailable"
+    assert result.steps[-1].phase == "spec_coherence"
+    assert git.mutation_calls == []
+
+
+def test_landing_coordinator_review_read_failure_is_unavailable_not_skipped(monkeypatch, tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "review read failure", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    monkeypatch.setattr(store, "get_reviews_for_task", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("review read failed")))
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(LandRequest(task_id=impl.id, dry_run=True))
+
+    statuses = {step.phase: step.status for step in result.steps}
+    assert result.blocked is None
+    assert statuses["post_rebase_review"] == "conditional"
+    assert "defer_blockers" not in statuses
+    assert git.mutation_calls == []
+
+
+def test_landing_coordinator_rebase_read_failure_is_typed_unavailable(monkeypatch, tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "rebase read failure", "feature/rebase-read")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/rebase-read": "source-a", "main": "target-a"},
+        local_branches={"feature/rebase-read"},
+        ancestors={("target-a", "source-a")},
+    )
+
+    monkeypatch.setattr(
+        "gza.landing.get_same_branch_rebase_descendants_for_root",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("rebase read failed")),
+    )
+
+    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=impl.id, dry_run=True))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "rebase-or-conflict"
+    assert "rebase, ancestry, or clean-merge proof is unavailable" in result.blocked.fact
+    assert git.mutation_calls == []
+
+
+def test_landing_rebase_fingerprint_preserves_durable_attempt_heads_when_changed_diff_false(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "durable rebase", "feature/durable")
+    assert impl.id is not None
+    rebase = store.add("rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    store.mark_completed(rebase, has_commits=True, branch="feature/durable", changed_diff=False)
+    assert rebase.id is not None
+    metadata = {
+        "schema_version": 1,
+        "parent_task_id": impl.id,
+        "branch": "feature/durable",
+        "target_ref": "main",
+        "source_head_before": "attempted-source",
+        "target_head_before": "attempted-target",
+        "source_head_after": "live-source",
+        "target_head_after": "live-target",
+        "status": "provider_conflict_resolved",
+        "changed_diff": False,
+        "provider_conflict_resolved": True,
+        "target_contained": True,
+        "superseded": False,
+        "completion_reason": None,
+    }
+    payload = json.dumps(metadata, sort_keys=True)
+    artifact = store.add_artifact(
+        rebase.id,
+        kind="rebase_execution_outcome",
+        label="rebase_execution_outcome",
+        path=f".gza/artifacts/{rebase.id}/outcome.txt",
+        byte_size=len(payload.encode()),
+        sha256=sha256(payload.encode()).hexdigest(),
+        metadata=metadata,
+        status="provider_conflict_resolved",
+        head_sha="live-source",
+    )
+    git = _LandingSourceGit(
+        {"feature/durable": "live-source", "main": "live-target"},
+        local_branches={"feature/durable"},
+        ancestors={("live-target", "live-source")},
+    )
+
+    coordinator = LandingCoordinator(store=store, git=git)
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    fingerprint = LandingStateFingerprint.from_facts(coordinator._landing_policy_facts(identity))
+    assert fingerprint.rebase.outcome_id == str(artifact.id)
+    assert fingerprint.rebase.changed_diff is False
+    assert fingerprint.rebase.resolution_kind == "provider_resolved"
+    assert fingerprint.rebase.attempted_source_head == "attempted-source"
+    assert fingerprint.rebase.attempted_target_head == "attempted-target"
+    assert fingerprint.rebase.attempted_source_head != fingerprint.source_sha
+    assert fingerprint.rebase.attempted_target_head != fingerprint.target_sha
+
+
+@pytest.mark.parametrize(
+    "facts",
+    (
+        _green_facts(review=_review(review_id="gza-201")),
+        _green_facts(verify=_verify(epoch="verify-2")),
+        _green_facts(
+            rebase_status="completed",
+            rebase_resolution_kind="mechanical",
+            rebase_changed_diff=False,
+            rebase_outcome_id="rebase-outcome-2",
+            rebase_attempted_source_head="source-a",
+            rebase_attempted_target_head="target-a",
+            rebase_target_contained=True,
+            rebase_provider_resolution_proof=False,
+        ),
+        _green_facts(open_blockers=(_blocker("B2", deferrable=True, blocker_class="out_of_scope"),)),
+        _green_facts(policy_judgment_identity="judgment-key-2"),
+        _green_facts(adjudication_fingerprints=("adjudication:2",)),
+        _green_facts(
+            spec_coherence=LandingSpecCoherenceEvidence(
+                required=True,
+                status="completed",
+                verdict="APPROVED",
+                current=True,
+                identity_matched=True,
+                evidence_id="spec-review-2",
+                reviewed_head="source-a",
+                changed_paths_fingerprint="specs/behavior/a.md",
+            ),
+        ),
+    ),
+)
+def test_landing_coordinator_full_fingerprint_treats_decision_evidence_progress_as_distinct(
+    facts: LandingPolicyFacts,
+    tmp_path,
+) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "fingerprint progress", "feature/fingerprint")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/fingerprint": "source-a", "main": "target-a"},
+        local_branches={"feature/fingerprint"},
+        ancestors={("target-a", "source-a")},
+    )
+    calls = 0
+
+    def inspect(_identity: Any) -> LandingPolicyFacts:
+        nonlocal calls
+        calls += 1
+        return _green_facts() if calls == 1 else facts
+
+    def re_resolve(_identity: Any, _fingerprint: LandingStateFingerprint, _steps: tuple[LandStep, ...]) -> bool:
+        return calls == 1
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        inspect_policy_facts=inspect,
+        should_re_resolve=re_resolve,
+    ).run(LandRequest(task_id=impl.id, dry_run=True))
+
+    if facts.open_blockers:
+        # An open blocker against an otherwise-APPROVED review is a genuine
+        # nondeferrable-blocker refusal (contradicts a merge-permitting review),
+        # not a fingerprint-progress artifact.
+        assert result.blocked is not None
+        assert result.blocked.reason_code == "nondeferrable-blocker"
+    else:
+        assert result.blocked is None
+    assert calls == 2
+
+
+def test_landing_coordinator_exact_repeated_full_fingerprint_stops_before_later_side_effects(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "repeat fingerprint", "feature/repeat")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/repeat": "source-a", "main": "target-a"},
+        local_branches={"feature/repeat"},
+        ancestors={("target-a", "source-a")},
+    )
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        inspect_policy_facts=lambda _identity: _green_facts(),
+        should_re_resolve=lambda *_args: True,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "bounded-attempt-exhausted"
+    assert "revisited the same decision state" in result.blocked.fact
+    assert git.mutation_calls == []
+
+
+def test_landing_coordinator_distinct_full_fingerprints_stop_at_custom_transition_cap(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "transition cap", "feature/cap")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/cap": "source-a", "main": "target-a"},
+        local_branches={"feature/cap"},
+        ancestors={("target-a", "source-a")},
+    )
+    facts = [
+        _green_facts(review=_review(review_id="gza-200")),
+        _green_facts(review=_review(review_id="gza-201")),
+        _green_facts(review=_review(review_id="gza-202")),
+    ]
+    calls = 0
+
+    def inspect(_identity: Any) -> LandingPolicyFacts:
+        nonlocal calls
+        value = facts[calls]
+        calls += 1
+        return value
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        transition_limit=LandingTransitionLimitPolicy(max_transitions=2),
+        inspect_policy_facts=inspect,
+        should_re_resolve=lambda *_args: True,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "bounded-attempt-exhausted"
+    assert "transition limit was exhausted" in result.blocked.fact
+    assert calls == 3
+    assert git.mutation_calls == []
+
+
+def test_land_cli_prints_concrete_dry_run_evidence(monkeypatch, capsys, tmp_path) -> None:
+    from gza.cli import land as land_cli
+
+    class FakeCoordinator:
+        def __init__(self, *, store: Any, git: Any, config: Any) -> None:
+            self.store = store
+            self.git = git
+            self.config = config
+
+        def run(self, request: LandRequest) -> LandResult:
+            return LandResult(
+                request=request,
+                owner_task_id="gza-9316",
+                target_branch="main",
+                source_ref="feature/landing",
+                steps=(
+                    LandStep("resolve", "completed", "resolved gza-9316 to owner gza-9316 on feature/landing -> main"),
+                    LandStep("verify", "completed", "current green source verify evidence verify-1 passed for gate gate-a"),
+                    LandStep("post_rebase_review", "completed", "current plain_full review gza-10158 is APPROVED"),
+                    LandStep("merge", "conditional", "execution required before later outcomes are knowable"),
+                ),
+            )
+
+    monkeypatch.setattr(land_cli.Config, "load", lambda project_dir: SimpleNamespace(project_dir=project_dir))
+    monkeypatch.setattr(land_cli, "get_store", lambda _config, open_mode: SimpleNamespace(open_mode=open_mode))
+    monkeypatch.setattr(land_cli, "Git", lambda project_dir: SimpleNamespace(project_dir=project_dir))
+    monkeypatch.setattr(land_cli, "resolve_id", lambda _config, task_id: task_id)
+    monkeypatch.setattr("gza.landing.LandingCoordinator", FakeCoordinator)
+
+    status = land_cli.cmd_land(
+        land_cli.argparse.Namespace(project_dir=tmp_path, task_id="gza-9316", policy="guarded", dry_run=True)
+    )
+    output = capsys.readouterr().out
+
+    assert status == 0
+    assert "verify-1 passed for gate gate-a" in output
+    assert "review gza-10158 is APPROVED" in output
 
 
 def _verify_config(tmp_path) -> Config:
@@ -2848,6 +4251,72 @@ def _completed_full_review(
     review.output_content = _review_report(verdict)
     store.update(review)
     return review
+
+
+def _completed_spec_review(
+    store: SqliteTaskStore,
+    impl,
+    *,
+    head: str,
+    changed_paths: tuple[str, ...],
+    verdict: str = "APPROVED",
+    completed_at: datetime | None = None,
+):
+    review = store.add("Completed spec review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    review.status = "completed"
+    review.completed_at = completed_at or datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    review.review_verify_head_sha = head
+    review.review_scope = build_spec_coherence_review_scope(
+        implementation_task_id=impl.id,
+        reviewed_head_sha=head,
+        changed_paths=changed_paths,
+    )
+    review.output_content = _review_report(verdict)
+    store.update(review)
+    return review
+
+
+def _persist_landing_rebase_outcome(
+    store: SqliteTaskStore,
+    rebase: Task,
+    impl: Task,
+    *,
+    source_before: str = "source-before",
+    target_before: str = "target-a",
+    source_after: str = "source-a",
+    target_after: str = "target-a",
+    status: str = "provider_conflict_resolved",
+    changed_diff: bool = False,
+    provider_conflict_resolved: bool = True,
+) -> Any:
+    metadata = {
+        "schema_version": 1,
+        "parent_task_id": impl.id,
+        "branch": impl.branch,
+        "target_ref": "main",
+        "source_head_before": source_before,
+        "target_head_before": target_before,
+        "source_head_after": source_after,
+        "target_head_after": target_after,
+        "status": status,
+        "changed_diff": changed_diff,
+        "provider_conflict_resolved": provider_conflict_resolved,
+        "target_contained": True,
+        "superseded": False,
+        "completion_reason": None,
+    }
+    payload = json.dumps(metadata, sort_keys=True)
+    return store.add_artifact(
+        rebase.id or "",
+        kind="rebase_execution_outcome",
+        label="rebase_execution_outcome",
+        path=f".gza/artifacts/{rebase.id}/outcome.txt",
+        byte_size=len(payload.encode()),
+        sha256=sha256(payload.encode()).hexdigest(),
+        metadata=metadata,
+        status=status,
+        head_sha=source_after,
+    )
 
 
 def _resolution_review(

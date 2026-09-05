@@ -3,22 +3,39 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
-from gza.advance_engine import plan_manual_verify_gate_action
+from gza.advance_engine import (
+    _resolve_spec_coherence_inspection,
+    _resolve_strict_scope_inspection,
+    plan_manual_verify_gate_action,
+)
 from gza.cli.advance_executor import (
     AdvanceActionExecutionContext,
     AdvanceActionExecutionResult,
     execute_advance_action,
 )
-from gza.db import SqliteTaskStore, Task as DbTask
+from gza.db import SqliteTaskStore, Task as DbTask, _task_is_actionable_merge_unit_member
+from gza.dependency_preconditions import dependency_readiness
+from gza.merge_services import ResolvedMergeSubject, check_manual_merge_preflight, resolve_merge_subject_query_only
+from gza.query import get_implementation_review_evidence, get_same_branch_rebase_descendants_for_root
+from gza.rebase_service import REBASE_EXECUTION_OUTCOME_ARTIFACT_KIND
+from gza.review_scope import (
+    build_spec_coherence_review_scope,
+    declares_resolution_review_mode,
+    declares_spec_coherence_review_mode,
+    parse_spec_coherence_review_scope,
+)
 from gza.review_tasks import DuplicateReviewError, create_resolution_review_task, create_review_task
 from gza.review_verdict import get_review_report
 from gza.review_verify_state import VerifyGateDecision, resolve_verify_gate_decision
 from gza.runner import _compute_tree_fingerprint
+from gza.sync_ops import BranchSyncResult, reconcile_task_branch_merge_truth
 from gza.watch_progress import review_matches_create_review_action
 
 LandingPolicyName = Literal["guarded", "strict"]
@@ -120,6 +137,7 @@ LANDING_PHASES: tuple[LandingPhaseName, ...] = (
     "post_merge_verify",
 )
 LANDING_POLICIES: tuple[LandingPolicyName, ...] = ("guarded", "strict")
+DEFAULT_LANDING_MAX_TRANSITIONS = 12
 LAND_BLOCKED_PRECEDENCE: tuple[LandBlockedReasonCode, ...] = (
     "identity-proof-unavailable",
     "dirty-checkout",
@@ -176,6 +194,7 @@ class LandBlocked:
     evidence_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "fact", _normalize_terminal_fact(self.fact))
         object.__setattr__(self, "evidence_refs", _normalize_evidence_refs(self.evidence_refs))
         if not self.evidence_refs:
             raise ValueError("blocked landing result requires durable evidence")
@@ -264,6 +283,572 @@ class LandResult:
             raise ValueError("landing judgment identity requires manual_land_escalated provenance")
         object.__setattr__(self, "judgment_artifact_id", judgment_refs[0] if judgment_refs else None)
         object.__setattr__(self, "judgment_key", judgment_refs[1] if judgment_refs else None)
+
+
+@dataclass(frozen=True)
+class LandingResolvedIdentity:
+    """Canonical query result for the operator-selected landing subject."""
+
+    selected_task_id: str
+    owner_task: DbTask
+    representative_task: DbTask
+    merge_unit_id: str | None
+    merge_unit_state: str
+    source_branch: str
+    source_ref: str | None
+    source_sha: str | None
+    target_branch: str
+    target_sha: str | None
+    current_branch: str | None
+    member_task_ids: tuple[str, ...] = ()
+    checkout_clean: bool = True
+    already_merged: bool = False
+    merge_truth: BranchSyncResult | None = None
+
+    @property
+    def owner_task_id(self) -> str:
+        assert self.owner_task.id is not None
+        return self.owner_task.id
+
+
+@dataclass(frozen=True)
+class LandingTransitionLimitPolicy:
+    """Bound writable landing transitions and repeated decision states."""
+
+    max_transitions: int = DEFAULT_LANDING_MAX_TRANSITIONS
+
+    def __post_init__(self) -> None:
+        if self.max_transitions <= 0:
+            raise ValueError("landing transition limit must be positive")
+
+
+@dataclass
+class LandingCoordinator:
+    """Initial landing coordinator skeleton.
+
+    This slice resolves identity, reconciles already-landed state, emits
+    query-only dry-run plans, and stops before execution-required phases.
+    """
+
+    store: SqliteTaskStore
+    git: Any
+    config: Any | None = None
+    transition_limit: LandingTransitionLimitPolicy = LandingTransitionLimitPolicy()
+    resolve_subject: Callable[..., ResolvedMergeSubject | None] = resolve_merge_subject_query_only
+    reconcile_merge_truth: Callable[..., BranchSyncResult] = reconcile_task_branch_merge_truth
+    inspect_policy_facts: Callable[[LandingResolvedIdentity], LandingPolicyFacts] | None = None
+    should_re_resolve: Callable[[LandingResolvedIdentity, LandingStateFingerprint, tuple[LandStep, ...]], bool] | None = None
+
+    def plan(self, request: LandRequest) -> LandResult:
+        return self.run(request)
+
+    def run(self, request: LandRequest) -> LandResult:
+        steps: list[LandStep] = []
+        visited: set[LandingStateFingerprint] = set()
+
+        def guard(fingerprint: LandingStateFingerprint) -> LandBlocked | None:
+            if len(visited) >= self.transition_limit.max_transitions:
+                return LandBlocked(
+                    "bounded-attempt-exhausted",
+                    "landing transition limit was exhausted before progress",
+                    _evidence_refs(request.task_id, fingerprint.source_sha, fingerprint.target_sha),
+                )
+            if fingerprint in visited:
+                return LandBlocked(
+                    "bounded-attempt-exhausted",
+                    "landing revisited the same decision state without progress",
+                    _evidence_refs(request.task_id, fingerprint.source_sha, fingerprint.target_sha),
+                )
+            visited.add(fingerprint)
+            return None
+
+        while True:
+            identity = self._resolve_identity(request, persist_reconciliation=not request.dry_run)
+            if isinstance(identity, LandBlocked):
+                steps.append(LandStep("resolve", "blocked", "resolve current landing identity", blocked=identity))
+                return LandResult(
+                    request=request,
+                    owner_task_id=None,
+                    target_branch=None,
+                    source_ref=None,
+                    steps=tuple(steps),
+                    blocked=identity,
+                )
+
+            resolve_step_summary = (
+                f"resolved {request.task_id} to owner {identity.owner_task_id} "
+                f"on {identity.source_ref or identity.source_branch} -> {identity.target_branch}"
+            )
+            steps.append(
+                LandStep(
+                    "resolve",
+                    "completed",
+                    resolve_step_summary,
+                    evidence_refs=_evidence_refs(
+                        identity.owner_task_id,
+                        identity.merge_unit_id,
+                        identity.source_ref,
+                        identity.source_sha,
+                        identity.target_branch,
+                        identity.target_sha,
+                    ),
+                )
+            )
+
+            facts = self._landing_policy_facts(identity)
+            fingerprint = LandingStateFingerprint.from_facts(facts)
+            bounded = guard(fingerprint)
+            if bounded is not None:
+                steps.append(LandStep("resolve", "blocked", bounded.fact, blocked=bounded))
+                return self._blocked_result(request, identity, steps, bounded)
+            if self.should_re_resolve is None or not self.should_re_resolve(identity, fingerprint, tuple(steps)):
+                break
+
+        if identity.already_merged:
+            steps.append(
+                LandStep(
+                    "merge",
+                    "completed",
+                    "source is already landed or equivalent on target",
+                    evidence_refs=_evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+                )
+            )
+            return LandResult(
+                request=request,
+                owner_task_id=identity.owner_task_id,
+                target_branch=identity.target_branch,
+                source_ref=identity.source_ref,
+                steps=tuple(steps),
+                already_merged=True,
+            )
+
+        pre_execution_block = _known_pre_execution_block(facts)
+        if pre_execution_block is not None:
+            steps.append(
+                LandStep(
+                    _phase_for_block(pre_execution_block),
+                    "blocked",
+                    pre_execution_block.fact,
+                    blocked=pre_execution_block,
+                )
+            )
+            return self._blocked_result(request, identity, steps, pre_execution_block)
+
+        first_boundary = self._first_execution_required_phase(identity, facts, policy=request.policy)
+        if isinstance(first_boundary, LandBlocked):
+            phase = _phase_for_block(first_boundary)
+            steps.append(LandStep(phase, "blocked", first_boundary.fact, blocked=first_boundary))
+            return self._blocked_result(request, identity, steps, first_boundary)
+        if request.dry_run:
+            dry_steps = dry_run_steps_until_boundary(resolved=True, first_execution_required_phase=first_boundary, facts=facts)
+            steps.extend(dry_steps[1:])
+            return LandResult(
+                request=request,
+                owner_task_id=identity.owner_task_id,
+                target_branch=identity.target_branch,
+                source_ref=identity.source_ref,
+                steps=tuple(steps),
+            )
+
+        blocked = LandBlocked(
+            self._boundary_reason_code(first_boundary),
+            self._boundary_fact(first_boundary),
+            _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+        )
+        steps.append(LandStep(first_boundary, "blocked", blocked.fact, blocked=blocked))
+        return self._blocked_result(request, identity, steps, blocked)
+
+    def _blocked_result(
+        self,
+        request: LandRequest,
+        identity: LandingResolvedIdentity,
+        steps: list[LandStep],
+        blocked: LandBlocked,
+    ) -> LandResult:
+        return LandResult(
+            request=request,
+            owner_task_id=identity.owner_task_id,
+            target_branch=identity.target_branch,
+            source_ref=identity.source_ref,
+            steps=tuple(steps),
+            blocked=blocked,
+        )
+
+    def _resolve_identity(
+        self,
+        request: LandRequest,
+        *,
+        persist_reconciliation: bool,
+    ) -> LandingResolvedIdentity | LandBlocked:
+        try:
+            target_branch = self._default_target_branch()
+        except Exception as exc:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                _exception_fact("canonical target proof is unavailable", exc),
+                _evidence_refs(request.task_id),
+            )
+        try:
+            subject = self.resolve_subject(
+                self.store,
+                self.git,
+                request.task_id,
+                target_branch=target_branch,
+            )
+        except Exception as exc:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                _exception_fact("landing merge-unit identity is unavailable", exc),
+                _evidence_refs(request.task_id),
+            )
+        if subject is None:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                "selected task does not resolve to a landing merge unit",
+                _evidence_refs(request.task_id),
+            )
+        if subject.merge_resolution_warning:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                subject.merge_resolution_warning,
+                _evidence_refs(request.task_id, subject.trigger_task.id),
+            )
+        if subject.merge_unit_id is None:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                "selected task is not attached to a canonical active merge unit",
+                _evidence_refs(request.task_id, subject.trigger_task.id),
+            )
+        owner = subject.merge_subject
+        representative = subject.execution_task
+        owner_id = owner.id
+        if owner_id is None or representative.id is None:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                "canonical landing owner or representative identity is unavailable",
+                _evidence_refs(request.task_id, subject.merge_unit_id),
+            )
+        unit = self.store.get_merge_unit(subject.merge_unit_id)
+        if unit is None:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                "canonical merge-unit row is unavailable",
+                _evidence_refs(request.task_id, subject.merge_unit_id),
+            )
+        if unit.state not in {"unmerged", "merged"}:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                f"canonical merge unit is {unit.state}, not active unmerged",
+                _evidence_refs(request.task_id, unit.id, unit.state),
+            )
+        if unit.state == "merged":
+            target_sha = _rev_parse_if_exists(self.git, unit.target_branch)
+            member_task_ids = tuple(task.id for task in subject.merge_member_tasks if task.id is not None)
+            return LandingResolvedIdentity(
+                selected_task_id=request.task_id,
+                owner_task=owner,
+                representative_task=representative,
+                merge_unit_id=unit.id,
+                merge_unit_state="merged",
+                source_branch=unit.source_branch,
+                source_ref=_normalize_optional_identity(subject.merge_source_ref) or unit.source_branch,
+                source_sha=_rev_parse_if_exists(self.git, subject.merge_source_ref or unit.source_branch),
+                target_branch=unit.target_branch,
+                target_sha=target_sha,
+                current_branch=None,
+                member_task_ids=member_task_ids,
+                checkout_clean=True,
+                already_merged=True,
+                merge_truth=None,
+            )
+        if not _task_is_actionable_merge_unit_member(representative, unit):
+            return LandBlocked(
+                "identity-proof-unavailable",
+                f"canonical merge unit has no actionable code-bearing representative "
+                f"(resolved {representative.id} is {representative.task_type}/{representative.status})",
+                _evidence_refs(request.task_id, representative.id, unit.id),
+            )
+        source_ref = _normalize_optional_identity(subject.merge_source_ref)
+        if source_ref is None:
+            fact = subject.merge_source_warning or "local source ref proof is unavailable"
+            return LandBlocked(
+                "identity-proof-unavailable",
+                fact,
+                _evidence_refs(request.task_id, owner_id, unit.id, subject.merge_branch),
+            )
+        try:
+            current_branch = self.git.current_branch()
+        except Exception as exc:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                _exception_fact("current checkout branch proof is unavailable", exc),
+                _evidence_refs(request.task_id, owner_id, source_ref),
+            )
+        if current_branch != unit.target_branch:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                f"current checkout is {current_branch}, expected target {unit.target_branch}",
+                _evidence_refs(request.task_id, owner_id, current_branch, unit.target_branch),
+            )
+        source_sha = _rev_parse_if_exists(self.git, source_ref)
+        target_sha = _rev_parse_if_exists(self.git, unit.target_branch)
+        if source_sha is None or target_sha is None:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                "exact local source or target ref proof is unavailable",
+                _evidence_refs(request.task_id, owner_id, source_ref, unit.target_branch),
+            )
+        try:
+            merge_truth = self.reconcile_merge_truth(
+                self.store,
+                self.git,
+                owner_id,
+                target_branch=unit.target_branch,
+                include_diff_stats=False,
+                persist=False,
+            )
+        except Exception as exc:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                _exception_fact("merge-truth reconciliation proof is unavailable", exc),
+                _evidence_refs(request.task_id, owner_id, source_sha, target_sha),
+            )
+        try:
+            dirty = self.git.has_changes(include_untracked=False)
+        except Exception as exc:
+            return LandBlocked(
+                "dirty-checkout",
+                _exception_fact("tracked checkout cleanliness proof is unavailable", exc),
+                _evidence_refs(request.task_id, owner_id, source_sha, target_sha),
+            )
+        already_merged = unit.state == "merged" or _merge_truth_has_current_target_merged_proof(merge_truth)
+        if merge_truth.merge_status == "merged" and not already_merged:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                "merge-truth reconciliation did not prove the source is merged into the current target",
+                _evidence_refs(
+                    request.task_id,
+                    owner_id,
+                    source_sha,
+                    target_sha,
+                    merge_truth.branch,
+                    *(merge_truth.errors or merge_truth.warnings),
+                    merge_truth.skipped_reason,
+                ),
+            )
+        if already_merged and persist_reconciliation:
+            try:
+                persisted_truth = self.reconcile_merge_truth(
+                    self.store,
+                    self.git,
+                    owner_id,
+                    target_branch=unit.target_branch,
+                    include_diff_stats=False,
+                    persist=True,
+                )
+            except Exception as exc:
+                return LandBlocked(
+                    "identity-proof-unavailable",
+                    _exception_fact("merge-truth persistence proof is unavailable", exc),
+                    _evidence_refs(request.task_id, owner_id, source_sha, target_sha),
+                )
+            if not _merge_truth_has_current_target_merged_proof(persisted_truth):
+                return LandBlocked(
+                    "identity-proof-unavailable",
+                    "merge-truth persistence did not preserve successful current-target proof",
+                    _evidence_refs(
+                        request.task_id,
+                        owner_id,
+                        source_sha,
+                        target_sha,
+                        persisted_truth.branch,
+                        *(persisted_truth.errors or persisted_truth.warnings),
+                        persisted_truth.skipped_reason,
+                    ),
+                )
+            merge_truth = persisted_truth
+        member_task_ids = tuple(
+            task.id for task in subject.merge_member_tasks if task.id is not None
+        )
+        return LandingResolvedIdentity(
+            selected_task_id=request.task_id,
+            owner_task=owner,
+            representative_task=representative,
+            merge_unit_id=unit.id,
+            merge_unit_state="merged" if already_merged else unit.state,
+            source_branch=unit.source_branch,
+            source_ref=source_ref,
+            source_sha=source_sha,
+            target_branch=unit.target_branch,
+            target_sha=target_sha,
+            current_branch=current_branch,
+            member_task_ids=member_task_ids,
+            checkout_clean=not dirty,
+            already_merged=already_merged,
+            merge_truth=merge_truth,
+        )
+
+    def _default_target_branch(self) -> str:
+        default_merge_target = getattr(self.store, "default_merge_target", None)
+        if callable(default_merge_target):
+            return cast(str, default_merge_target(strict=True))
+        default_branch = getattr(self.git, "default_branch", None)
+        if callable(default_branch):
+            return cast(str, default_branch())
+        return "main"
+
+    def _landing_policy_facts(self, identity: LandingResolvedIdentity) -> LandingPolicyFacts:
+        if self.inspect_policy_facts is not None:
+            return self.inspect_policy_facts(identity)
+        verify = _inspect_query_landing_verify_evidence(self.store, identity, config=self.config, git=self.git)
+        review = _inspect_query_landing_review_evidence(self.store, identity, config=self.config)
+        rebase = _inspect_query_landing_rebase_fingerprint(self.store, identity)
+        gates = _inspect_query_landing_lifecycle_gates(
+            self.store,
+            self.git,
+            identity,
+            config=self.config,
+            rebase=rebase,
+        )
+        return LandingPolicyFacts(
+            task_id=identity.owner_task_id,
+            merge_unit_state=identity.merge_unit_state,
+            representative_status=identity.representative_task.status,
+            has_active_merge_unit=identity.merge_unit_id is not None,
+            has_local_source=identity.source_ref is not None,
+            target_matches_checkout=identity.current_branch == identity.target_branch,
+            dependency_ready=gates.dependency_ready,
+            project_scope_ok=gates.project_scope_ok,
+            checkout_clean=identity.checkout_clean and gates.checkout_clean,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            clean_merge=gates.clean_merge,
+            ancestry_proof_available=gates.ancestry_proof_available,
+            rebase_status=rebase.status,
+            rebase_resolution_kind=rebase.resolution_kind,
+            rebase_changed_diff=rebase.changed_diff,
+            rebase_outcome_id=rebase.outcome_id,
+            rebase_no_op_subtype=rebase.no_op_subtype,
+            rebase_attempted_source_head=rebase.attempted_source_head,
+            rebase_attempted_target_head=rebase.attempted_target_head,
+            rebase_target_contained=gates.rebase_target_contained,
+            rebase_provider_resolution_proof=rebase.provider_resolution_proof,
+            verify=verify,
+            spec_coherence=gates.spec_coherence,
+            review=review,
+            actionable_lifecycle_work=gates.actionable_lifecycle_work,
+        )
+
+    def _first_execution_required_phase(
+        self,
+        identity: LandingResolvedIdentity,
+        facts: LandingPolicyFacts,
+        *,
+        policy: LandingPolicyName,
+    ) -> LandingPhaseName | LandBlocked:
+        if (
+            identity.source_ref is None
+            or identity.source_sha is None
+            or identity.target_sha is None
+            or identity.current_branch is None
+        ):
+            return LandBlocked(
+                "identity-proof-unavailable",
+                "exact local source or target ref proof is unavailable",
+                _evidence_refs(identity.owner_task_id, identity.source_ref, identity.target_branch),
+            )
+        try:
+            target_contained = self.git.is_ancestor(identity.target_sha, identity.source_sha)
+        except Exception as exc:
+            return LandBlocked(
+                "rebase-or-conflict",
+                _exception_fact("ancestry proof is unavailable before landing can continue", exc),
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+        if target_contained is not True:
+            return "rebase"
+        try:
+            preflight = check_manual_merge_preflight(
+                self.git,
+                merge_subject=identity.owner_task,
+                merge_source_ref=identity.source_ref,
+                current_branch=identity.current_branch,
+                merge_preflight_target=identity.target_branch,
+            )
+        except Exception as exc:
+            return LandBlocked(
+                "rebase-or-conflict",
+                _exception_fact("manual merge preflight proof is unavailable before landing can continue", exc),
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+        if preflight.status == "merge_conflict":
+            return "rebase"
+        if not preflight.ok and preflight.status == "dirty_checkout":
+            return LandBlocked(
+                "dirty-checkout",
+                "tracked checkout is not clean",
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+        if not preflight.ok:
+            return LandBlocked(
+                "rebase-or-conflict",
+                "manual merge preflight proof is unavailable before landing can continue",
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+        verify = facts.verify
+        if verify is None or not _landing_verify_evidence_is_current_green(verify):
+            return "verify"
+        spec = facts.spec_coherence
+        if spec is not None and spec.required:
+            spec_terminal_block = _terminal_spec_coherence_block(facts)
+            if spec_terminal_block is not None:
+                return spec_terminal_block
+            if (
+                spec.status != "completed"
+                or spec.verdict != "APPROVED"
+                or not spec.current
+                or not spec.identity_matched
+            ):
+                return "spec_coherence"
+        review = facts.review
+        if review is None:
+            return "post_rebase_review"
+        review_terminal_block = _terminal_code_review_block(facts)
+        if review_terminal_block is not None:
+            return review_terminal_block
+        if review.required and not _landing_review_evidence_is_current(review):
+            return "post_rebase_review"
+        if review.verdict == "CHANGES_REQUESTED":
+            return _dry_run_review_boundary(policy, facts)
+        return "merge"
+
+    def _boundary_reason_code(self, phase: LandingPhaseName) -> LandBlockedReasonCode:
+        if phase == "rebase":
+            return "rebase-or-conflict"
+        if phase in {"verify", "post_merge_verify"}:
+            return "verify-unavailable-or-red"
+        if phase in {"post_rebase_review", "spec_coherence"}:
+            return "required-review-unavailable"
+        if phase == "judge":
+            return "policy-or-judge-refused"
+        if phase == "defer_blockers":
+            return "materialization-or-persistence-failed"
+        return "merge-failed"
+
+    def _boundary_fact(self, phase: LandingPhaseName) -> str:
+        if phase == "rebase":
+            return "task-backed rebase execution is required before landing can continue"
+        if phase == "verify":
+            return "current green source verify evidence must be acquired before landing can continue"
+        if phase == "post_rebase_review":
+            return "current post-rebase review evidence must be acquired before landing can continue"
+        if phase == "judge":
+            return "guarded landing judgment is required before landing can continue"
+        if phase == "defer_blockers":
+            return "deferred blocker materialization is required before landing can continue"
+        if phase == "post_merge_verify":
+            return "post-merge verification is required before landing can complete"
+        return "merge execution is outside this landing coordinator slice"
 
 
 @dataclass(frozen=True)
@@ -606,6 +1191,9 @@ LandingAdvanceExecutor = Callable[
     AdvanceActionExecutionResult,
 ]
 
+_LOG = logging.getLogger(__name__)
+_INTERNAL_SENTENCE_TERMINATOR_RE = re.compile(r"([.!?;:])\s+")
+
 
 @dataclass(frozen=True)
 class LandingSpecCoherenceEvidence:
@@ -653,7 +1241,23 @@ class LandingPolicyFacts:
     open_blockers: tuple[LandingOpenBlocker, ...] = ()
     parked_reason: str | None = None
     review_blocker_adjudication_evidence_complete: bool = False
+    policy_judgment_identity: str | None = None
+    adjudication_fingerprints: tuple[str, ...] = ()
     guarded_judgment_enabled: bool = True
+    actionable_lifecycle_work: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _LandingQueryableGates:
+    """Query-only lifecycle facts that landing needs before boundedness wins."""
+
+    dependency_ready: bool = False
+    project_scope_ok: bool = False
+    checkout_clean: bool = True
+    clean_merge: bool = False
+    ancestry_proof_available: bool = False
+    rebase_target_contained: bool | None = None
+    spec_coherence: LandingSpecCoherenceEvidence | None = None
     actionable_lifecycle_work: tuple[str, ...] = ()
 
 
@@ -767,13 +1371,19 @@ class LandingStateFingerprint:
         *,
         rebase: LandingRebaseFingerprint | None = None,
         policy_judgment_identity: str | None = None,
-        adjudication_fingerprints: tuple[str, ...] = (),
+        adjudication_fingerprints: tuple[str, ...] | None = None,
         spec_coherence: LandingSpecCoherenceFingerprint | None = None,
     ) -> LandingStateFingerprint:
         review = facts.review
         verify = facts.verify
         resolved_rebase = _select_rebase_fingerprint(facts=facts, supplied=rebase)
         resolved_spec = _select_spec_coherence_fingerprint(facts=facts, supplied=spec_coherence)
+        resolved_judgment_identity = policy_judgment_identity or facts.policy_judgment_identity
+        resolved_adjudication_fingerprints = (
+            adjudication_fingerprints
+            if adjudication_fingerprints is not None
+            else facts.adjudication_fingerprints
+        )
         return cls(
             merge_unit_state=facts.merge_unit_state,
             source_sha=facts.source_head,
@@ -798,8 +1408,8 @@ class LandingStateFingerprint:
             ),
             rebase=resolved_rebase,
             blocker_fingerprints=tuple(sorted(_blocker_fingerprint(blocker) for blocker in facts.open_blockers)),
-            policy_judgment_identity=policy_judgment_identity,
-            adjudication_fingerprints=tuple(sorted(adjudication_fingerprints)),
+            policy_judgment_identity=resolved_judgment_identity,
+            adjudication_fingerprints=tuple(sorted(resolved_adjudication_fingerprints)),
             spec_coherence=resolved_spec,
         )
 
@@ -1201,6 +1811,7 @@ def dry_run_steps_until_boundary(
     *,
     resolved: bool,
     first_execution_required_phase: LandingPhaseName | None,
+    facts: LandingPolicyFacts | None = None,
 ) -> tuple[LandStep, ...]:
     """Build query-only dry-run phase data without predicting execution outcomes."""
 
@@ -1221,8 +1832,82 @@ def dry_run_steps_until_boundary(
                 )
             )
             break
-        steps.append(LandStep(phase=phase, status="pending", summary="queryable prerequisite"))
+        step = _dry_run_completed_step_for_phase(phase, facts)
+        if step is not None:
+            steps.append(step)
+        else:
+            steps.append(LandStep(phase=phase, status="pending", summary="queryable prerequisite"))
     return tuple(steps)
+
+
+def _dry_run_completed_step_for_phase(
+    phase: LandingPhaseName,
+    facts: LandingPolicyFacts | None,
+) -> LandStep | None:
+    if facts is None:
+        return None
+    if phase == "rebase" and facts.rebase_status == "none" and facts.rebase_target_contained is True:
+        return LandStep(
+            phase,
+            "skipped",
+            "source already contains the target tip; no rebase evidence is required",
+            evidence_refs=_evidence_refs(facts.task_id, facts.source_head, facts.target_head),
+        )
+    if phase == "verify" and facts.verify is not None and _landing_verify_evidence_is_current_green(facts.verify):
+        verify = facts.verify
+        return LandStep(
+            phase,
+            "completed",
+            (
+                "current green source verify evidence "
+                f"{verify.epoch} passed for gate {verify.gate_identity}"
+            ),
+            evidence_refs=_verify_evidence(verify, facts),
+        )
+    if phase == "spec_coherence":
+        spec = facts.spec_coherence
+        if spec is None or not spec.required:
+            return LandStep(phase, "skipped", "spec-coherence evidence is not required")
+        if (
+            spec.status == "completed"
+            and spec.verdict == "APPROVED"
+            and spec.current
+            and spec.identity_matched
+            and spec.evidence_id
+        ):
+            return LandStep(
+                phase,
+                "completed",
+                f"current spec-coherence evidence {spec.evidence_id} is APPROVED",
+                evidence_refs=_spec_coherence_evidence(spec, facts),
+            )
+    if phase == "post_rebase_review" and facts.review is not None and _landing_review_evidence_is_current(facts.review):
+        review = facts.review
+        return LandStep(
+            phase,
+            "completed",
+            f"current {review.mode} review {review.review_id} is {review.verdict}",
+            evidence_refs=_review_evidence(review, facts),
+        )
+    if phase == "post_rebase_review" and facts.review is not None and not facts.review.required:
+        return LandStep(phase, "skipped", "code review evidence is not required")
+    if phase == "judge":
+        review_evidence = facts.review
+        if review_evidence is not None and not review_evidence.required:
+            return LandStep(phase, "skipped", "landing judgment is not required when code review is disabled")
+        if (
+            review_evidence is not None
+            and review_evidence.verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
+            and not facts.open_blockers
+        ):
+            return LandStep(phase, "skipped", "landing judgment is not required for merge-permitting review evidence")
+    if phase == "defer_blockers":
+        review_evidence = facts.review
+        if not facts.open_blockers and (
+            review_evidence is None or not review_evidence.followup_findings
+        ):
+            return LandStep(phase, "skipped", "no follow-up or deferred blocker materialization is required")
+    return None
 
 
 def evaluate_landing_policy(
@@ -1328,6 +2013,107 @@ def _evidence_refs(*refs: str | None) -> tuple[str, ...]:
     return _normalize_evidence_refs(refs)
 
 
+def _normalize_terminal_fact(fact: str) -> str:
+    words = str(fact).replace("\r", "\n").split()
+    normalized = " ".join(words).strip()
+    if not normalized:
+        normalized = "landing proof is unavailable"
+    normalized = _INTERNAL_SENTENCE_TERMINATOR_RE.sub(", ", normalized)
+    return normalized.rstrip(".!?;:")
+
+
+def _exception_fact(prefix: str, exc: Exception) -> str:
+    _LOG.warning("%s: %s", prefix, exc, exc_info=True)
+    return f"{prefix}: {_exception_identity(exc)}"
+
+
+def _exception_identity(exc: Exception) -> str:
+    message = " ".join(str(exc).replace("\r", "\n").split()).strip()
+    if not message:
+        return exc.__class__.__name__
+    concise = _INTERNAL_SENTENCE_TERMINATOR_RE.split(message, maxsplit=1)[0].strip()
+    return concise or exc.__class__.__name__
+
+
+def _select_landing_block_by_precedence(*blocks: LandBlocked | None) -> LandBlocked:
+    available = [block for block in blocks if block is not None]
+    if not available:
+        raise ValueError("at least one landing block is required")
+    return min(available, key=lambda block: LAND_BLOCKED_PRECEDENCE.index(block.reason_code))
+
+
+def _merge_truth_has_current_target_merged_proof(result: BranchSyncResult) -> bool:
+    return (
+        result.ok
+        and result.skipped_reason is None
+        and result.merge_status == "merged"
+        and result.merge_source is not None
+        and result.head_sha is not None
+        and result.base_sha is not None
+        and "marked merged" in result.actions
+    )
+
+
+def _known_pre_execution_block(facts: LandingPolicyFacts) -> LandBlocked | None:
+    blocked = evaluate_landing_policy(policy="guarded", facts=facts, judge=None).blocked
+    if blocked is None:
+        return None
+    if blocked.reason_code in {"identity-proof-unavailable", "dirty-checkout", "nondeferrable-blocker"}:
+        return blocked
+    if blocked.reason_code == "rebase-or-conflict" and (
+        not facts.ancestry_proof_available
+        or (facts.rebase_target_contained is True and not facts.clean_merge)
+        or facts.rebase_status in {"pending", "in_progress", "failed", "unavailable", "completed"}
+    ):
+        return blocked
+    return None
+
+
+def _phase_for_block(blocked: LandBlocked) -> LandingPhaseName:
+    if blocked.reason_code == "required-review-unavailable" and (
+        "spec-coherence" in blocked.fact
+        or any("spec-coherence" in ref for ref in blocked.evidence_refs)
+    ):
+        return "spec_coherence"
+    return _phase_for_blocked_reason(blocked.reason_code)
+
+
+def _phase_for_blocked_reason(reason_code: LandBlockedReasonCode) -> LandingPhaseName:
+    if reason_code == "dirty-checkout":
+        return "resolve"
+    if reason_code == "rebase-or-conflict":
+        return "rebase"
+    if reason_code == "verify-unavailable-or-red":
+        return "verify"
+    if reason_code == "required-review-unavailable":
+        return "post_rebase_review"
+    if reason_code == "policy-or-judge-refused":
+        return "judge"
+    if reason_code == "materialization-or-persistence-failed":
+        return "defer_blockers"
+    if reason_code == "merge-failed":
+        return "merge"
+    return "resolve"
+
+
+def _rev_parse_if_exists(git: Any, ref: str) -> str | None:
+    rev_parse_if_exists = getattr(git, "rev_parse_if_exists", None)
+    if callable(rev_parse_if_exists):
+        value = rev_parse_if_exists(ref)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+    rev_parse = getattr(git, "rev_parse", None)
+    if callable(rev_parse):
+        try:
+            value = rev_parse(ref)
+        except Exception:
+            return None
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def _normalize_evidence_refs(refs: tuple[str | None, ...]) -> tuple[str, ...]:
     normalized: list[str] = []
     for ref in refs:
@@ -1391,6 +2177,452 @@ def _landing_verify_evidence_is_current_green(evidence: LandingVerifyEvidence) -
         and bool(evidence.gate_identity)
         and bool(evidence.tree_fingerprint)
     )
+
+
+def _landing_review_evidence_is_current(evidence: LandingReviewEvidence) -> bool:
+    return (
+        evidence.status == "completed"
+        and evidence.current
+        and evidence.parseable
+        and evidence.identity_matched
+        and bool(evidence.review_id)
+        and bool(evidence.reviewed_head)
+        and evidence.verdict in {
+            "APPROVED",
+            "APPROVED_WITH_FOLLOWUPS",
+            "CHANGES_REQUESTED",
+        }
+    )
+
+
+def _terminal_code_review_block(facts: LandingPolicyFacts) -> LandBlocked | None:
+    review = facts.review
+    if review is None or not review.required:
+        return None
+    if review.status in {"failed"}:
+        return LandBlocked(
+            "required-review-unavailable",
+            "required code review evidence is terminally failed",
+            _review_evidence(review, facts),
+        )
+    if (
+        review.status == "completed"
+        and (
+            not review.parseable
+            or review.verdict == "NEEDS_DISCUSSION"
+            or review.mode == "unknown"
+            or review.mode == "spec_coherence"
+        )
+    ):
+        return LandBlocked(
+            "required-review-unavailable",
+            "required code review evidence is malformed or not merge-decision bearing",
+            _review_evidence(review, facts),
+        )
+    return None
+
+
+def _terminal_spec_coherence_block(facts: LandingPolicyFacts) -> LandBlocked | None:
+    spec = facts.spec_coherence
+    if spec is None or not spec.required:
+        return None
+    if spec.status == "failed":
+        return LandBlocked(
+            "required-review-unavailable",
+            "required spec-coherence evidence is terminally failed",
+            _spec_coherence_evidence(spec, facts),
+        )
+    if spec.status == "completed" and (
+        spec.verdict != "APPROVED"
+        or not spec.current
+        or not spec.identity_matched
+        or not spec.evidence_id
+        or spec.reviewed_head != facts.source_head
+        or not spec.changed_paths_fingerprint
+    ):
+        return LandBlocked(
+            "required-review-unavailable",
+            "required spec-coherence evidence is malformed, failed, or not current",
+            _spec_coherence_evidence(spec, facts),
+        )
+    return None
+
+
+def _inspect_query_landing_verify_evidence(
+    store: SqliteTaskStore,
+    identity: LandingResolvedIdentity,
+    *,
+    config: Any | None,
+    git: Any,
+) -> LandingVerifyEvidence:
+    if identity.source_sha is None:
+        return LandingVerifyEvidence(status="missing")
+    try:
+        initial = inspect_current_landing_verify_evidence(
+            store,
+            identity.owner_task,
+            config=config,
+            git=git,
+            source_head=identity.source_sha,
+        )
+        expected_tree = initial.tree_fingerprint
+        return inspect_current_landing_verify_evidence(
+            store,
+            identity.owner_task,
+            config=config,
+            git=git,
+            source_head=identity.source_sha,
+            gate_identity=initial.gate_identity,
+            tree_fingerprint=expected_tree,
+        )
+    except Exception:
+        return LandingVerifyEvidence(status="unavailable")
+
+
+def _task_recency_key(task: DbTask) -> tuple[str, str]:
+    timestamp = task.completed_at or task.started_at or task.created_at
+    return (timestamp.isoformat() if timestamp is not None else "", task.id or "")
+
+
+def _inspect_query_landing_review_evidence(
+    store: SqliteTaskStore,
+    identity: LandingResolvedIdentity,
+    *,
+    config: Any | None,
+) -> LandingReviewEvidence:
+    required = bool(getattr(config, "require_review_before_merge", True))
+    if identity.owner_task.id is None:
+        return LandingReviewEvidence(required=required, status="unavailable")
+    latest: DbTask | None = None
+    try:
+        reviews = get_implementation_review_evidence(store, identity.owner_task)
+    except Exception:
+        return LandingReviewEvidence(required=required, status="unavailable")
+    for review in reviews:
+        if review.task_type != "review":
+            continue
+        if declares_spec_coherence_review_mode(review.review_scope):
+            continue
+        if review.status not in {"completed", "failed", "pending", "in_progress"}:
+            continue
+        if latest is None or _task_recency_key(review) > _task_recency_key(latest):
+            latest = review
+    if latest is None:
+        return LandingReviewEvidence(required=required, status="unavailable")
+    status = cast(LandingReviewStatus, latest.status if latest.status in {"completed", "failed", "pending", "in_progress"} else "unavailable")
+    mode: LandingReviewMode = "resolution" if declares_resolution_review_mode(latest.review_scope) else "plain_full"
+    verdict = _landing_review_verdict_from_task(config, latest) if latest.status == "completed" else None
+    parseable = verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS", "CHANGES_REQUESTED", "NEEDS_DISCUSSION"}
+    reviewed_head = latest.review_verify_head_sha
+    current = latest.status == "completed" and parseable and reviewed_head == identity.source_sha
+    return LandingReviewEvidence(
+        required=required,
+        status=status,
+        mode=mode,
+        verdict=cast(LandingReviewVerdict, verdict) if parseable else None,
+        current=current,
+        parseable=parseable,
+        identity_matched=current,
+        review_id=latest.id,
+        reviewed_head=reviewed_head,
+    )
+
+
+def _inspect_query_landing_lifecycle_gates(
+    store: SqliteTaskStore,
+    git: Any,
+    identity: LandingResolvedIdentity,
+    *,
+    config: Any | None,
+    rebase: LandingRebaseFingerprint,
+) -> _LandingQueryableGates:
+    actionable: list[str] = []
+    dependency_ready = False
+    try:
+        readiness = dependency_readiness(store, identity.owner_task)
+        dependency_ready = readiness.ready
+        if not readiness.ready:
+            refs = ":".join(
+                ref
+                for ref in (
+                    readiness.reason,
+                    readiness.blocking_task_id,
+                    readiness.blocking_merge_unit_id,
+                    readiness.blocking_merge_state,
+                )
+                if ref
+            )
+            actionable.append(f"active-work-identity-mismatch:dependency:{refs or 'unknown'}")
+    except Exception as exc:
+        actionable.append(f"active-work-identity-mismatch:dependency-read-unavailable:{_exception_identity(exc)}")
+
+    project_scope_ok = True
+    spec = _inspect_query_landing_spec_coherence_evidence(store, git, identity, config=config)
+    if config is not None and identity.source_ref is not None:
+        try:
+            strict_scope = _resolve_strict_scope_inspection(
+                config,
+                git,
+                identity.owner_task,
+                merge_source_ref=identity.source_ref,
+                target_branch=identity.target_branch,
+            )
+        except Exception as exc:
+            strict_scope = None
+            actionable.append(f"active-work-identity-mismatch:scope-read-unavailable:{_exception_identity(exc)}")
+        if strict_scope is None:
+            project_scope_ok = False
+        elif strict_scope.inspection_error is not None:
+            project_scope_ok = False
+            actionable.append(f"active-work-identity-mismatch:project-scope-unverified:{strict_scope.inspection_error}")
+        elif strict_scope.violation_paths:
+            project_scope_ok = False
+            actionable.append(
+                "active-work-identity-mismatch:project-scope-violation:"
+                + ",".join(strict_scope.violation_paths)
+            )
+
+    clean_merge = False
+    ancestry_proof_available = False
+    rebase_target_contained = rebase.target_contained
+    if identity.source_ref is not None and identity.source_sha is not None and identity.target_sha is not None:
+        try:
+            rebase_target_contained = git.is_ancestor(identity.target_sha, identity.source_sha)
+            ancestry_proof_available = True
+        except Exception as exc:
+            actionable.append(f"rebase:ancestry-proof-unavailable:{_exception_identity(exc)}")
+        if ancestry_proof_available and rebase_target_contained is True and identity.current_branch is not None:
+            try:
+                preflight = check_manual_merge_preflight(
+                    git,
+                    merge_subject=identity.owner_task,
+                    merge_source_ref=identity.source_ref,
+                    current_branch=identity.current_branch,
+                    merge_preflight_target=identity.target_branch,
+                )
+            except Exception as exc:
+                actionable.append(f"rebase:merge-preflight-unavailable:{_exception_identity(exc)}")
+            else:
+                clean_merge = bool(preflight.ok)
+                if preflight.status == "dirty_checkout":
+                    return _LandingQueryableGates(
+                        dependency_ready=dependency_ready,
+                        project_scope_ok=project_scope_ok,
+                        checkout_clean=False,
+                        clean_merge=False,
+                        ancestry_proof_available=ancestry_proof_available,
+                        rebase_target_contained=rebase_target_contained,
+                        spec_coherence=spec,
+                        actionable_lifecycle_work=tuple(actionable),
+                    )
+                if not preflight.ok:
+                    actionable.append(f"rebase:merge-preflight:{preflight.status}")
+    return _LandingQueryableGates(
+        dependency_ready=dependency_ready,
+        project_scope_ok=project_scope_ok,
+        checkout_clean=True,
+        clean_merge=clean_merge,
+        ancestry_proof_available=ancestry_proof_available,
+        rebase_target_contained=rebase_target_contained,
+        spec_coherence=spec,
+        actionable_lifecycle_work=tuple(actionable),
+    )
+
+
+def _inspect_query_landing_spec_coherence_evidence(
+    store: SqliteTaskStore,
+    git: Any,
+    identity: LandingResolvedIdentity,
+    *,
+    config: Any | None,
+) -> LandingSpecCoherenceEvidence | None:
+    if identity.owner_task.id is None:
+        return None
+    required = False
+    changed_paths: tuple[str, ...] = ()
+    inspection_error: str | None = None
+    if config is not None and identity.source_ref is not None:
+        try:
+            inspection = _resolve_spec_coherence_inspection(
+                config,
+                git,
+                identity.owner_task,
+                merge_source_ref=identity.source_ref,
+                target_branch=identity.target_branch,
+            )
+        except Exception as exc:
+            inspection = None
+            required = bool(getattr(getattr(config, "spec_coherence", None), "enabled", False))
+            inspection_error = _exception_identity(exc)
+        if inspection is not None:
+            required = bool(inspection.required)
+            changed_paths = tuple(inspection.changed_paths)
+            inspection_error = inspection.inspection_error
+    if inspection_error is not None:
+        return LandingSpecCoherenceEvidence(
+            required=required,
+            status="unavailable",
+            current=False,
+            identity_matched=False,
+            evidence_id="spec-coherence-inspection-unavailable",
+            reviewed_head=identity.source_sha,
+            changed_paths_fingerprint=f"unavailable:{inspection_error}",
+        )
+    if not required:
+        return None
+    try:
+        reviews = get_implementation_review_evidence(store, identity.owner_task)
+    except Exception:
+        return LandingSpecCoherenceEvidence(
+            required=required,
+            status="unavailable",
+            current=False,
+            identity_matched=False,
+            evidence_id="spec-coherence-review-read-unavailable",
+            reviewed_head=identity.source_sha,
+            changed_paths_fingerprint=_changed_paths_fingerprint(changed_paths),
+        )
+    expected_scope: str | None = None
+    if identity.source_sha is not None and changed_paths:
+        try:
+            expected_scope = build_spec_coherence_review_scope(
+                implementation_task_id=identity.owner_task.id,
+                reviewed_head_sha=identity.source_sha,
+                changed_paths=changed_paths,
+            )
+        except ValueError:
+            expected_scope = None
+    spec_reviews = [review for review in reviews if declares_spec_coherence_review_mode(review.review_scope)]
+    if not spec_reviews:
+        if not required:
+            return None
+        return LandingSpecCoherenceEvidence(
+            required=True,
+            status="unavailable",
+            current=False,
+            identity_matched=False,
+            evidence_id="spec-coherence-review-missing",
+            reviewed_head=identity.source_sha,
+            changed_paths_fingerprint=_changed_paths_fingerprint(changed_paths),
+        )
+    latest = max(spec_reviews, key=_task_recency_key)
+    verdict = _landing_review_verdict_from_task(None, latest) if latest.status == "completed" else None
+    parseable = verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS", "CHANGES_REQUESTED", "NEEDS_DISCUSSION"}
+    parsed_paths: tuple[str, ...] = ()
+    try:
+        parsed_scope = parse_spec_coherence_review_scope(latest.review_scope)
+        if parsed_scope is not None:
+            parsed_paths = parsed_scope.changed_paths
+    except ValueError:
+        parsed_paths = ()
+    scope_matched = latest.review_scope == expected_scope if expected_scope is not None else parsed_paths == changed_paths
+    current = (
+        latest.status == "completed"
+        and parseable
+        and latest.review_verify_head_sha == identity.source_sha
+        and scope_matched
+    )
+    return LandingSpecCoherenceEvidence(
+        required=required,
+        status=cast(LandingReviewStatus, latest.status if latest.status in {"completed", "failed", "pending", "in_progress"} else "unavailable"),
+        verdict=cast(LandingReviewVerdict, verdict) if parseable else None,
+        current=current,
+        identity_matched=current,
+        evidence_id=latest.id,
+        reviewed_head=latest.review_verify_head_sha,
+        changed_paths_fingerprint=_changed_paths_fingerprint(changed_paths or parsed_paths),
+    )
+
+
+def _inspect_query_landing_rebase_fingerprint(
+    store: SqliteTaskStore,
+    identity: LandingResolvedIdentity,
+) -> LandingRebaseFingerprint:
+    if identity.owner_task.id is None:
+        return LandingRebaseFingerprint(
+            status="unavailable",
+            resolution_kind="unknown",
+        )
+    try:
+        children = get_same_branch_rebase_descendants_for_root(store, identity.owner_task)
+    except Exception:
+        return LandingRebaseFingerprint(status="unavailable", resolution_kind="unknown")
+    rebases = [task for task in children if task.task_type == "rebase"]
+    if not rebases:
+        return LandingRebaseFingerprint(status="none", resolution_kind="none")
+    latest = max(rebases, key=_task_recency_key)
+    status = cast(LandingRebaseStatus, latest.status if latest.status in {"pending", "in_progress", "completed", "failed"} else "unavailable")
+    if status != "completed":
+        return LandingRebaseFingerprint(
+            outcome_id=latest.id,
+            status=status,
+            changed_diff=latest.changed_diff,
+            resolution_kind="unknown",
+        )
+    if latest.id is None:
+        return LandingRebaseFingerprint(status="unavailable", resolution_kind="unknown")
+    try:
+        artifacts = store.list_artifacts(latest.id, kind=REBASE_EXECUTION_OUTCOME_ARTIFACT_KIND)
+    except Exception:
+        return LandingRebaseFingerprint(outcome_id=latest.id, status="unavailable", resolution_kind="unknown")
+    artifact_entries: list[tuple[Any, dict[str, Any]]] = []
+    for artifact in artifacts:
+        metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
+        if metadata is None:
+            continue
+        if metadata.get("parent_task_id") != identity.owner_task.id:
+            continue
+        artifact_entries.append((artifact, metadata))
+    if len(artifact_entries) != 1:
+        return LandingRebaseFingerprint(outcome_id=latest.id, status="unavailable", resolution_kind="unknown")
+    artifact, metadata = artifact_entries[0]
+    service_status = metadata.get("status")
+    if service_status == "completed_mechanical":
+        resolution_kind: LandingRebaseResolutionKind = "mechanical"
+        no_op_subtype = None
+    elif service_status == "provider_conflict_resolved":
+        resolution_kind = "provider_resolved"
+        no_op_subtype = None
+    elif service_status == "completed_no_op":
+        resolution_kind = "no_op"
+        no_op_subtype = _no_op_subtype_from_rebase_metadata(metadata)
+    else:
+        return LandingRebaseFingerprint(outcome_id=str(artifact.id), status="unavailable", resolution_kind="unknown")
+    changed_diff = metadata.get("changed_diff")
+    provider_resolution_proof = metadata.get("provider_conflict_resolved")
+    target_contained = metadata.get("target_contained")
+    if not isinstance(changed_diff, bool) or not isinstance(provider_resolution_proof, bool):
+        return LandingRebaseFingerprint(outcome_id=str(artifact.id), status="unavailable", resolution_kind="unknown")
+    return LandingRebaseFingerprint(
+        outcome_id=str(artifact.id),
+        status="completed",
+        changed_diff=changed_diff,
+        resolution_kind=resolution_kind,
+        no_op_subtype=no_op_subtype,
+        attempted_source_head=cast(str | None, metadata.get("source_head_before")),
+        attempted_target_head=cast(str | None, metadata.get("target_head_before")),
+        target_contained=target_contained if isinstance(target_contained, bool) else None,
+        provider_resolution_proof=provider_resolution_proof,
+    )
+
+
+def _no_op_subtype_from_rebase_metadata(metadata: dict[str, Any]) -> LandingRebaseNoOpSubtype | None:
+    completion_reason = str(metadata.get("completion_reason") or "")
+    if "already contains target" in completion_reason:
+        return "already_contained"
+    if metadata.get("superseded") is True:
+        return "superseded_contained"
+    if "target unchanged" in completion_reason:
+        return "unchanged_target"
+    if "moot" in completion_reason:
+        return "moot"
+    return None
+
+
+def _changed_paths_fingerprint(paths: tuple[str, ...]) -> str | None:
+    if not paths:
+        return None
+    return json.dumps(tuple(sorted(paths)), separators=(",", ":"))
 
 
 def _normalize_optional_nonblank_ref(ref: str | None) -> str | None:
@@ -1589,7 +2821,7 @@ def _find_exact_landing_review(
         return None
     candidates = [
         review
-        for review in store.get_reviews_for_task(impl_task.id)
+        for review in get_implementation_review_evidence(store, impl_task)
         if review.status in {"completed", "failed", "stopped"}
         and _landing_review_matches_required_identity(
             review,
@@ -1613,7 +2845,7 @@ def _select_active_landing_review(
         return None, None
     candidates = [
         review
-        for review in store.get_reviews_for_task(impl_task.id)
+        for review in get_implementation_review_evidence(store, impl_task)
         if review.status in {"pending", "in_progress"}
     ]
     if not candidates:
@@ -1860,8 +3092,6 @@ def _mechanical_blocked_fact(facts: LandingPolicyFacts) -> LandBlocked | None:
         or facts.representative_status not in {"completed", "unmerged"}
         or not facts.has_local_source
         or not facts.target_matches_checkout
-        or not facts.dependency_ready
-        or not facts.project_scope_ok
         or not facts.source_head
         or not facts.target_head
     ):
@@ -1876,6 +3106,12 @@ def _mechanical_blocked_fact(facts: LandingPolicyFacts) -> LandBlocked | None:
     )
     if lifecycle_identity_block is not None:
         return lifecycle_identity_block
+    if not facts.dependency_ready or not facts.project_scope_ok:
+        return LandBlocked(
+            "identity-proof-unavailable",
+            "landing dependency or project-scope proof is unavailable",
+            _identity_evidence(facts),
+        )
     if not facts.checkout_clean:
         return LandBlocked("dirty-checkout", "tracked checkout is not clean", _identity_evidence(facts))
     lifecycle_rebase_block = _actionable_lifecycle_work_blocked_fact(
@@ -1976,6 +3212,10 @@ def _actionable_lifecycle_work_fact(
     if reason_code == "identity-proof-unavailable":
         return f"active lifecycle work identity is unavailable or mismatched: {work}"
     if reason_code == "rebase-or-conflict":
+        if "ancestry-proof-unavailable" in work:
+            return "ancestry proof is unavailable before landing can continue"
+        if "merge-preflight-unavailable" in work:
+            return "manual merge preflight proof is unavailable before landing can continue"
         return f"required rebase work remains: {work}"
     if reason_code == "verify-unavailable-or-red":
         return f"required verify work remains: {work}"
@@ -2043,6 +3283,39 @@ def _valid_no_op_rebase_proof(facts: LandingPolicyFacts) -> bool:
         and bool(facts.rebase_attempted_source_head)
         and facts.rebase_attempted_source_head == facts.source_head
     )
+
+
+def _dry_run_review_boundary(
+    policy: LandingPolicyName,
+    facts: LandingPolicyFacts,
+) -> LandingPhaseName | LandBlocked:
+    """Classify the CHANGES_REQUESTED boundary the same way `_evaluate_review_policy`
+    would, without invoking the judge, so dry-run/pre-execution phase selection
+    never advertises a conditional judge that strict policy or missing blocker
+    evidence would actually refuse outright."""
+
+    review = facts.review
+    assert review is not None
+    if policy == "strict":
+        return LandBlocked(
+            "nondeferrable-blocker",
+            "strict policy refuses open review blockers",
+            _review_evidence(review, facts),
+        )
+    nondeferrable = _first_nondeferrable_blocker(facts.open_blockers)
+    if nondeferrable is not None:
+        return LandBlocked(
+            "nondeferrable-blocker",
+            f"review blocker {nondeferrable.finding_id} is non-deferable",
+            _blocker_evidence(nondeferrable),
+        )
+    if not facts.open_blockers:
+        return LandBlocked(
+            "nondeferrable-blocker",
+            "changes-requested review has no blocker evidence",
+            _review_evidence(review, facts),
+        )
+    return "judge"
 
 
 def _evaluate_review_policy(
