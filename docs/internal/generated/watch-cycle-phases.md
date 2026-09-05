@@ -137,6 +137,54 @@ here is memoized across cycles yet. For tag-scoped runs, owner action/git
 resolution now scales with the retained scoped owners plus conservative
 terminal-reroot candidates rather than every ordinary owner in the snapshot.
 
+## Diagram
+
+Phase order plus the external systems each phase touches: the task/runtime
+DB (`.gza/gza.db`, sqlite), `git` (subprocess calls against the working
+repo/worktrees), `disk` (installed-package/config filesystem checks), and
+`proc` (OS process spawn/liveness checks for workers).
+
+```mermaid
+flowchart TD
+    DB[("sqlite DB")]
+    GIT[/"git (repo/worktrees)"/]
+    DISK[/"disk (installed pkg / config)"/]
+
+    Start(["cycle start"]) --> Drift["drift-check"]
+    Drift -.-> DISK
+    Drift --> Runtime["runtime-reconcile"]
+    Runtime -.-> DB
+    Runtime --> Plan["cycle-plan<br/>(full task scan + per-branch git probes)"]
+    Plan -.-> DB
+    Plan -.-> GIT
+    Plan --> Stale["stale-no-progress-reconcile"]
+    Stale -.-> DB
+    Stale --> Header["cycle-header (log only)"]
+    Header --> Preflight["lifecycle-preflight<br/>(runs full verify/test suite)"]
+    Preflight -.-> GIT
+    Preflight --> Lifecycle["lifecycle<br/>(merge/rebase/advance dispatch)"]
+    Lifecycle -.-> GIT
+    Lifecycle -.-> DB
+    Lifecycle --> Rearm["blind-parked-auto-rearm<br/>(git diff per parked candidate)"]
+    Rearm -.-> GIT
+    Rearm -.-> DB
+    Rearm -- rearmed something --> Plan
+    Rearm -- nothing rearmed --> RecPlan["recovery-plan (in-memory)"]
+    RecPlan --> RecDispatch["recovery-dispatch<br/>(spawn recovery workers)"]
+    RecDispatch -.-> DB
+    RecDispatch --> PendDispatch["pending-dispatch<br/>(spawn pending workers)"]
+    PendDispatch -.-> DB
+    PendDispatch --> Finalize["cycle-finalize<br/>(checkout boundary + live-process scan)"]
+    Finalize -.-> DB
+    Finalize -.-> GIT
+    Finalize --> Boundary{"cycle boundary"}
+    Boundary -- "code drift detected" --> Reexec(["re-exec process"])
+    Boundary -- "no drift" --> Start
+
+    classDef storage fill:#e6d9b8,stroke:#8a6d1d,color:#3a2e0a
+    class DB,GIT,DISK storage
+```
+
 ## Related
 
 - `specs/behavior/watch-supervisor.md` — prescriptive intent for drift/re-exec
