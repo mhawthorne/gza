@@ -12,6 +12,8 @@ from gza.git import Git
 def cmd_land(args: argparse.Namespace) -> int:
     """Resolve and plan an operator-triggered landing attempt."""
 
+    from gza.cli._common import _create_rebase_task
+    from gza.cli.git_ops import _run_task_backed_rebase
     from gza.landing import LANDING_POLICIES, LandingCoordinator, LandRequest
 
     config = Config.load(args.project_dir)
@@ -23,7 +25,13 @@ def cmd_land(args: argparse.Namespace) -> int:
         print(f"Error: unknown landing policy {policy!r}")
         return 2
 
-    result = LandingCoordinator(store=store, git=git, config=config).run(
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        create_rebase_task=_create_rebase_task,
+        rebase_executor=_run_task_backed_rebase,
+    ).run(
         LandRequest(task_id=task_id, policy=policy, dry_run=bool(args.dry_run))
     )
     for step in result.steps:

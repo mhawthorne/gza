@@ -60,6 +60,7 @@ from gza.runner import (
     ReviewVerifyResult,
     _persist_lifecycle_verify_execution,
 )
+from gza.rebase_service import RebaseServiceRequest, RebaseServiceResult
 from gza.sync_ops import BranchSyncResult
 
 TREE_A = "a" * 64
@@ -3671,11 +3672,297 @@ def test_landing_coordinator_distinct_full_fingerprints_stop_at_custom_transitio
     assert git.mutation_calls == []
 
 
+def _unused_rebase_factory(*_args: Any, **_kwargs: Any) -> Task:
+    raise AssertionError("coordinator should not create a rebase task")
+
+
+def _unused_rebase_executor(*_args: Any, **_kwargs: Any) -> int:
+    raise AssertionError("coordinator should not run a rebase executor")
+
+
+def test_landing_coordinator_skip_rebase_when_source_contains_target_tip(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "contains target", "feature/contains-target")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/contains-target": "source-a", "main": "target-a"},
+        local_branches={"feature/contains-target"},
+        ancestors={("target-a", "source-a")},
+    )
+    service_calls: list[RebaseServiceRequest] = []
+
+    def recording_service(**kwargs: Any) -> RebaseServiceResult:
+        request = kwargs["request"]
+        service_calls.append(request)
+        return RebaseServiceResult(
+            status="skipped",
+            parent_task_id=request.parent_task_id,
+            branch=request.branch,
+            target_ref=request.target_branch,
+            changed_diff=False,
+            artifact_id=10,
+            artifact_key="skip-key",
+            source_head_before="source-a",
+            target_head_before="target-a",
+            source_head_after="source-a",
+            target_head_after="target-a",
+            fact="source already contains target",
+        )
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        create_rebase_task=_unused_rebase_factory,
+        rebase_executor=_unused_rebase_executor,
+        execute_rebase_service=recording_service,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert service_calls == []
+    statuses = {step.phase: step.status for step in result.steps}
+    assert statuses["rebase"] == "skipped"
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "verify-unavailable-or-red"
+
+
+def test_landing_coordinator_runs_one_task_backed_rebase_when_source_is_behind(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "behind target", "feature/behind")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/behind": "source-before", "main": "target-a"},
+        local_branches={"feature/behind"},
+        ancestors=set(),
+    )
+    service_calls: list[RebaseServiceRequest] = []
+    resolved_heads: list[tuple[str | None, str | None]] = []
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        resolved_heads.append((identity.source_sha, identity.target_sha))
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            rebase_status="none",
+            rebase_resolution_kind="none",
+            rebase_target_contained=(identity.target_sha, identity.source_sha) in git.ancestors,
+            ancestry_proof_available=True,
+            clean_merge=True,
+        )
+
+    def recording_service(**kwargs: Any) -> RebaseServiceResult:
+        request = kwargs["request"]
+        service_calls.append(request)
+        assert request.trigger_source == "manual_land"
+        assert request.run is True
+        assert request.skip_if_target_contained is True
+        git.heads["feature/behind"] = "source-after"
+        git.ancestors.add(("target-a", "source-after"))
+        return RebaseServiceResult(
+            status="completed_mechanical",
+            parent_task_id=request.parent_task_id,
+            branch=request.branch,
+            target_ref=request.target_branch,
+            rebase_task_id="gza-200",
+            changed_diff=False,
+            artifact_id=11,
+            artifact_key="rebase-key",
+            source_head_before="source-before",
+            target_head_before="target-a",
+            source_head_after="source-after",
+            target_head_after="target-a",
+        )
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        create_rebase_task=_unused_rebase_factory,
+        rebase_executor=_unused_rebase_executor,
+        execute_rebase_service=recording_service,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert len(service_calls) == 1
+    assert service_calls[0].parent_task_id == impl.id
+    assert service_calls[0].branch == "feature/behind"
+    assert service_calls[0].target_branch == "main"
+    assert resolved_heads == [("source-before", "target-a"), ("source-after", "target-a")]
+    assert any(step.phase == "rebase" and step.status == "completed" for step in result.steps)
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "merge-failed"
+
+
+def test_landing_coordinator_unknown_ancestry_blocks_without_rebase(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "unknown ancestry", "feature/unknown-ancestry")
+    assert impl.id is not None
+
+    class FailingAncestryGit(_LandingSourceGit):
+        def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+            raise RuntimeError(f"cannot prove {ancestor}->{descendant}")
+
+    git = FailingAncestryGit(
+        {"feature/unknown-ancestry": "source-a", "main": "target-a"},
+        local_branches={"feature/unknown-ancestry"},
+    )
+    service_calls: list[RebaseServiceRequest] = []
+
+    def unexpected_service(**kwargs: Any) -> RebaseServiceResult:
+        service_calls.append(kwargs["request"])
+        raise AssertionError("coordinator should not call rebase service without ancestry proof")
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        create_rebase_task=_unused_rebase_factory,
+        rebase_executor=_unused_rebase_executor,
+        execute_rebase_service=unexpected_service,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert service_calls == []
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "rebase-or-conflict"
+    assert "ancestry proof is unavailable" in result.blocked.fact
+
+
+def test_landing_coordinator_failed_rebase_blocks_once_without_merge(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "failed rebase", "feature/failed-rebase")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/failed-rebase": "source-a", "main": "target-a"},
+        local_branches={"feature/failed-rebase"},
+    )
+    service_calls = 0
+
+    def failing_service(**kwargs: Any) -> RebaseServiceResult:
+        nonlocal service_calls
+        service_calls += 1
+        request = kwargs["request"]
+        return RebaseServiceResult(
+            status="failed",
+            parent_task_id=request.parent_task_id,
+            branch=request.branch,
+            target_ref=request.target_branch,
+            rebase_task_id="gza-201",
+            exit_code=1,
+            artifact_id=12,
+            artifact_key="failed-key",
+            source_head_before="source-a",
+            target_head_before="target-a",
+            source_head_after="source-a",
+            target_head_after="target-a",
+            fact="AI conflict resolution could not complete",
+        )
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        create_rebase_task=_unused_rebase_factory,
+        rebase_executor=_unused_rebase_executor,
+        execute_rebase_service=failing_service,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert service_calls == 1
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "rebase-or-conflict"
+    assert result.blocked.fact == "AI conflict resolution could not complete"
+    assert sum(1 for step in result.steps if step.phase == "rebase" and step.status == "blocked") == 1
+    assert git.mutation_calls == []
+
+
+def test_landing_coordinator_stale_target_after_rebase_blocks_without_second_rebase(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "stale target", "feature/stale-target")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/stale-target": "source-before", "main": "target-a"},
+        local_branches={"feature/stale-target"},
+    )
+    service_calls = 0
+    facts_calls = 0
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        nonlocal facts_calls
+        facts_calls += 1
+        if facts_calls == 1:
+            return _green_facts(
+                task_id=identity.owner_task_id,
+                source_head=identity.source_sha,
+                target_head=identity.target_sha,
+                rebase_status="none",
+                rebase_resolution_kind="none",
+                rebase_target_contained=False,
+                ancestry_proof_available=True,
+                clean_merge=False,
+            )
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            rebase_status="completed",
+            rebase_resolution_kind="mechanical",
+            rebase_changed_diff=False,
+            rebase_outcome_id="artifact-13",
+            rebase_attempted_source_head="source-before",
+            rebase_attempted_target_head="target-a",
+            rebase_target_contained=False,
+            rebase_provider_resolution_proof=False,
+            ancestry_proof_available=True,
+            clean_merge=False,
+        )
+
+    def stale_target_service(**kwargs: Any) -> RebaseServiceResult:
+        nonlocal service_calls
+        service_calls += 1
+        request = kwargs["request"]
+        git.heads["feature/stale-target"] = "source-after"
+        git.heads["main"] = "target-b"
+        return RebaseServiceResult(
+            status="completed_mechanical",
+            parent_task_id=request.parent_task_id,
+            branch=request.branch,
+            target_ref=request.target_branch,
+            rebase_task_id="gza-202",
+            changed_diff=False,
+            artifact_id=13,
+            artifact_key="stale-key",
+            source_head_before="source-before",
+            target_head_before="target-a",
+            source_head_after="source-after",
+            target_head_after="target-a",
+        )
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        create_rebase_task=_unused_rebase_factory,
+        rebase_executor=_unused_rebase_executor,
+        execute_rebase_service=stale_target_service,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert service_calls == 1
+    assert facts_calls == 2
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "rebase-or-conflict"
+    assert git.mutation_calls == []
+
+
 def test_land_cli_prints_concrete_dry_run_evidence(monkeypatch, capsys, tmp_path) -> None:
     from gza.cli import land as land_cli
 
     class FakeCoordinator:
-        def __init__(self, *, store: Any, git: Any, config: Any) -> None:
+        def __init__(self, *, store: Any, git: Any, config: Any, **_kwargs: Any) -> None:
             self.store = store
             self.git = git
             self.config = config

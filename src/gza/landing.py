@@ -24,7 +24,15 @@ from gza.db import SqliteTaskStore, Task as DbTask, _task_is_actionable_merge_un
 from gza.dependency_preconditions import dependency_readiness
 from gza.merge_services import ResolvedMergeSubject, check_manual_merge_preflight, resolve_merge_subject_query_only
 from gza.query import get_implementation_review_evidence, get_same_branch_rebase_descendants_for_root
-from gza.rebase_service import REBASE_EXECUTION_OUTCOME_ARTIFACT_KIND
+from gza.rebase_service import (
+    COMPLETED_REBASE_EXECUTION_STATUSES,
+    REBASE_EXECUTION_OUTCOME_ARTIFACT_KIND,
+    RebaseExecutor,
+    RebaseServiceRequest,
+    RebaseServiceResult,
+    RebaseTaskFactory,
+    execute_task_backed_rebase_service,
+)
 from gza.review_scope import (
     build_spec_coherence_review_scope,
     declares_resolution_review_mode,
@@ -338,6 +346,10 @@ class LandingCoordinator:
     reconcile_merge_truth: Callable[..., BranchSyncResult] = reconcile_task_branch_merge_truth
     inspect_policy_facts: Callable[[LandingResolvedIdentity], LandingPolicyFacts] | None = None
     should_re_resolve: Callable[[LandingResolvedIdentity, LandingStateFingerprint, tuple[LandStep, ...]], bool] | None = None
+    create_rebase_task: RebaseTaskFactory | None = None
+    rebase_executor: RebaseExecutor | None = None
+    execute_rebase_service: Callable[..., RebaseServiceResult] = execute_task_backed_rebase_service
+    runtime_context: Any | None = None
 
     def plan(self, request: LandRequest) -> LandResult:
         return self.run(request)
@@ -401,62 +413,186 @@ class LandingCoordinator:
             if bounded is not None:
                 steps.append(LandStep("resolve", "blocked", bounded.fact, blocked=bounded))
                 return self._blocked_result(request, identity, steps, bounded)
-            if self.should_re_resolve is None or not self.should_re_resolve(identity, fingerprint, tuple(steps)):
-                break
+            if self.should_re_resolve is not None and self.should_re_resolve(identity, fingerprint, tuple(steps)):
+                continue
 
-        if identity.already_merged:
-            steps.append(
+            if identity.already_merged:
+                steps.append(
+                    LandStep(
+                        "merge",
+                        "completed",
+                        "source is already landed or equivalent on target",
+                        evidence_refs=_evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+                    )
+                )
+                return LandResult(
+                    request=request,
+                    owner_task_id=identity.owner_task_id,
+                    target_branch=identity.target_branch,
+                    source_ref=identity.source_ref,
+                    steps=tuple(steps),
+                    already_merged=True,
+                )
+
+            pre_execution_block = _known_pre_execution_block(facts)
+            if pre_execution_block is not None:
+                steps.append(
+                    LandStep(
+                        _phase_for_block(pre_execution_block),
+                        "blocked",
+                        pre_execution_block.fact,
+                        blocked=pre_execution_block,
+                    )
+                )
+                return self._blocked_result(request, identity, steps, pre_execution_block)
+
+            first_boundary = self._first_execution_required_phase(identity, facts, policy=request.policy)
+            if isinstance(first_boundary, LandBlocked):
+                phase = _phase_for_block(first_boundary)
+                steps.append(LandStep(phase, "blocked", first_boundary.fact, blocked=first_boundary))
+                return self._blocked_result(request, identity, steps, first_boundary)
+            if request.dry_run:
+                dry_steps = dry_run_steps_until_boundary(
+                    resolved=True,
+                    first_execution_required_phase=first_boundary,
+                    facts=facts,
+                )
+                steps.extend(dry_steps[1:])
+                return LandResult(
+                    request=request,
+                    owner_task_id=identity.owner_task_id,
+                    target_branch=identity.target_branch,
+                    source_ref=identity.source_ref,
+                    steps=tuple(steps),
+                )
+
+            if (
+                first_boundary != "rebase"
+                and facts.rebase_status == "none"
+                and facts.rebase_target_contained is True
+            ):
+                steps.append(
+                    LandStep(
+                        "rebase",
+                        "skipped",
+                        "source already contains the target tip; no rebase was run",
+                        evidence_refs=_evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+                    )
+                )
+
+            if first_boundary == "rebase":
+                step, blocked = self._run_rebase_phase(identity)
+                steps.append(step)
+                if blocked is not None:
+                    return self._blocked_result(request, identity, steps, blocked)
+                continue
+
+            blocked = LandBlocked(
+                self._boundary_reason_code(first_boundary),
+                self._boundary_fact(first_boundary),
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+            steps.append(LandStep(first_boundary, "blocked", blocked.fact, blocked=blocked))
+            return self._blocked_result(request, identity, steps, blocked)
+
+    def _run_rebase_phase(
+        self,
+        identity: LandingResolvedIdentity,
+    ) -> tuple[LandStep, LandBlocked | None]:
+        if self.config is None:
+            blocked = LandBlocked(
+                "rebase-or-conflict",
+                "task-backed rebase service configuration is unavailable",
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+            return LandStep("rebase", "blocked", blocked.fact, blocked=blocked), blocked
+        if identity.source_ref is None or identity.source_sha is None or identity.target_sha is None:
+            blocked = LandBlocked(
+                "identity-proof-unavailable",
+                "exact local source or target ref proof is unavailable",
+                _evidence_refs(identity.owner_task_id, identity.source_ref, identity.target_branch),
+            )
+            return LandStep("rebase", "blocked", blocked.fact, blocked=blocked), blocked
+        create_rebase_task = self.create_rebase_task
+        rebase_executor = self.rebase_executor
+        if create_rebase_task is None or rebase_executor is None:
+            try:
+                from gza.cli._common import _create_rebase_task as default_create_rebase_task
+                from gza.cli.git_ops import _run_task_backed_rebase as default_rebase_executor
+            except Exception as exc:
+                blocked = LandBlocked(
+                    "rebase-or-conflict",
+                    _exception_fact("task-backed rebase service dependencies are unavailable", exc),
+                    _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+                )
+                return LandStep("rebase", "blocked", blocked.fact, blocked=blocked), blocked
+            create_rebase_task = create_rebase_task or default_create_rebase_task
+            rebase_executor = rebase_executor or default_rebase_executor
+        try:
+            result = self.execute_rebase_service(
+                config=self.config,
+                store=self.store,
+                git=self.git,
+                request=RebaseServiceRequest(
+                    parent_task_id=identity.owner_task_id,
+                    branch=identity.source_branch,
+                    target_branch=identity.target_branch,
+                    remote=False,
+                    trigger_source="manual_land",
+                    run=True,
+                    skip_if_target_contained=True,
+                    reuse_completed=True,
+                    duplicate_as_result=True,
+                ),
+                create_rebase_task=create_rebase_task,
+                executor=rebase_executor,
+                runtime_context=self.runtime_context,
+            )
+        except Exception as exc:
+            blocked = LandBlocked(
+                "rebase-or-conflict",
+                _exception_fact("task-backed rebase execution failed before recording an outcome", exc),
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+            return LandStep("rebase", "blocked", blocked.fact, blocked=blocked), blocked
+
+        evidence = _evidence_refs(
+            identity.owner_task_id,
+            result.rebase_task_id,
+            str(result.artifact_id) if result.artifact_id is not None else None,
+            result.artifact_key,
+            result.source_head_before,
+            result.target_head_before,
+            result.source_head_after,
+            result.target_head_after,
+        )
+        if result.status == "skipped":
+            return (
                 LandStep(
-                    "merge",
+                    "rebase",
+                    "skipped",
+                    "source already contains the target tip; no rebase was run",
+                    evidence_refs=evidence,
+                ),
+                None,
+            )
+        if result.status in COMPLETED_REBASE_EXECUTION_STATUSES:
+            return (
+                LandStep(
+                    "rebase",
                     "completed",
-                    "source is already landed or equivalent on target",
-                    evidence_refs=_evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
-                )
-            )
-            return LandResult(
-                request=request,
-                owner_task_id=identity.owner_task_id,
-                target_branch=identity.target_branch,
-                source_ref=identity.source_ref,
-                steps=tuple(steps),
-                already_merged=True,
-            )
-
-        pre_execution_block = _known_pre_execution_block(facts)
-        if pre_execution_block is not None:
-            steps.append(
-                LandStep(
-                    _phase_for_block(pre_execution_block),
-                    "blocked",
-                    pre_execution_block.fact,
-                    blocked=pre_execution_block,
-                )
-            )
-            return self._blocked_result(request, identity, steps, pre_execution_block)
-
-        first_boundary = self._first_execution_required_phase(identity, facts, policy=request.policy)
-        if isinstance(first_boundary, LandBlocked):
-            phase = _phase_for_block(first_boundary)
-            steps.append(LandStep(phase, "blocked", first_boundary.fact, blocked=first_boundary))
-            return self._blocked_result(request, identity, steps, first_boundary)
-        if request.dry_run:
-            dry_steps = dry_run_steps_until_boundary(resolved=True, first_execution_required_phase=first_boundary, facts=facts)
-            steps.extend(dry_steps[1:])
-            return LandResult(
-                request=request,
-                owner_task_id=identity.owner_task_id,
-                target_branch=identity.target_branch,
-                source_ref=identity.source_ref,
-                steps=tuple(steps),
+                    f"task-backed rebase {result.rebase_task_id} completed with {result.status}",
+                    evidence_refs=evidence,
+                ),
+                None,
             )
 
         blocked = LandBlocked(
-            self._boundary_reason_code(first_boundary),
-            self._boundary_fact(first_boundary),
-            _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            "rebase-or-conflict",
+            result.fact or _rebase_service_blocking_fact(result.status),
+            evidence,
         )
-        steps.append(LandStep(first_boundary, "blocked", blocked.fact, blocked=blocked))
-        return self._blocked_result(request, identity, steps, blocked)
+        return LandStep("rebase", "blocked", blocked.fact, blocked=blocked), blocked
 
     def _blocked_result(
         self,
@@ -2120,6 +2256,20 @@ def _phase_for_blocked_reason(reason_code: LandBlockedReasonCode) -> LandingPhas
     if reason_code == "merge-failed":
         return "merge"
     return "resolve"
+
+
+def _rebase_service_blocking_fact(status: str) -> str:
+    if status == "proof_unavailable":
+        return "ancestry proof is unavailable before landing can continue"
+    if status == "failed":
+        return "task-backed rebase failed and requires manual conflict resolution"
+    if status == "in_progress":
+        return "matching task-backed rebase is already in progress"
+    if status == "queued":
+        return "task-backed rebase is queued but has not completed"
+    if status == "identity_conflict":
+        return "active task-backed rebase identity does not match the landing source and target"
+    return f"task-backed rebase stopped with status {status}"
 
 
 def _rev_parse_if_exists(git: Any, ref: str) -> str | None:
