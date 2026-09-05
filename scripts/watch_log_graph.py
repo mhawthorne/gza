@@ -5,16 +5,22 @@
 # ///
 """Graph gza ``watch`` queue depth over time from ``.gza/watch.log`` archives.
 
-Parses the selected watch log family and plots six disjoint series — tasks
-**running**, **pending** (runnable), **blocked**, **parked** (needs attention),
-**recovery** (failed, awaiting automatic retry/resume), and **other**
-(classification residual; should stay at zero) — against time, saving a PNG and
-printing a text table of the same numbers. Newer logs carry a per-cycle
-``cycle accounting:`` line with the full breakdown; older logs only have the
-WAKE counts plus attention lines. By default parked is left unknown on those
-older cycles, since the old attention lines count a broader, differently-scoped
-set of conditions than the modern parked bucket; pass --legacy-attention to map
-them onto parked anyway (recovery and other are unknown either way). Live watch logs
+Parses the selected watch log family and plots six disjoint series — units
+**running**, **pending**, **blocked**, **parked** (needs a human), **recovery**
+(failed, awaiting automatic retry/resume), and **other** (classification
+residual; should stay at zero) — against time, saving a PNG and printing a text
+table of the same numbers. A "unit" is a merge unit (implement lineages;
+review/improve/fix/rebase/verify_fix members fold into their unit rather than
+counting separately) or, for plan-only lineages that never produce a merge
+unit, the plan/plan_review/plan_improve/explore chain itself. This is the
+default view whenever the log carries the newer ``unit accounting:`` line;
+pass --task-level for the older per-task counts instead (or as an automatic
+fallback on logs from before unit accounting existed). Older logs (no ``cycle
+accounting:`` line at all) only have the WAKE counts plus attention lines; by
+default parked is left unknown on those cycles, since the old attention lines
+count a broader, differently-scoped set of conditions than the modern parked
+bucket, pass --legacy-attention to map them onto parked anyway (recovery and
+other are unknown either way). Live watch logs
 (``.gza/watch.log`` plus ``watch.<timestamp>.log`` archives) and dry-run watch
 logs (``.gza/watch.dry-run.log`` plus ``watch.dry-run.<timestamp>.log``
 archives) are read separately because they describe different runs.
@@ -48,6 +54,7 @@ Log line shapes it understands::
     HH:MM:SS INFO      12 tasks still need attention (unchanged)
     HH:MM:SS INFO      Needs attention (13 tasks):
     HH:MM:SS INFO      cycle accounting: running=2 pending=3 blocked=1 parked=4 recovery=2 other=0
+    HH:MM:SS INFO      unit accounting: running=1 pending=2 blocked=1 parked=3 recovery=1 other=0
 """
 
 from __future__ import annotations
@@ -90,6 +97,16 @@ _ACCOUNTING_RE = re.compile(
     r"cycle accounting: running=(\d+) pending=(\d+) blocked=(\d+) "
     r"parked=(\d+) recovery=(\d+) other=(\d+)"
 )
+# Merge-unit-level accounting (emitted right after the task-level line, same
+# cycle): the six buckets count merge units / plan-only lineages, not tasks.
+# This is the primary view now - see UnitPoint and _UNIT_ACCOUNTING_RE usage
+# in parse_log. Older logs never emit this line; those cycles simply have no
+# unit data (unit=None on the Point), there is no legacy fallback to compute
+# it from.
+_UNIT_ACCOUNTING_RE = re.compile(
+    r"unit accounting: running=(\d+) pending=(\d+) blocked=(\d+) "
+    r"parked=(\d+) recovery=(\d+) other=(\d+)"
+)
 # Real merge events: "MERGE     gza-7957 -> main" (dry-run variants excluded below).
 _MERGE_RE = re.compile(r"MERGE\s+(gza-\d+)\s*->")
 _ARCHIVE_TIMESTAMP_FORMAT = "%Y-%m-%dT%H-%M-%S"
@@ -109,12 +126,34 @@ class WatchLogFile:
         self.archive_end = archive_end
 
 
+class UnitPoint:
+    """One cycle's merge-unit-level counts: same six disjoint buckets as Point,
+    but counting merge units (and plan-only lineages that never produce one)
+    instead of tasks. Only present on cycles that emitted a
+    ``unit accounting:`` line; older cycles simply have no UnitPoint.
+    """
+
+    __slots__ = ("running", "pending", "blocked", "parked", "recovery", "other")
+
+    def __init__(self, running, pending, blocked, parked, recovery, other):
+        self.running = running
+        self.pending = pending
+        self.blocked = blocked
+        self.parked = parked
+        self.recovery = recovery
+        self.other = other
+
+
 class Point:
-    """One WAKE cycle's counts: running/pending/blocked plus parked/recovery/other."""
+    """One WAKE cycle's counts: running/pending/blocked plus parked/recovery/other.
 
-    __slots__ = ("when", "running", "pending", "blocked", "parked", "recovery", "other")
+    ``unit`` carries the merge-unit-level counterpart (a UnitPoint) when the
+    cycle emitted a ``unit accounting:`` line, else None - see UnitPoint.
+    """
 
-    def __init__(self, when, running, pending, blocked, parked, recovery=None, other=None):
+    __slots__ = ("when", "running", "pending", "blocked", "parked", "recovery", "other", "unit")
+
+    def __init__(self, when, running, pending, blocked, parked, recovery=None, other=None, unit=None):
         self.when = when
         self.running = running  # int
         self.pending = pending  # int | None (None for old-format WAKE)
@@ -122,6 +161,7 @@ class Point:
         self.parked = parked  # int | None
         self.recovery = recovery  # int | None (only from accounting lines)
         self.other = other  # int | None (only from accounting lines)
+        self.unit = unit  # UnitPoint | None (only from unit accounting lines)
 
 
 def _parse_clock(line):
@@ -199,6 +239,10 @@ def parse_log(path, base_date, *, use_anchor_time=False, legacy_attention=False)
             if m:
                 raw.append((full_dt, hms, "acct", tuple(int(g) for g in m.groups())))
                 continue
+            m = _UNIT_ACCOUNTING_RE.search(line)
+            if m:
+                raw.append((full_dt, hms, "uacct", tuple(int(g) for g in m.groups())))
+                continue
             m = _MERGE_RE.search(line)
             if m and "[dry-run]" not in line:
                 raw.append((full_dt, hms, "merge", m.group(1)))
@@ -230,15 +274,18 @@ def parse_log(path, base_date, *, use_anchor_time=False, legacy_attention=False)
     attention = None
     for i, (row, when) in enumerate(zip(raw, times)):
         kind = row[2]
-        if kind in ("attn", "acct"):
+        if kind in ("attn", "acct", "uacct"):
             continue
         if kind == "merge":
             merges.append((when, row[3]))
             continue
         # WAKE: find this cycle's accounting/attention lines, if any, before the
-        # next WAKE.
+        # next WAKE. Unit accounting (uacct) is emitted right after the
+        # task-level accounting (acct) line within the same cycle, so it is
+        # never terminal for the inner scan the way acct used to be.
         cycle_attn = None
         cycle_acct = None
+        cycle_uacct = None
         for j in range(i + 1, len(raw)):
             nxt = raw[j][2]
             if nxt == "wake":
@@ -247,11 +294,13 @@ def parse_log(path, base_date, *, use_anchor_time=False, legacy_attention=False)
                 cycle_attn = raw[j][3]
             elif nxt == "acct":
                 cycle_acct = raw[j][3]
-                break  # accounting comes after attention lines within a cycle
+            elif nxt == "uacct":
+                cycle_uacct = raw[j][3]
+        unit_point = UnitPoint(*cycle_uacct) if cycle_uacct is not None else None
         if cycle_acct is not None:
             acct_running, acct_pending, acct_blocked, acct_parked, acct_recovery, acct_other = cycle_acct
             points.append(Point(when, acct_running, acct_pending, acct_blocked,
-                                acct_parked, acct_recovery, acct_other))
+                                acct_parked, acct_recovery, acct_other, unit_point))
             attention = acct_parked
             continue
         if legacy_attention:
@@ -263,7 +312,7 @@ def parse_log(path, base_date, *, use_anchor_time=False, legacy_attention=False)
         else:
             attention = None  # no accounting line on this cycle -> parked unknown
         _, _, _, running, pending, blocked = row
-        points.append(Point(when, running, pending, blocked, attention))
+        points.append(Point(when, running, pending, blocked, attention, unit=unit_point))
     return points, merges
 
 
@@ -457,6 +506,14 @@ def _draw_merges(ax, merges, bucket="hour", labels="auto", band=MERGE_BAND_DEFAU
         """(rows_needed for horizontal fit, uniform row height px) for a box set."""
         total_px = sum(2 * b[2] for b in bxs) + gap_px * (len(bxs) - 1)
         rows_needed = max(1, math.ceil(total_px / usable_px)) if usable_px else 1
+        # Always alternate at least 2 rows when there's more than one box, even if
+        # one row would technically fit them all: staggering "one higher, one
+        # lower" lets nearby-in-time boxes sit closer together horizontally
+        # instead of being pushed apart along a single row, where a wide box can
+        # shove a later-in-time neighbour far enough right that its leader line
+        # reads as pointing backward in time.
+        if len(bxs) > 1:
+            rows_needed = max(rows_needed, 2)
         row_h = max((b[4] for b in bxs), default=1) * line_px + 12
         return rows_needed, row_h
 
@@ -551,7 +608,8 @@ def _draw_merges(ax, merges, bucket="hour", labels="auto", band=MERGE_BAND_DEFAU
 
 def render_png(points, out_path, log_path, fig_ax=None, resolution="raw", agg_label="",
                merges=None, merge_bucket="auto", merge_labels="auto",
-               merge_band=MERGE_BAND_DEFAULT, xmin=None, xmax=None, markers=True):
+               merge_band=MERGE_BAND_DEFAULT, xmin=None, xmax=None, markers=True,
+               view_label="merge units"):
     """Render the 4-series plot to ``out_path``.
 
     Pass ``fig_ax`` (from :func:`make_figure`) to reuse a single figure across
@@ -610,10 +668,10 @@ def render_png(points, out_path, log_path, fig_ax=None, resolution="raw", agg_la
 
     unit = _UNIT.get(resolution, "cycles")
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ax.set_ylabel("task count")
+    ax.set_ylabel(f"{view_label} count")
     ax.set_xlabel("time")
     ax.set_title(
-        f"gza watch queue depth — {log_path}\n"
+        f"gza watch queue depth ({view_label}) — {log_path}\n"
         f"{len(points)} {unit}{agg_label} · generated {generated}"
     )
     ax.legend(loc="upper left")
@@ -956,6 +1014,34 @@ def _bucket_key(dt, resolution):
     return dt.replace(hour=0, minute=0, second=0, microsecond=0)  # day
 
 
+def _select_view(points, *, task_level):
+    """Return (display_points, view_label) - unit-level by default.
+
+    Merge units (and plan-only lineages) are the primary thing this script
+    plots now: pass --task-level to see the old per-task counts instead. When
+    unit-level data is unavailable (older logs with no ``unit accounting:``
+    line), falls back to the task-level points automatically rather than
+    plotting an all-empty series.
+    """
+    if task_level:
+        return points, "tasks"
+    if not any(p.unit is not None for p in points):
+        return points, "tasks (no unit accounting in this log - pass --task-level to silence this)"
+    unit_points = [
+        Point(
+            p.when,
+            p.unit.running if p.unit is not None else None,
+            p.unit.pending if p.unit is not None else None,
+            p.unit.blocked if p.unit is not None else None,
+            p.unit.parked if p.unit is not None else None,
+            p.unit.recovery if p.unit is not None else None,
+            p.unit.other if p.unit is not None else None,
+        )
+        for p in points
+    ]
+    return unit_points, "merge units"
+
+
 def rollup(points, resolution, agg):
     """Bucket ``points`` to hour/day and aggregate each series within a bucket."""
     if resolution == "raw":
@@ -1049,6 +1135,11 @@ def main(argv=None):
                     help="max share of vertical space the merge id band may use, so the data "
                          f"lines stay readable (default {MERGE_BAND_DEFAULT}; clamped to "
                          f"0.05–{MERGE_BAND_MAX})")
+    ap.add_argument("--task-level", action="store_true",
+                    help="plot per-task counts instead of the default per-merge-unit "
+                         "view (units fold review/improve/fix/rebase/verify_fix members "
+                         "into their owning unit; plan-only lineages that never produce a "
+                         "unit are tracked the same way)")
     ap.add_argument("--legacy-attention", action="store_true",
                      help="for cycles that predate the 'cycle accounting:' line, fall back to "
                           "the old 'Needs attention' lines for the parked series (a broader, "
@@ -1093,9 +1184,11 @@ def main(argv=None):
     if not points:
         print("no cycles in the selected window", file=sys.stderr)
         return 1
+    points, view_label = _select_view(points, task_level=args.task_level)
     points = rollup(points, args.resolution, agg)
     merges = filter_window_events(merges, lo, hi) if args.merges else None
 
+    print(f"view      : {view_label}")
     print_table(points, args.table_rows, unit=unit)
     if merges is not None:
         print_merges(merges)
@@ -1103,7 +1196,8 @@ def main(argv=None):
         render_png(points, args.out, log_path, resolution=args.resolution,
                    agg_label=agg_label, merges=merges, merge_bucket=args.merge_bucket,
                    merge_labels=args.merge_labels, merge_band=args.merge_band,
-                   xmin=args.start, xmax=args.end, markers=args.markers)
+                   xmin=args.start, xmax=args.end, markers=args.markers,
+                   view_label=view_label)
     print_summary(points, "(skipped)" if args.no_png else args.out,
                   unit=unit, agg_label=agg_label)
     return 0
@@ -1143,6 +1237,7 @@ def _watch_loop(args, log_path):
             )
             lo, hi = compute_window(points, args)
             points = filter_window(points, lo, hi)
+            points, view_label = _select_view(points, task_level=args.task_level)
             points = rollup(points, args.resolution, agg)
             merges = filter_window_events(merges, lo, hi) if args.merges else None
 
@@ -1150,6 +1245,7 @@ def _watch_loop(args, log_path):
             if not points:
                 print(f"no WAKE cycles yet in {log_path} for the selected window")
             else:
+                print(f"view      : {view_label}")
                 print_current(points)
                 print()
                 print_table(points, args.table_rows, tail=True, unit=unit)
@@ -1160,7 +1256,8 @@ def _watch_loop(args, log_path):
                                resolution=args.resolution, agg_label=agg_label,
                                merges=merges, merge_bucket=args.merge_bucket,
                                merge_labels=args.merge_labels, merge_band=args.merge_band,
-                               xmin=args.start, xmax=args.end, markers=args.markers)
+                               xmin=args.start, xmax=args.end, markers=args.markers,
+                               view_label=view_label)
                     print(f"\npng refreshed: {args.out}")
             # A bounded --end window is static once the log has advanced past it, so there
             # is nothing new to show — render once and stop rather than re-drawing forever.
