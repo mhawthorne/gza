@@ -2352,6 +2352,40 @@ class TestGitCached:
 
             assert git.is_patch_equivalent_commit_present_on_target("recorded-head", "main") is True
 
+    def test_batch_patch_equivalence_returns_none_when_missing_patch_is_unmapped(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+        head_sha = "a" * 40
+        target_sha = "b" * 40
+        missing_sha = "c" * 40
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(
+                    returncode=0,
+                    stdout=f"{head_sha} commit 1\n{target_sha} commit 1\n",
+                    stderr="",
+                ),
+                MagicMock(returncode=0, stdout=f"{missing_sha}\n", stderr=""),
+                MagicMock(returncode=0, stdout=f"{head_sha}\n", stderr=""),
+            ]
+
+            assert git.patch_equivalent_commits_present_on_target(("recorded-head",), "main") == {"recorded-head": None}
+
+        assert mock_run.call_args_list == [
+            call("cat-file", "--batch-check", check=False, stdin=b"recorded-head^{commit}\nmain^{commit}\n"),
+            call(
+                "rev-list",
+                "--cherry-pick",
+                "--right-only",
+                "--no-merges",
+                f"{target_sha}...{head_sha}",
+                check=False,
+            ),
+            call("rev-list", "--topo-order", "--parents", head_sha, check=False),
+        ]
+
     def test_cached_scope_does_not_leak_between_calls(self, tmp_path: Path) -> None:
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()

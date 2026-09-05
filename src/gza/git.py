@@ -1384,6 +1384,7 @@ class Git:
 
         walk = self._run_readonly_cached(
             "rev-list",
+            "--topo-order",
             "--parents",
             *descendant_shas,
             check=False,
@@ -1436,7 +1437,7 @@ class Git:
             if commit_sha is None or target_sha is None:
                 result[commit] = None
             else:
-                result[commit] = True
+                result[commit] = None
                 commit_shas.append(commit_sha)
 
         if not commit_shas or target_sha is None:
@@ -1446,6 +1447,7 @@ class Git:
             "rev-list",
             "--cherry-pick",
             "--right-only",
+            "--no-merges",
             f"{target_sha}...{commit_shas[0]}",
             *commit_shas[1:],
             check=False,
@@ -1457,10 +1459,14 @@ class Git:
             return result
         missing_patch_shas = frozenset(line.strip() for line in missing.stdout.splitlines() if line.strip())
         if not missing_patch_shas:
+            for commit in requested:
+                if resolved_refs.get(commit) is not None:
+                    result[commit] = True
             return result
 
         walk = self._run_readonly_cached(
             "rev-list",
+            "--topo-order",
             "--parents",
             *commit_shas,
             check=False,
@@ -1486,9 +1492,18 @@ class Git:
             for parent_sha in fields[1:]:
                 reachable_heads_by_commit.setdefault(parent_sha, set()).update(labels)
 
+        unmapped_missing_patch = False
         for missing_sha in missing_patch_shas:
-            for commit in reachable_heads_by_commit.get(missing_sha, set()):
+            reachable_heads = reachable_heads_by_commit.get(missing_sha, set())
+            if not reachable_heads:
+                unmapped_missing_patch = True
+                continue
+            for commit in reachable_heads:
                 result[commit] = False
+        if not unmapped_missing_patch:
+            for commit in requested:
+                if resolved_refs.get(commit) is not None and result[commit] is None:
+                    result[commit] = True
         return result
 
     def merge_base(self, ref1: str, ref2: str) -> str:
