@@ -22,11 +22,17 @@ from gza.cli.advance_executor import (
     AdvanceActionExecutionResult,
     execute_advance_action,
 )
-from gza.db import MERGE_UNIT_LANDED_OR_NO_WORK_STATES, MergeUnit, SqliteTaskStore, Task as DbTask, _task_is_actionable_merge_unit_member
+from gza.db import (
+    MERGE_UNIT_LANDED_OR_NO_WORK_STATES,
+    MergeUnit,
+    SqliteTaskStore,
+    Task as DbTask,
+    _task_is_actionable_merge_unit_member,
+)
 from gza.dependency_preconditions import dependency_readiness
 from gza.git import Git
-from gza.merge_state import classify_branch_merge_state_for_target
 from gza.merge_services import ResolvedMergeSubject, check_manual_merge_preflight, resolve_merge_subject_query_only
+from gza.merge_state import classify_branch_merge_state_for_target
 from gza.query import get_implementation_review_evidence, get_same_branch_rebase_descendants_for_root
 from gza.rebase_service import (
     COMPLETED_REBASE_EXECUTION_STATUSES,
@@ -1188,6 +1194,7 @@ class LandingCoordinator:
         *,
         persist_reconciliation: bool,
     ) -> LandingResolvedIdentity | LandBlocked:
+        git = cast(Git, self.git)
         target_branch: str | None = None
         try:
             selected_task = self.store.get(request.task_id)
@@ -1276,7 +1283,7 @@ class LandingCoordinator:
                 _evidence_refs(request.task_id, unit.id, unit.state),
             )
         if unit.state in MERGE_UNIT_LANDED_OR_NO_WORK_STATES:
-            target_sha = _rev_parse_if_exists(self.git, unit.target_branch)
+            target_sha = _rev_parse_if_exists(git, unit.target_branch)
             member_task_ids = tuple(task.id for task in subject.merge_member_tasks if task.id is not None)
             return LandingResolvedIdentity(
                 selected_task_id=request.task_id,
@@ -1286,7 +1293,7 @@ class LandingCoordinator:
                 merge_unit_state=unit.state,
                 source_branch=unit.source_branch,
                 source_ref=_normalize_optional_identity(subject.merge_source_ref) or unit.source_branch,
-                source_sha=_rev_parse_if_exists(self.git, subject.merge_source_ref or unit.source_branch),
+                source_sha=_rev_parse_if_exists(git, subject.merge_source_ref or unit.source_branch),
                 target_branch=unit.target_branch,
                 target_sha=target_sha,
                 current_branch=None,
@@ -1311,7 +1318,7 @@ class LandingCoordinator:
                 _evidence_refs(request.task_id, owner_id, unit.id, subject.merge_branch),
             )
         try:
-            current_branch = self.git.current_branch()
+            current_branch = git.current_branch()
         except Exception as exc:
             return LandBlocked(
                 "identity-proof-unavailable",
@@ -1324,8 +1331,8 @@ class LandingCoordinator:
                 f"current checkout is {current_branch}, expected target {unit.target_branch}",
                 _evidence_refs(request.task_id, owner_id, current_branch, unit.target_branch),
             )
-        source_sha = _rev_parse_if_exists(self.git, source_ref)
-        target_sha = _rev_parse_if_exists(self.git, unit.target_branch)
+        source_sha = _rev_parse_if_exists(git, source_ref)
+        target_sha = _rev_parse_if_exists(git, unit.target_branch)
         if source_sha is None or target_sha is None:
             return LandBlocked(
                 "identity-proof-unavailable",
@@ -1335,7 +1342,7 @@ class LandingCoordinator:
         try:
             merge_truth = self.reconcile_merge_truth(
                 self.store,
-                self.git,
+                git,
                 owner_id,
                 target_branch=unit.target_branch,
                 include_diff_stats=False,
@@ -1349,7 +1356,7 @@ class LandingCoordinator:
             )
         checkout_clean_block: LandBlocked | None = None
         try:
-            dirty = self.git.has_changes(include_untracked=False)
+            dirty = git.has_changes(include_untracked=False)
         except Exception as exc:
             dirty = True
             checkout_clean_block = LandBlocked(
@@ -1376,7 +1383,7 @@ class LandingCoordinator:
             try:
                 persisted_truth = self.reconcile_merge_truth(
                     self.store,
-                    self.git,
+                    git,
                     owner_id,
                     target_branch=unit.target_branch,
                     include_diff_stats=False,
@@ -1499,6 +1506,7 @@ class LandingCoordinator:
         *,
         policy: LandingPolicyName,
     ) -> LandingPhaseName | LandBlocked:
+        git = cast(Git, self.git)
         if (
             identity.source_ref is None
             or identity.source_sha is None
@@ -1511,7 +1519,7 @@ class LandingCoordinator:
                 _evidence_refs(identity.owner_task_id, identity.source_ref, identity.target_branch),
             )
         try:
-            target_contained = self.git.is_ancestor(identity.target_sha, identity.source_sha)
+            target_contained = git.is_ancestor(identity.target_sha, identity.source_sha)
         except Exception as exc:
             return LandBlocked(
                 "rebase-or-conflict",
@@ -1522,7 +1530,7 @@ class LandingCoordinator:
             return "rebase"
         try:
             preflight = check_manual_merge_preflight(
-                self.git,
+                git,
                 merge_subject=identity.owner_task,
                 merge_source_ref=identity.source_ref,
                 current_branch=identity.current_branch,

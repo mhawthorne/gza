@@ -7,7 +7,13 @@ import argparse
 from gza.cli._common import get_store, resolve_id
 from gza.config import Config
 from gza.git import Git
-from gza.landing import LandResult, LandTerminalResult, LandingCollaborators, land_terminal_state, reconcile_terminal_merge_truth
+from gza.landing import (
+    LandingCollaborators,
+    LandResult,
+    LandTerminalResult,
+    land_terminal_state,
+    reconcile_terminal_merge_truth,
+)
 
 
 def cmd_land(args: argparse.Namespace) -> int:
