@@ -3187,6 +3187,89 @@ def test_landing_coordinator_dry_run_stops_at_stale_review_after_green_verify(tm
     assert "review" not in {step.phase for step in result.steps if step.phase == "merge"}
 
 
+def test_landing_coordinator_dry_run_stops_at_malformed_resolution_review_scope(
+    tmp_path,
+) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "malformed resolution scope", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    rebase = store.add("Completed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    store.mark_completed(rebase, has_commits=True, branch="feature/landing", changed_diff=False)
+    _persist_landing_rebase_outcome(store, rebase, impl)
+    review = store.add("Malformed resolution review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    review.status = "completed"
+    review.completed_at = datetime(2026, 8, 26, 12, 30, tzinfo=UTC)
+    review.review_verify_head_sha = "head-a"
+    review.review_scope = "\n".join(
+        (
+            "Review mode: resolution",
+            f"Implementation task: {impl.id}",
+            f"Rebase task: {rebase.id}",
+            "Resolved head SHA: head-a",
+            "",
+            "Review only the conflict-resolution delta introduced by this rebase.",
+        )
+    )
+    review.output_content = _review_report("APPROVED")
+    store.update(review)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(
+        LandRequest(task_id=impl.id, dry_run=True)
+    )
+
+    statuses = {step.phase: step.status for step in result.steps}
+    assert statuses["verify"] == "completed"
+    assert statuses["post_rebase_review"] == "conditional"
+    assert all(step.phase != "merge" for step in result.steps)
+    assert result.blocked is None
+
+
+def test_landing_coordinator_dry_run_stops_at_resolution_review_with_stale_target_scope(
+    tmp_path,
+) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "stale resolution target", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    rebase = store.add("Completed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    store.mark_completed(rebase, has_commits=True, branch="feature/landing", changed_diff=False)
+    _persist_landing_rebase_outcome(store, rebase, impl)
+    _resolution_review(
+        store,
+        impl,
+        rebase,
+        status="completed",
+        resolved_head="head-a",
+        target="target-old",
+        verify_head="head-a",
+        verdict="APPROVED",
+        completed_at=datetime(2026, 8, 26, 12, 30, tzinfo=UTC),
+    )
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    result = LandingCoordinator(store=store, git=git, config=config).run(
+        LandRequest(task_id=impl.id, dry_run=True)
+    )
+
+    statuses = {step.phase: step.status for step in result.steps}
+    assert statuses["verify"] == "completed"
+    assert statuses["post_rebase_review"] == "conditional"
+    assert all(step.phase != "merge" for step in result.steps)
+    assert result.blocked is None
+
+
 def test_landing_coordinator_repeated_fingerprint_returns_bounded_without_later_policy_simulation(tmp_path) -> None:
     store = _coordinator_store(tmp_path)
     impl = _completed_impl(store, "repeat bounded", "feature/repeat-bounded")

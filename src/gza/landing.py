@@ -37,6 +37,7 @@ from gza.review_scope import (
     build_spec_coherence_review_scope,
     declares_resolution_review_mode,
     declares_spec_coherence_review_mode,
+    parse_resolution_review_scope,
     parse_spec_coherence_review_scope,
 )
 from gza.review_tasks import DuplicateReviewError, create_resolution_review_task, create_review_task
@@ -866,9 +867,14 @@ class LandingCoordinator:
     def _landing_policy_facts(self, identity: LandingResolvedIdentity) -> LandingPolicyFacts:
         if self.inspect_policy_facts is not None:
             return self.inspect_policy_facts(identity)
-        verify = _inspect_query_landing_verify_evidence(self.store, identity, config=self.config, git=self.git)
-        review = _inspect_query_landing_review_evidence(self.store, identity, config=self.config)
         rebase = _inspect_query_landing_rebase_fingerprint(self.store, identity)
+        verify = _inspect_query_landing_verify_evidence(self.store, identity, config=self.config, git=self.git)
+        review = _inspect_query_landing_review_evidence(
+            self.store,
+            identity,
+            config=self.config,
+            rebase=rebase,
+        )
         gates = _inspect_query_landing_lifecycle_gates(
             self.store,
             self.git,
@@ -890,6 +896,7 @@ class LandingCoordinator:
             target_head=identity.target_sha,
             clean_merge=gates.clean_merge,
             ancestry_proof_available=gates.ancestry_proof_available,
+            rebase_task_id=rebase.rebase_task_id,
             rebase_status=rebase.status,
             rebase_resolution_kind=rebase.resolution_kind,
             rebase_changed_diff=rebase.changed_diff,
@@ -1394,6 +1401,7 @@ class LandingPolicyFacts:
     checkout_clean_block: LandBlocked | None = None
     clean_merge: bool = False
     ancestry_proof_available: bool = False
+    rebase_task_id: str | None = None
     rebase_status: LandingRebaseStatus = "unavailable"
     rebase_resolution_kind: LandingRebaseResolutionKind = "unknown"
     rebase_changed_diff: bool | None = None
@@ -1474,6 +1482,7 @@ class LandingPolicyDecision:
 class LandingRebaseFingerprint:
     """Durable rebase outcome identity used in landing non-progress detection."""
 
+    rebase_task_id: str | None = None
     outcome_id: str | None = None
     status: LandingRebaseStatus = "none"
     changed_diff: bool | None = None
@@ -2471,6 +2480,7 @@ def _inspect_query_landing_review_evidence(
     identity: LandingResolvedIdentity,
     *,
     config: Any | None,
+    rebase: LandingRebaseFingerprint | None = None,
 ) -> LandingReviewEvidence:
     required = bool(getattr(config, "require_review_before_merge", True))
     if identity.owner_task.id is None:
@@ -2492,11 +2502,19 @@ def _inspect_query_landing_review_evidence(
     if latest is None:
         return LandingReviewEvidence(required=required, status="unavailable")
     status = cast(LandingReviewStatus, latest.status if latest.status in {"completed", "failed", "pending", "in_progress"} else "unavailable")
-    mode: LandingReviewMode = "resolution" if declares_resolution_review_mode(latest.review_scope) else "plain_full"
+    resolution_declared = declares_resolution_review_mode(latest.review_scope)
+    mode: LandingReviewMode = "resolution" if resolution_declared else "plain_full"
     verdict = _landing_review_verdict_from_task(config, latest) if latest.status == "completed" else None
     parseable = verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS", "CHANGES_REQUESTED", "NEEDS_DISCUSSION"}
     reviewed_head = latest.review_verify_head_sha
-    current = latest.status == "completed" and parseable and reviewed_head == identity.source_sha
+    identity_matched = latest.status == "completed" and parseable and reviewed_head == identity.source_sha
+    if resolution_declared:
+        identity_matched = identity_matched and _resolution_review_scope_matches_landing_identity(
+            latest.review_scope,
+            identity,
+            rebase=rebase,
+        )
+    current = identity_matched
     return LandingReviewEvidence(
         required=required,
         status=status,
@@ -2504,9 +2522,33 @@ def _inspect_query_landing_review_evidence(
         verdict=cast(LandingReviewVerdict, verdict) if parseable else None,
         current=current,
         parseable=parseable,
-        identity_matched=current,
+        identity_matched=identity_matched,
         review_id=latest.id,
         reviewed_head=reviewed_head,
+    )
+
+
+def _resolution_review_scope_matches_landing_identity(
+    review_scope: str | None,
+    identity: LandingResolvedIdentity,
+    *,
+    rebase: LandingRebaseFingerprint | None,
+) -> bool:
+    if identity.owner_task.id is None or identity.source_sha is None or identity.target_sha is None:
+        return False
+    if rebase is None or rebase.status != "completed" or not rebase.rebase_task_id:
+        return False
+    try:
+        scope = parse_resolution_review_scope(review_scope)
+    except ValueError:
+        return False
+    if scope is None:
+        return False
+    return (
+        scope.implementation_task_id == identity.owner_task.id
+        and scope.rebase_task_id == rebase.rebase_task_id
+        and scope.resolved_head_sha == identity.source_sha
+        and scope.resolved_target_sha == identity.target_sha
     )
 
 
@@ -2736,6 +2778,7 @@ def _inspect_query_landing_rebase_fingerprint(
     status = cast(LandingRebaseStatus, latest.status if latest.status in {"pending", "in_progress", "completed", "failed"} else "unavailable")
     if status != "completed":
         return LandingRebaseFingerprint(
+            rebase_task_id=latest.id,
             outcome_id=latest.id,
             status=status,
             changed_diff=latest.changed_diff,
@@ -2746,7 +2789,12 @@ def _inspect_query_landing_rebase_fingerprint(
     try:
         artifacts = store.list_artifacts(latest.id, kind=REBASE_EXECUTION_OUTCOME_ARTIFACT_KIND)
     except Exception:
-        return LandingRebaseFingerprint(outcome_id=latest.id, status="unavailable", resolution_kind="unknown")
+        return LandingRebaseFingerprint(
+            rebase_task_id=latest.id,
+            outcome_id=latest.id,
+            status="unavailable",
+            resolution_kind="unknown",
+        )
     artifact_entries: list[tuple[Any, dict[str, Any]]] = []
     for artifact in artifacts:
         metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
@@ -2756,7 +2804,12 @@ def _inspect_query_landing_rebase_fingerprint(
             continue
         artifact_entries.append((artifact, metadata))
     if len(artifact_entries) != 1:
-        return LandingRebaseFingerprint(outcome_id=latest.id, status="unavailable", resolution_kind="unknown")
+        return LandingRebaseFingerprint(
+            rebase_task_id=latest.id,
+            outcome_id=latest.id,
+            status="unavailable",
+            resolution_kind="unknown",
+        )
     artifact, metadata = artifact_entries[0]
     service_status = metadata.get("status")
     if service_status == "completed_mechanical":
@@ -2769,13 +2822,24 @@ def _inspect_query_landing_rebase_fingerprint(
         resolution_kind = "no_op"
         no_op_subtype = _no_op_subtype_from_rebase_metadata(metadata)
     else:
-        return LandingRebaseFingerprint(outcome_id=str(artifact.id), status="unavailable", resolution_kind="unknown")
+        return LandingRebaseFingerprint(
+            rebase_task_id=latest.id,
+            outcome_id=str(artifact.id),
+            status="unavailable",
+            resolution_kind="unknown",
+        )
     changed_diff = metadata.get("changed_diff")
     provider_resolution_proof = metadata.get("provider_conflict_resolved")
     target_contained = metadata.get("target_contained")
     if not isinstance(changed_diff, bool) or not isinstance(provider_resolution_proof, bool):
-        return LandingRebaseFingerprint(outcome_id=str(artifact.id), status="unavailable", resolution_kind="unknown")
+        return LandingRebaseFingerprint(
+            rebase_task_id=latest.id,
+            outcome_id=str(artifact.id),
+            status="unavailable",
+            resolution_kind="unknown",
+        )
     return LandingRebaseFingerprint(
+        rebase_task_id=latest.id,
         outcome_id=str(artifact.id),
         status="completed",
         changed_diff=changed_diff,
@@ -3153,6 +3217,7 @@ def _rebase_evidence(facts: LandingPolicyFacts) -> tuple[str, ...]:
 
 def _rebase_fingerprint_from_facts(facts: LandingPolicyFacts) -> LandingRebaseFingerprint:
     return LandingRebaseFingerprint(
+        rebase_task_id=facts.rebase_task_id,
         outcome_id=facts.rebase_outcome_id,
         status=facts.rebase_status,
         changed_diff=facts.rebase_changed_diff,
@@ -3255,6 +3320,7 @@ def _facts_have_rebase_identity(facts: LandingPolicyFacts) -> bool:
     return any(
         (
             facts.rebase_outcome_id != default_facts.rebase_outcome_id,
+            facts.rebase_task_id != default_facts.rebase_task_id,
             facts.rebase_status != default_facts.rebase_status,
             facts.rebase_resolution_kind != default_facts.rebase_resolution_kind,
             facts.rebase_changed_diff != default_facts.rebase_changed_diff,
