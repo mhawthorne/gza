@@ -84,6 +84,7 @@ from gza.runner import (
 )
 from gza.runtime_context import RuntimeExecutionContext
 from gza.verify_fix_outcome import effective_verify_fix_completion_outcome
+from gza.verify_gate_preflight import parse_verify_gate_preflight_provenance
 
 from .conftest import make_store, setup_config
 
@@ -5824,7 +5825,7 @@ def _build_merge_unit_lifecycle_git(owner: DbTask, *, head_sha: str = "head-1") 
         "origin/main": "base-1",
         owner.branch: head_sha,
     }.get(ref)
-    lifecycle_git.is_ancestor.return_value = False
+    lifecycle_git.is_ancestor.return_value = True
     lifecycle_git.count_commits_behind_checked.return_value = 0
     lifecycle_git.count_commits_ahead_checked.return_value = 1
     lifecycle_git.get_diff_name_status.return_value = ""
@@ -6811,7 +6812,7 @@ def test_completed_no_source_timeout_verify_fix_rerun_persists_green_then_plans_
     lifecycle_git.branch_exists.return_value = True
     lifecycle_git.ref_exists.return_value = False
     lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
-    lifecycle_git.is_ancestor.return_value = False
+    lifecycle_git.is_ancestor.return_value = True
     lifecycle_git.count_commits_behind_checked.return_value = 0
     lifecycle_git.count_commits_ahead_checked.return_value = 1
     lifecycle_git.get_diff_name_status.return_value = ""
@@ -6962,7 +6963,7 @@ def test_completed_legacy_timeout_verify_fix_dry_run_does_not_persist_upgrade(tm
     lifecycle_git.branch_exists.return_value = True
     lifecycle_git.ref_exists.return_value = False
     lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
-    lifecycle_git.is_ancestor.return_value = False
+    lifecycle_git.is_ancestor.return_value = True
     lifecycle_git.count_commits_behind_checked.return_value = 0
     lifecycle_git.count_commits_ahead_checked.return_value = 1
     lifecycle_git.get_diff_name_status.return_value = ""
@@ -7100,7 +7101,7 @@ def test_completed_legacy_timeout_verify_fix_rerun_uses_managed_worktree_not_dir
     lifecycle_git.branch_exists.return_value = True
     lifecycle_git.ref_exists.return_value = False
     lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
-    lifecycle_git.is_ancestor.return_value = False
+    lifecycle_git.is_ancestor.return_value = True
     lifecycle_git.count_commits_behind_checked.return_value = 0
     lifecycle_git.count_commits_ahead_checked.return_value = 1
     lifecycle_git.get_diff_name_status.return_value = ""
@@ -7257,7 +7258,7 @@ def test_completed_no_source_timeout_verify_fix_rerun_atomic_persistence_failure
     lifecycle_git.branch_exists.return_value = True
     lifecycle_git.ref_exists.return_value = False
     lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
-    lifecycle_git.is_ancestor.return_value = False
+    lifecycle_git.is_ancestor.return_value = True
     lifecycle_git.count_commits_behind_checked.return_value = 0
     lifecycle_git.count_commits_ahead_checked.return_value = 1
     lifecycle_git.get_diff_name_status.return_value = ""
@@ -7655,7 +7656,7 @@ def test_completed_no_source_timeout_verify_fix_rerun_refusals_do_not_clear_gate
     lifecycle_git.branch_exists.return_value = True
     lifecycle_git.ref_exists.return_value = False
     lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
-    lifecycle_git.is_ancestor.return_value = False
+    lifecycle_git.is_ancestor.return_value = True
     lifecycle_git.count_commits_behind_checked.return_value = 0
     lifecycle_git.count_commits_ahead_checked.return_value = 1
     lifecycle_git.get_diff_name_status.return_value = ""
@@ -8382,6 +8383,8 @@ def test_needs_rebase_recovery_preflight_uses_explicit_rebase_parent_task(tmp_pa
             task_type="rebase",
             based_on=parent.id,
             same_branch=True,
+            branch=parent.branch,
+            base_branch="main",
         )
 
     context = AdvanceActionExecutionContext(
@@ -8510,6 +8513,138 @@ def test_needs_rebase_uses_canonical_parent_from_general_pre_dispatch_action(
     else:
         assert spawned == [(result.created_task.id, "rebase", None)]
         assert result.worker_label == "rebase"
+
+
+def test_needs_rebase_verify_gate_preflight_persists_matching_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    monkeypatch.setattr(Git, "branch_exists", lambda _self, _branch: False)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/verify-gate-preflight-parent")
+    store.update(impl)
+
+    def _create_rebase(parent: DbTask) -> DbTask:
+        assert parent.id is not None
+        return store.add(
+            prompt=f"Rebase {parent.id}",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+            branch=parent.branch,
+            base_branch="main",
+        )
+
+    context = _base_executor_context(
+        store=store,
+        config=Config.load(tmp_path),
+        create_rebase_task=_create_rebase,
+        spawn_worker=lambda _task, _kind: 0,
+    )
+
+    result = execute_advance_action(
+        task=impl,
+        action={
+            "type": "needs_rebase",
+            "reason": "verify-gate-preflight-rebase",
+            "rebase_parent_task_id": impl.id,
+            "verify_gate_preflight": {
+                "owner_task_id": impl.id,
+                "reviewed_branch": impl.branch,
+                "reviewed_head_sha": "verify-head",
+                "verify_command": "./bin/tests",
+                "verify_timeout_seconds": 120,
+                "verify_timeout_grace_seconds": 5.0,
+                "target_branch": "main",
+                "target_tip_sha": "target-head",
+                "failed_captured_at": "2026-07-06T12:05:00+00:00",
+            },
+        },
+        context=context,
+    )
+
+    assert result.status == "success"
+    assert result.created_task is not None
+    stored_rebase = store.get(result.created_task.id)
+    assert stored_rebase is not None
+    provenance = parse_verify_gate_preflight_provenance(stored_rebase.review_scope)
+    assert provenance is not None
+    assert provenance.owner_task_id == impl.id
+    assert provenance.reviewed_head_sha == "verify-head"
+    assert provenance.target_branch == "main"
+    assert provenance.target_tip_sha == "target-head"
+
+
+def test_needs_rebase_verify_gate_preflight_provenance_failure_drops_orphan_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provenance-persistence failure must not leave a pending rebase child that
+    a later lifecycle pass would mistake for an active in-progress rebase (B3)."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    monkeypatch.setattr(Git, "branch_exists", lambda _self, _branch: False)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/verify-gate-preflight-provenance-failure")
+    store.update(impl)
+
+    before_count = len(store.get_all())
+
+    def _create_rebase(parent: DbTask) -> DbTask:
+        assert parent.id is not None
+        return store.add(
+            prompt=f"Rebase {parent.id}",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+            branch=parent.branch,
+            base_branch="main",
+        )
+
+    context = _base_executor_context(
+        store=store,
+        config=Config.load(tmp_path),
+        create_rebase_task=_create_rebase,
+        spawn_worker=lambda _task, _kind: 0,
+    )
+
+    monkeypatch.setattr(
+        "gza.cli.advance_executor._persist_verify_gate_preflight_rebase_provenance",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    result = execute_advance_action(
+        task=impl,
+        action={
+            "type": "needs_rebase",
+            "reason": "verify-gate-preflight-rebase",
+            "rebase_parent_task_id": impl.id,
+            "verify_gate_preflight": {
+                "owner_task_id": impl.id,
+                "reviewed_branch": impl.branch,
+                "reviewed_head_sha": "verify-head",
+                "verify_command": "./bin/tests",
+                "verify_timeout_seconds": 120,
+                "verify_timeout_grace_seconds": 5.0,
+                "target_branch": "main",
+                "target_tip_sha": "target-head",
+                "failed_captured_at": "2026-07-06T12:05:00+00:00",
+            },
+        },
+        context=context,
+    )
+
+    assert result.status == "error"
+    assert "provenance could not be persisted" in (result.message or "")
+    assert len(store.get_all()) == before_count
+    remaining_rebases = [t for t in store.get_all() if t.task_type == "rebase"]
+    assert remaining_rebases == []
 
 
 def test_needs_rebase_iterate_rolls_back_when_prepare_fails(tmp_path: Path) -> None:

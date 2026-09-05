@@ -16220,6 +16220,37 @@ class TestExtractedRunInnerHelpers:
         refreshed_impl = store.get(impl.id)
         assert refreshed_impl is not None
         assert refreshed_impl.review_cleared_at is None, label
+        assert refreshed_impl.review_cleared_at is None
+        assert store.list_artifacts(impl.id, kind="review_clearance") == []
+
+        refreshed_improve = store.get(improve.id)
+        assert refreshed_improve is not None
+        assert refreshed_improve.review_verify_status == "passed"
+        assert refreshed_improve.review_verify_branch == improve_branch
+        assert refreshed_improve.review_verify_head_sha == improve_head_sha
+        assert refreshed_improve.review_verify_captured_at == review.completed_at + timedelta(
+            seconds=captured_offset_seconds
+        )
+        assert refreshed_improve.review_verify_artifact_file is None
+        assert store.list_artifacts(impl.id, kind="verify_command_output") == []
+        assert store.list_artifacts(improve.id, kind="verify_command_output") == []
+        reviews = [task for task in store.get_all() if task.task_type == "review" and task.depends_on == impl.id]
+        assert len(reviews) == 1
+
+        lifecycle_git = Mock()
+        lifecycle_git.can_merge.return_value = True
+        lifecycle_git.is_merged.return_value = False
+        lifecycle_git.branch_exists.return_value = True
+        lifecycle_git.ref_exists.return_value = False
+        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "cafebabe", impl.branch: "abc1234"}.get(ref)
+        lifecycle_git.is_ancestor.return_value = True
+        lifecycle_git.count_commits_behind_checked.return_value = 0
+        lifecycle_git.count_commits_ahead_checked.return_value = 1
+        lifecycle_git.get_diff_name_status.return_value = ""
+        lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
+
+        action = evaluate_advance_rules(config, store, lifecycle_git, refreshed_impl, "main")
+        assert action["type"] != "merge"
 
         output = capsys.readouterr().out
         assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in output
@@ -16571,7 +16602,7 @@ class TestExtractedRunInnerHelpers:
         lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "cafebabe", impl.branch: "abc1234"}.get(
             ref
         )
-        lifecycle_git.is_ancestor.return_value = False
+        lifecycle_git.is_ancestor.return_value = True
         lifecycle_git.count_commits_behind_checked.return_value = 0
         lifecycle_git.count_commits_ahead_checked.return_value = 1
         lifecycle_git.get_diff_name_status.return_value = ""
@@ -17135,6 +17166,29 @@ class TestExtractedRunInnerHelpers:
         refreshed_impl = store.get(impl.id)
         assert refreshed_impl is not None
         assert refreshed_impl.review_cleared_at is None
+
+        refreshed_improve = store.get(improve.id)
+        assert refreshed_improve is not None
+        assert refreshed_improve.review_verify_status == "passed"
+        assert refreshed_improve.review_verify_branch == impl.branch
+        assert refreshed_improve.review_verify_head_sha == "newsha"
+
+        lifecycle_git = Mock()
+        lifecycle_git.can_merge.return_value = True
+        lifecycle_git.is_merged.return_value = False
+        lifecycle_git.branch_exists.return_value = True
+        lifecycle_git.ref_exists.return_value = False
+        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "cafebabe", impl.branch: "abc1234"}.get(ref)
+        lifecycle_git.is_ancestor.return_value = True
+        lifecycle_git.count_commits_behind_checked.return_value = 0
+        lifecycle_git.count_commits_ahead_checked.return_value = 1
+        lifecycle_git.get_diff_name_status.return_value = ""
+        lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
+
+        action = evaluate_advance_rules(config, store, lifecycle_git, refreshed_impl, "main")
+        assert action["type"] == "improve"
+        assert action["review_task"].id == review.id
+
         output = capsys.readouterr().out
         assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in output
 
@@ -17397,7 +17451,7 @@ class TestExtractedRunInnerHelpers:
         lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "cafebabe", impl.branch: "abc1234"}.get(
             ref
         )
-        lifecycle_git.is_ancestor.return_value = False
+        lifecycle_git.is_ancestor.return_value = True
         lifecycle_git.count_commits_behind_checked.return_value = 0
         lifecycle_git.count_commits_ahead_checked.return_value = 1
         lifecycle_git.get_diff_name_status.return_value = ""
@@ -26159,7 +26213,7 @@ class TestProviderPromptSanitization:
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
         lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
-        lifecycle_git.is_ancestor.return_value = False
+        lifecycle_git.is_ancestor.return_value = True
         lifecycle_git.count_commits_behind_checked.return_value = 0
         lifecycle_git.count_commits_ahead_checked.return_value = 1
         lifecycle_git.get_diff_name_status.return_value = ""
@@ -26305,7 +26359,7 @@ class TestProviderPromptSanitization:
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
         lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
-        lifecycle_git.is_ancestor.return_value = False
+        lifecycle_git.is_ancestor.return_value = True
         lifecycle_git.count_commits_behind_checked.return_value = 0
         lifecycle_git.count_commits_ahead_checked.return_value = 1
         lifecycle_git.get_diff_name_status.return_value = ""
@@ -26421,7 +26475,7 @@ class TestProviderPromptSanitization:
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
         lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", branch: "head-1"}.get(ref)
-        lifecycle_git.is_ancestor.return_value = False
+        lifecycle_git.is_ancestor.return_value = True
         lifecycle_git.count_commits_behind_checked.return_value = 0
         lifecycle_git.count_commits_ahead_checked.return_value = 1
         lifecycle_git.get_diff_name_status.return_value = ""
@@ -28130,6 +28184,17 @@ class TestProviderPromptSanitization:
         assert validation.reason == "malformed aggregate_details: must be an object"
 
         action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
+        lifecycle_git = Mock()
+        lifecycle_git.can_merge.return_value = True
+        lifecycle_git.is_merged.return_value = False
+        lifecycle_git.branch_exists.return_value = True
+        lifecycle_git.ref_exists.return_value = False
+        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
+        lifecycle_git.is_ancestor.return_value = True
+        lifecycle_git.count_commits_behind_checked.return_value = 0
+        lifecycle_git.count_commits_ahead_checked.return_value = 1
+        lifecycle_git.get_diff_name_status.return_value = ""
+        lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
 
         assert action["type"] == "needs_discussion"
         assert action["needs_attention_reason"] == PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID
@@ -28553,7 +28618,7 @@ class TestProviderPromptSanitization:
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
         lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
-        lifecycle_git.is_ancestor.return_value = False
+        lifecycle_git.is_ancestor.return_value = True
         lifecycle_git.count_commits_behind_checked.return_value = 0
         lifecycle_git.count_commits_ahead_checked.return_value = 1
         lifecycle_git.get_diff_name_status.return_value = ""
@@ -28928,7 +28993,7 @@ class TestProviderPromptSanitization:
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
         lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
-        lifecycle_git.is_ancestor.return_value = False
+        lifecycle_git.is_ancestor.return_value = True
         lifecycle_git.count_commits_behind_checked.return_value = 0
         lifecycle_git.count_commits_ahead_checked.return_value = 1
         lifecycle_git.get_diff_name_status.return_value = ""

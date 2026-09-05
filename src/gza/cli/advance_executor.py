@@ -86,6 +86,10 @@ from ..verify_fix_outcome import (
     inspect_verify_fix_completion_outcome,
     persist_verify_fix_completion_outcome,
 )
+from ..verify_gate_preflight import (
+    VerifyGatePreflightProvenance,
+    append_verify_gate_preflight_provenance,
+)
 from ..watch_progress import review_matches_create_review_action
 from ._common import (
     PlanReviewMaterializationRepairBlocked,
@@ -271,6 +275,49 @@ def _should_continue_branch_publication_after_reconcile(
     if decision.action != "reconcile":
         return False
     return task.status == "failed" and task.failure_reason in {"BRANCH_UNPUSHABLE", "PR_REQUIRED"}
+
+
+def _persist_verify_gate_preflight_rebase_provenance(
+    store: SqliteTaskStore,
+    *,
+    rebase_task: DbTask,
+    action: dict[str, Any],
+) -> None:
+    payload = action.get("verify_gate_preflight")
+    if not isinstance(payload, dict):
+        return
+    timeout_value = payload.get("verify_timeout_seconds")
+    grace_value = payload.get("verify_timeout_grace_seconds")
+    failed_captured_at_value = payload.get("failed_captured_at")
+    provenance = VerifyGatePreflightProvenance(
+        owner_task_id=str(payload.get("owner_task_id") or ""),
+        reviewed_branch=str(payload.get("reviewed_branch") or ""),
+        reviewed_head_sha=str(payload.get("reviewed_head_sha") or ""),
+        verify_command=str(payload.get("verify_command") or ""),
+        verify_timeout_seconds=timeout_value if isinstance(timeout_value, int) else None,
+        verify_timeout_grace_seconds=(
+            float(grace_value) if isinstance(grace_value, (int, float)) else None
+        ),
+        target_branch=str(payload.get("target_branch") or ""),
+        target_tip_sha=str(payload.get("target_tip_sha") or ""),
+        failed_captured_at=failed_captured_at_value if isinstance(failed_captured_at_value, str) else None,
+    )
+    if not all(
+        (
+            provenance.owner_task_id,
+            provenance.reviewed_branch,
+            provenance.reviewed_head_sha,
+            provenance.verify_command,
+            provenance.target_branch,
+            provenance.target_tip_sha,
+        )
+    ):
+        raise ValueError("verify-gate preflight provenance is incomplete")
+    rebase_task.review_scope = append_verify_gate_preflight_provenance(
+        rebase_task.review_scope,
+        provenance,
+    )
+    store.update(rebase_task)
 
 
 def _prepare_resolution_review_action(
@@ -3717,6 +3764,32 @@ def execute_advance_action(
                 action_type=action_type,
                 permit=permit,
                 exc=exc,
+            )
+        try:
+            _persist_verify_gate_preflight_rebase_provenance(
+                context.store,
+                rebase_task=rebase_task,
+                action=action,
+            )
+        except Exception as exc:
+            if permit is not None:
+                permit.release()
+            rollback_message = ""
+            if rebase_task.id is not None:
+                try:
+                    context.store.delete(rebase_task.id)
+                except Exception as rollback_exc:
+                    rollback_message = (
+                        f" (rollback also failed: could not delete orphaned rebase task "
+                        f"{rebase_task.id}: {rollback_exc})"
+                    )
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="error",
+                message=(
+                    f"Cannot rebase: verify-gate preflight provenance could not be persisted: "
+                    f"{exc}{rollback_message}"
+                ),
             )
         prepared_rebase_task, prepare_error = _prepare_background_start(
             context=context,

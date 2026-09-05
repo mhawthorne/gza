@@ -2565,7 +2565,8 @@ def test_merge_single_task_reconciles_contributor_verify_evidence_before_merge(
     else:
         assert result.rc == 1
         git.merge.assert_not_called()
-        assert "verify_fix" in output
+        assert "verify-gate preflight cannot prove" in output
+        assert "git runtime cannot check ancestry" in output
 
 
 def test_merge_single_task_default_keeps_merge_mechanics_output(

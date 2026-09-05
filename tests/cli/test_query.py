@@ -7012,8 +7012,11 @@ class TestShowCommand:
         verify_fix.has_commits = False
         store.update(verify_fix)
 
+        git = _mock_unmerged_git()
+        git.is_ancestor = MagicMock(return_value=True)  # type: ignore[method-assign]
+
         with (
-            patch("gza.cli.query.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.query.Git", return_value=git),
             patch(
                 "gza.advance_engine.get_review_report",
                 return_value=ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),

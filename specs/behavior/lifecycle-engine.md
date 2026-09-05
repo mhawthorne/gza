@@ -453,11 +453,11 @@ epoch.
   (`merge-source-needs-manual-resolution`) before any pre-review `verify_gate`,
   `create_review`, or `run_review` automation.
 - Missing or stale verify evidence for the current owner epoch MUST select `verify_gate`
-  first. Lifecycle MUST rerun verify before it creates a review for that source epoch.
-- Current red verify evidence before review MUST route into the `verify_fix` lane, not the
-  review/improve lane, unless it is a budget-only timeout. Lifecycle MUST create, reuse,
-  run, or wait on one same-branch `verify_fix` task keyed by the exact current verify
-  epoch and implementation owner.
+  first. Lifecycle MUST rerun verify before it creates a review for that head.
+- Current non-budget red verify evidence before review MUST route into the `verify_fix`
+  lane, not the review/improve lane, only after the preflight rebase guard below allows
+  it. Lifecycle MUST create, reuse, run, or wait on one same-branch `verify_fix` task
+  keyed by the exact current verify epoch and implementation owner.
 - If the current verify evidence has `failure_origin == "timeout"` and persisted phase
   diagnostics show no failed phase, lifecycle MUST park with
   `verify-budget-exceeded` instead of creating a `verify_fix`. The gate remains
@@ -490,6 +490,26 @@ epoch.
   decision with remaining attempts MUST dispatch/reuse the verify-fix retry; only
   non-retry decisions or exhausted retry attempts may park with `verify-failed-needs-fix`,
   and the park message MUST distinguish those cases.
+- Current non-budget red verify evidence before review MUST first prove that the
+  implementation branch contains the local target tip. A same-branch rebase that is
+  already pending or running MUST skip with reason `verify-gate-preflight-rebase` before
+  any ancestry, completed-rebase, or verify-fix routing. If local target-tip proof is
+  unavailable, lifecycle MUST fail closed with `needs_discussion`
+  (`verify-gate-proof-unavailable`) and surface the proof diagnostic without creating a
+  rebase or verify-fix task. If the branch is proven not to contain the target tip and no
+  same-branch rebase is active, lifecycle MUST select
+  `needs_rebase` with reason `verify-gate-preflight-rebase` instead of routing into
+  `verify_fix`. After that rebase changes the source head, lifecycle MUST reevaluate the
+  verify gate for the fresh epoch instead of emitting another rebase for the same stale
+  red evidence. If a completed preflight exists for the exact implementation-owner
+  verify epoch and the live source head still equals that red epoch while the branch
+  still lacks the target tip, lifecycle MUST fail closed instead of refreshing verify or
+  creating another same-epoch rebase, even if a later failed result artifact for that
+  same epoch is now newest. Once the branch contains the target tip and no same-branch
+  rebase is active, lifecycle MUST continue to same-epoch `verify_fix` creation or reuse.
+- If the current evidence is not a budget-only timeout and a same-epoch `verify_fix`
+  is already `pending`, lifecycle MUST `run_verify_fix`; if it is already
+  `in_progress`, lifecycle MUST `wait_verify_fix`.
 - If one same-epoch `verify_fix` attempt completed without source changes and the current
   red verify evidence is structurally classified as timeout-origin, lifecycle MUST rerun
   verification for the exact same head once before treating that `verify_fix` as
@@ -1432,6 +1452,8 @@ is a spec change. The accompanying human message is free text.
 | `closing-review-needs-manual-refresh` † | needs_discussion | §6/§8 closing-review requirement, manual refresh |
 | `verify-budget-exceeded` | needs_discussion | §5a verify gate timed out with no failed phase in persisted phase diagnostics |
 | `verify-failed-needs-fix` | needs_discussion | §5a verify gate is red before review can proceed, but lifecycle cannot safely create/continue the current `verify_fix` lane |
+| `verify-gate-proof-unavailable` | needs_discussion | §5a target-tip or live-head proof is unavailable while evaluating red verify-gate preflight; no rebase or verify-fix is created |
+| `verify-gate-preflight-rebase` | needs_discussion | §5a completed same-epoch verify-gate preflight rebase left the live source head at the same red verify epoch while the branch still lacks the target tip |
 | `verify-fix-failed` | needs_discussion | §5a current verify gate is still red after one completed same-epoch `verify_fix` |
 | `verify-unavailable` | needs_discussion | §5a verify gate is unavailable and lifecycle cannot safely route through `verify_fix` |
 | `verify-unavailable-after-fix` | needs_discussion | §5a verify gate remains unavailable after one completed same-epoch `verify_fix` |
