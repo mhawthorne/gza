@@ -131,10 +131,11 @@ underlying pattern — cheap DB reads, expensive per-item subprocess calls:
 - **blind-parked-auto-rearm**: one `git diff` subprocess per parked
   candidate, and re-runs the full cycle-plan analysis if anything rearms.
 
-None of these costs are proportional to how much work watch is actually
-doing that cycle — they're proportional to task/branch count and repo size,
-and they pay the cost fresh every cycle since nothing here is memoized across
-cycles yet.
+The remaining full snapshot/index work is still proportional to task/branch
+count and repo size, and it pays that cost fresh every cycle since nothing
+here is memoized across cycles yet. For tag-scoped runs, owner action/git
+resolution now scales with the retained scoped owners plus conservative
+terminal-reroot candidates rather than every ordinary owner in the snapshot.
 
 ## Related
 
