@@ -1257,6 +1257,303 @@ def test_watch_failed_recovery_scan_same_target_fingerprint_change_rechecks_rewr
     assert refreshed.head_sha == "rewritten-head"
 
 
+def test_watch_failed_recovery_scan_same_target_reclassifies_rewritten_empty_unit_as_unmerged(
+    tmp_path: Path,
+) -> None:
+    store, config, task, _failed_improve = _setup_retry_limit_parked_lineage(tmp_path)
+    assert task.id is not None and task.branch is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, head_sha="old-empty-head", base_sha="target-head")
+    store.set_merge_unit_state(unit.id, "empty")
+    _record_current_watch_failed_recovery_scan(store, target_branch="main", target_sha="target-head")
+
+    git = _make_watch_git()
+    git.is_merged = MagicMock(return_value=False)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "rewritten-empty-head" if ref == task.branch else "target-head" if ref == "main" else None
+    )
+    git.merge_base = MagicMock(return_value="target-head")  # type: ignore[method-assign]
+    git.count_commits_ahead = MagicMock(return_value=1)  # type: ignore[method-assign]
+    git.count_commits_ahead_checked = MagicMock(side_effect=AssertionError("primary commit count should be used"))  # type: ignore[method-assign]
+
+    assert _watch_failed_recovery_scan_is_current(
+        store=store,
+        git=git,
+        target_branch="main",
+        target_sha="target-head",
+    )
+
+    refreshed = store.get_merge_unit(unit.id)
+    assert refreshed is not None
+    assert refreshed.state == "unmerged"
+    assert refreshed.head_sha == "rewritten-empty-head"
+    assert refreshed.base_sha == "target-head"
+    marker = store.get_watch_failed_recovery_scan_state(target_branch="main")
+    assert marker is not None
+    assert marker.target_sha == "target-head"
+    assert marker.unit_fingerprint == watch_module._watch_failed_recovery_scan_unit_fingerprint(
+        store.list_watch_failed_recovery_scan_units(target_branch="main")
+    )
+
+    live_candidates, _ = watch_module.discover_parked_tasks(
+        store,
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+    live_candidate_ids = tuple(candidate.subject_task.id for candidate in live_candidates)
+
+    setattr(git, "_gza_recovery_scan_db_authoritative", True)
+    db_candidates, _ = watch_module.discover_parked_tasks(
+        store,
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+    db_candidate_ids = tuple(candidate.subject_task.id for candidate in db_candidates)
+
+    assert db_candidate_ids == live_candidate_ids
+
+
+def test_watch_failed_recovery_scan_same_target_reclassifies_rewritten_redundant_unit_as_merged(
+    tmp_path: Path,
+) -> None:
+    store, config, task, _failed_improve = _setup_retry_limit_parked_lineage(tmp_path)
+    assert task.id is not None and task.branch is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, head_sha="old-redundant-head", base_sha="target-head")
+    store.set_merge_unit_state(unit.id, "redundant")
+    _record_current_watch_failed_recovery_scan(store, target_branch="main", target_sha="target-head")
+
+    git = _make_watch_git()
+    git.is_merged = MagicMock(return_value=True)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "rewritten-landed-head" if ref == task.branch else "target-head" if ref == "main" else None
+    )
+    git.count_commits_ahead_checked = MagicMock(return_value=1)  # type: ignore[method-assign]
+
+    assert _watch_failed_recovery_scan_is_current(
+        store=store,
+        git=git,
+        target_branch="main",
+        target_sha="target-head",
+    )
+
+    refreshed = store.get_merge_unit(unit.id)
+    assert refreshed is not None
+    assert refreshed.state == "merged"
+    assert refreshed.merge_source == "external"
+    assert refreshed.head_sha == "rewritten-landed-head"
+    assert refreshed.base_sha == "target-head"
+    marker = store.get_watch_failed_recovery_scan_state(target_branch="main")
+    assert marker is not None
+    assert marker.target_sha == "target-head"
+    assert marker.unit_fingerprint == watch_module._watch_failed_recovery_scan_unit_fingerprint(
+        store.list_watch_failed_recovery_scan_units(target_branch="main")
+    )
+
+    live_candidates, _ = watch_module.discover_parked_tasks(
+        store,
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+    live_candidate_ids = tuple(candidate.subject_task.id for candidate in live_candidates)
+
+    setattr(git, "_gza_recovery_scan_db_authoritative", True)
+    db_candidates, _ = watch_module.discover_parked_tasks(
+        store,
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+    db_candidate_ids = tuple(candidate.subject_task.id for candidate in db_candidates)
+
+    assert db_candidate_ids == live_candidate_ids
+
+
+def _assert_blind_rearm_uses_live_discovery_after_incomplete_scan(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config.watch.parked_auto_rearm.enabled = True
+
+    def discover_with_live_git(*args: object, **kwargs: object) -> tuple[tuple[object, ...], int]:
+        assert not getattr(git, "_gza_recovery_scan_db_authoritative", False)
+        return ((), 0)
+
+    monkeypatch.setattr(watch_module, "discover_parked_tasks", discover_with_live_git)
+
+    result = _evaluate_blind_parked_auto_rearm(
+        config=config,
+        store=store,
+        git=git,
+        target_branch="main",
+        target_sha="target-head",
+        tags=None,
+        any_tag=False,
+        scoped_owner_ids=None,
+    )
+
+    assert result.decisions == ()
+    assert not hasattr(git, "_gza_recovery_scan_db_authoritative")
+
+
+def test_watch_failed_recovery_scan_proven_merged_classifier_exception_keeps_previous_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store, config, task, _failed_improve = _setup_retry_limit_parked_lineage(tmp_path)
+    assert task.id is not None and task.branch is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, head_sha="old-redundant-head", base_sha="target-head")
+    store.set_merge_unit_state(unit.id, "redundant")
+    _record_current_watch_failed_recovery_scan(store, target_branch="main", target_sha="target-head")
+
+    git = _make_watch_git()
+    git.is_merged = MagicMock(return_value=True)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "rewritten-landed-head" if ref == task.branch else "target-head" if ref == "main" else None
+    )
+    git.count_commits_ahead_checked = MagicMock(side_effect=RuntimeError("ahead proof unavailable"))  # type: ignore[method-assign]
+    record_marker = MagicMock(side_effect=AssertionError("incomplete proof must not record scan marker"))
+    monkeypatch.setattr(store, "record_watch_failed_recovery_scan", record_marker)
+
+    with caplog.at_level("WARNING", logger="gza.cli.watch"):
+        assert not _watch_failed_recovery_scan_is_current(
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="target-head",
+        )
+
+    refreshed = store.get_merge_unit(unit.id)
+    assert refreshed is not None
+    assert refreshed.state == "redundant"
+    assert refreshed.head_sha == "old-redundant-head"
+    assert refreshed.base_sha == "target-head"
+    marker = store.get_watch_failed_recovery_scan_state(target_branch="main")
+    assert marker is not None
+    assert marker.target_sha == "target-head"
+    record_marker.assert_not_called()
+    assert "proved-merged state could not be refined" in caplog.text
+    assert "keeping previous marker" in caplog.text
+
+    _assert_blind_rearm_uses_live_discovery_after_incomplete_scan(
+        config=config,
+        store=store,
+        git=git,
+        monkeypatch=monkeypatch,
+    )
+
+
+def test_watch_failed_recovery_scan_proven_merged_unknown_refinement_keeps_previous_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store, config, task, _failed_improve = _setup_retry_limit_parked_lineage(tmp_path)
+    assert task.id is not None and task.branch is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, head_sha="old-empty-head", base_sha="target-head")
+    store.set_merge_unit_state(unit.id, "empty")
+    _record_current_watch_failed_recovery_scan(store, target_branch="main", target_sha="target-head")
+
+    git = _make_watch_git()
+    git.is_merged = MagicMock(return_value=True)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "rewritten-empty-head" if ref == task.branch else "target-head" if ref == "main" else None
+    )
+    git.count_commits_ahead_checked = MagicMock(return_value=0)  # type: ignore[method-assign]
+    git.is_ancestor = MagicMock(return_value=False)  # type: ignore[method-assign]
+    git.is_patch_equivalent_commit_present_on_target = MagicMock(return_value=None)  # type: ignore[method-assign]
+    record_marker = MagicMock(side_effect=AssertionError("incomplete proof must not record scan marker"))
+    monkeypatch.setattr(store, "record_watch_failed_recovery_scan", record_marker)
+
+    with caplog.at_level("WARNING", logger="gza.cli.watch"):
+        assert not _watch_failed_recovery_scan_is_current(
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="target-head",
+        )
+
+    refreshed = store.get_merge_unit(unit.id)
+    assert refreshed is not None
+    assert refreshed.state == "empty"
+    assert refreshed.head_sha == "old-empty-head"
+    assert refreshed.base_sha == "target-head"
+    marker = store.get_watch_failed_recovery_scan_state(target_branch="main")
+    assert marker is not None
+    assert marker.target_sha == "target-head"
+    record_marker.assert_not_called()
+    assert "proved-merged state could not be refined" in caplog.text
+    assert "could not classify merge state" in caplog.text
+    assert "keeping previous marker" in caplog.text
+
+    _assert_blind_rearm_uses_live_discovery_after_incomplete_scan(
+        config=config,
+        store=store,
+        git=git,
+        monkeypatch=monkeypatch,
+    )
+
+
+def test_watch_failed_recovery_scan_incomplete_no_work_reclassification_keeps_previous_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_watch_scan_task(store, "feature/watch-empty-rewrite-unknown")
+    assert task.id is not None and task.branch is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, head_sha="old-empty-head", base_sha="target-head")
+    store.set_merge_unit_state(unit.id, "empty")
+    _record_current_watch_failed_recovery_scan(store, target_branch="main", target_sha="target-head")
+
+    git = _make_watch_git()
+    git.is_merged = MagicMock(return_value=False)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "rewritten-empty-head" if ref == task.branch else "target-head" if ref == "main" else None
+    )
+    git.merge_base = MagicMock(return_value=None)  # type: ignore[method-assign]
+    git.count_commits_ahead = MagicMock(return_value=None)  # type: ignore[method-assign]
+    git.count_commits_ahead_checked = MagicMock(return_value=None)  # type: ignore[method-assign]
+    record_marker = MagicMock(side_effect=AssertionError("incomplete proof must not record scan marker"))
+    monkeypatch.setattr(store, "record_watch_failed_recovery_scan", record_marker)
+
+    with caplog.at_level("WARNING", logger="gza.cli.watch"):
+        assert not _watch_failed_recovery_scan_is_current(
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="target-head",
+        )
+
+    refreshed = store.get_merge_unit(unit.id)
+    assert refreshed is not None
+    assert refreshed.state == "empty"
+    assert refreshed.head_sha == "old-empty-head"
+    assert refreshed.base_sha == "target-head"
+    marker = store.get_watch_failed_recovery_scan_state(target_branch="main")
+    assert marker is not None
+    assert marker.target_sha == "target-head"
+    record_marker.assert_not_called()
+    assert "could not classify merge state" in caplog.text
+    assert "keeping previous marker" in caplog.text
+
+
 def test_blind_parked_auto_rearm_uses_db_authoritative_scan_when_target_unchanged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1428,6 +1725,7 @@ def test_watch_failed_recovery_scan_moved_target_rechecks_only_changed_no_work_p
         target_sha="target-newer",
     )
     assert {call_args.args[0] for call_args in git.branch_exists.call_args_list} == {
+        "feature/watch-first-affected-scan",
         "feature/watch-second-affected-scan",
     }
     refreshed_first = store.get_merge_unit(first_unit.id)

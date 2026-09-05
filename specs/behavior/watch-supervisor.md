@@ -521,6 +521,9 @@ Each watch cycle MUST execute these phases in order:
    branch/unit classification at branch granularity. The proof MUST be invalidated by new
    units, source-head changes, and target movement; target movement MUST revalidate
    branch content equivalence rather than relying only on stable merge-base ancestry.
+   When a scan invalidates a unit previously classified as `empty` or `redundant`, watch
+   MUST reclassify that unit against the scan's target snapshot instead of preserving the
+   stale terminal no-work state.
    Incomplete reconciliation, missing head/base proof, or classifier exceptions MUST keep
    the previous marker and force the ordinary live fail-closed recovery classification path.
    Only a current complete marker MAY let failed-task discovery reuse DB-backed

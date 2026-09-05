@@ -14404,6 +14404,8 @@ def _watch_failed_recovery_scan_is_current(
             target_branch=target_branch,
             include_diff_stats=False,
             preserve_recorded_merged=False,
+            preserve_terminal_no_work=False,
+            require_complete_classification=True,
             proof_target_ref=target_sha,
             target_sha=target_sha,
             merged_proof_by_branch=merged_proof_by_branch,

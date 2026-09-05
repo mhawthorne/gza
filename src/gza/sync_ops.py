@@ -395,6 +395,8 @@ def reconcile_branch_merge_truth(
     include_diff_stats: bool,
     remote_target_ref: str | None = None,
     preserve_recorded_merged: bool = True,
+    preserve_terminal_no_work: bool = True,
+    require_complete_classification: bool = False,
     reuse_unchanged_ref_proof: bool = False,
     proof_target_ref: str | None = None,
     target_sha: str | None = None,
@@ -476,7 +478,11 @@ def reconcile_branch_merge_truth(
             merge_state_is_terminal_for_lifecycle(cohort.merge_unit_state)
             and cohort.merge_unit_target_branch == target_branch
         ):
-            if cohort.merge_unit_state in {"empty", "redundant"} or preserve_recorded_merged:
+            if cohort.merge_unit_state in {"empty", "redundant"}:
+                if preserve_terminal_no_work:
+                    result.merge_status = cohort.merge_unit_state
+                    continue
+            elif preserve_recorded_merged:
                 result.merge_status = cohort.merge_unit_state
                 continue
 
@@ -493,17 +499,37 @@ def reconcile_branch_merge_truth(
             continue
 
         if target_merged is True and reconcile_ref is not None:
-            desired_merge_status = classify_proven_merged_state(
-                git=git,
-                source_ref=reconcile_ref,
-                target_branch=effective_proof_target_ref,
-                source_has_commits=source_has_commits,
-                recorded_head_sha=cohort.merge_unit_head_sha,
-                on_warning=result.warnings.append,
-            )
-            if desired_merge_status == "merged":
-                _mark_merged(result)
-                result.merge_source = MERGE_SOURCE_EXTERNAL
+            try:
+                classify_state = classify_proven_merged_state(
+                    git=git,
+                    source_ref=reconcile_ref,
+                    target_branch=effective_proof_target_ref,
+                    source_has_commits=source_has_commits,
+                    recorded_head_sha=cohort.merge_unit_head_sha,
+                    on_warning=result.warnings.append,
+                )
+            except Exception as exc:
+                task_detail = f" tasks {', '.join(result.task_ids)}" if result.task_ids else ""
+                result.errors.append(
+                    f"branch '{cohort.branch}'{task_detail} classification failed "
+                    f"against '{effective_proof_target_ref}': proved-merged state could not be refined; {exc}"
+                )
+                classify_state = "unknown"
+            if classify_state == "unknown":
+                result.warnings.append(
+                    f"branch '{cohort.branch}': proved-merged state could not be refined "
+                    f"against '{effective_proof_target_ref}'; preserving existing merge state"
+                )
+                if require_complete_classification:
+                    result.errors.append(
+                        f"branch '{cohort.branch}': proved-merged state could not be refined; could not classify merge state "
+                        f"against '{effective_proof_target_ref}'"
+                    )
+            else:
+                desired_merge_status = classify_state
+                if desired_merge_status == "merged":
+                    _mark_merged(result)
+                    result.merge_source = MERGE_SOURCE_EXTERNAL
         elif reconcile_ref is None:
             # No surviving ref: cannot inspect the branch to prove merge truth.
             # Fail-closed: preserve a previously-proven "empty" state rather than
@@ -565,6 +591,11 @@ def reconcile_branch_merge_truth(
                     f"branch '{cohort.branch}': could not determine unique commit count "
                     f"against '{effective_proof_target_ref}'; preserving existing merge state"
                 )
+                if require_complete_classification:
+                    result.errors.append(
+                        f"branch '{cohort.branch}': could not classify merge state "
+                        f"against '{effective_proof_target_ref}'"
+                    )
                 # desired_merge_status remains as initialized (from task.merge_status) — fail-closed
             else:
                 if not preserve_recorded_merged or desired_merge_status != "merged":
