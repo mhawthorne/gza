@@ -8,10 +8,11 @@ than the illustrative one in the protocol doc.
 from __future__ import annotations
 
 import json
+import subprocess
+import types
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -382,6 +383,7 @@ def test_codex_usage_launch_uses_runtime_path_cwd_and_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from gza.providers import codex as codex_module
     from gza.providers.codex import _read_codex_usage
 
     runtime_cwd = tmp_path / "runtime-project"
@@ -411,11 +413,18 @@ def test_codex_usage_launch_uses_runtime_path_cwd_and_environment(
         def terminate(self) -> None:
             raise AssertionError("completed usage process should not be terminated")
 
-    with (
-        patch("gza.providers.codex.shutil.which", lambda name, path=None: "/runtime/bin/codex"),
-        patch("gza.providers.codex.subprocess.Popen", FakeProcess),
-    ):
-        usage = _read_codex_usage(timeout_seconds=10.0, gza_version="test", env=env, cwd=runtime_cwd)
+    monkeypatch.setattr("gza.providers.codex.shutil.which", lambda name, path=None: "/runtime/bin/codex")
+    monkeypatch.setattr(
+        codex_module,
+        "subprocess",
+        types.SimpleNamespace(
+            PIPE=subprocess.PIPE,
+            Popen=FakeProcess,
+            TimeoutExpired=subprocess.TimeoutExpired,
+        ),
+    )
+
+    usage = _read_codex_usage(timeout_seconds=10.0, gza_version="test", env=env, cwd=runtime_cwd)
 
     assert usage.provider == "codex"
     assert len(popen_calls) == 1

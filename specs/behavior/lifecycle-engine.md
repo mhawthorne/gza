@@ -872,6 +872,12 @@ failure *and* actionable merge/review work remains eligible for the latter.
 - Manual `gza merge --no-followups` remains scoped to ordinary `FOLLOWUP` findings only.
   It MUST NOT suppress mandatory deferred-blocker tasks created for bypassed `BLOCKER`
   findings.
+- Shared manual merge execution results MUST NOT encode failed preflight or merge
+  attempts with success-looking statuses. Any `rc != 0` dirty-checkout, conflict,
+  already-merged refusal, mandatory deferred-blocker materialization failure, or caught
+  merge error MUST report an explicit non-`merged` status. The successful authoritative
+  already-landed reconciliation path MUST remain represented separately as
+  `status="already_merged"` with `rc == 0`.
 - After a merge lands on the canonical local target, and whenever automation can prove the
   local target's HEAD changed since the last successful or failed target-level verify
   fingerprint, watch/advance MUST rerun the configured verify gate against that local

@@ -57,6 +57,49 @@ class ManualMergePreflightResult:
     block_reason: str | None = None
 
 
+ManualMergeExecutionStatus = Literal[
+    "merged",
+    "already_merged",
+    "already_merged_refused",
+    "already_merged_proof_persistence_failed",
+    "already_merged_state_persistence_failed",
+    "blocked_candidate_verify",
+    "blocked_candidate_verify_unavailable",
+    "blocked_dirty_checkout",
+    "blocked_lifecycle_gate",
+    "blocked_red_verify_gate",
+    "deferred_blocker_materialization_failed",
+    "invalid_execution_state",
+    "invalid_merge_options",
+    "isolated_merge_failed",
+    "isolated_post_promotion_checkpoint_persistence_failed",
+    "isolated_post_promotion_finalization_failed",
+    "isolated_post_promotion_merge_state_finalization_failed",
+    "isolated_post_promotion_proof_persistence_failed",
+    "isolated_post_promotion_rollback_failed",
+    "isolated_promotion_rollback_failed_target_uncertain",
+    "max_cycle_lifecycle_authority_changed",
+    "merge_cleanup_failed",
+    "merge_conflict",
+    "merge_failed",
+    "merge_prerequisite_failed",
+    "merge_prerequisite_loop_unresolved",
+    "merge_side_effect_materialization_failed",
+    "merge_source_ref_changed",
+    "merge_source_ref_unavailable",
+    "merge_source_warning",
+    "merge_target_ref_changed",
+    "merge_target_ref_unavailable",
+    "merge_subject_not_found",
+    "no_resolvable_merge_source",
+    "pending_merge_finalization_proof_stale",
+    "post_merge_proof_persistence_failed",
+    "post_merge_state_persistence_failed",
+    "pre_merge_proof_persistence_failed",
+    "unknown_failure",
+]
+
+
 @dataclass(frozen=True)
 class ManualMergeExecutionRequest:
     store: SqliteTaskStore
@@ -100,13 +143,19 @@ class ManualMergeExecutionHooks:
 @dataclass(frozen=True)
 class ManualMergeExecutionResult:
     rc: int
-    status: str
+    status: ManualMergeExecutionStatus
     block_reason: str | None = None
     pending_squash_reconcile: Any = None
     created_followups: list[DbTask] | None = None
     reused_followups: list[DbTask] | None = None
     created_deferred_blockers: list[DbTask] | None = None
     reused_deferred_blockers: list[DbTask] | None = None
+
+    def __post_init__(self) -> None:
+        if self.rc != 0 and self.status in {"merged", "already_merged"}:
+            raise ValueError(f"manual merge failure cannot use success status {self.status!r}")
+        if self.rc == 0 and self.status == "already_merged_refused":
+            raise ValueError("already_merged_refused requires a non-zero rc")
 
 
 def latest_completed_review_for_merge_subject(
@@ -527,7 +576,7 @@ def execute_manual_merge(
             )
         return ManualMergeExecutionResult(
             rc=1,
-            status="already_merged_refusal",
+            status="already_merged_refused",
             block_reason=preflight.block_reason,
         )
 
@@ -549,7 +598,7 @@ def execute_manual_merge(
                 hooks.emit(f"Error: {block_reason}")
                 return ManualMergeExecutionResult(
                     rc=1,
-                    status="deferred_blocker_materialization_missing",
+                    status="deferred_blocker_materialization_failed",
                     block_reason=block_reason,
                 )
             created_deferred_blockers, reused_deferred_blockers = deferred_blockers

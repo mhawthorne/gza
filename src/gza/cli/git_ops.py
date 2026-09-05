@@ -108,6 +108,7 @@ from ..merge_services import (
     ManualMergeExecutionHooks,
     ManualMergeExecutionRequest,
     ManualMergeExecutionResult,
+    ManualMergeExecutionStatus,
     MergeDeferredBlockerDecision as _MergeDeferredBlockerDecision,
     ResolvedMergeSubject as _ResolvedMergeSubject,
     classify_manual_merge_blockers,
@@ -908,7 +909,7 @@ class _PendingSquashBranchReconcile:
 @dataclass(frozen=True)
 class _MergeSingleTaskResult:
     rc: int
-    status: str = "merged"
+    status: ManualMergeExecutionStatus
     block_reason: str | None = None
     pending_squash_reconcile: _PendingSquashBranchReconcile | None = None
     created_followups: tuple[DbTask, ...] = ()
@@ -917,6 +918,12 @@ class _MergeSingleTaskResult:
     reused_deferred_blockers: tuple[DbTask, ...] = ()
     authorized_merge_action: dict[str, Any] | None = None
     authorized_source_ref_sha: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.rc != 0 and self.status in {"merged", "already_merged"}:
+            raise ValueError(f"merge task failure cannot use success status {self.status!r}")
+        if self.rc == 0 and self.status == "already_merged_refused":
+            raise ValueError("already_merged_refused requires a non-zero rc")
 
 
 class _CappedReviewLifecycleAuthorityChanged(GitError):
@@ -939,7 +946,10 @@ class _AlreadyMergedLifecycleProofGit:
 def _coerce_merge_single_task_result(result: int | _MergeSingleTaskResult) -> _MergeSingleTaskResult:
     if isinstance(result, _MergeSingleTaskResult):
         return result
-    return _MergeSingleTaskResult(rc=result)
+    return _MergeSingleTaskResult(
+        rc=result,
+        status="merged" if result == 0 else "unknown_failure",
+    )
 
 
 def _coerce_manual_merge_execution_result(result: ManualMergeExecutionResult) -> _MergeSingleTaskResult:
@@ -1713,7 +1723,7 @@ def _merge_single_task(
     option_error = _merge_option_relationship_error(args)
     if option_error is not None:
         print(option_error)
-        return _MergeSingleTaskResult(rc=1)
+        return _MergeSingleTaskResult(rc=1, status="invalid_merge_options")
 
     def _process_monitor_factory(process: subprocess.Popen[str], started_at: float) -> _LongPhaseHeartbeatState:
         return _LongPhaseHeartbeatState(
@@ -1729,7 +1739,7 @@ def _merge_single_task(
     resolved = resolved_subject or _resolve_merge_subject(store, git, task_id, target_branch=target_branch)
     if resolved is None:
         print(f"Error: Task {task_id} not found")
-        return _MergeSingleTaskResult(rc=1)
+        return _MergeSingleTaskResult(rc=1, status="merge_subject_not_found")
     execution_task = resolved.execution_task
     merge_subject = resolved.merge_subject
     assert merge_subject.id is not None
@@ -1743,17 +1753,17 @@ def _merge_single_task(
     status_error = _merge_execution_status_error(merge_subject.id, execution_task)
     if status_error is not None:
         print(f"Error: {status_error}")
-        return _MergeSingleTaskResult(rc=1)
+        return _MergeSingleTaskResult(rc=1, status="invalid_execution_state")
     if resolved.merge_source_warning:
         print(f"Error: {resolved.merge_source_warning}")
-        return _MergeSingleTaskResult(rc=1)
+        return _MergeSingleTaskResult(rc=1, status="merge_source_warning")
 
     if not merge_branch or not merge_source_ref:
         print(f"Error: Task {merge_subject.id} has no resolvable merge source")
-        return _MergeSingleTaskResult(rc=1)
+        return _MergeSingleTaskResult(rc=1, status="no_resolvable_merge_source")
     if resolved.merge_source_warning:
         print(f"Error: {resolved.merge_source_warning}")
-        return _MergeSingleTaskResult(rc=1)
+        return _MergeSingleTaskResult(rc=1, status="merge_source_warning")
 
     def _materialize_manual_followups_before_state() -> _MergeSingleTaskResult | None:
         nonlocal created_followups, reused_followups
@@ -1771,7 +1781,7 @@ def _merge_single_task(
         # Check for conflicting flags
         if getattr(args, "squash", False) or getattr(args, "delete", False) or getattr(args, "force", False):
             print("Error: --mark-only cannot be used with --squash, --delete, or --force")
-            return _MergeSingleTaskResult(rc=1)
+            return _MergeSingleTaskResult(rc=1, status="invalid_merge_options")
 
         if materialize_side_effects:
             deferred_blockers = _materialize_merge_deferred_blockers(
@@ -1781,7 +1791,7 @@ def _merge_single_task(
                 defer_blockers=getattr(args, "defer_blockers", False),
             )
             if deferred_blockers is None:
-                return _MergeSingleTaskResult(rc=1)
+                return _MergeSingleTaskResult(rc=1, status="deferred_blocker_materialization_failed")
             _print_deferred_blocker_tasks(merge_subject, deferred_blockers)
             if deferred_blockers[0] or deferred_blockers[1]:
                 merge_source = manual_force_merge_source(merge_source)
@@ -1812,6 +1822,7 @@ def _merge_single_task(
         print(f"✓ Marked task {merge_subject.id} as merged (branch '{merge_branch}' preserved)")
         return _MergeSingleTaskResult(
             rc=0,
+            status="merged",
             created_followups=tuple(created_followups),
             reused_followups=tuple(reused_followups),
         )
@@ -1857,7 +1868,7 @@ def _merge_single_task(
         if message:
             print(message)
         if prerequisite_result.status != "success":
-            return _MergeSingleTaskResult(rc=1)
+            return _MergeSingleTaskResult(rc=1, status="merge_prerequisite_failed")
         planned_action = determine_next_action(
             config,
             store,
@@ -1868,7 +1879,7 @@ def _merge_single_task(
         )
     else:
         print("Error: merge prerequisite loop did not converge")
-        return _MergeSingleTaskResult(rc=1)
+        return _MergeSingleTaskResult(rc=1, status="merge_prerequisite_loop_unresolved")
     effective_merge_source = merge_source
     authorized_merge_action: dict[str, Any] | None = None
     pregate_deferred_blockers: tuple[list[DbTask], list[DbTask]] | None = None
@@ -1879,7 +1890,7 @@ def _merge_single_task(
             if not (getattr(args, "force", False) and getattr(args, "ignore_verify_gate", False)):
                 description = str(planned_action.get("description") or "verify gate is red")
                 print(f"Error: {description}. Red verify gates require --force --ignore-verify-gate.")
-                return _MergeSingleTaskResult(rc=1)
+                return _MergeSingleTaskResult(rc=1, status="blocked_red_verify_gate")
             effective_merge_source = manual_force_merge_source(merge_source)
             proof = planned_action["red_verify_gate_proof"]
             failing_head = str(proof["reviewed_head_sha"])
@@ -1905,13 +1916,13 @@ def _merge_single_task(
                 defer_blockers=True,
             )
             if pregate_deferred_blockers is None:
-                return _MergeSingleTaskResult(rc=1)
+                return _MergeSingleTaskResult(rc=1, status="deferred_blocker_materialization_failed")
             if not (pregate_deferred_blockers[0] or pregate_deferred_blockers[1]):
                 print(
                     "Error: --defer-blockers could not create or reuse any deferred blocker tasks "
                     "for the selected review gate. Refusing to guess."
                 )
-                return _MergeSingleTaskResult(rc=1)
+                return _MergeSingleTaskResult(rc=1, status="deferred_blocker_materialization_failed")
             _print_deferred_blocker_tasks(merge_subject, pregate_deferred_blockers)
             pregate_deferred_blockers_printed = True
             effective_merge_source = manual_force_merge_source(merge_source)
@@ -1926,7 +1937,7 @@ def _merge_single_task(
                     f"{description}. Live verify-fix tasks cannot be bypassed; wait for the existing "
                     "same-epoch verify_fix task to complete before forcing merge."
                 )
-                return _MergeSingleTaskResult(rc=1)
+                return _MergeSingleTaskResult(rc=1, status="blocked_red_verify_gate")
             proof = planned_action.get("red_verify_gate_proof")
             if (
                 isinstance(proof, dict)
@@ -1941,13 +1952,13 @@ def _merge_single_task(
                     f"{description}. This current red verify-gate recovery state cannot be bypassed; "
                     "follow the remediation above before forcing merge."
                 )
-                return _MergeSingleTaskResult(rc=1)
+                return _MergeSingleTaskResult(rc=1, status="blocked_red_verify_gate")
             print(
                 "Error: "
                 f"{description}. Red verify gate bypass requires current failed pre-merge proof; "
                 "rerun or repair the verify gate evidence before forcing merge."
             )
-            return _MergeSingleTaskResult(rc=1)
+            return _MergeSingleTaskResult(rc=1, status="blocked_red_verify_gate")
         elif getattr(args, "force", False) and classify_advance_action(planned_action) == "needs_attention":
             effective_merge_source = manual_force_merge_source(merge_source)
             description = str(planned_action.get("description") or "merge is blocked")
@@ -1955,7 +1966,7 @@ def _merge_single_task(
         else:
             description = str(planned_action.get("description") or "merge is blocked")
             print(f"Error: {description}")
-            return _MergeSingleTaskResult(rc=1)
+            return _MergeSingleTaskResult(rc=1, status="blocked_lifecycle_gate")
 
     if planned_action.get("type") in {"merge", "merge_with_followups"}:
         authorized_merge_action = dict(planned_action)
@@ -3450,16 +3461,22 @@ def _cmd_advance_unimplemented(
 @dataclass
 class _MergeActionResult:
     rc: int
+    status: ManualMergeExecutionStatus
     created_followups: list[DbTask]
     reused_followups: list[DbTask]
     created_investigation_task_ids: list[str]
     reused_investigation_task_ids: list[str]
     created_deferred_blockers: list[DbTask] = field(default_factory=list)
     reused_deferred_blockers: list[DbTask] = field(default_factory=list)
-    status: str = "merged"
     block_reason: str | None = None
     promotion_warnings: tuple[str, ...] = ()
     candidate_verify: CandidateIntegrationVerifyCheck | None = None
+
+    def __post_init__(self) -> None:
+        if self.rc != 0 and self.status in {"merged", "already_merged"}:
+            raise ValueError(f"merge action failure cannot use success status {self.status!r}")
+        if self.rc == 0 and self.status == "already_merged_refused":
+            raise ValueError("already_merged_refused requires a non-zero rc")
 
 
 PRE_PROMOTION_MERGE_REFUSAL_STATUSES = frozenset(
@@ -3816,7 +3833,7 @@ def _mandatory_merge_side_effects_failed_result(
 def _post_merge_state_persistence_failed_result(
     *,
     exc: Exception,
-    status: str,
+    status: ManualMergeExecutionStatus,
     phase: str,
     created_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
     reused_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
@@ -3846,7 +3863,7 @@ def _post_merge_state_persistence_failed_result(
 def _post_merge_proof_persistence_failed_result(
     *,
     exc: Exception,
-    status: str,
+    status: ManualMergeExecutionStatus,
     phase: str,
     created_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
     reused_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
@@ -3877,7 +3894,7 @@ def _post_merge_proof_persistence_failed_result(
 def _pre_promotion_merge_refusal_result(
     *,
     exc: Exception | str,
-    status: str,
+    status: ManualMergeExecutionStatus,
     phase: str,
     created_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
     reused_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
@@ -5225,6 +5242,7 @@ def _finalize_staged_isolated_merge_action(
         )
     return _MergeActionResult(
         rc=0,
+        status="merged",
         created_followups=created_followups,
         reused_followups=reused_followups,
         created_investigation_task_ids=list(staged.created_investigation_task_ids),
@@ -5271,6 +5289,7 @@ def _stage_isolated_merge_action(
             print(f"Error: {status_error}")
             return _MergeActionResult(
                 rc=1,
+                status="invalid_execution_state",
                 created_followups=[],
                 reused_followups=[],
                 created_investigation_task_ids=list(created_investigation_task_ids),
@@ -5280,6 +5299,7 @@ def _stage_isolated_merge_action(
             print(f"Error: {resolved_subject.merge_source_warning}")
             return _MergeActionResult(
                 rc=1,
+                status="merge_source_warning",
                 created_followups=[],
                 reused_followups=[],
                 created_investigation_task_ids=list(created_investigation_task_ids),
@@ -5307,6 +5327,7 @@ def _stage_isolated_merge_action(
         )
         return _MergeActionResult(
             rc=1,
+            status="blocked_lifecycle_gate",
             created_followups=[],
             reused_followups=[],
             created_investigation_task_ids=list(created_investigation_task_ids),
@@ -5713,6 +5734,7 @@ def _execute_merge_action(
             print(f"Error: {status_error}")
             return _MergeActionResult(
                 rc=1,
+                status="invalid_execution_state",
                 created_followups=created_followups,
                 reused_followups=reused_followups,
                 created_investigation_task_ids=created_investigation_task_ids,
@@ -5726,6 +5748,7 @@ def _execute_merge_action(
         )
         return _MergeActionResult(
             rc=1,
+            status="blocked_lifecycle_gate",
             created_followups=created_followups,
             reused_followups=reused_followups,
             created_investigation_task_ids=created_investigation_task_ids,
@@ -5736,6 +5759,7 @@ def _execute_merge_action(
         print(f"Error: {resolved_subject.merge_source_warning}")
         return _MergeActionResult(
             rc=1,
+            status="merge_source_warning",
             created_followups=created_followups,
             reused_followups=reused_followups,
             created_investigation_task_ids=created_investigation_task_ids,
@@ -6208,7 +6232,7 @@ def _execute_merge_action(
         if isinstance(staged_result, _MergeActionResult):
             return staged_result
         staged_isolated = staged_result
-        merge_result = _MergeSingleTaskResult(rc=0)
+        merge_result = _MergeSingleTaskResult(rc=0, status="merged")
     else:
         merge_result = _coerce_merge_single_task_result(
             _merge_single_task(

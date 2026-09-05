@@ -322,12 +322,6 @@ def _isolate_home_dir(tmp_path: Path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_ambient_db_path(monkeypatch):
-    """Keep externally selected project DBs from contaminating tmp-project tests."""
-    monkeypatch.delenv("GZA_DB_PATH", raising=False)
-
-
-@pytest.fixture(autouse=True)
 def _isolate_rich_console(monkeypatch):
     """Pin Rich console color and width so test assertions are deterministic.
 

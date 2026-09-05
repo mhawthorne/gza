@@ -422,7 +422,7 @@ def test_squash_merge_reconciles_origin_branch_and_keeps_advance_planning_clean(
     result = _merge_single_task(task.id, config, store, git, args, "main")
 
     assert result.rc == 1
-    assert result.status == "merged"
+    assert result.status == "merge_prerequisite_failed"
 
 
 def test_run_task_backed_rebase_clean_rebase_updates_origin_and_clears_merge_source_divergence(
@@ -770,7 +770,7 @@ def test_squash_merge_without_remote_tracking_ref_stays_local_only(tmp_path: Pat
     result = _merge_single_task(task.id, config, store, git, args, "main")
 
     assert result.rc == 1
-    assert result.status == "merged"
+    assert result.status == "merge_prerequisite_failed"
 
 
 def test_merge_force_refuses_real_git_conflict_and_leaves_clean_checkout(tmp_path: Path) -> None:

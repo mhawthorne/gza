@@ -28,6 +28,7 @@ from gza.cli.git_ops import (
     _capped_review_blocker_findings_for_action,
     _classify_rebase_git_failure,
     _classify_squash_reconcile_push_failure,
+    _coerce_merge_single_task_result,
     _execute_merge_action,
     _finalize_staged_isolated_merge_action,
     _IsolatedPromotionRollbackFailed,
@@ -790,7 +791,7 @@ def test_full_path_max_cycle_merge_and_defer_creates_debt_before_merge_success_a
         ]
         assert len(blocker_children) == 1
         order.append("merge-success")
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(rc=0, status="merged")
 
     with (
         patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
@@ -858,7 +859,7 @@ def test_full_path_max_cycle_merge_and_defer_fans_out_multi_blocker_debt_and_cle
 
     with (
         patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
-        patch("gza.cli.git_ops._merge_single_task", return_value=_MergeSingleTaskResult(rc=0)),
+        patch("gza.cli.git_ops._merge_single_task", return_value=_MergeSingleTaskResult(rc=0, status="merged")),
     ):
         result = _execute_merge_action(
             config,
@@ -1006,6 +1007,217 @@ def _manual_merge_service_request(
         pre_materialized_deferred_blockers=pre_materialized_deferred_blockers,
         pre_materialized_deferred_blockers_printed=pre_materialized_deferred_blockers_printed,
     )
+
+
+def _assert_failed_merge_status_is_not_success(result: Any) -> None:
+    assert result.rc != 0
+    assert result.status not in {"merged", "already_merged"}
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_status"),
+    [
+        ("dirty_checkout", "blocked_dirty_checkout"),
+        ("merge_conflict", "merge_conflict"),
+        ("already_merged_refusal", "already_merged_refused"),
+        ("deferred_materialization_none", "deferred_blocker_materialization_failed"),
+        ("mandatory_side_effect_failure", "merge_side_effect_materialization_failed"),
+        ("merge_failure", "merge_failed"),
+        ("merge_cleanup_failure", "merge_cleanup_failed"),
+    ],
+)
+def test_manual_merge_execution_failure_statuses_are_never_success(
+    tmp_path: Path,
+    scenario: str,
+    expected_status: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_merge_task(store, f"Failure status {scenario}", f"feature/failure-status-{scenario}")
+    assert store.get_or_create_merge_unit_for_task(task) is not None
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=scenario == "already_merged_refusal"),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=scenario == "dirty_checkout"),
+        can_merge=MagicMock(return_value=scenario != "merge_conflict"),
+        merge=MagicMock(),
+        merge_abort=MagicMock(),
+        reset_hard_head=MagicMock(),
+    )
+    hooks = _manual_merge_service_hooks()
+    if scenario == "deferred_materialization_none":
+        hooks = replace(hooks, materialize_deferred_blockers=lambda _task: None)
+    elif scenario == "mandatory_side_effect_failure":
+        hooks = replace(hooks, materialize_followups=lambda _task: (_ for _ in ()).throw(RuntimeError("boom")))
+    elif scenario == "merge_failure":
+        git.merge.side_effect = GitError("merge exploded")
+    elif scenario == "merge_cleanup_failure":
+        git.merge.side_effect = GitError("merge exploded")
+        git.merge_abort.side_effect = GitError("abort failed")
+        git.reset_hard_head.side_effect = GitError("reset failed")
+
+    result = execute_manual_merge(
+        _manual_merge_service_request(tmp_path, store, git, task),
+        hooks,
+    )
+
+    assert result.status == expected_status
+    _assert_failed_merge_status_is_not_success(result)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: ManualMergeExecutionResult(rc=1, status="merged"),
+        lambda: ManualMergeExecutionResult(rc=1, status="already_merged"),
+        lambda: _MergeSingleTaskResult(rc=1, status="merged"),
+        lambda: _MergeSingleTaskResult(rc=1, status="already_merged"),
+        lambda: _MergeActionResult(
+            rc=1,
+            status="merged",
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+        ),
+        lambda: _MergeActionResult(
+            rc=1,
+            status="already_merged",
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+        ),
+    ],
+)
+def test_merge_result_models_reject_failure_success_status(factory: Any) -> None:
+    with pytest.raises(ValueError):
+        factory()
+
+
+def test_merge_single_task_integer_failure_coercion_is_not_success() -> None:
+    result = _coerce_merge_single_task_result(2)
+
+    assert result.status == "unknown_failure"
+    _assert_failed_merge_status_is_not_success(result)
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_status"),
+    [
+        ("removed_option", "invalid_merge_options"),
+        ("missing_task", "merge_subject_not_found"),
+        ("invalid_execution_state", "invalid_execution_state"),
+        ("merge_source_warning", "merge_source_warning"),
+        ("no_source", "no_resolvable_merge_source"),
+    ],
+)
+def test_merge_single_task_early_refusals_are_not_success_status(
+    tmp_path: Path,
+    scenario: str,
+    expected_status: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    git = SimpleNamespace(default_branch=MagicMock(return_value="main"))
+    args = _manual_merge_args()
+    task_id = "testproject-404"
+    resolved = None
+
+    if scenario == "removed_option":
+        args.rebase = True
+    elif scenario != "missing_task":
+        task = _completed_merge_task(store, f"Early refusal {scenario}", f"feature/early-{scenario}")
+        task_id = task.id
+        execution_task = replace(task)
+        merge_source_warning = None
+        merge_branch = task.branch
+        merge_source_ref = task.branch
+        if scenario == "invalid_execution_state":
+            execution_task.status = "failed"
+        elif scenario == "merge_source_warning":
+            merge_source_warning = "source ref is ambiguous"
+        elif scenario == "no_source":
+            merge_branch = None
+            merge_source_ref = None
+        resolved = _ResolvedMergeSubject(
+            trigger_task=task,
+            execution_task=execution_task,
+            merge_subject=task,
+            merge_unit_id=None,
+            merge_branch=merge_branch,
+            merge_source_ref=merge_source_ref,
+            merge_source_warning=merge_source_warning,
+        )
+
+    result = _merge_single_task(
+        task_id,
+        Config.load(tmp_path),
+        store,
+        git,
+        args,
+        "main",
+        resolved_subject=resolved,
+    )
+
+    assert result.status == expected_status
+    _assert_failed_merge_status_is_not_success(result)
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_status"),
+    [
+        ("invalid_execution_state", "invalid_execution_state"),
+        ("wrong_target_checkout", "blocked_lifecycle_gate"),
+        ("merge_source_warning", "merge_source_warning"),
+    ],
+)
+def test_execute_merge_action_isolated_preflight_refusals_are_not_success_status(
+    tmp_path: Path,
+    scenario: str,
+    expected_status: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_merge_task(store, f"Isolated refusal {scenario}", f"feature/isolated-refusal-{scenario}")
+    execution_task = replace(task)
+    merge_source_warning = None
+    execution_branch = "main"
+    if scenario == "invalid_execution_state":
+        execution_task.status = "failed"
+    elif scenario == "wrong_target_checkout":
+        execution_branch = "feature/not-main"
+    elif scenario == "merge_source_warning":
+        merge_source_warning = "source ref is ambiguous"
+    resolved = _ResolvedMergeSubject(
+        trigger_task=task,
+        execution_task=execution_task,
+        merge_subject=task,
+        merge_unit_id=None,
+        merge_branch=task.branch,
+        merge_source_ref=task.branch,
+        merge_source_warning=merge_source_warning,
+    )
+    repo_git = SimpleNamespace(repo_dir=tmp_path)
+    merge_git = SimpleNamespace(repo_dir=tmp_path / "isolated")
+
+    with patch("gza.cli.git_ops._resolve_merge_subject", return_value=resolved):
+        result = _execute_merge_action(
+            Config.load(tmp_path),
+            store,
+            repo_git,
+            task,
+            {"type": "merge"},
+            target_branch="main",
+            current_branch="main",
+            merge_git=merge_git,
+            merge_current_branch=execution_branch,
+        )
+
+    assert result.status == expected_status
+    _assert_failed_merge_status_is_not_success(result)
 
 
 @pytest.mark.parametrize("squash", [False, True])
@@ -1797,7 +2009,7 @@ def test_manual_merge_execution_api_refuses_spec_coherence_materialization_failu
     )
 
     assert result.rc == 1
-    assert result.status == "deferred_blocker_materialization_missing"
+    assert result.status == "deferred_blocker_materialization_failed"
     assert "returned no result" in (result.block_reason or "")
     git.merge.assert_not_called()
     refreshed_unit = store.resolve_merge_unit_for_task(task.id)
@@ -1836,7 +2048,8 @@ def test_manual_merge_execution_api_late_already_merged_refusal_is_not_success_s
     )
 
     assert result.rc == 1
-    assert result.status == "already_merged_refusal"
+    assert result.status == "already_merged_refused"
+    assert result.status != "merged"
     assert "already merged" in (result.block_reason or "")
     git.merge.assert_not_called()
     refreshed_unit = store.get_merge_unit(unit.id)
@@ -1876,7 +2089,8 @@ def test_merge_single_task_manual_already_merged_message_and_exit_code_are_prese
         result = _merge_single_task(task.id, Config.load(tmp_path), store, git, _manual_merge_args(), "main")
 
     assert result.rc == 1
-    assert result.status == "already_merged_refusal"
+    assert result.status == "already_merged_refused"
+    assert result.status != "merged"
     assert "Error: Branch 'feature/manual-already' is already merged into main" in capsys.readouterr().out
     git.merge.assert_not_called()
     refreshed_unit = store.get_merge_unit(unit.id)
@@ -1966,7 +2180,8 @@ def test_staged_isolated_merge_late_already_merged_race_stops_without_reconcilia
 
     assert isinstance(result, _MergeActionResult)
     assert result.rc == 1
-    assert result.status == "already_merged_refusal"
+    assert result.status == "already_merged_refused"
+    assert result.status != "merged"
     git.merge.assert_not_called()
     refreshed_unit = store.get_merge_unit(unit.id)
     assert refreshed_unit is not None
@@ -5240,7 +5455,7 @@ def _execute_capped_merge_through_materialization_side_effect(
                 created_deferred_blockers=tuple(materialization_error.created_deferred_blockers),
                 reused_deferred_blockers=tuple(materialization_error.reused_deferred_blockers),
             )
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(rc=0, status="merged")
 
     with (
         patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
@@ -5841,7 +6056,7 @@ def test_execute_merge_action_max_cycle_materializes_blockers_before_non_isolate
         materialization_error = side_effect()
         assert materialization_error is None
         order.append("merge")
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(rc=0, status="merged")
 
     def _materialize_side_effect(*args: object, **kwargs: object) -> tuple[list[Any], list[Any]]:
         order.append("defer")
@@ -5965,7 +6180,7 @@ def test_execute_merge_action_materializes_fresh_inner_replan_identity_before_me
         assert materialization_error is None
         order.append("materialized")
         order.append("git.merge")
-        return _MergeSingleTaskResult(rc=0, authorized_merge_action=dict(fresh_action))
+        return _MergeSingleTaskResult(rc=0, status="merged", authorized_merge_action=dict(fresh_action))
 
     with (
         patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
@@ -6744,6 +6959,7 @@ def test_max_cycle_post_materialization_authority_race_preserves_debt_without_me
                 if executor_path == "non-isolated"
                 else lambda *_args, **_kwargs: _MergeSingleTaskResult(
                     rc=0,
+                    status="merged",
                     authorized_source_ref_sha="source-sha",
                 ),
             ):
@@ -7962,7 +8178,7 @@ def test_execute_merge_action_max_cycle_replay_reuses_existing_blockers_and_fill
         assert materialization_error is None
         if merge_attempts == 1:
             return _MergeSingleTaskResult(rc=1, status="merge_failed", block_reason="conflict after materialization")
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(rc=0, status="merged")
 
     with (
         patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
@@ -8035,7 +8251,7 @@ def test_execute_merge_action_max_cycle_passes_active_scope_tags_to_blocker_crea
         materialization_error = side_effect()
         assert materialization_error is None
         order.append("git.merge")
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(rc=0, status="merged")
 
     with (
         patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
@@ -8083,7 +8299,7 @@ def test_execute_merge_action_ordinary_merge_persists_state_and_followups_once(
 
     with (
         patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
-        patch("gza.cli.git_ops._merge_single_task", return_value=_MergeSingleTaskResult(rc=0)),
+        patch("gza.cli.git_ops._merge_single_task", return_value=_MergeSingleTaskResult(rc=0, status="merged")),
         patch("gza.cli.git_ops._create_or_reuse_capped_review_blocker_tasks") as materialize,
     ):
         result = _execute_merge_action(
@@ -8139,7 +8355,7 @@ def test_execute_merge_action_ordinary_followups_materialize_before_merge_and_st
         materialization_error = side_effect()
         assert materialization_error is None
         order.append("git.merge")
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(rc=0, status="merged")
 
     def followup_side_effect(*args: object, **kwargs: object) -> tuple[list[DbTask], list[DbTask]]:
         order.append("followups")
@@ -8465,7 +8681,7 @@ def test_execute_merge_action_ordinary_followup_partial_failure_replay_reuses_pr
                 reused_followups=tuple(materialization_error.reused_followups),
             )
         assert materialization_error is None
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(rc=0, status="merged")
 
     def followup_side_effect(*_args: object, **_kwargs: object) -> tuple[list[DbTask], list[DbTask]]:
         if merge_attempts == 1:
@@ -8558,7 +8774,7 @@ def test_execute_merge_action_ordinary_followup_real_partial_failure_returns_cre
                 reused_followups=tuple(materialization_error.reused_followups),
             )
         assert materialization_error is None
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(rc=0, status="merged")
 
     store.create_or_reuse_followup_task = MagicMock(side_effect=followup_create_side_effect)  # type: ignore[method-assign]
     with (
@@ -8752,7 +8968,7 @@ def test_execute_merge_action_legacy_no_merge_unit_marks_task_row_merged(tmp_pat
     with (
         patch("gza.cli.git_ops._resolve_merge_subject", return_value=resolved),
         patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
-        patch("gza.cli.git_ops._merge_single_task", return_value=_MergeSingleTaskResult(rc=0)),
+        patch("gza.cli.git_ops._merge_single_task", return_value=_MergeSingleTaskResult(rc=0, status="merged")),
     ):
         result = _execute_merge_action(
             config,
@@ -8796,7 +9012,7 @@ def test_execute_merge_action_non_isolated_post_merge_state_failure_preserves_de
         side_effect = kwargs.get("before_irreversible_side_effect")
         assert side_effect is not None
         assert side_effect() is None
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(rc=0, status="merged")
 
     store.set_merge_unit_state = MagicMock(side_effect=sqlite3.OperationalError("locked after merge"))  # type: ignore[method-assign]
     with (
@@ -8904,7 +9120,7 @@ def test_execute_merge_action_non_isolated_proof_persistence_failure_requires_at
         side_effect = kwargs.get("before_irreversible_side_effect")
         assert side_effect is not None
         assert side_effect() is None
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(rc=0, status="merged")
 
     with (
         patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
@@ -9094,7 +9310,7 @@ def test_capped_replay_reuses_initially_accepted_child_without_trigger_source_id
         side_effect = kwargs.get("before_irreversible_side_effect")
         assert side_effect is not None
         assert side_effect() is None
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(rc=0, status="merged")
 
     store.set_merge_unit_state = MagicMock(side_effect=sqlite3.OperationalError("locked after merge"))  # type: ignore[method-assign]
     with (
@@ -9198,7 +9414,7 @@ def test_cmd_advance_replays_capped_post_merge_state_failure_reusing_deferred_bl
         side_effect = kwargs.get("before_irreversible_side_effect")
         assert side_effect is not None
         assert side_effect() is None
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(rc=0, status="merged")
 
     store.set_merge_unit_state = MagicMock(side_effect=sqlite3.OperationalError("locked after merge"))  # type: ignore[method-assign]
     with (
@@ -9374,7 +9590,7 @@ def test_pending_finalization_replay_uses_only_fresh_promotion_bound_proof(
         side_effect = kwargs.get("before_irreversible_side_effect")
         assert side_effect is not None
         assert side_effect() is None
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(rc=0, status="merged")
 
     store.set_merge_unit_state = MagicMock(side_effect=sqlite3.OperationalError("locked after merge"))  # type: ignore[method-assign]
     with (
@@ -9529,7 +9745,7 @@ def test_cmd_advance_replays_capped_post_merge_state_failure_for_merge_represent
         side_effect = kwargs.get("before_irreversible_side_effect")
         assert side_effect is not None
         assert side_effect() is None
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(rc=0, status="merged")
 
     store.set_merge_unit_state = MagicMock(side_effect=sqlite3.OperationalError("locked after merge"))  # type: ignore[method-assign]
     with (
@@ -9645,7 +9861,7 @@ def test_cmd_advance_replays_ordinary_followup_post_merge_state_failure_reusing_
         side_effect = kwargs.get("before_irreversible_side_effect")
         assert side_effect is not None
         assert side_effect() is None
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(rc=0, status="merged")
 
     store.set_merge_unit_state = MagicMock(side_effect=sqlite3.OperationalError("locked after merge"))  # type: ignore[method-assign]
     with (
@@ -10228,7 +10444,7 @@ def test_execute_merge_action_isolated_candidate_verify_red_blocks_promotion(
         patch("gza.cli.git_ops._require_fresh_capped_review_lifecycle_authority"),
         patch(
             "gza.cli.git_ops._merge_single_task",
-            return_value=_MergeSingleTaskResult(rc=0, authorized_source_ref_sha="isolated-merge-oid"),
+            return_value=_MergeSingleTaskResult(rc=0, status="merged", authorized_source_ref_sha="isolated-merge-oid"),
         ),
         patch("gza.cli.git_ops.check_candidate_integration_verify", return_value=red_check),
         patch("gza.cli.git_ops._promote_isolated_merge_to_target_branch") as promote,
@@ -10295,7 +10511,7 @@ def test_execute_merge_action_isolated_max_cycle_red_candidate_creates_no_debt(
         patch("gza.cli.git_ops._require_fresh_capped_review_lifecycle_authority"),
         patch(
             "gza.cli.git_ops._merge_single_task",
-            return_value=_MergeSingleTaskResult(rc=0, authorized_source_ref_sha="isolated-merge-oid"),
+            return_value=_MergeSingleTaskResult(rc=0, status="merged", authorized_source_ref_sha="isolated-merge-oid"),
         ),
         patch("gza.cli.git_ops.check_candidate_integration_verify", return_value=red_check),
         patch("gza.cli.git_ops._promote_isolated_merge_to_target_branch") as promote,
@@ -10370,7 +10586,7 @@ def test_execute_merge_action_isolated_max_cycle_refuses_when_target_advances_be
         patch("gza.cli.git_ops._require_fresh_capped_review_lifecycle_authority"),
         patch(
             "gza.cli.git_ops._merge_single_task",
-            return_value=_MergeSingleTaskResult(rc=0, authorized_source_ref_sha="source-sha"),
+            return_value=_MergeSingleTaskResult(rc=0, status="merged", authorized_source_ref_sha="source-sha"),
         ),
         patch("gza.cli.git_ops.active_worktree_path_for_branch", return_value=None),
     ):
@@ -10443,7 +10659,7 @@ def test_execute_merge_action_isolated_candidate_verify_unavailable_uses_distinc
         patch("gza.cli.git_ops._require_fresh_capped_review_lifecycle_authority"),
         patch(
             "gza.cli.git_ops._merge_single_task",
-            return_value=_MergeSingleTaskResult(rc=0, authorized_source_ref_sha="isolated-merge-oid"),
+            return_value=_MergeSingleTaskResult(rc=0, status="merged", authorized_source_ref_sha="isolated-merge-oid"),
         ),
         patch("gza.cli.git_ops.check_candidate_integration_verify", return_value=unavailable_check),
         patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate-unavailable"),
@@ -10572,7 +10788,7 @@ def test_execute_merge_action_isolated_max_cycle_materializes_debt_before_promot
         patch("gza.cli.git_ops._require_fresh_capped_review_lifecycle_authority"),
         patch(
             "gza.cli.git_ops._merge_single_task",
-            return_value=_MergeSingleTaskResult(rc=0, authorized_source_ref_sha="isolated-merge-oid"),
+            return_value=_MergeSingleTaskResult(rc=0, status="merged", authorized_source_ref_sha="isolated-merge-oid"),
         ),
         patch(
             "gza.cli.git_ops._create_or_reuse_capped_review_blocker_tasks",
@@ -10638,7 +10854,7 @@ def test_execute_merge_action_isolated_max_cycle_source_move_after_staging_creat
         patch("gza.cli.git_ops._require_fresh_capped_review_lifecycle_authority"),
         patch(
             "gza.cli.git_ops._merge_single_task",
-            return_value=_MergeSingleTaskResult(rc=0, authorized_source_ref_sha="source-sha"),
+            return_value=_MergeSingleTaskResult(rc=0, status="merged", authorized_source_ref_sha="source-sha"),
         ),
         patch(
             "gza.cli.git_ops._create_or_reuse_capped_review_blocker_tasks",
@@ -10720,7 +10936,7 @@ def test_max_cycle_blank_verify_refuses_before_debt_or_state(
         patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
         patch(
             "gza.cli.git_ops._merge_single_task",
-            return_value=_MergeSingleTaskResult(rc=0, authorized_source_ref_sha="source-sha"),
+            return_value=_MergeSingleTaskResult(rc=0, status="merged", authorized_source_ref_sha="source-sha"),
         ) as merge_single,
         patch(
             "gza.cli.git_ops._create_or_reuse_capped_review_blocker_tasks",
@@ -10797,7 +11013,7 @@ def test_execute_merge_action_isolated_max_cycle_source_move_during_materializat
         patch("gza.cli.git_ops._require_fresh_capped_review_lifecycle_authority"),
         patch(
             "gza.cli.git_ops._merge_single_task",
-            return_value=_MergeSingleTaskResult(rc=0, authorized_source_ref_sha="source-sha"),
+            return_value=_MergeSingleTaskResult(rc=0, status="merged", authorized_source_ref_sha="source-sha"),
         ),
         patch("gza.cli.git_ops._create_or_reuse_capped_review_blocker_tasks", side_effect=real_capped_creator),
         patch("gza.cli.git_ops._promote_isolated_merge_to_target_branch") as promote,
@@ -10862,7 +11078,7 @@ def test_execute_merge_action_isolated_followup_source_move_during_materializati
     with (
         patch(
             "gza.cli.git_ops._merge_single_task",
-            return_value=_MergeSingleTaskResult(rc=0, authorized_source_ref_sha="same-sha"),
+            return_value=_MergeSingleTaskResult(rc=0, status="merged", authorized_source_ref_sha="same-sha"),
         ),
         patch("gza.cli.git_ops._promote_isolated_merge_to_target_branch") as promote,
     ):
@@ -10930,7 +11146,7 @@ def test_execute_merge_action_isolated_max_cycle_materialization_failure_prevent
         patch("gza.cli.git_ops._require_fresh_capped_review_lifecycle_authority"),
         patch(
             "gza.cli.git_ops._merge_single_task",
-            return_value=_MergeSingleTaskResult(rc=0, authorized_source_ref_sha="isolated-merge-oid"),
+            return_value=_MergeSingleTaskResult(rc=0, status="merged", authorized_source_ref_sha="isolated-merge-oid"),
         ),
         patch(
             "gza.cli.git_ops._create_or_reuse_capped_review_blocker_tasks",
@@ -10994,7 +11210,7 @@ def test_execute_merge_action_isolated_max_cycle_replay_reuses_existing_debt(
         patch("gza.cli.git_ops._require_fresh_capped_review_lifecycle_authority"),
         patch(
             "gza.cli.git_ops._merge_single_task",
-            return_value=_MergeSingleTaskResult(rc=0, authorized_source_ref_sha="isolated-merge-oid"),
+            return_value=_MergeSingleTaskResult(rc=0, status="merged", authorized_source_ref_sha="isolated-merge-oid"),
         ),
         patch(
             "gza.cli.git_ops._promote_isolated_merge_to_target_branch",

@@ -23640,6 +23640,7 @@ def test_execute_merge_action_reconciles_pending_squash_only_after_isolated_prom
     )
     merge_result = _MergeSingleTaskResult(
         rc=0,
+        status="merged",
         pending_squash_reconcile=_PendingSquashBranchReconcile(
             branch=task.branch,
             pre_squash_local_oid="local-oid",
@@ -23731,6 +23732,7 @@ def test_execute_merge_action_skips_pending_squash_reconcile_when_isolated_promo
     )
     merge_result = _MergeSingleTaskResult(
         rc=0,
+        status="merged",
         pending_squash_reconcile=_PendingSquashBranchReconcile(
             branch=task.branch,
             pre_squash_local_oid="local-oid",
@@ -23804,6 +23806,7 @@ def test_execute_merge_action_isolated_squash_uses_real_checkout_pre_squash_refs
     )
     merge_result = _MergeSingleTaskResult(
         rc=0,
+        status="merged",
         pending_squash_reconcile=_PendingSquashBranchReconcile(
             branch=task.branch,
             pre_squash_local_oid="isolated-local-oid",
@@ -23883,6 +23886,7 @@ def test_execute_merge_action_isolated_squash_uses_real_checkout_missing_remote_
     )
     merge_result = _MergeSingleTaskResult(
         rc=0,
+        status="merged",
         pending_squash_reconcile=_PendingSquashBranchReconcile(
             branch=task.branch,
             pre_squash_local_oid="isolated-local-oid",
@@ -28603,7 +28607,7 @@ def test_watch_cycle_isolated_batch_late_already_merged_preflight_failure_stops_
             reused_followups=[],
             created_investigation_task_ids=[],
             reused_investigation_task_ids=[],
-            status="merged",
+            status="already_merged_refused",
         )
 
     with (
@@ -28877,7 +28881,7 @@ def test_watch_cycle_isolated_batch_candidate_only_containment_waits_for_candida
         task_id = args[0]
         assert task_id in {task.id for task in tasks}
         merge_single_task_ids.append(str(task_id))
-        return _MergeSingleTaskResult(rc=0, authorized_source_ref_sha="source-sha")
+        return _MergeSingleTaskResult(rc=0, status="merged", authorized_source_ref_sha="source-sha")
 
     candidate_check = _candidate_verify_check(
         tmp_path,
@@ -29352,7 +29356,7 @@ def test_watch_cycle_isolated_batch_max_cycle_final_authorization_blocks_before_
     with (
         patch(
             "gza.cli.git_ops._merge_single_task",
-            return_value=_MergeSingleTaskResult(rc=0, authorized_source_ref_sha="source-sha"),
+            return_value=_MergeSingleTaskResult(rc=0, status="merged", authorized_source_ref_sha="source-sha"),
         ),
         patch(
             "gza.cli.git_ops._create_or_reuse_capped_review_blocker_tasks",
@@ -29450,7 +29454,7 @@ def test_watch_cycle_isolated_batch_blank_verify_refuses_capped_action_before_de
     with (
         patch(
             "gza.cli.git_ops._merge_single_task",
-            return_value=_MergeSingleTaskResult(rc=0, authorized_source_ref_sha="source-sha"),
+            return_value=_MergeSingleTaskResult(rc=0, status="merged", authorized_source_ref_sha="source-sha"),
         ),
         patch(
             "gza.cli.git_ops._create_or_reuse_capped_review_blocker_tasks",
@@ -30502,6 +30506,7 @@ def test_watch_cycle_isolated_batch_later_failures_log_deferred_blockers_and_cre
             raise GitError("finalize failed")
         return _MergeActionResult(
             rc=0,
+            status="merged",
             created_followups=[],
             reused_followups=[],
             created_investigation_task_ids=[],
