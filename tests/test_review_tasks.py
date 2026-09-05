@@ -65,8 +65,10 @@ from gza.review_tasks import (
     resolution_review_scope_provenance_is_complete,
     resolve_latest_failed_verify_epoch,
     resolve_verify_fix_context,
+    resolve_verify_fix_operative_epoch,
     resolve_verify_fix_representative_task,
     resolve_verify_fix_task_identity,
+    VerifyFixContextError,
 )
 from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.review_verify_state import VerifyEpoch, persist_verify_gate_artifact
@@ -592,6 +594,58 @@ class TestVerifyFixTasks:
         assert reused.id == created.id
         assert find_existing_verify_fix_task(store, impl_task_id=impl.id, verify_epoch=current_epoch).id == created.id
 
+    def test_create_or_reuse_verify_fix_task_reuses_structured_same_tree_lane_after_rewrite(
+        self, tmp_path: Path
+    ) -> None:
+        config, store = _make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        recorded_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="old-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=900,
+            verify_timeout_grace_seconds=5.0,
+        )
+        current_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="new-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=900,
+            verify_timeout_grace_seconds=5.0,
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=improve,
+            epoch=recorded_epoch,
+        )
+
+        created, did_create = create_or_reuse_verify_fix_task(
+            store,
+            config,
+            impl_task=impl,
+            based_on_task=improve,
+            verify_epoch=recorded_epoch,
+            trigger_source="advance",
+        )
+        reused, reused_create = create_or_reuse_verify_fix_task(
+            store,
+            config,
+            impl_task=impl,
+            based_on_task=improve,
+            verify_epoch=current_epoch,
+            trigger_source="advance",
+        )
+
+        assert did_create is True
+        assert reused_create is False
+        assert reused.id == created.id
+        assert resolve_verify_fix_task_identity(store, created) == (impl.id, recorded_epoch)
+
     def test_find_existing_verify_fix_task_matches_legacy_prompt_with_timeout_drift(
         self, tmp_path: Path
     ) -> None:
@@ -622,6 +676,36 @@ class TestVerifyFixTasks:
 
         assert matched is not None
         assert matched.id == legacy.id
+
+    def test_find_existing_verify_fix_task_keeps_legacy_prompt_exact_head_after_rewrite(
+        self, tmp_path: Path
+    ) -> None:
+        _config, store = _make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        recorded_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="old-head",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        current_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="new-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        store.add(
+            build_verify_fix_prompt(impl.id, recorded_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+
+        assert find_existing_verify_fix_task(store, impl_task_id=impl.id, verify_epoch=current_epoch) is None
 
     def test_create_or_reuse_verify_fix_task_creates_new_lane_for_new_epoch(self, tmp_path: Path) -> None:
         config, store = _make_store(tmp_path)
@@ -1083,6 +1167,8 @@ class TestVerifyFixTasks:
         config, store = _make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")
         assert impl.id is not None
+        impl.branch = "feature/test"
+        store.update(impl)
         improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
         epoch = VerifyEpoch(
             reviewed_branch="feature/test",
@@ -1120,12 +1206,115 @@ class TestVerifyFixTasks:
         assert f"- Output artifact path: `{artifact_path}`" in rendered
         assert "AssertionError: expected green" in rendered
 
+    def test_resolve_verify_fix_context_rebinds_structured_lane_to_current_operative_epoch(
+        self, tmp_path: Path
+    ) -> None:
+        config, store = _make_store(tmp_path)
+        config.verify_command = "./bin/tests"
+        config.autonomous_verify_timeout_seconds = 1800
+        config.review_verify_timeout_grace_seconds = 5.0
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/test"
+        store.update(impl)
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        recorded_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="old-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=improve,
+            epoch=recorded_epoch,
+            output="old failed output\n",
+        )
+        created, _did_create = create_or_reuse_verify_fix_task(
+            store,
+            config,
+            impl_task=impl,
+            based_on_task=improve,
+            verify_epoch=recorded_epoch,
+            trigger_source="advance",
+        )
+        git = MagicMock()
+        git.rev_parse_if_exists.return_value = "new-head"
+        git.resolve_refs.return_value = {"feature/test": "tree-same"}
+
+        resolved_impl, operative_epoch, origin_epoch = resolve_verify_fix_operative_epoch(
+            store,
+            config,
+            task=created,
+            git=git,
+        )
+        context = resolve_verify_fix_context(store, config, task=created, git=git)
+        rendered = format_verify_fix_context(context)
+
+        assert resolved_impl.id == impl.id
+        assert origin_epoch == recorded_epoch
+        assert operative_epoch.reviewed_head_sha == "new-head"
+        assert context.origin_verify_epoch == recorded_epoch
+        assert context.verify_epoch == operative_epoch
+        assert context.reviewed_head_sha == "old-head"
+        assert "- Reviewed head: `old-head`" in rendered
+        assert "- Operative head: `new-head`" in rendered
+
+    def test_resolve_verify_fix_context_fails_closed_when_structured_live_epoch_unavailable(
+        self, tmp_path: Path
+    ) -> None:
+        config, store = _make_store(tmp_path)
+        config.verify_command = "./bin/tests"
+        config.autonomous_verify_timeout_seconds = 1800
+        config.review_verify_timeout_grace_seconds = 5.0
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/test"
+        store.update(impl)
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        recorded_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="old-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=improve,
+            epoch=recorded_epoch,
+            output="old failed output\n",
+        )
+        created, _did_create = create_or_reuse_verify_fix_task(
+            store,
+            config,
+            impl_task=impl,
+            based_on_task=improve,
+            verify_epoch=recorded_epoch,
+            trigger_source="advance",
+        )
+        git = MagicMock()
+        git.rev_parse_if_exists.return_value = None
+
+        with pytest.raises(VerifyFixContextError, match="could not resolve the current operative verify epoch"):
+            resolve_verify_fix_context(store, config, task=created, git=git)
+
     def test_resolve_verify_fix_context_prefers_structured_task_artifact_for_multiline_command(
         self, tmp_path: Path
     ) -> None:
         config, store = _make_store(tmp_path)
+        config.verify_command = "set -e\n./bin/tests"
         impl = store.add("Implement feature", task_type="implement")
         assert impl.id is not None
+        impl.branch = "feature/test"
+        store.update(impl)
         improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
         epoch = VerifyEpoch(
             reviewed_branch="feature/test",
@@ -1163,7 +1352,9 @@ class TestVerifyFixTasks:
         assert reused_create is False
         assert reused.id == created.id
 
-        context = resolve_verify_fix_context(store, config, task=created)
+        git = MagicMock()
+        git.rev_parse_if_exists.return_value = "deadbeef"
+        context = resolve_verify_fix_context(store, config, task=created, git=git)
 
         assert context.command == "set -e\n./bin/tests"
         assert context.trimmed_output.endswith("AssertionError: expected green")

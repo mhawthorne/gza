@@ -218,6 +218,8 @@ class TestPromptBuilderBuild:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         impl = store.add(prompt="Implement feature", task_type="implement")
+        impl.branch = "feature/test"
+        store.update(impl)
         improve = store.add(prompt="Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
 
         config = Config(
@@ -287,7 +289,9 @@ class TestPromptBuilderBuild:
         )
 
         summary_path = Path("/workspace/.gza/summaries/verify-fix-test.md")
-        prompt = PromptBuilder().build(task, config, store, summary_path=summary_path)
+        git = Mock()
+        git.rev_parse_if_exists.return_value = "deadbeef"
+        prompt = PromptBuilder().build(task, config, store, summary_path=summary_path, git=git)
 
         assert created is True
         assert "## verify_fix failed verify context" in prompt
@@ -305,6 +309,8 @@ class TestPromptBuilderBuild:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         impl = store.add(prompt="Implement feature", task_type="implement")
+        impl.branch = "feature/test"
+        store.update(impl)
         improve = store.add(prompt="Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
 
         config = Config(
@@ -373,7 +379,15 @@ class TestPromptBuilderBuild:
             trigger_source="advance",
         )
 
-        prompt = PromptBuilder().build(task, config, store, summary_path=Path("/workspace/.gza/summaries/verify-fix-test.md"))
+        git = Mock()
+        git.rev_parse_if_exists.return_value = "deadbeef"
+        prompt = PromptBuilder().build(
+            task,
+            config,
+            store,
+            summary_path=Path("/workspace/.gza/summaries/verify-fix-test.md"),
+            git=git,
+        )
 
         assert created is True
         assert "## verify_fix failed verify context" in prompt
@@ -387,6 +401,8 @@ class TestPromptBuilderBuild:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         impl = store.add(prompt="Implement feature", task_type="implement")
+        impl.branch = "feature/test"
+        store.update(impl)
         improve = store.add(prompt="Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
 
         config = Config(
@@ -455,7 +471,15 @@ class TestPromptBuilderBuild:
             trigger_source="advance",
         )
 
-        prompt = PromptBuilder().build(task, config, store, summary_path=Path("/workspace/.gza/summaries/verify-fix-test.md"))
+        git = Mock()
+        git.rev_parse_if_exists.return_value = "deadbeef"
+        prompt = PromptBuilder().build(
+            task,
+            config,
+            store,
+            summary_path=Path("/workspace/.gza/summaries/verify-fix-test.md"),
+            git=git,
+        )
 
         assert created is True
         assert "## verify_fix failed verify context" in prompt

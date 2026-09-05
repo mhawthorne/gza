@@ -49,12 +49,8 @@ from .task_slug import (
     strip_derived_implement_prefixes,
 )
 
-_FOLLOWUP_PROMPT_PREFIX_RE = re.compile(
-    r"^Follow-up\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+):"
-)
-_DEFERRED_BLOCKER_PROMPT_PREFIX_RE = re.compile(
-    r"^Deferred blocker\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+):"
-)
+_FOLLOWUP_PROMPT_PREFIX_RE = re.compile(r"^Follow-up\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+):")
+_DEFERRED_BLOCKER_PROMPT_PREFIX_RE = re.compile(r"^Deferred blocker\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+):")
 _CAPPED_REVIEW_BLOCKER_PROMPT_PREFIX_RE = re.compile(
     r"^Capped review blocker\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+)\s+reason\s+review-max-cycles:"
 )
@@ -134,6 +130,8 @@ def _require_model_for_created_task(
             provider_override=provider,
             model_override=model,
         )
+
+
 VERIFY_FIX_EPOCH_ARTIFACT_KIND = "verify_fix_epoch"
 VERIFY_FIX_EPOCH_ARTIFACT_LABEL = "verify_fix_epoch"
 VERIFY_FIX_EPOCH_ARTIFACT_SCHEMA_VERSION = 1
@@ -149,9 +147,7 @@ class DuplicateReviewError(ValueError):
 
     def __init__(self, active_review: Task) -> None:
         self.active_review = active_review
-        super().__init__(
-            f"An active review task already exists: {active_review.id} ({active_review.status})"
-        )
+        super().__init__(f"An active review task already exists: {active_review.id} ({active_review.status})")
 
 
 class OffTopicVerifyPersistenceError(RuntimeError):
@@ -195,6 +191,7 @@ class VerifyFixContext:
     impl_task: Task
     owner_task: Task
     verify_epoch: VerifyEpoch
+    origin_verify_epoch: VerifyEpoch
     status: str
     exit_status: str
     command: str
@@ -211,9 +208,7 @@ class VerifyFixContext:
     source_task_type: str | None
 
 
-_VERIFY_FIX_CODE_CHANGING_TASK_TYPES = frozenset(
-    {"implement", "improve", "verify_fix", "fix", "rebase"}
-)
+_VERIFY_FIX_CODE_CHANGING_TASK_TYPES = frozenset({"implement", "improve", "verify_fix", "fix", "rebase"})
 
 
 def _known_derived_suffixes_for_review(store: SqliteTaskStore, impl_task: Task) -> set[str]:
@@ -269,7 +264,7 @@ def build_auto_review_prompt(
                 slug = normalized
         if slug:
             if project_prefix and slug.startswith(f"{project_prefix}-"):
-                slug = slug[len(project_prefix) + 1:]
+                slug = slug[len(project_prefix) + 1 :]
             return f"review {slug}"
 
     return f"Review task {impl_task.id}"
@@ -323,9 +318,7 @@ def parse_verify_fix_epoch_artifact_metadata(
     grace_raw = epoch_payload.get("verify_timeout_grace_seconds")
     timeout_seconds = timeout_raw if isinstance(timeout_raw, int) and not isinstance(timeout_raw, bool) else None
     grace_seconds = (
-        float(grace_raw)
-        if isinstance(grace_raw, (int, float)) and not isinstance(grace_raw, bool)
-        else None
+        float(grace_raw) if isinstance(grace_raw, (int, float)) and not isinstance(grace_raw, bool) else None
     )
     return (
         impl_task_id,
@@ -403,13 +396,112 @@ def resolve_verify_fix_task_identity(
     task: Task,
 ) -> tuple[str, VerifyEpoch] | None:
     """Resolve a verify_fix task's structured identity, preferring task artifacts."""
+    structured = _resolve_structured_verify_fix_task_identity(store, task)
+    if structured is not None:
+        return structured
+    return parse_verify_fix_prompt(task.prompt)
+
+
+def _resolve_structured_verify_fix_task_identity(
+    store: SqliteTaskStore,
+    task: Task,
+) -> tuple[str, VerifyEpoch] | None:
     if task.id is not None:
         for artifact in store.list_artifacts(task.id, kind=VERIFY_FIX_EPOCH_ARTIFACT_KIND):
             metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
             parsed = parse_verify_fix_epoch_artifact_metadata(metadata)
             if parsed is not None:
                 return parsed
-    return parse_verify_fix_prompt(task.prompt)
+    return None
+
+
+def resolve_verify_fix_operative_epoch(
+    store: SqliteTaskStore,
+    config: Config,
+    *,
+    task: Task | None = None,
+    impl_task: Task | None = None,
+    verify_epoch: VerifyEpoch | None = None,
+    git: Any | None = None,
+) -> tuple[Task, VerifyEpoch, VerifyEpoch]:
+    """Resolve ``(impl, operative_epoch, origin_epoch)`` for verify_fix execution.
+
+    Structured verify-fix artifacts are origin provenance. When the live owner
+    branch has been rewritten to an equivalent tree, execution must bind exact
+    head guards to the current live epoch instead of the historical artifact
+    head. Legacy prompt-only rows keep their old head-only identity.
+    """
+    resolved_impl = impl_task
+    supplied_operative_epoch = verify_epoch
+    origin_epoch = verify_epoch
+    structured_identity = False
+
+    if task is not None and (resolved_impl is None or origin_epoch is None or supplied_operative_epoch is not None):
+        structured = _resolve_structured_verify_fix_task_identity(store, task)
+        parsed = structured if structured is not None else parse_verify_fix_prompt(task.prompt)
+        if parsed is None:
+            task_id = task.id or "(unsaved)"
+            raise VerifyFixContextError(
+                f"verify_fix task {task_id} cannot resolve its structured verify epoch metadata. "
+                "Stop and ask the operator to recreate the task from failed verify evidence instead of proceeding blind."
+            )
+        structured_identity = structured is not None
+        prompt_impl_id, parsed_epoch = parsed
+        if resolved_impl is None:
+            resolved_impl, err = resolve_impl_task(store, prompt_impl_id)
+            if resolved_impl is None:
+                raise VerifyFixContextError(
+                    f"verify_fix task {task.id or '(unsaved)'} cannot resolve implementation owner {prompt_impl_id}: {err}"
+                )
+        if origin_epoch is None:
+            origin_epoch = parsed_epoch
+        elif supplied_operative_epoch is not None and structured_identity:
+            origin_epoch = parsed_epoch
+
+    if resolved_impl is None or resolved_impl.id is None:
+        raise VerifyFixContextError("verify_fix requires a persisted implementation owner task")
+    if origin_epoch is None:
+        raise VerifyFixContextError(
+            f"verify_fix for {resolved_impl.id} is missing verify epoch metadata and cannot resolve failed evidence"
+        )
+
+    if supplied_operative_epoch is not None:
+        if structured_identity and not verify_epoch_matches(expected=supplied_operative_epoch, candidate=origin_epoch):
+            raise VerifyFixContextError(
+                f"verify_fix for {resolved_impl.id} stored failed/source epoch is stale for the retained operative epoch. "
+                f"Stored origin: branch={origin_epoch.reviewed_branch} head={origin_epoch.reviewed_head_sha} "
+                f"tree={origin_epoch.reviewed_tree_sha}. "
+                f"Retained operative: branch={supplied_operative_epoch.reviewed_branch} "
+                f"head={supplied_operative_epoch.reviewed_head_sha} tree={supplied_operative_epoch.reviewed_tree_sha}."
+            )
+        return resolved_impl, supplied_operative_epoch, origin_epoch
+
+    if not structured_identity:
+        return resolved_impl, origin_epoch, origin_epoch
+
+    live_git = git
+    if live_git is None:
+        try:
+            live_git = Git(config.project_dir)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise VerifyFixContextError(
+                f"verify_fix for {resolved_impl.id} could not resolve the current operative verify epoch: {exc}"
+            ) from exc
+    current_epoch = owner_task_verify_epoch(resolved_impl, config, live_git)
+    if current_epoch is None:
+        raise VerifyFixContextError(
+            f"verify_fix for {resolved_impl.id} could not resolve the current operative verify epoch "
+            "from the live implementation branch/head."
+        )
+    if not verify_epoch_matches(expected=current_epoch, candidate=origin_epoch):
+        raise VerifyFixContextError(
+            f"verify_fix for {resolved_impl.id} stored failed/source epoch is stale for the live branch. "
+            f"Stored origin: branch={origin_epoch.reviewed_branch} head={origin_epoch.reviewed_head_sha} "
+            f"tree={origin_epoch.reviewed_tree_sha}. "
+            f"Current: branch={current_epoch.reviewed_branch} head={current_epoch.reviewed_head_sha} "
+            f"tree={current_epoch.reviewed_tree_sha}."
+        )
+    return resolved_impl, current_epoch, origin_epoch
 
 
 def parse_verify_fix_prompt(prompt: str) -> tuple[str, VerifyEpoch] | None:
@@ -574,10 +666,7 @@ def resolve_verify_fix_representative_task(
         if task.task_type not in _VERIFY_FIX_CODE_CHANGING_TASK_TYPES:
             continue
         task_branch, task_head_sha = _verify_fix_task_branch_and_head(store, task)
-        if (
-            task_branch == verify_epoch.reviewed_branch
-            and task_head_sha == verify_epoch.reviewed_head_sha
-        ):
+        if task_branch == verify_epoch.reviewed_branch and task_head_sha == verify_epoch.reviewed_head_sha:
             matching_candidates.append(task)
     if not matching_candidates:
         source_task_id_display = lookup.result.source_task_id or "(unknown)"
@@ -617,35 +706,17 @@ def resolve_verify_fix_context(
     task: Task | None = None,
     impl_task: Task | None = None,
     verify_epoch: VerifyEpoch | None = None,
+    git: Any | None = None,
 ) -> VerifyFixContext:
     """Resolve the failed verify evidence a verify_fix task must use, or fail closed."""
-    resolved_impl = impl_task
-    resolved_epoch = verify_epoch
-
-    if task is not None and (resolved_impl is None or resolved_epoch is None):
-        parsed = resolve_verify_fix_task_identity(store, task)
-        if parsed is None:
-            task_id = task.id or "(unsaved)"
-            raise VerifyFixContextError(
-                f"verify_fix task {task_id} cannot resolve its structured verify epoch metadata. "
-                "Stop and ask the operator to recreate the task from failed verify evidence instead of proceeding blind."
-            )
-        prompt_impl_id, prompt_epoch = parsed
-        if resolved_impl is None:
-            resolved_impl, err = resolve_impl_task(store, prompt_impl_id)
-            if resolved_impl is None:
-                raise VerifyFixContextError(
-                    f"verify_fix task {task.id or '(unsaved)'} cannot resolve implementation owner {prompt_impl_id}: {err}"
-                )
-        if resolved_epoch is None:
-            resolved_epoch = prompt_epoch
-
-    if resolved_impl is None or resolved_impl.id is None:
-        raise VerifyFixContextError("verify_fix requires a persisted implementation owner task")
-    if resolved_epoch is None:
-        raise VerifyFixContextError(
-            f"verify_fix for {resolved_impl.id} is missing verify epoch metadata and cannot resolve failed evidence"
-        )
+    resolved_impl, resolved_epoch, origin_epoch = resolve_verify_fix_operative_epoch(
+        store,
+        config,
+        task=task,
+        impl_task=impl_task,
+        verify_epoch=verify_epoch,
+        git=git,
+    )
 
     lookup = latest_verify_result_for_epoch(store, resolved_impl, current_epoch=resolved_epoch)
     if lookup.result is None or lookup.source is None or not lookup.is_current:
@@ -662,7 +733,9 @@ def resolve_verify_fix_context(
             f"verify_fix for {resolved_impl.id} requires failed verify evidence, but the latest matching result is {result.status!r}"
         )
     if not result.command:
-        raise VerifyFixContextError(f"verify_fix for {resolved_impl.id} is missing the verify command in persisted evidence")
+        raise VerifyFixContextError(
+            f"verify_fix for {resolved_impl.id} is missing the verify command in persisted evidence"
+        )
     if not result.working_directory:
         raise VerifyFixContextError(
             f"verify_fix for {resolved_impl.id} is missing the verify working directory in persisted evidence"
@@ -700,6 +773,7 @@ def resolve_verify_fix_context(
         impl_task=resolved_impl,
         owner_task=resolved_impl,
         verify_epoch=resolved_epoch,
+        origin_verify_epoch=origin_epoch,
         status=result.status,
         exit_status=result.exit_status,
         command=result.command,
@@ -734,6 +808,15 @@ def format_verify_fix_context(context: VerifyFixContext) -> str:
     ]
     if context.reviewed_tree_sha:
         lines.append(f"- Reviewed tree: `{context.reviewed_tree_sha}`")
+    if context.origin_verify_epoch != context.verify_epoch:
+        lines.extend(
+            [
+                f"- Operative branch: `{context.verify_epoch.reviewed_branch}`",
+                f"- Operative head: `{context.verify_epoch.reviewed_head_sha}`",
+            ]
+        )
+        if context.verify_epoch.reviewed_tree_sha:
+            lines.append(f"- Operative tree: `{context.verify_epoch.reviewed_tree_sha}`")
     if context.reviewed_base_sha:
         lines.append(f"- Reviewed base/default SHA: `{context.reviewed_base_sha}`")
     lines.extend(
@@ -770,11 +853,7 @@ def find_existing_verify_fix_task(
     verify_epoch: VerifyEpoch,
 ) -> Task | None:
     """Return the latest non-dropped verify_fix task for the given verify epoch."""
-    candidates = [
-        task
-        for task in store.get_verify_fix_tasks_by_root(impl_task_id)
-        if task.status != "dropped"
-    ]
+    candidates = [task for task in store.get_verify_fix_tasks_by_root(impl_task_id) if task.status != "dropped"]
     matches: list[Task] = []
     expected_prompt = build_verify_fix_prompt(impl_task_id, verify_epoch)
     for task in candidates:
@@ -812,9 +891,7 @@ def create_or_reuse_verify_fix_task(
         raise ValueError("Cannot create verify_fix without a based_on task ID.")
     based_on_impl, based_on_error = resolve_impl_task(store, based_on_task.id)
     if based_on_impl is None:
-        raise ValueError(
-            f"Cannot create verify_fix from based_on task {based_on_task.id}: {based_on_error}"
-        )
+        raise ValueError(f"Cannot create verify_fix from based_on task {based_on_task.id}: {based_on_error}")
     if based_on_impl.id != impl_task.id:
         raise ValueError(
             f"Cannot create verify_fix for implementation {impl_task.id} from based_on task {based_on_task.id} "
@@ -899,14 +976,9 @@ def create_review_task(
     Validates implementation type/state and prevents duplicate active reviews.
     """
     if impl_task.task_type != "implement":
-        raise ValueError(
-            f"Task {impl_task.id} is a {impl_task.task_type} task. "
-            "Expected an implementation task."
-        )
+        raise ValueError(f"Task {impl_task.id} is a {impl_task.task_type} task. Expected an implementation task.")
     if impl_task.status != "completed":
-        raise ValueError(
-            f"Task {impl_task.id} is {impl_task.status}. Can only review completed tasks."
-        )
+        raise ValueError(f"Task {impl_task.id} is {impl_task.status}. Can only review completed tasks.")
     if impl_task.id is None:
         raise ValueError("Cannot create review for task without an ID.")
 
@@ -981,13 +1053,9 @@ def create_spec_coherence_review_task(
 ) -> Task:
     """Create the dedicated behavior-spec coherence review task for an implementation."""
     if impl_task.task_type != "implement":
-        raise ValueError(
-            f"Task {impl_task.id} is a {impl_task.task_type} task. Expected an implementation task."
-        )
+        raise ValueError(f"Task {impl_task.id} is a {impl_task.task_type} task. Expected an implementation task.")
     if impl_task.status != "completed":
-        raise ValueError(
-            f"Task {impl_task.id} is {impl_task.status}. Can only review completed tasks."
-        )
+        raise ValueError(f"Task {impl_task.id} is {impl_task.status}. Can only review completed tasks.")
     if impl_task.id is None:
         raise ValueError("Cannot create review for task without an ID.")
 
@@ -1116,11 +1184,7 @@ def repair_rebase_review_scope_provenance(
     """Recover and persist a clobbered rebase provenance block when local refs still prove it."""
     if rebase_task.id is None or rebase_task.task_type != "rebase" or not rebase_task.branch:
         return ReviewScopeRepairResult(task=rebase_task, persisted=True)
-    target_ref = (
-        rebase_task.base_branch
-        or target_branch
-        or git.default_branch()
-    )
+    target_ref = rebase_task.base_branch or target_branch or git.default_branch()
     recovered = recover_rebase_diff_provenance(
         git,
         branch=rebase_task.branch,
@@ -1206,12 +1270,7 @@ def resolution_review_scope_needs_canonical_repair(
         resolved_head_sha = rebuild_fields.resolved_head_sha
         resolved_target_sha = rebuild_fields.resolved_target_sha
 
-    if (
-        not implementation_task_id
-        or not rebase_task_id
-        or not resolved_head_sha
-        or not resolved_target_sha
-    ):
+    if not implementation_task_id or not rebase_task_id or not resolved_head_sha or not resolved_target_sha:
         return False
 
     rebase_task = store.get(rebase_task_id)
@@ -1272,12 +1331,7 @@ def repair_resolution_review_scope_provenance(
         resolved_head_sha = rebuild_fields.resolved_head_sha
         resolved_target_sha = rebuild_fields.resolved_target_sha
 
-    if (
-        not implementation_task_id
-        or not rebase_task_id
-        or not resolved_head_sha
-        or not resolved_target_sha
-    ):
+    if not implementation_task_id or not rebase_task_id or not resolved_head_sha or not resolved_target_sha:
         return ReviewScopeRepairResult(task=review_task, persisted=True)
 
     rebase_task = store.get(rebase_task_id)
@@ -1645,9 +1699,7 @@ def persist_off_topic_verify_clearance(
                         break
             matching_tasks = [tasks_by_id[task_id] for task_id in dict.fromkeys(matching_task_ids)]
             reusable_tasks = [
-                task
-                for task in matching_tasks
-                if task.status in OFF_TOPIC_VERIFY_INVESTIGATION_REUSABLE_STATUSES
+                task for task in matching_tasks if task.status in OFF_TOPIC_VERIFY_INVESTIGATION_REUSABLE_STATUSES
             ]
             if len(reusable_tasks) > 1:
                 raise ValueError(
@@ -1776,9 +1828,7 @@ def persist_off_topic_verify_clearance(
                     parent = parent.parent
             except Exception:
                 continue
-        raise OffTopicVerifyPersistenceError(
-            f"off-topic verify clearance persistence failed: {exc}"
-        ) from exc
+        raise OffTopicVerifyPersistenceError(f"off-topic verify clearance persistence failed: {exc}") from exc
     finally:
         try:
             conn.close()
@@ -1854,9 +1904,7 @@ def persist_review_clearance_artifact(
                     parent = parent.parent
             except Exception:
                 continue
-        raise OffTopicVerifyPersistenceError(
-            f"review clearance persistence failed: {exc}"
-        ) from exc
+        raise OffTopicVerifyPersistenceError(f"review clearance persistence failed: {exc}") from exc
     finally:
         try:
             conn.close()
@@ -1948,9 +1996,7 @@ def build_review_blocker_adjudication_prompt(
     current_state_citation = str(dispute_metadata.get("current_state_citation", "")).strip() or "not provided"
     source_task_id = str(dispute_metadata.get("source_task_id", "")).strip() or "unknown"
     source_head_sha = str(dispute_metadata.get("head_sha", "")).strip()
-    dispute_artifact_id = _normalize_dispute_artifact_id(
-        dispute_metadata.get("disputed_artifact_id")
-    )
+    dispute_artifact_id = _normalize_dispute_artifact_id(dispute_metadata.get("disputed_artifact_id"))
     scope_citation = str(dispute_metadata.get("scope_citation", "")).strip()
     downstream_task_id = str(dispute_metadata.get("downstream_task_id", "")).strip()
     source_branch = str(dispute_metadata.get("source_branch", "")).strip()
@@ -2150,6 +2196,7 @@ def extract_review_blocker_adjudication_prompt_parts(prompt: str) -> tuple[str, 
         return None
     return match.group(1), match.group(2), match.group(3)
 
+
 def extract_review_blocker_adjudication_dispute_reference(
     prompt: str,
 ) -> tuple[int | None, str | None, str | None]:
@@ -2245,9 +2292,7 @@ def review_blocker_dispute_matches_current(
     candidate_artifact_id = None
     candidate_source_task_id = None
     if metadata is not None:
-        candidate_artifact_id = _normalize_dispute_artifact_id(
-            metadata.get("disputed_artifact_id")
-        )
+        candidate_artifact_id = _normalize_dispute_artifact_id(metadata.get("disputed_artifact_id"))
         disputed_source_task_id = metadata.get("disputed_source_task_id")
         if isinstance(disputed_source_task_id, str) and disputed_source_task_id.strip():
             candidate_source_task_id = disputed_source_task_id
@@ -2385,9 +2430,7 @@ def find_existing_review_blocker_adjudication_task(
         if child.task_type != "internal":
             continue
         if child.prompt.strip().startswith(prefix):
-            prompt_source_task_id, prompt_head_sha = (
-                extract_review_blocker_adjudication_dispute_identity(child.prompt)
-            )
+            prompt_source_task_id, prompt_head_sha = extract_review_blocker_adjudication_dispute_identity(child.prompt)
             if dispute_source_task_id is not None and prompt_source_task_id != dispute_source_task_id:
                 continue
             if dispute_head_sha is not None and prompt_head_sha != dispute_head_sha:
@@ -2611,9 +2654,7 @@ def validate_capped_review_blocker_action(
 
     report = parse_review_report(persisted_review_output)
     if report.verdict != "CHANGES_REQUESTED":
-        raise ValueError(
-            f"Max-cycle merge-and-defer requires CHANGES_REQUESTED review output, got {report.verdict!r}."
-        )
+        raise ValueError(f"Max-cycle merge-and-defer requires CHANGES_REQUESTED review output, got {report.verdict!r}.")
     parsed_blockers = tuple(finding for finding in report.findings if finding.severity == "BLOCKER")
     if not parsed_blockers:
         raise ValueError("Max-cycle merge-and-defer requires at least one parsed BLOCKER finding.")
@@ -2625,17 +2666,13 @@ def validate_capped_review_blocker_action(
     if len(parsed_by_id) != len(parsed_blockers):
         raise ValueError("Max-cycle merge-and-defer parsed duplicate blocker IDs.")
     if set(supplied_by_id) != set(parsed_by_id):
-        raise ValueError(
-            "Max-cycle merge-and-defer supplied blocker IDs do not match parsed review blocker IDs."
-        )
+        raise ValueError("Max-cycle merge-and-defer supplied blocker IDs do not match parsed review blocker IDs.")
     for finding_id, parsed_finding in parsed_by_id.items():
         supplied_finding = supplied_by_id[finding_id]
         supplied_fingerprint = get_review_finding_fingerprint(supplied_finding)
         parsed_fingerprint = get_review_finding_fingerprint(parsed_finding)
         if supplied_fingerprint is None or parsed_fingerprint is None:
-            raise ValueError(
-                f"Max-cycle merge-and-defer blocker {finding_id} lacks a stable review fingerprint."
-            )
+            raise ValueError(f"Max-cycle merge-and-defer blocker {finding_id} lacks a stable review fingerprint.")
         if supplied_fingerprint != parsed_fingerprint:
             raise ValueError(
                 f"Max-cycle merge-and-defer blocker {finding_id} fingerprint does not match persisted review."

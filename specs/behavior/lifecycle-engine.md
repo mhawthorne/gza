@@ -512,10 +512,15 @@ epoch.
   `in_progress`, lifecycle MUST `wait_verify_fix`.
 - If one same-epoch `verify_fix` attempt completed without source changes and the current
   red verify evidence is structurally classified as timeout-origin, lifecycle MUST rerun
-  verification for the exact same head once before treating that `verify_fix` as
-  terminally complete for the epoch. That rerun MUST persist SHA-keyed green evidence
-  only when the tested tracked tree is clean for the recorded head and the verify-fix
-  task is proven not to have restored, edited, or committed source relative to that head.
+  verification for the exact current operative head once before treating that
+  `verify_fix` as terminally complete for the epoch. A structured verify-fix lane whose
+  stored failed/source epoch matches the live branch by tree identity MUST keep that
+  stored epoch as origin provenance while rebinding exact-head runner stability and
+  completion-head guards to the current live head. Legacy prompt-only verify-fix rows
+  without tree proof MAY use only their recorded exact head. That rerun MUST persist
+  SHA-keyed green evidence only when the tested tracked tree is clean for the operative
+  head and the verify-fix task is proven not to have restored, edited, or committed
+  source relative to that head.
   During verify-fix completion, if the rerun cannot be performed, cannot be persisted, or
   does not produce green evidence, lifecycle MUST leave the `verify_fix`
   non-completed/retryable rather than completing against the timeout-origin red. For an

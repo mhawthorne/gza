@@ -44,7 +44,12 @@ from gza.rebase_checkout import IsolatedRebaseCheckout, StaleRebaseImportError
 from gza.rebase_diff import RebaseDiffBaseline, RebaseDiffResult, parse_rebase_diff_provenance
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.recovery_transients import classify_transient_recovery_terminal
-from gza.review_tasks import DuplicateReviewError, build_verify_fix_prompt, create_or_reuse_followup_task
+from gza.review_tasks import (
+    VERIFY_FIX_EPOCH_ARTIFACT_KIND,
+    DuplicateReviewError,
+    build_verify_fix_prompt,
+    create_or_reuse_followup_task,
+)
 from gza.review_verdict import ParsedReviewReport, ReviewFinding, parse_review_report
 from gza.review_verify_state import (
     VERIFY_GATE_ARTIFACT_KIND,
@@ -53,11 +58,6 @@ from gza.review_verify_state import (
     latest_verify_result_for_epoch,
     persist_verify_gate_artifact,
     summarize_verify_phases,
-)
-from gza.schema_compat import (
-    SCHEMA_RUNTIME_SKEW_EXIT_STATUS,
-    SCHEMA_RUNTIME_SKEW_FAILURE_ORIGIN,
-    SchemaCompatibilityDiagnostic,
 )
 from gza.runner import (
     BACKUP_DIR,
@@ -147,6 +147,11 @@ from gza.runner import (
     write_worker_start_event,
 )
 from gza.runtime_context import RuntimeExecutionContext
+from gza.schema_compat import (
+    SCHEMA_RUNTIME_SKEW_EXIT_STATUS,
+    SCHEMA_RUNTIME_SKEW_FAILURE_ORIGIN,
+    SchemaCompatibilityDiagnostic,
+)
 from gza.verify_fix_outcome import effective_verify_fix_completion_outcome
 from gza.worktree_roots import managed_worktree_root_paths
 
@@ -2247,10 +2252,7 @@ class TestReviewContextFromChain:
                     output="\n".join(
                         [
                             "gza-verify phase=start name=unit",
-                            (
-                                "gza-verify phase=passed name=unit duration_seconds=1.0 "
-                                f"tree_fingerprint={fingerprint}"
-                            ),
+                            (f"gza-verify phase=passed name=unit duration_seconds=1.0 tree_fingerprint={fingerprint}"),
                             "gza-verify phase=start name=functional",
                             "gza-verify phase=passed name=functional duration_seconds=2.0",
                         ]
@@ -2502,7 +2504,9 @@ class TestReviewContextFromChain:
             "result": {"command": "(per-project verify_command)", "status": "failed", "failure_origin": "timeout"},
             "verify_epoch": {"verify_command": "(per-project verify_command)"},
             "aggregate_details": {
-                "phase_results": [{"scope": "services/foo", "name": "unit", "status": "passed", "duration_seconds": 1.0}],
+                "phase_results": [
+                    {"scope": "services/foo", "name": "unit", "status": "passed", "duration_seconds": 1.0}
+                ],
                 "started_phase_names": ["services/foo:unit", "services/foo:functional"],
                 "completed_phase_names": ["services/foo:unit"],
                 "failed_phase_names": [],
@@ -2847,9 +2851,7 @@ class TestReviewContextFromChain:
                             "status": "passed",
                             "command_identity": "./bin/foo-verify",
                             "phase_diagnostics": {
-                                "phase_results": [
-                                    {"name": "unit", "status": "passed", "duration_seconds": 300.0}
-                                ],
+                                "phase_results": [{"name": "unit", "status": "passed", "duration_seconds": 300.0}],
                                 "started_phase_names": ["unit"],
                                 "completed_phase_names": ["unit"],
                                 "failed_phase_names": [],
@@ -2862,9 +2864,7 @@ class TestReviewContextFromChain:
                             "status": "passed",
                             "command_identity": "./bin/bar-verify",
                             "phase_diagnostics": {
-                                "phase_results": [
-                                    {"name": "unit", "status": "passed", "duration_seconds": 700.0}
-                                ],
+                                "phase_results": [{"name": "unit", "status": "passed", "duration_seconds": 700.0}],
                                 "started_phase_names": ["unit"],
                                 "completed_phase_names": ["unit"],
                                 "failed_phase_names": [],
@@ -2877,9 +2877,7 @@ class TestReviewContextFromChain:
                             "status": "passed",
                             "command_identity": "./bin/other-verify",
                             "phase_diagnostics": {
-                                "phase_results": [
-                                    {"name": "unit", "status": "passed", "duration_seconds": 900.0}
-                                ],
+                                "phase_results": [{"name": "unit", "status": "passed", "duration_seconds": 900.0}],
                                 "started_phase_names": ["unit"],
                                 "completed_phase_names": ["unit"],
                                 "failed_phase_names": [],
@@ -2913,10 +2911,7 @@ class TestReviewContextFromChain:
         worktree_project_dir.mkdir(parents=True)
         for target in (project_dir, worktree_project_dir):
             (target / "gza.yaml").write_text(
-                "project_name: foo\n"
-                "provider: codex\n"
-                "model: gpt-5.5\n"
-                "verify_command: ./bin/foo-verify\n"
+                "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
             )
         config = Config(
             project_dir=project_dir,
@@ -3743,9 +3738,7 @@ class TestReviewContextFromChain:
         child_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
         worktree_child_dir.mkdir(parents=True)
-        root_config_text = (
-            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n"
-        )
+        root_config_text = "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n"
         child_config_text = (
             "project_name: bar\n"
             "project_id: bar\n"
@@ -3815,9 +3808,7 @@ class TestReviewContextFromChain:
         child_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
         worktree_child_dir.mkdir(parents=True)
-        root_config_text = (
-            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n"
-        )
+        root_config_text = "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n"
         child_config_text = (
             "project_name: bar\n"
             "project_id: bar\n"
@@ -3979,9 +3970,7 @@ class TestReviewContextFromChain:
             worktree_path / "apps" / "baz",
         ):
             path.mkdir(parents=True)
-        root_config_text = (
-            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n"
-        )
+        root_config_text = "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n"
         child_config_text = (
             "project_name: bar\nproject_id: bar\nprovider: codex\nmodel: gpt-5.5\n"
             "verify_command: ./bin/tests\nautonomous_verify_timeout_seconds: 600\n"
@@ -4121,8 +4110,7 @@ class TestReviewContextFromChain:
         source = store.add("Successful root verify source", task_type="review", depends_on=task.id)
         assert source.id is not None
         output = "\n".join(
-            f"gza-verify phase={event} name={phase}"
-            + (" duration_seconds=1.0" if event == "passed" else "")
+            f"gza-verify phase={event} name={phase}" + (" duration_seconds=1.0" if event == "passed" else "")
             for phase in ("ruff", "ty", "mypy", "checks", "unit", "functional")
             for event in ("start", "passed")
         )
@@ -5919,6 +5907,67 @@ class TestReviewContextFromChain:
         prompt = build_prompt(followup_task, config, store, git=None)
         assert "## Follow-up finding to implement:" in prompt
         assert "Recommended tests: add malformed optional-claim regression tests." in prompt
+
+    def test_verify_fix_prompt_fails_closed_when_supplied_live_epoch_unavailable(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add(prompt="Implement resilient retries", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/retries"
+        store.update(impl)
+        recorded_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="old-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            prompt=build_verify_fix_prompt(impl.id, recorded_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        store.add_artifact(
+            verify_fix.id,
+            kind=VERIFY_FIX_EPOCH_ARTIFACT_KIND,
+            label="verify_fix_epoch",
+            path=".gza/artifacts/verify-fix-epoch.json",
+            byte_size=2,
+            sha256="0" * 64,
+            created_at=datetime(2026, 8, 17, 10, 1, tzinfo=UTC),
+            producer="test",
+            head_sha="old-head",
+            metadata={
+                "schema_version": 1,
+                "impl_task_id": impl.id,
+                "verify_epoch": {
+                    "reviewed_branch": recorded_epoch.reviewed_branch,
+                    "reviewed_head_sha": recorded_epoch.reviewed_head_sha,
+                    "reviewed_tree_sha": recorded_epoch.reviewed_tree_sha,
+                    "verify_command": recorded_epoch.verify_command,
+                    "verify_timeout_seconds": recorded_epoch.verify_timeout_seconds,
+                    "verify_timeout_grace_seconds": recorded_epoch.verify_timeout_grace_seconds,
+                },
+            },
+        )
+        git = Mock(spec=Git)
+        git.rev_parse_if_exists.return_value = None
+
+        prompt = build_prompt(verify_fix, config, store, git=git)
+
+        assert "verify_fix cannot proceed automatically" in prompt
+        assert "could not resolve the current operative verify epoch" in prompt
+        assert "- Operative head: `old-head`" not in prompt
 
     def test_first_review_has_no_tool_hints(self, tmp_path: Path):
         """First-time review (no prior cycles) does not include tool hints or lineage."""
@@ -16311,7 +16360,9 @@ class TestExtractedRunInnerHelpers:
         lifecycle_git.is_merged.return_value = False
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
-        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "cafebabe", impl.branch: "abc1234"}.get(ref)
+        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "cafebabe", impl.branch: "abc1234"}.get(
+            ref
+        )
         lifecycle_git.is_ancestor.return_value = True
         lifecycle_git.count_commits_behind_checked.return_value = 0
         lifecycle_git.count_commits_ahead_checked.return_value = 1
@@ -17247,7 +17298,9 @@ class TestExtractedRunInnerHelpers:
         lifecycle_git.is_merged.return_value = False
         lifecycle_git.branch_exists.return_value = True
         lifecycle_git.ref_exists.return_value = False
-        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "cafebabe", impl.branch: "abc1234"}.get(ref)
+        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "cafebabe", impl.branch: "abc1234"}.get(
+            ref
+        )
         lifecycle_git.is_ancestor.return_value = True
         lifecycle_git.count_commits_behind_checked.return_value = 0
         lifecycle_git.count_commits_ahead_checked.return_value = 1
@@ -20055,6 +20108,116 @@ class TestExtractedRunInnerHelpers:
             recovered=True,
         )
 
+    def test_run_inner_binds_resumed_verify_fix_operative_epoch_before_provider(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Resumed verify_fix runs must bind the current operative head before provider execution."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.slug = "20260817-impl-verify-fix-resume"
+        impl.status = "completed"
+        impl.branch = "feature/verify-fix-resume"
+        impl.has_commits = True
+        store.update(impl)
+
+        origin_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="old-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        operative_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="new-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, origin_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.slug = "20260817-verify-fix-resume"
+        verify_fix.branch = impl.branch
+        verify_fix.session_id = "resume-session"
+        store.mark_failed(verify_fix, log_file="logs/verify-fix-resume.log", stats=None)
+
+        worktree_path = config.worktree_path / verify_fix.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        events: list[str] = []
+
+        def provider_run(
+            _config,
+            _prompt,
+            _log_file,
+            _work_dir,
+            resume_session_id=None,
+            **_kwargs,
+        ) -> RunResult:
+            assert resume_session_id == "resume-session"
+            assert events == ["resolve"]
+            events.append("provider")
+            return RunResult(exit_code=0, duration_seconds=1.0, session_id=resume_session_id)
+
+        provider = Mock()
+        provider.name = "TestProvider"
+        provider.run.side_effect = provider_run
+
+        main_git = Mock(spec=Git)
+        main_git.default_branch.return_value = "main"
+        worktree_git = Mock(spec=Git)
+        worktree_git.repo_dir = worktree_path
+        worktree_git.status_porcelain.return_value = set()
+
+        def resolve_epoch(*_args, **_kwargs):
+            events.append("resolve")
+            return impl, operative_epoch, origin_epoch
+
+        def complete_code_task(*_args, **kwargs):
+            assert events == ["resolve", "provider"]
+            assert kwargs["verify_fix_operative_epoch"] == operative_epoch
+            events.append("complete")
+            return 0
+
+        with (
+            patch("gza.runner.Git", return_value=worktree_git),
+            patch("gza.runner._resolve_code_task_branch_name", return_value=impl.branch),
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner._restore_wip_changes"),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._fail_if_workspace_not_populated", return_value=False),
+            patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
+            patch("gza.runner.resolve_verify_fix_operative_epoch", side_effect=resolve_epoch),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
+            patch("gza.runner._prepare_validated_docker_worktree_git_metadata", return_value=None),
+            patch("gza.runner._restore_validated_docker_worktree_git_metadata"),
+            patch("gza.runner._complete_code_task", side_effect=complete_code_task),
+        ):
+            rc = _run_inner(verify_fix, config, config, store, provider, main_git, resume=True)
+
+        assert rc == 0
+        assert events == ["resolve", "provider", "complete"]
+
     def test_run_inner_marks_retry_recovery_rebase_baseline_as_recovered(
         self,
         tmp_path: Path,
@@ -20521,7 +20684,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner._snapshot_task_db_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt naming mutable main"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch("gza.runner.capture_rebase_diff_baseline", side_effect=capture_baseline),
             patch("gza.runner.is_rebase_in_progress", return_value=False),
             patch("gza.runner.publish_rebased_branch", return_value=SimpleNamespace(local_sha=rebased_head)),
@@ -20635,7 +20801,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner._snapshot_task_db_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch(
                 "gza.runner.capture_rebase_diff_baseline",
                 return_value=RebaseDiffBaseline(
@@ -21476,13 +21645,19 @@ class TestExtractedRunInnerHelpers:
 
         with (
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
-            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch(
+                "gza.runner._setup_code_task_worktree",
+                side_effect=AssertionError("shared worktree path should be skipped"),
+            ),
             patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()) as isolated_checkout,
             patch("gza.runner._stage_worktree_agent_resources", return_value=0),
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
-            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner._resolve_task_timeout_budget",
+                return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget"),
+            ),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
             patch(
                 "gza.runner.capture_rebase_diff_baseline",
@@ -25821,6 +25996,379 @@ class TestProviderPromptSanitization:
         assert lookup.result is not None
         assert lookup.result.status == "failed"
 
+    def test_capture_noop_verify_fix_rebinds_structured_same_tree_lane_to_current_head(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/verify-fix-rewrite"
+        impl.has_commits = True
+        store.update(impl)
+        source = store.add("Verify source", task_type="review", based_on=impl.id, depends_on=impl.id)
+        assert source.id is not None
+        recorded_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="old-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="old-head",
+                reviewed_tree_sha="tree-same",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 120s",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, recorded_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.status = "completed"
+        verify_fix.branch = impl.branch
+        verify_fix.changed_diff = False
+        store.update(verify_fix)
+        store.add_artifact(
+            verify_fix.id,
+            kind=VERIFY_FIX_EPOCH_ARTIFACT_KIND,
+            label="verify_fix_epoch",
+            path=".gza/artifacts/verify-fix-epoch.json",
+            byte_size=2,
+            sha256="0" * 64,
+            created_at=datetime(2026, 8, 17, 10, 1, tzinfo=UTC),
+            producer="test",
+            head_sha="old-head",
+            metadata={
+                "schema_version": 1,
+                "impl_task_id": impl.id,
+                "verify_epoch": {
+                    "reviewed_branch": recorded_epoch.reviewed_branch,
+                    "reviewed_head_sha": recorded_epoch.reviewed_head_sha,
+                    "reviewed_tree_sha": recorded_epoch.reviewed_tree_sha,
+                    "verify_command": recorded_epoch.verify_command,
+                    "verify_timeout_seconds": recorded_epoch.verify_timeout_seconds,
+                    "verify_timeout_grace_seconds": recorded_epoch.verify_timeout_grace_seconds,
+                },
+            },
+        )
+
+        rerun_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="new-head",
+            reviewed_tree_sha="tree-same",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path / "worktree"),
+        )
+        worktree_git = Mock(spec=Git)
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            "HEAD": "new-head",
+            impl.branch: "new-head",
+            "main": "base-1",
+        }.get(ref)
+        worktree_git.resolve_refs.side_effect = lambda refs, peel="commit": (
+            {ref: "tree-same" for ref in refs} if peel == "tree" else {ref: None for ref in refs}
+        )
+        worktree_git.status_porcelain.return_value = set()
+
+        with (
+            patch(
+                "gza.runner._run_lifecycle_verify",
+                return_value=SimpleNamespace(aggregate_result=rerun_result, project_results=()),
+            ) as run_verify,
+            patch(
+                "gza.runner._persist_lifecycle_verify_execution",
+                return_value=(rerun_result, ".gza/artifacts/verify.txt"),
+            ) as persist_verify,
+        ):
+            can_complete = _capture_noop_verify_fix_timeout_rerun(
+                config=config,
+                store=store,
+                task=verify_fix,
+                worktree_git=worktree_git,
+                worktree_path=tmp_path / "worktree",
+                branch_name=impl.branch,
+                head_sha="new-head",
+                base_sha="base-1",
+                task_logger=None,
+            )
+
+        assert can_complete is True
+        assert run_verify.call_args.kwargs["reviewed_head_sha"] == "new-head"
+        assert run_verify.call_args.kwargs["reviewed_tree_sha"] == "tree-same"
+        assert persist_verify.call_args.kwargs["consumed_verify_fix_completion_head_sha"] == "new-head"
+        assert (
+            store.list_artifacts(verify_fix.id, kind=VERIFY_FIX_EPOCH_ARTIFACT_KIND)[0].metadata["verify_epoch"][
+                "reviewed_head_sha"
+            ]
+            == "old-head"
+        )
+
+    def test_capture_noop_verify_fix_keeps_bound_epoch_when_head_moves_same_tree_after_source_check(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/verify-fix-post-bind-race"
+        impl.has_commits = True
+        store.update(impl)
+        source = store.add("Verify source", task_type="review", based_on=impl.id, depends_on=impl.id)
+        assert source.id is not None
+        origin_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="origin-a",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="origin-a",
+                reviewed_tree_sha="tree-same",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 120s",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, origin_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.status = "completed"
+        verify_fix.branch = impl.branch
+        verify_fix.changed_diff = False
+        store.update(verify_fix)
+        store.add_artifact(
+            verify_fix.id,
+            kind=VERIFY_FIX_EPOCH_ARTIFACT_KIND,
+            label="verify_fix_epoch",
+            path=".gza/artifacts/verify-fix-post-bind-race.json",
+            byte_size=2,
+            sha256="0" * 64,
+            created_at=datetime(2026, 8, 17, 10, 1, tzinfo=UTC),
+            producer="test",
+            head_sha="origin-a",
+            metadata={
+                "schema_version": 1,
+                "impl_task_id": impl.id,
+                "verify_epoch": {
+                    "reviewed_branch": origin_epoch.reviewed_branch,
+                    "reviewed_head_sha": origin_epoch.reviewed_head_sha,
+                    "reviewed_tree_sha": origin_epoch.reviewed_tree_sha,
+                    "verify_command": origin_epoch.verify_command,
+                    "verify_timeout_seconds": origin_epoch.verify_timeout_seconds,
+                    "verify_timeout_grace_seconds": origin_epoch.verify_timeout_grace_seconds,
+                },
+            },
+        )
+        bound_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="operative-b",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        rerun_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="post-run-c",
+            reviewed_tree_sha="tree-same",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path / "worktree"),
+        )
+        worktree_git = Mock(spec=Git)
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            "HEAD": "post-run-c",
+            impl.branch: "post-run-c",
+            "main": "base-1",
+        }.get(ref)
+        worktree_git.resolve_refs.side_effect = lambda refs, peel="commit": (
+            {ref: "tree-same" for ref in refs} if peel == "tree" else {ref: None for ref in refs}
+        )
+        worktree_git.status_porcelain.return_value = set()
+
+        with (
+            patch(
+                "gza.runner._run_lifecycle_verify",
+                return_value=SimpleNamespace(aggregate_result=rerun_result, project_results=()),
+            ) as run_verify,
+            patch("gza.runner._persist_lifecycle_verify_execution") as persist_verify,
+        ):
+            can_complete = _capture_noop_verify_fix_timeout_rerun(
+                config=config,
+                store=store,
+                task=verify_fix,
+                worktree_git=worktree_git,
+                worktree_path=tmp_path / "worktree",
+                branch_name=impl.branch,
+                head_sha="post-run-c",
+                base_sha="base-1",
+                task_logger=None,
+                changed_source=False,
+                operative_epoch=bound_epoch,
+            )
+
+        assert can_complete is False
+        run_verify.assert_not_called()
+        persist_verify.assert_not_called()
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=bound_epoch)
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.status == "failed"
+
+    def test_verify_fix_changed_source_rejects_same_tree_head_movement_after_binding(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/verify-fix-rewrite"
+        impl.has_commits = True
+        store.update(impl)
+        recorded_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="old-origin-a",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, recorded_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.status = "completed"
+        verify_fix.branch = impl.branch
+        verify_fix.changed_diff = False
+        store.update(verify_fix)
+        store.add_artifact(
+            verify_fix.id,
+            kind=VERIFY_FIX_EPOCH_ARTIFACT_KIND,
+            label="verify_fix_epoch",
+            path=".gza/artifacts/verify-fix-epoch.json",
+            byte_size=2,
+            sha256="0" * 64,
+            created_at=datetime(2026, 8, 17, 10, 1, tzinfo=UTC),
+            producer="test",
+            head_sha="old-origin-a",
+            metadata={
+                "schema_version": 1,
+                "impl_task_id": impl.id,
+                "verify_epoch": {
+                    "reviewed_branch": recorded_epoch.reviewed_branch,
+                    "reviewed_head_sha": recorded_epoch.reviewed_head_sha,
+                    "reviewed_tree_sha": recorded_epoch.reviewed_tree_sha,
+                    "verify_command": recorded_epoch.verify_command,
+                    "verify_timeout_seconds": recorded_epoch.verify_timeout_seconds,
+                    "verify_timeout_grace_seconds": recorded_epoch.verify_timeout_grace_seconds,
+                },
+            },
+        )
+        bound_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="operative-b",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        worktree_git = Mock(spec=Git)
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            "HEAD": "post-run-c",
+            impl.branch: "post-run-c",
+        }.get(ref)
+        worktree_git.resolve_refs.side_effect = lambda refs, peel="commit": (
+            {ref: "tree-same" for ref in refs} if peel == "tree" else {ref: None for ref in refs}
+        )
+        worktree_git.status_porcelain.return_value = set()
+
+        changed_source = runner._verify_fix_changed_source_for_epoch(
+            store=store,
+            config=config,
+            task=verify_fix,
+            worktree_git=worktree_git,
+            branch_name=impl.branch,
+            boundary=ProjectBoundary(repo_root=tmp_path, scope_root=Path("."), local_dependencies=()),
+            operative_epoch=bound_epoch,
+        )
+
+        assert changed_source is True
+
     def test_capture_noop_verify_fix_refuses_dirty_restored_source_for_clean_head(
         self,
         tmp_path: Path,
@@ -26247,6 +26795,7 @@ class TestProviderPromptSanitization:
                 summary_path,
                 summary_dir,
                 target_branch="main",
+                verify_fix_operative_epoch=verify_epoch,
             )
 
         assert rc == 0
@@ -26290,6 +26839,320 @@ class TestProviderPromptSanitization:
 
         action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
         assert action["type"] != "verify_gate"
+
+    def test_complete_resumed_same_tree_noop_verify_fix_uses_bound_current_epoch_for_timeout_rerun(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/resumed-verify-fix"
+        impl.has_commits = True
+        store.update(impl)
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 8, 17, 9, 0, tzinfo=UTC)
+        review.output_content = "# Review\n\nVerdict: APPROVED\n"
+        store.update(review)
+
+        origin_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="old-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        operative_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="new-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="old-head",
+                reviewed_tree_sha="tree-same",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 120s",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, origin_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.branch = impl.branch
+        verify_fix.slug = "20260817-resumed-verify-fix"
+        verify_fix.session_id = "resume-session"
+        verify_fix.status = "in_progress"
+        store.update(verify_fix)
+        store.add_artifact(
+            verify_fix.id,
+            kind=VERIFY_FIX_EPOCH_ARTIFACT_KIND,
+            label="verify_fix_epoch",
+            path=".gza/artifacts/verify-fix-epoch.json",
+            byte_size=2,
+            sha256="0" * 64,
+            created_at=datetime(2026, 8, 17, 10, 1, tzinfo=UTC),
+            producer="test",
+            head_sha="old-head",
+            metadata={
+                "schema_version": 1,
+                "impl_task_id": impl.id,
+                "verify_epoch": {
+                    "reviewed_branch": origin_epoch.reviewed_branch,
+                    "reviewed_head_sha": origin_epoch.reviewed_head_sha,
+                    "reviewed_tree_sha": origin_epoch.reviewed_tree_sha,
+                    "verify_command": origin_epoch.verify_command,
+                    "verify_timeout_seconds": origin_epoch.verify_timeout_seconds,
+                    "verify_timeout_grace_seconds": origin_epoch.verify_timeout_grace_seconds,
+                },
+            },
+        )
+
+        worktree_path = config.worktree_path / verify_fix.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        log_file = tmp_path / ".gza" / "logs" / "resumed-verify-fix.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        summary_dir = tmp_path / ".gza" / "summaries"
+        worktree_summary_path = worktree_path / ".gza" / "summaries" / "resumed-verify-fix.md"
+        summary_path = summary_dir / "resumed-verify-fix.md"
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.repo_dir = worktree_path
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.count_commits_ahead.return_value = 1
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = ""
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            "HEAD": "new-head",
+            "main": "base-1",
+            impl.branch: "new-head",
+        }.get(ref)
+        worktree_git.resolve_refs.side_effect = lambda refs, peel="commit": (
+            {ref: "tree-same" for ref in refs} if peel == "tree" else {ref: None for ref in refs}
+        )
+
+        rerun_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="new-head",
+            reviewed_tree_sha="tree-same",
+            reviewed_base_sha="base-1",
+            working_directory=str(worktree_path),
+            output="passed\n",
+        )
+
+        with (
+            patch(
+                "gza.runner._run_lifecycle_verify",
+                return_value=SimpleNamespace(aggregate_result=rerun_result, project_results=()),
+            ) as run_verify,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                verify_fix,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                impl.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=1),
+                0,
+                set(),
+                worktree_summary_path,
+                summary_path,
+                summary_dir,
+                target_branch="main",
+                verify_fix_operative_epoch=operative_epoch,
+            )
+
+        assert rc == 0
+        assert run_verify.call_args.kwargs["reviewed_head_sha"] == "new-head"
+        assert run_verify.call_args.kwargs["reviewed_tree_sha"] == "tree-same"
+        refreshed_fix = store.get(verify_fix.id)
+        assert refreshed_fix is not None
+        assert refreshed_fix.changed_diff is False
+        assert refreshed_fix.review_verify_head_sha == "new-head"
+        outcome = effective_verify_fix_completion_outcome(refreshed_fix)
+        assert outcome is not None
+        assert outcome.no_source_changes is True
+        assert outcome.completion_head_sha == "new-head"
+        assert outcome.recovery_rerun_attempted is True
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=operative_epoch)
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.status == "passed"
+        assert lookup.result.source_task_id == verify_fix.id
+
+    def test_complete_resumed_verify_fix_head_movement_after_binding_blocks_noop_evidence(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/resumed-verify-fix-moved"
+        impl.has_commits = True
+        store.update(impl)
+        source = store.add("Verify source", task_type="review", based_on=impl.id, depends_on=impl.id)
+        assert source.id is not None
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="old-head",
+                reviewed_tree_sha="tree-same",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 120s",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        origin_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="old-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        bound_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="bound-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, origin_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.branch = impl.branch
+        verify_fix.slug = "20260817-resumed-verify-fix-moved"
+        verify_fix.session_id = "resume-session"
+        verify_fix.status = "in_progress"
+        store.update(verify_fix)
+
+        worktree_path = config.worktree_path / verify_fix.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        log_file = tmp_path / ".gza" / "logs" / "resumed-verify-fix-moved.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        summary_dir = tmp_path / ".gza" / "summaries"
+        worktree_summary_path = worktree_path / ".gza" / "summaries" / "resumed-verify-fix-moved.md"
+        summary_path = summary_dir / "resumed-verify-fix-moved.md"
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.repo_dir = worktree_path
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.count_commits_ahead.return_value = 1
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = ""
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            "HEAD": "moved-head",
+            "main": "base-1",
+            impl.branch: "moved-head",
+        }.get(ref)
+        worktree_git.resolve_refs.side_effect = lambda refs, peel="commit": (
+            {ref: "tree-same" for ref in refs} if peel == "tree" else {ref: None for ref in refs}
+        )
+
+        with (
+            patch("gza.runner._run_lifecycle_verify") as run_verify,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                verify_fix,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                impl.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=1),
+                0,
+                set(),
+                worktree_summary_path,
+                summary_path,
+                summary_dir,
+                target_branch="main",
+                verify_fix_operative_epoch=bound_epoch,
+            )
+
+        assert rc == 0
+        run_verify.assert_not_called()
+        refreshed_fix = store.get(verify_fix.id)
+        assert refreshed_fix is not None
+        assert refreshed_fix.changed_diff is True
+        outcome = effective_verify_fix_completion_outcome(refreshed_fix)
+        assert outcome is not None
+        assert outcome.no_source_changes is False
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=origin_epoch)
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.status == "failed"
 
     @pytest.mark.parametrize(
         ("output", "failure_origin", "expected_action_type", "expected_reason", "expected_completed"),
@@ -26967,7 +27830,14 @@ class TestProviderPromptSanitization:
         [
             (
                 (
-                    ("services/foo", "./bin/foo-verify", "failed", "timed out", "timeout", "gza-verify phase=start name=unit\n"),
+                    (
+                        "services/foo",
+                        "./bin/foo-verify",
+                        "failed",
+                        "timed out",
+                        "timeout",
+                        "gza-verify phase=start name=unit\n",
+                    ),
                     (
                         "libs/bar",
                         "./bin/bar-verify",
@@ -26998,7 +27868,14 @@ class TestProviderPromptSanitization:
             ),
             (
                 (
-                    ("services/foo", "./bin/tests", "failed", "timed out", "timeout", "gza-verify phase=start name=unit\n"),
+                    (
+                        "services/foo",
+                        "./bin/tests",
+                        "failed",
+                        "timed out",
+                        "timeout",
+                        "gza-verify phase=start name=unit\n",
+                    ),
                     ("libs/bar", "./bin/tests", "unavailable", "launch failed", None, ""),
                 ),
                 "unavailable",
@@ -27007,7 +27884,14 @@ class TestProviderPromptSanitization:
             ),
             (
                 (
-                    ("services/foo", "./bin/foo-verify", "failed", "timed out", "timeout", "gza-verify phase=start name=unit\n"),
+                    (
+                        "services/foo",
+                        "./bin/foo-verify",
+                        "failed",
+                        "timed out",
+                        "timeout",
+                        "gza-verify phase=start name=unit\n",
+                    ),
                     ("libs/bar", "./bin/bar-verify", "unavailable", "launch failed", None, ""),
                 ),
                 "unavailable",
@@ -27093,9 +27977,7 @@ class TestProviderPromptSanitization:
                         "status": entry.result.status if entry.result is not None else "skipped",
                         "exit_status": entry.result.exit_status if entry.result is not None else None,
                         "failure_origin": entry.result.failure_origin if entry.result is not None else None,
-                        "command_identity": (
-                            entry.result.command if entry.result is not None else None
-                        ),
+                        "command_identity": (entry.result.command if entry.result is not None else None),
                         "phase_summary": (
                             summarize_verify_phases(command=entry.result.command, output=entry.result.output)
                             if entry.result is not None
@@ -27362,7 +28244,9 @@ class TestProviderPromptSanitization:
 
         self._assert_timeout_routes_with_reason(config, store, impl, PARK_REASON_VERIFY_BUDGET_EXCEEDED)
 
-    def test_verify_gate_timeout_with_contradictory_phase_summary_parks_as_invalid_evidence(self, tmp_path: Path) -> None:
+    def test_verify_gate_timeout_with_contradictory_phase_summary_parks_as_invalid_evidence(
+        self, tmp_path: Path
+    ) -> None:
         store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
         persist_verify_gate_artifact(
             store,
@@ -28489,6 +29373,7 @@ class TestProviderPromptSanitization:
                 summary_path,
                 summary_dir,
                 target_branch="main",
+                verify_fix_operative_epoch=verify_epoch,
             )
 
         assert rc == 0
@@ -28661,6 +29546,7 @@ class TestProviderPromptSanitization:
                 summary_path,
                 summary_dir,
                 target_branch="main",
+                verify_fix_operative_epoch=verify_epoch,
             )
 
         assert rc == 1
@@ -28797,6 +29683,7 @@ class TestProviderPromptSanitization:
                 summary_path,
                 summary_dir,
                 target_branch="main",
+                verify_fix_operative_epoch=verify_epoch,
             )
 
         assert rc == 0
@@ -30956,27 +31843,21 @@ def _names(*stamps):
 def test_select_backups_keeps_everything_inside_hourly_window():
     now = datetime(2026, 8, 28, 12)
     names = _names("2026082810", "2026082811", "2026082812")
-    assert runner.select_backups_to_prune(
-        names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4
-    ) == []
+    assert runner.select_backups_to_prune(names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4) == []
 
 
 def test_select_backups_thins_intraday_window_to_per_day_quota():
     now = datetime(2026, 8, 28, 12)
     # Three snapshots inside one 6h bucket, 3 days back: only the newest survives.
     names = _names("2026082500", "2026082501", "2026082502")
-    prune = runner.select_backups_to_prune(
-        names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4
-    )
+    prune = runner.select_backups_to_prune(names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4)
     assert sorted(prune) == sorted(_names("2026082500", "2026082501"))
 
 
 def test_select_backups_keeps_one_per_day_beyond_intraday_window():
     now = datetime(2026, 8, 28, 12)
     names = _names("2026080100", "2026080106", "2026080112", "2026080218")
-    prune = runner.select_backups_to_prune(
-        names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4
-    )
+    prune = runner.select_backups_to_prune(names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4)
     # One survivor per day; Aug 1 loses two of its three.
     assert len(prune) == 2
     assert "gza-2026080218.db" not in prune
@@ -30985,9 +31866,7 @@ def test_select_backups_keeps_one_per_day_beyond_intraday_window():
 def test_select_backups_never_prunes_unparseable_names():
     now = datetime(2026, 8, 28, 12)
     names = ["notes.txt", "gza-backup.db", "gza-2026010100.db", "gza-2026010101.db"]
-    prune = runner.select_backups_to_prune(
-        names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4
-    )
+    prune = runner.select_backups_to_prune(names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4)
     assert "notes.txt" not in prune
     assert "gza-backup.db" not in prune
     assert len(prune) == 1
@@ -31019,9 +31898,7 @@ def test_parse_backup_stamp_rejects_bad_names():
 def test_select_backups_prunes_nothing_for_non_numeric_dials():
     now = datetime(2026, 8, 28, 12)
     names = _names("2026010100", "2026010101")
-    assert runner.select_backups_to_prune(
-        names, now, hourly_hours=object(), intraday_days=7, intraday_per_day=4
-    ) == []
+    assert runner.select_backups_to_prune(names, now, hourly_hours=object(), intraday_days=7, intraday_per_day=4) == []
 
 
 def _sqlite_with_rows(path):
@@ -31081,8 +31958,6 @@ def test_backup_database_uncompressed_when_disabled(tmp_path):
 def test_select_backups_handles_compressed_names():
     now = datetime(2026, 8, 28, 12)
     names = ["gza-2026010100.db.zst", "gza-2026010101.db.zst"]
-    prune = runner.select_backups_to_prune(
-        names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4
-    )
+    prune = runner.select_backups_to_prune(names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4)
     assert len(prune) == 1
     assert prune[0].endswith(".db.zst")

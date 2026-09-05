@@ -166,7 +166,7 @@ from .review_tasks import (
     format_verify_fix_context,
     format_verify_fix_context_error,
     resolve_verify_fix_context,
-    resolve_verify_fix_task_identity,
+    resolve_verify_fix_operative_epoch,
 )
 from .review_verdict import (
     ParsedReviewReport,
@@ -1608,19 +1608,31 @@ def _complete_failed_code_task_after_pr_publication(
             )
 
     verification_git = canonical_git
+    verify_fix_operative_epoch: VerifyEpoch | None = None
     if task.task_type == "verify_fix":
+        if task.changed_diff is not True:
+            try:
+                _impl_task, verify_fix_operative_epoch, _origin_epoch = resolve_verify_fix_operative_epoch(
+                    store,
+                    config,
+                    task=task,
+                    git=canonical_git,
+                )
+            except VerifyFixContextError:
+                return 1
         rerun_needed = _verify_fix_timeout_rerun_needed(
             store=store,
+            config=config,
             task=task,
             changed_source=task.changed_diff,
+            git=canonical_git,
+            operative_epoch=verify_fix_operative_epoch,
         )
         if rerun_needed is None:
             return 1
         if rerun_needed:
-            identity = resolve_verify_fix_task_identity(store, task)
-            if identity is None:
+            if verify_fix_operative_epoch is None:
                 return 1
-            _impl_task_id, verify_epoch = identity
             if worktree_path is None:
                 worktree_path = _verify_fix_completion_worktree_path(config, task)
             if worktree_path is None:
@@ -1633,7 +1645,7 @@ def _complete_failed_code_task_after_pr_publication(
                 worktree_path=worktree_path,
                 branch_name=branch_name,
                 head_sha=head_sha,
-                verify_epoch=verify_epoch,
+                verify_epoch=verify_fix_operative_epoch,
                 env=getattr(canonical_git, "env", None),
             )
             if resolved_verification_git is None:
@@ -1652,6 +1664,7 @@ def _complete_failed_code_task_after_pr_publication(
         task_logger=task_logger,
         changed_source=task.changed_diff,
         log_file=log_file,
+        operative_epoch=verify_fix_operative_epoch,
     ):
         if task.status == "failed" and task.failure_reason is None:
             _mark_task_failed(
@@ -6740,8 +6753,11 @@ def _prove_verify_fix_rerun_head(
 def _verify_fix_timeout_rerun_needed(
     *,
     store: SqliteTaskStore,
+    config: Config,
     task: Task,
     changed_source: bool | None,
+    git: Git | None = None,
+    operative_epoch: VerifyEpoch | None = None,
 ) -> bool | None:
     """Return whether no-op timeout rerun proof is required, or None when prerequisites are missing."""
     if task.id is None or task.task_type != "verify_fix":
@@ -6750,20 +6766,27 @@ def _verify_fix_timeout_rerun_needed(
         changed_source = task.changed_diff
     if changed_source is True:
         return False
-    identity = resolve_verify_fix_task_identity(store, task)
-    if identity is None:
+    try:
+        impl_task, operative_epoch, _origin_epoch = resolve_verify_fix_operative_epoch(
+            store,
+            config,
+            task=task,
+            verify_epoch=operative_epoch,
+            git=git,
+        )
+    except VerifyFixContextError as exc:
+        detail = str(exc)
+        owner_prefix = (
+            "Cannot resolve verify_fix implementation owner; "
+            if "cannot resolve implementation owner" in detail
+            else ""
+        )
         _warn_verify_fix_timeout_rerun_prerequisite(
-            f"Cannot determine verify_fix timeout rerun identity for task {task.id}; leaving task retryable"
+            f"Cannot determine verify_fix timeout rerun identity for task {task.id}; "
+            f"leaving task retryable. {owner_prefix}{detail}"
         )
         return None
-    impl_task_id, verify_epoch = identity
-    impl_task = store.get(impl_task_id)
-    if impl_task is None:
-        _warn_verify_fix_timeout_rerun_prerequisite(
-            f"Cannot resolve verify_fix implementation owner {impl_task_id} for task {task.id}; leaving task retryable"
-        )
-        return None
-    lookup = latest_verify_result_for_epoch(store, impl_task, current_epoch=verify_epoch)
+    lookup = latest_verify_result_for_epoch(store, impl_task, current_epoch=operative_epoch)
     if not lookup.is_current or lookup.result is None:
         _warn_verify_fix_timeout_rerun_prerequisite(
             f"Cannot find current verify evidence for verify_fix timeout epoch on task {task.id}; leaving task retryable"
@@ -6775,6 +6798,7 @@ def _verify_fix_timeout_rerun_needed(
 def _verify_fix_changed_source_for_epoch(
     *,
     store: SqliteTaskStore,
+    config: Config,
     task: Task,
     worktree_git: Git,
     branch_name: str,
@@ -6782,12 +6806,12 @@ def _verify_fix_changed_source_for_epoch(
     pre_run_status: set[tuple[str, str]] | None = None,
     post_run_status: set[tuple[str, str]] | None = None,
     current_head_sha: str | None = None,
+    operative_epoch: VerifyEpoch | None = None,
 ) -> bool:
     """Fail-closed source-change proof for verify-fix gate evidence."""
-    identity = resolve_verify_fix_task_identity(store, task)
-    if identity is None:
+    if operative_epoch is None:
         return True
-    _impl_task_id, verify_epoch = identity
+    verify_epoch = operative_epoch
     current_head = current_head_sha
     if current_head is None:
         current_head = _prove_verify_fix_rerun_head(
@@ -7275,6 +7299,7 @@ def _capture_noop_verify_fix_timeout_rerun(
     base_sha: str | None,
     task_logger: TaskExecutionLogger | None,
     changed_source: bool | None = None,
+    operative_epoch: VerifyEpoch | None = None,
 ) -> bool:
     """Persist fresh verify evidence for a no-change verify_fix of a timeout red.
 
@@ -7290,18 +7315,29 @@ def _capture_noop_verify_fix_timeout_rerun(
         return True
     rerun_needed = _verify_fix_timeout_rerun_needed(
         store=store,
+        config=config,
         task=task,
         changed_source=changed_source,
+        git=worktree_git,
+        operative_epoch=operative_epoch,
     )
     if rerun_needed is False:
         return True
     if rerun_needed is None:
         return False
-    identity = resolve_verify_fix_task_identity(store, task)
-    assert identity is not None
-    impl_task_id, verify_epoch = identity
-    impl_task = store.get(impl_task_id)
-    assert impl_task is not None
+    try:
+        impl_task, verify_epoch, _origin_epoch = resolve_verify_fix_operative_epoch(
+            store,
+            config,
+            task=task,
+            verify_epoch=operative_epoch,
+            git=worktree_git,
+        )
+    except VerifyFixContextError as exc:
+        _warn_verify_fix_timeout_rerun_prerequisite(
+            f"Cannot determine verify_fix timeout rerun identity for task {task.id}; leaving task retryable. {exc}"
+        )
+        return False
     if changed_source is not False:
         _warn_verify_fix_timeout_rerun_prerequisite(
             f"Cannot prove whether verify_fix task {task.id} changed source; leaving task retryable"
@@ -7320,11 +7356,13 @@ def _capture_noop_verify_fix_timeout_rerun(
         return False
     if _verify_fix_changed_source_for_epoch(
         store=store,
+        config=config,
         task=task,
         worktree_git=worktree_git,
         branch_name=branch_name,
         boundary=boundary,
         current_head_sha=proven_head,
+        operative_epoch=verify_epoch,
     ):
         return False
     try:
@@ -7374,11 +7412,13 @@ def _capture_noop_verify_fix_timeout_rerun(
         return False
     if _verify_fix_changed_source_for_epoch(
         store=store,
+        config=config,
         task=task,
         worktree_git=worktree_git,
         branch_name=branch_name,
         boundary=boundary,
         current_head_sha=proven_head_after,
+        operative_epoch=verify_epoch,
     ):
         return False
     persisted_result, artifact_path = _persist_lifecycle_verify_execution(
@@ -7437,6 +7477,7 @@ def _ensure_noop_verify_fix_timeout_rerun_before_completion(
     task_logger: TaskExecutionLogger | None,
     changed_source: bool | None = None,
     log_file: Path | None = None,
+    operative_epoch: VerifyEpoch | None = None,
 ) -> bool:
     """Fail closed when a no-op timeout-origin verify_fix lacks durable green rerun evidence."""
     if task.task_type != "verify_fix":
@@ -7446,8 +7487,11 @@ def _ensure_noop_verify_fix_timeout_rerun_before_completion(
     if worktree_path is None:
         rerun_needed = _verify_fix_timeout_rerun_needed(
             store=store,
+            config=config,
             task=task,
             changed_source=changed_source,
+            git=worktree_git,
+            operative_epoch=operative_epoch,
         )
         if rerun_needed is False:
             return True
@@ -7467,6 +7511,7 @@ def _ensure_noop_verify_fix_timeout_rerun_before_completion(
             base_sha=base_sha,
             task_logger=task_logger,
             changed_source=changed_source,
+            operative_epoch=operative_epoch,
         )
     except Exception as exc:
         refreshed = store.get(task.id) if task.id is not None else None
@@ -8128,6 +8173,7 @@ def _build_context_from_chain(
                     store,
                     config,
                     task=task,
+                    git=git,
                 )
             except VerifyFixContextError as exc:
                 context_parts.append(format_verify_fix_context_error(task, exc))
@@ -10948,6 +10994,7 @@ def _complete_code_task(
     rebase_superseded_by_concurrent_rebase: bool = False,
     rebase_supersession_proof_target: str | None = None,
     error_type: str | None = None,
+    verify_fix_operative_epoch: VerifyEpoch | None = None,
 ) -> int:
     """Handle successful code-task completion (staging, commit, completion state, output).
 
@@ -11043,12 +11090,14 @@ def _complete_code_task(
         if task.task_type == "verify_fix":
             verify_fix_changed_source = _verify_fix_changed_source_for_epoch(
                 store=store,
+                config=config,
                 task=task,
                 worktree_git=worktree_git,
                 branch_name=branch_name,
                 boundary=boundary,
                 pre_run_status=pre_run_status,
                 post_run_status=post_run_status,
+                operative_epoch=verify_fix_operative_epoch,
             )
 
         if not has_uncommitted:
@@ -11324,6 +11373,7 @@ def _complete_code_task(
         task_logger=task_logger,
         changed_source=verify_fix_changed_source,
         log_file=log_file,
+        operative_epoch=verify_fix_operative_epoch,
     ):
         _restore_claimed_task_retryable_after_verify_rerun_refusal(task, store)
         return 1
@@ -12351,6 +12401,40 @@ def _run_inner(
         )
         return 0
 
+    verify_fix_operative_epoch: VerifyEpoch | None = None
+    if task.task_type == "verify_fix":
+        try:
+            _impl_task, verify_fix_operative_epoch, _origin_epoch = resolve_verify_fix_operative_epoch(
+                store,
+                config,
+                task=task,
+                git=worktree_git,
+            )
+        except VerifyFixContextError as exc:
+            failure_message = f"verify_fix cannot resolve current operative epoch: {exc}"
+            error_message(f"Error: {failure_message}")
+            write_log_entry(
+                log_file,
+                {
+                    "type": "gza",
+                    "subtype": "outcome",
+                    "message": failure_message,
+                    "failure_reason": "VERIFY_FIX_CONTEXT_ERROR",
+                },
+            )
+            _mark_task_failed(
+                task=task,
+                config=config,
+                store=store,
+                log_file=log_file,
+                stats=TaskStats(),
+                branch=branch_name,
+                explicit_reason="VERIFY_FIX_CONTEXT_ERROR",
+                error_type="VerifyFixContextError",
+                exit_code=1,
+            )
+            return 1
+
     # Run provider in the worktree
     if resume:
         timeout_resume_context = None
@@ -12369,7 +12453,14 @@ def _run_inner(
             )
         prompt = PromptBuilder().resume_prompt(resume_context=timeout_resume_context)
     else:
-        prompt = build_prompt(task, task_config, store, report_path=None, summary_path=prompt_summary_path, git=git)
+        prompt = build_prompt(
+            task,
+            task_config,
+            store,
+            report_path=None,
+            summary_path=prompt_summary_path,
+            git=worktree_git if task.task_type == "verify_fix" else git,
+        )
 
     # Snapshot worktree state before provider runs so we can selectively stage only new changes
     try:
@@ -12626,6 +12717,7 @@ def _run_inner(
             rebase_superseded_by_concurrent_rebase=rebase_superseded_by_concurrent_rebase,
             rebase_supersession_proof_target=rebase_supersession_proof_target,
             error_type=result.error_type,
+            verify_fix_operative_epoch=verify_fix_operative_epoch,
         )
 
     except GitError as e:
