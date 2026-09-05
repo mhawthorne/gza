@@ -27,6 +27,7 @@ import gza.metrics as metrics
 from gza.artifact_paths import normalize_artifact_path
 from gza.rebase_identity import rebase_persisted_branch_is_authoritative
 from gza.resume_policy import RESUMABLE_FAILURE_REASONS, is_resumable_failure_reason
+from gza.schema_compat import newer_schema_compatibility_diagnostic, newer_schema_compatibility_message
 from gza.task_slug import get_task_slug
 
 logger = logging.getLogger(__name__)
@@ -246,6 +247,10 @@ class InvalidTaskIdError(ValueError):
 class SchemaIntegrityError(RuntimeError):
     """Raised when persisted DB artifacts are internally inconsistent."""
 
+    def __init__(self, message: str, *, schema_compatibility: object | None = None) -> None:
+        self.schema_compatibility = schema_compatibility
+        super().__init__(message)
+
 
 class ExecutionProjectActivationError(SchemaIntegrityError):
     """Raised when an execution project fails activation with a typed disabled reason."""
@@ -253,6 +258,23 @@ class ExecutionProjectActivationError(SchemaIntegrityError):
     def __init__(self, reason: ExecutionProjectDisableReason, message: str) -> None:
         self.reason = reason
         super().__init__(message)
+
+
+def _newer_schema_error(
+    *,
+    observed_db_version: int,
+    supported_db_version: int,
+    db_role: Literal["live_shared", "private_snapshot"],
+) -> SchemaIntegrityError:
+    diagnostic = newer_schema_compatibility_diagnostic(
+        observed_db_version=observed_db_version,
+        supported_db_version=supported_db_version,
+        db_role=db_role,
+    )
+    return SchemaIntegrityError(
+        newer_schema_compatibility_message(diagnostic),
+        schema_compatibility=diagnostic,
+    )
 
 
 class MergeTargetResolutionError(RuntimeError):
@@ -698,7 +720,13 @@ def _classify_existing_execution_db(
             if schema_version > SCHEMA_VERSION:
                 return (
                     "schema_incompatible",
-                    f"Database schema v{schema_version} is newer than supported v{SCHEMA_VERSION}.",
+                    newer_schema_compatibility_message(
+                        newer_schema_compatibility_diagnostic(
+                            observed_db_version=schema_version,
+                            supported_db_version=SCHEMA_VERSION,
+                            db_role="live_shared",
+                        )
+                    ),
                 )
 
             for target_version, _migration_sql in _MIGRATIONS:
@@ -6534,8 +6562,10 @@ class SqliteTaskStore:
                             schema_version_error or f"Database {self.db_path} has no schema_version row."
                         )
                     if current_version > SCHEMA_VERSION:
-                        raise SchemaIntegrityError(
-                            f"Database schema v{current_version} is newer than supported v{SCHEMA_VERSION}."
+                        raise _newer_schema_error(
+                            observed_db_version=current_version,
+                            supported_db_version=SCHEMA_VERSION,
+                            db_role="live_shared",
                         )
                     _ensure_required_auto_migration_artifacts(conn, target_version=current_version)
                     # Remember whether that call already covered the current schema so the
@@ -6638,7 +6668,11 @@ class SqliteTaskStore:
         if schema_version_error is not None or current_version is None:
             raise SchemaIntegrityError(schema_version_error or f"Database {self.db_path} has no schema_version row.")
         if current_version > SCHEMA_VERSION:
-            raise SchemaIntegrityError(f"Database schema v{current_version} is newer than supported v{SCHEMA_VERSION}.")
+            raise _newer_schema_error(
+                observed_db_version=current_version,
+                supported_db_version=SCHEMA_VERSION,
+                db_role="live_shared",
+            )
 
         pending_manual = [
             target_version
@@ -6770,6 +6804,12 @@ class SqliteTaskStore:
 
             row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
             current_version = int(row["version"]) if row and row["version"] is not None else 0
+            if current_version > SCHEMA_VERSION:
+                raise _newer_schema_error(
+                    observed_db_version=current_version,
+                    supported_db_version=SCHEMA_VERSION,
+                    db_role="private_snapshot",
+                )
 
             pending_manual: list[int] = []
             for target_version, _migration_sql in _MIGRATIONS:

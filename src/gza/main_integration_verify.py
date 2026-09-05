@@ -29,10 +29,17 @@ from .runner import (
     _run_review_verify_command,
     resolve_lifecycle_verify_timeout_settings,
 )
+from .schema_compat import (
+    SCHEMA_RUNTIME_SKEW_EXIT_STATUS,
+    SCHEMA_RUNTIME_SKEW_FAILURE_ORIGIN,
+    SchemaCompatibilityDiagnostic,
+    parse_schema_compatibility_diagnostic,
+)
 
 MAIN_INTEGRATION_VERIFY_PROMPT = "System alert: local main integration verify"
 MAIN_INTEGRATION_VERIFY_REASON = "main-integration-verify-red"
 MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_REASON = "main-integration-verify-launch-failed"
+MAIN_INTEGRATION_VERIFY_SCHEMA_RUNTIME_SKEW_REASON = "main-integration-verify-schema-runtime-skew"
 MAIN_INTEGRATION_VERIFY_TAG = "system-main-verify"
 MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS = "tree fingerprint unavailable"
 MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS = "launch failed"
@@ -83,6 +90,7 @@ class MainIntegrationVerifyState:
     pending_retirement_signatures: tuple[str, ...]
     red_since: datetime | None
     captured_at: datetime | None
+    schema_compatibility: SchemaCompatibilityDiagnostic | None = None
 
 
 @dataclass(frozen=True)
@@ -278,6 +286,7 @@ class CandidateIntegrationVerifyEvidence:
     reviewed_branch: str | None
     working_directory: str | None
     captured_at: datetime | None
+    schema_compatibility: SchemaCompatibilityDiagnostic | None = None
 
 
 @dataclass(frozen=True)
@@ -365,10 +374,15 @@ def load_main_integration_verify_state(store: SqliteTaskStore) -> MainIntegratio
             red_since = None
     failing_phase = payload.get("failing_phase") if isinstance(payload.get("failing_phase"), str) else None
     failure_signature = payload.get("failure_signature") if isinstance(payload.get("failure_signature"), str) else None
+    schema_compatibility = SchemaCompatibilityDiagnostic.from_payload(payload.get("schema_compatibility"))
     if failure_signature is None and _verify_result_halts_merges(
         status=task.review_verify_status,
         gate_enabled=_payload_gate_enabled(task, payload),
         exit_status=task.review_verify_exit_status,
+    ) and not _verify_result_is_schema_runtime_skew(
+        status=task.review_verify_status,
+        exit_status=task.review_verify_exit_status,
+        schema_compatibility=schema_compatibility,
     ):
         failure_signature = _verify_failure_signature(
             failing_phase=failing_phase,
@@ -399,6 +413,7 @@ def load_main_integration_verify_state(store: SqliteTaskStore) -> MainIntegratio
         pending_retirement_signatures=pending_retirement_signatures,
         red_since=red_since,
         captured_at=captured_at or task.review_verify_captured_at,
+        schema_compatibility=schema_compatibility,
     )
 
 
@@ -713,6 +728,19 @@ def _build_freshness_unavailable_alert_message(*, head_sha: str | None) -> str:
     return "main verify freshness unproven; exact tree fingerprint unavailable"
 
 
+def _build_schema_runtime_skew_alert_message(
+    *,
+    head_sha: str | None,
+    diagnostic: SchemaCompatibilityDiagnostic,
+) -> str:
+    del head_sha
+    return (
+        "main verify runtime unavailable - verify runtime is stale relative to the database schema; "
+        f"observed DB v{diagnostic.observed_db_version}, supported v{diagnostic.supported_db_version}; "
+        "restart or update the runtime, then rerun from canonical main"
+    )
+
+
 def main_integration_verify_state_needs_non_red_attention(state: object) -> bool:
     from .main_verify_format import main_verify_state_needs_non_red_attention
 
@@ -723,6 +751,12 @@ def main_integration_verify_state_is_freshness_unavailable(state: object) -> boo
     from .main_verify_format import main_verify_state_is_freshness_unavailable
 
     return main_verify_state_is_freshness_unavailable(state)
+
+
+def main_integration_verify_state_is_schema_runtime_skew(state: object) -> bool:
+    from .main_verify_format import main_verify_state_is_schema_runtime_skew
+
+    return main_verify_state_is_schema_runtime_skew(state)
 
 
 def main_integration_verify_state_is_red_verdict(state: object) -> bool:
@@ -738,8 +772,10 @@ def main_integration_verify_state_has_exhausted_remediation_attention(state: obj
 
 
 def main_integration_verify_attention_reason(state: object) -> str:
-    from .main_verify_format import main_verify_state_needs_non_red_attention
+    from .main_verify_format import main_verify_state_is_schema_runtime_skew, main_verify_state_needs_non_red_attention
 
+    if main_verify_state_is_schema_runtime_skew(state):
+        return MAIN_INTEGRATION_VERIFY_SCHEMA_RUNTIME_SKEW_REASON
     if main_verify_state_needs_non_red_attention(state):
         return MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_REASON
     return MAIN_INTEGRATION_VERIFY_REASON
@@ -836,6 +872,55 @@ def _coerce_optional_float(value: object) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _result_schema_compatibility(result: object) -> SchemaCompatibilityDiagnostic | None:
+    diagnostic = getattr(result, "schema_compatibility", None)
+    if isinstance(diagnostic, SchemaCompatibilityDiagnostic):
+        return diagnostic
+    return parse_schema_compatibility_diagnostic(
+        "\n".join(
+            value
+            for value in (
+                getattr(result, "failure", None),
+                getattr(result, "output", None),
+            )
+            if isinstance(value, str) and value
+        )
+    )
+
+
+def _verify_result_is_schema_runtime_skew(
+    *,
+    status: str | None,
+    exit_status: str | None,
+    schema_compatibility: SchemaCompatibilityDiagnostic | None = None,
+) -> bool:
+    return status == "unavailable" and (
+        exit_status == SCHEMA_RUNTIME_SKEW_EXIT_STATUS or schema_compatibility is not None
+    )
+
+
+def _coerce_result_to_schema_runtime_skew(result: object, diagnostic: SchemaCompatibilityDiagnostic) -> Any:
+    return _make_review_verify_result(
+        getattr(result, "command", None) or "(verify_command unavailable)",
+        status="unavailable",
+        exit_status=SCHEMA_RUNTIME_SKEW_EXIT_STATUS,
+        captured_at=getattr(result, "captured_at", None) or datetime.now(UTC),
+        reviewed_branch=getattr(result, "reviewed_branch", None),
+        reviewed_head_sha=getattr(result, "reviewed_head_sha", None),
+        reviewed_base_sha=getattr(result, "reviewed_base_sha", None),
+        working_directory=getattr(result, "working_directory", None),
+        failure=(
+            "verify runtime is stale relative to the database schema: "
+            f"observed v{diagnostic.observed_db_version}, supported v{diagnostic.supported_db_version}; "
+            f"db role {diagnostic.db_role}; reason {diagnostic.reason}"
+        ),
+        failure_origin=SCHEMA_RUNTIME_SKEW_FAILURE_ORIGIN,
+        output=getattr(result, "output", None),
+        duration_seconds=getattr(result, "duration_seconds", None),
+        schema_compatibility=diagnostic,
+    )
 
 
 def normalized_verify_command(config: Config) -> str:
@@ -983,6 +1068,7 @@ def _persist_main_integration_verify_payload(
     pending_retirement_signatures: tuple[str, ...],
     red_since: datetime | None,
     captured_at: datetime,
+    schema_compatibility: SchemaCompatibilityDiagnostic | None = None,
 ) -> None:
     task.output_content = json.dumps(
         {
@@ -999,6 +1085,7 @@ def _persist_main_integration_verify_payload(
             "pending_retirement_signatures": list(pending_retirement_signatures),
             "red_since": red_since.isoformat() if red_since is not None else None,
             "captured_at": captured_at.isoformat(),
+            "schema_compatibility": schema_compatibility.to_payload() if schema_compatibility is not None else None,
         },
         sort_keys=True,
     )
@@ -1034,6 +1121,11 @@ def persist_main_integration_verify_alert_message(
                 gate_enabled=state.gate_enabled,
                 exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
             )
+            and not _verify_result_is_schema_runtime_skew(
+                status=verify_status if isinstance(verify_status, str) else None,
+                exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
+                schema_compatibility=getattr(state, "schema_compatibility", None),
+            )
             and isinstance(failing_phase, str)
             and failing_phase
         ):
@@ -1047,6 +1139,11 @@ def persist_main_integration_verify_alert_message(
                 status=verify_status if isinstance(verify_status, str) else None,
                 gate_enabled=state.gate_enabled,
                 exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
+            )
+            and not _verify_result_is_schema_runtime_skew(
+                status=verify_status if isinstance(verify_status, str) else None,
+                exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
+                schema_compatibility=getattr(state, "schema_compatibility", None),
             )
             and isinstance(verify_status, str)
             and verify_status
@@ -1074,6 +1171,7 @@ def persist_main_integration_verify_alert_message(
         pending_retirement_signatures=_pending_retirement_signatures_from_state(state),
         red_since=getattr(state, "red_since", None),
         captured_at=captured_at,
+        schema_compatibility=getattr(state, "schema_compatibility", None),
     )
     refreshed = load_main_integration_verify_state(store)
     assert refreshed is not None
@@ -1317,6 +1415,9 @@ def run_main_integration_verify(
             failure=_build_launch_issue_failure(launch_issue),
             output=result.output,
         )
+    schema_compatibility = _result_schema_compatibility(result)
+    if schema_compatibility is not None:
+        result = _coerce_result_to_schema_runtime_skew(result, schema_compatibility)
     tree_fingerprint = _verify_tree_fingerprint(result.output) or _compute_tree_fingerprint(git, head_sha=head_sha)
     capture_metadata: dict[str, Any] = {
         "reason": reason,
@@ -1336,34 +1437,48 @@ def run_main_integration_verify(
         producer="main_integration_verify",
         metadata=capture_metadata,
     )
-    alert_message = (
-        _build_launch_issue_alert_message(head_sha=head_sha, issue=launch_issue)
-        if gate_enabled and launch_issue is not None
-        else _build_freshness_unavailable_alert_message(head_sha=head_sha)
-        if gate_enabled
+    alert_message = None
+    if gate_enabled and schema_compatibility is not None:
+        alert_message = _build_schema_runtime_skew_alert_message(head_sha=head_sha, diagnostic=schema_compatibility)
+    elif gate_enabled and launch_issue is not None:
+        alert_message = _build_launch_issue_alert_message(head_sha=head_sha, issue=launch_issue)
+    elif (
+        gate_enabled
         and result.status == "unavailable"
         and result.exit_status == MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
-        else _build_red_alert_message(
-            head_sha=head_sha,
-            verify_status=result.status,
-            failing_phase=failing_phase,
-        )
-        if _verify_result_halts_merges(
-            status=result.status,
-            gate_enabled=gate_enabled,
-            exit_status=result.exit_status,
-        )
-        else None
-    )
-    if _verify_result_halts_merges(
+    ):
+        alert_message = _build_freshness_unavailable_alert_message(head_sha=head_sha)
+    elif _verify_result_halts_merges(
         status=result.status,
         gate_enabled=gate_enabled,
         exit_status=result.exit_status,
     ):
-        if prior_state is not None and _verify_result_halts_merges(
-            status=prior_state.verify_status,
-            gate_enabled=prior_state.gate_enabled,
-            exit_status=prior_state.verify_exit_status,
+        alert_message = _build_red_alert_message(
+            head_sha=head_sha,
+            verify_status=result.status,
+            failing_phase=failing_phase,
+        )
+    if _verify_result_halts_merges(
+        status=result.status,
+        gate_enabled=gate_enabled,
+        exit_status=result.exit_status,
+    ) and not _verify_result_is_schema_runtime_skew(
+        status=result.status,
+        exit_status=result.exit_status,
+        schema_compatibility=schema_compatibility,
+    ):
+        if (
+            prior_state is not None
+            and _verify_result_halts_merges(
+                status=prior_state.verify_status,
+                gate_enabled=prior_state.gate_enabled,
+                exit_status=prior_state.verify_exit_status,
+            )
+            and not _verify_result_is_schema_runtime_skew(
+                status=prior_state.verify_status,
+                exit_status=prior_state.verify_exit_status,
+                schema_compatibility=prior_state.schema_compatibility,
+            )
         ):
             red_since = prior_state.red_since or result.captured_at
         else:
@@ -1394,6 +1509,11 @@ def run_main_integration_verify(
                 gate_enabled=gate_enabled,
                 exit_status=result.exit_status,
             )
+            and not _verify_result_is_schema_runtime_skew(
+                status=result.status,
+                exit_status=result.exit_status,
+                schema_compatibility=schema_compatibility,
+            )
             else None
         ),
         failing_phase=failing_phase,
@@ -1401,6 +1521,7 @@ def run_main_integration_verify(
         pending_retirement_signatures=pending_retirement_signatures,
         red_since=red_since,
         captured_at=result.captured_at,
+        schema_compatibility=schema_compatibility,
     )
     state = load_main_integration_verify_state(store)
     assert state is not None
@@ -1427,6 +1548,12 @@ def _run_integration_verify_with_red_reruns(
         on_initial_run_start(1, total_attempts)
     state = run_once(reason, 1)
     verify_runs = 1 if getattr(state, "gate_enabled", True) else 0
+    if _verify_result_is_schema_runtime_skew(
+        status=state.verify_status,
+        exit_status=state.verify_exit_status,
+        schema_compatibility=getattr(state, "schema_compatibility", None),
+    ):
+        return state, None, None, verify_runs
     if red_reruns <= 0:
         return state, None, None, verify_runs
 
@@ -1437,6 +1564,11 @@ def _run_integration_verify_with_red_reruns(
             status=prior_red_state.verify_status,
             gate_enabled=prior_red_state.gate_enabled,
             exit_status=prior_red_state.verify_exit_status,
+        )
+        and not _verify_result_is_schema_runtime_skew(
+            status=prior_red_state.verify_status,
+            exit_status=prior_red_state.verify_exit_status,
+            schema_compatibility=getattr(prior_red_state, "schema_compatibility", None),
         )
         else state
     )
@@ -1465,6 +1597,12 @@ def _run_integration_verify_with_red_reruns(
             on_red_rerun_start(attempt + 1, total_attempts, state)
         rerun_state = run_once(f"{reason}-rerun-{attempt}", attempt + 1)
         verify_runs += 1
+        if _verify_result_is_schema_runtime_skew(
+            status=rerun_state.verify_status,
+            exit_status=rerun_state.verify_exit_status,
+            schema_compatibility=getattr(rerun_state, "schema_compatibility", None),
+        ):
+            return rerun_state, None, None, verify_runs
         if not _verify_result_halts_merges(
             status=rerun_state.verify_status,
             gate_enabled=rerun_state.gate_enabled,
@@ -1851,6 +1989,9 @@ def run_candidate_integration_verify(
             failure=_build_launch_issue_failure(launch_issue),
             output=result.output,
         )
+    schema_compatibility = _result_schema_compatibility(result)
+    if schema_compatibility is not None:
+        result = _coerce_result_to_schema_runtime_skew(result, schema_compatibility)
     tree_fingerprint = _verify_tree_fingerprint(result.output) or _compute_tree_fingerprint(git)
     if gate_enabled and result.status == "passed" and tree_fingerprint is None:
         result = _coerce_result_to_freshness_unavailable(result)
@@ -1870,6 +2011,7 @@ def run_candidate_integration_verify(
         reviewed_branch=result.reviewed_branch,
         working_directory=result.working_directory,
         captured_at=result.captured_at,
+        schema_compatibility=schema_compatibility,
     )
 
 

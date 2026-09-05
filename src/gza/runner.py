@@ -200,6 +200,12 @@ from .review_verify_state import (
     verify_result_is_timeout_origin,
 )
 from .runtime_context import RuntimeExecutionContext, build_dotenv_runtime_env, normalize_subprocess_env
+from .schema_compat import (
+    SCHEMA_RUNTIME_SKEW_EXIT_STATUS,
+    SCHEMA_RUNTIME_SKEW_FAILURE_ORIGIN,
+    SchemaCompatibilityDiagnostic,
+    parse_schema_compatibility_diagnostic,
+)
 from .sync_ops import resolve_branch_pr
 from .task_slug import (
     extract_task_id_suffix,
@@ -3484,6 +3490,7 @@ class ReviewVerifyResult:
     artifact_id: int | None = None
     artifact_path: str | None = None
     failure_origin: str | None = None
+    schema_compatibility: SchemaCompatibilityDiagnostic | None = None
 
 
 @dataclass(frozen=True)
@@ -3601,6 +3608,7 @@ def _make_verify_result(
     failure_origin: str | None = None,
     output: str | bytes | None = None,
     duration_seconds: float | None = None,
+    schema_compatibility: SchemaCompatibilityDiagnostic | None = None,
 ) -> VerificationResult:
     """Build a structured lifecycle verify result."""
     if status == "failed" and failure_origin is None:
@@ -3619,6 +3627,7 @@ def _make_verify_result(
         failure_origin=failure_origin,
         output=_combine_verify_output(output),
         duration_seconds=duration_seconds,
+        schema_compatibility=schema_compatibility,
     )
 
 
@@ -3629,6 +3638,28 @@ def _classify_failed_verify_origin(*, exit_status: str, failure: str | None = No
     if normalized_exit in {"timed out", "timeout"} or "verify_command timed out" in normalized_failure:
         return "timeout"
     return "test_failure"
+
+
+def _normalize_schema_runtime_skew_result(result: ReviewVerifyResult) -> ReviewVerifyResult:
+    """Coerce known schema/runtime skew output to non-red unavailable evidence."""
+    diagnostic = parse_schema_compatibility_diagnostic(
+        _combine_verify_output(result.failure, result.output)
+    )
+    if diagnostic is None:
+        return result
+    failure = (
+        "verify runtime is stale relative to the database schema: "
+        f"observed v{diagnostic.observed_db_version}, supported v{diagnostic.supported_db_version}; "
+        f"db role {diagnostic.db_role}; reason {diagnostic.reason}"
+    )
+    return replace(
+        result,
+        status="unavailable",
+        exit_status=SCHEMA_RUNTIME_SKEW_EXIT_STATUS,
+        failure=failure,
+        failure_origin=SCHEMA_RUNTIME_SKEW_FAILURE_ORIGIN,
+        schema_compatibility=diagnostic,
+    )
 
 
 def _make_review_verify_result(
@@ -3643,8 +3674,10 @@ def _make_review_verify_result(
     reviewed_base_sha: str | None = None,
     working_directory: str | None = None,
     failure: str | None = None,
+    failure_origin: str | None = None,
     output: str | bytes | None = None,
     duration_seconds: float | None = None,
+    schema_compatibility: SchemaCompatibilityDiagnostic | None = None,
 ) -> ReviewVerifyResult:
     """Compatibility wrapper for legacy review-specific callers."""
     return _make_verify_result(
@@ -3658,8 +3691,10 @@ def _make_review_verify_result(
         reviewed_base_sha=reviewed_base_sha,
         working_directory=working_directory,
         failure=failure,
+        failure_origin=failure_origin,
         output=output,
         duration_seconds=duration_seconds,
+        schema_compatibility=schema_compatibility,
     )
 
 
@@ -6519,19 +6554,21 @@ def _run_verify_command(
                 f"verify_command exceeded {timeout_seconds}s; sent SIGTERM, waited "
                 f"{timeout_grace_seconds}s, then sent SIGKILL"
             )
-        return _make_verify_result(
-            verify_command,
-            status="failed",
-            exit_status="timed out",
-            captured_at=captured_at,
-            reviewed_branch=reviewed_branch,
-            reviewed_head_sha=reviewed_head_sha,
-            reviewed_tree_sha=reviewed_tree_sha,
-            reviewed_base_sha=reviewed_base_sha,
-            working_directory=str(cwd),
-            failure=f"verify_command timed out after {timeout_seconds}s",
-            output=_combine_verify_output(timeout_diagnostic, result.stdout, result.stderr),
-            duration_seconds=elapsed,
+        return _normalize_schema_runtime_skew_result(
+            _make_verify_result(
+                verify_command,
+                status="failed",
+                exit_status="timed out",
+                captured_at=captured_at,
+                reviewed_branch=reviewed_branch,
+                reviewed_head_sha=reviewed_head_sha,
+                reviewed_tree_sha=reviewed_tree_sha,
+                reviewed_base_sha=reviewed_base_sha,
+                working_directory=str(cwd),
+                failure=f"verify_command timed out after {timeout_seconds}s",
+                output=_combine_verify_output(timeout_diagnostic, result.stdout, result.stderr),
+                duration_seconds=elapsed,
+            )
         )
     elapsed = time.monotonic() - started_at
     if elapsed > (0.8 * timeout_seconds):
@@ -6541,18 +6578,20 @@ def _run_verify_command(
         )
         logger.warning(warning_message)
         console.print(f"[yellow]Warning: {warning_message}[/yellow]")
-    return _make_verify_result(
-        verify_command,
-        status="passed" if result.returncode == 0 else "failed",
-        exit_status=str(result.returncode),
-        captured_at=captured_at,
-        reviewed_branch=reviewed_branch,
-        reviewed_head_sha=reviewed_head_sha,
-        reviewed_tree_sha=reviewed_tree_sha,
-        reviewed_base_sha=reviewed_base_sha,
-        working_directory=str(cwd),
-        output=_combine_verify_output(result.stdout, result.stderr),
-        duration_seconds=elapsed,
+    return _normalize_schema_runtime_skew_result(
+        _make_verify_result(
+            verify_command,
+            status="passed" if result.returncode == 0 else "failed",
+            exit_status=str(result.returncode),
+            captured_at=captured_at,
+            reviewed_branch=reviewed_branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_tree_sha=reviewed_tree_sha,
+            reviewed_base_sha=reviewed_base_sha,
+            working_directory=str(cwd),
+            output=_combine_verify_output(result.stdout, result.stderr),
+            duration_seconds=elapsed,
+        )
     )
 
 

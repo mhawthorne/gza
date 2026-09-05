@@ -61,6 +61,7 @@ from gza.advance_engine import resolve_review_cycle_boundary
 from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance, parse_rebase_diff_provenance
 from gza.review_tasks import build_auto_review_prompt
 from gza.runner import _compute_slug_override
+from gza.schema_compat import SCHEMA_COMPATIBILITY_DIAGNOSTIC_MARKER, SchemaCompatibilityDiagnostic
 from gza.sync_ops import BranchCohort, sync_branch_cohorts
 
 
@@ -13370,8 +13371,16 @@ class TestExecutionProjectResolver:
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION + 1,))
         before = self._sqlite_user_schema_and_rows(project_db)
 
-        with pytest.raises(SchemaIntegrityError, match=f"newer than supported v{SCHEMA_VERSION}"):
+        with pytest.raises(SchemaIntegrityError, match=f"newer than supported v{SCHEMA_VERSION}") as exc_info:
             SqliteTaskStore(project_db, prefix="gza", project_id="futureproj")
+
+        diagnostic = exc_info.value.schema_compatibility
+        assert isinstance(diagnostic, SchemaCompatibilityDiagnostic)
+        assert diagnostic.observed_db_version == SCHEMA_VERSION + 1
+        assert diagnostic.supported_db_version == SCHEMA_VERSION
+        assert diagnostic.db_role == "live_shared"
+        assert diagnostic.reason == "newer_schema"
+        assert SCHEMA_COMPATIBILITY_DIAGNOSTIC_MARKER in str(exc_info.value)
 
         after = self._sqlite_user_schema_and_rows(project_db)
         assert after == before
