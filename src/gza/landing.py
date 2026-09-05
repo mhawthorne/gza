@@ -8,7 +8,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, NoReturn, Protocol, cast
 
 from gza.advance_engine import (
     _resolve_spec_coherence_inspection,
@@ -352,6 +352,13 @@ class LandingCoordinator:
     rebase_executor: RebaseExecutor | None = None
     execute_rebase_service: Callable[..., RebaseServiceResult] = execute_task_backed_rebase_service
     runtime_context: Any | None = None
+    verify_action_context: AdvanceActionExecutionContext | None = None
+    execute_verify_action: LandingAdvanceExecutor | None = None
+    live_tree_fingerprint_resolver: LandingLiveTreeResolver | None = None
+    create_full_review: Callable[..., DbTask] = create_review_task
+    create_resolution_review: Callable[..., DbTask] = create_resolution_review_task
+    landing_judge: LandingJudge | None = None
+    post_rebase_review_budget_used: bool = False
 
     def plan(self, request: LandRequest) -> LandResult:
         return self.run(request)
@@ -489,6 +496,26 @@ class LandingCoordinator:
                     return self._blocked_result(request, identity, steps, blocked)
                 continue
 
+            if first_boundary == "verify":
+                step, blocked = self._run_verify_phase(identity)
+                steps.append(step)
+                if blocked is not None:
+                    return self._blocked_result(request, identity, steps, blocked)
+                continue
+
+            if first_boundary == "post_rebase_review":
+                step, blocked = self._run_post_rebase_review_phase(identity, facts, policy=request.policy)
+                steps.append(step)
+                if blocked is not None:
+                    return self._blocked_result(request, identity, steps, blocked)
+                blocked = LandBlocked(
+                    "merge-failed",
+                    self._boundary_fact("merge"),
+                    _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+                )
+                steps.append(LandStep("merge", "blocked", blocked.fact, blocked=blocked))
+                return self._blocked_result(request, identity, steps, blocked)
+
             blocked = LandBlocked(
                 self._boundary_reason_code(first_boundary),
                 self._boundary_fact(first_boundary),
@@ -595,6 +622,223 @@ class LandingCoordinator:
             evidence,
         )
         return LandStep("rebase", "blocked", blocked.fact, blocked=blocked), blocked
+
+    def _run_verify_phase(
+        self,
+        identity: LandingResolvedIdentity,
+    ) -> tuple[LandStep, LandBlocked | None]:
+        if self.config is None:
+            blocked = LandBlocked(
+                "verify-unavailable-or-red",
+                "shared lifecycle verify configuration is unavailable",
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+            return LandStep("verify", "blocked", blocked.fact, blocked=blocked), blocked
+        if identity.source_sha is None:
+            blocked = LandBlocked(
+                "identity-proof-unavailable",
+                "exact local source ref proof is unavailable",
+                _evidence_refs(identity.owner_task_id, identity.source_ref, identity.target_branch),
+            )
+            return LandStep("verify", "blocked", blocked.fact, blocked=blocked), blocked
+        try:
+            result = acquire_landing_verify_evidence(
+                self.store,
+                identity.owner_task,
+                config=self.config,
+                git=self.git,
+                target_branch=identity.target_branch,
+                source_head=identity.source_sha,
+                context=self.verify_action_context or self._default_verify_action_context(),
+                execute_action=self.execute_verify_action,
+                live_tree_fingerprint_resolver=self.live_tree_fingerprint_resolver,
+                member_tasks=self._member_tasks(identity),
+            )
+        except Exception as exc:
+            blocked = LandBlocked(
+                "verify-unavailable-or-red",
+                _exception_fact("shared lifecycle verify acquisition failed", exc),
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+            return LandStep("verify", "blocked", blocked.fact, blocked=blocked), blocked
+        evidence = _verify_evidence(result.evidence, _facts_identity_only(identity))
+        if result.blocked is not None:
+            return LandStep("verify", "blocked", result.blocked.fact, blocked=result.blocked), result.blocked
+        summary = (
+            f"current green source verify evidence {result.evidence.epoch} "
+            f"passed for gate {result.evidence.gate_identity}"
+        )
+        return LandStep("verify", "completed", summary, evidence_refs=evidence), None
+
+    def _run_post_rebase_review_phase(
+        self,
+        identity: LandingResolvedIdentity,
+        facts: LandingPolicyFacts,
+        *,
+        policy: LandingPolicyName,
+    ) -> tuple[LandStep, LandBlocked | None]:
+        if identity.source_sha is None or identity.target_sha is None:
+            blocked = LandBlocked(
+                "identity-proof-unavailable",
+                "exact local source or target ref proof is unavailable",
+                _evidence_refs(identity.owner_task_id, identity.source_ref, identity.target_branch),
+            )
+            return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked
+        review_request = self._post_rebase_review_request(identity, facts)
+        transition = run_landing_post_rebase_review_transition(
+            self.store,
+            review_request,
+            policy=policy,
+            facts=self._facts_with_preserved_review_if_eligible(facts, review_request),
+            config=self.config,
+            judge=self.landing_judge,
+            create_full_review=self.create_full_review,
+            create_resolution_review=self.create_resolution_review,
+        )
+        self.post_rebase_review_budget_used = transition.review_result.review_budget_used
+        review_result = transition.review_result
+        if review_result.blocked is not None:
+            return (
+                LandStep(
+                    "post_rebase_review",
+                    "blocked",
+                    review_result.blocked.fact,
+                    blocked=review_result.blocked,
+                ),
+                review_result.blocked,
+            )
+        if review_result.status in {"created", "pending", "in_progress"}:
+            review = review_result.review_task
+            blocked = LandBlocked(
+                "required-review-unavailable",
+                "post-rebase review has not completed",
+                _evidence_refs(review.id if review is not None else None, identity.owner_task_id, identity.source_sha),
+            )
+            return (
+                LandStep(
+                    "post_rebase_review",
+                    "blocked",
+                    blocked.fact,
+                    blocked=blocked,
+                    evidence_refs=blocked.evidence_refs,
+                ),
+                blocked,
+            )
+        if review_result.status == "not_required":
+            if not transition.decision.allowed and transition.decision.blocked is not None:
+                return (
+                    LandStep(
+                        _phase_for_block(transition.decision.blocked),
+                        "blocked",
+                        transition.decision.blocked.fact,
+                        blocked=transition.decision.blocked,
+                    ),
+                    transition.decision.blocked,
+                )
+            return (
+                LandStep(
+                    "post_rebase_review",
+                    "skipped",
+                    "mechanical unchanged rebase preserves eligible review evidence",
+                    evidence_refs=_review_evidence(facts.review, facts),
+                ),
+                None,
+            )
+        if not transition.decision.allowed and transition.decision.blocked is not None:
+            return (
+                LandStep(
+                    _phase_for_block(transition.decision.blocked),
+                    "blocked",
+                    transition.decision.blocked.fact,
+                    blocked=transition.decision.blocked,
+                ),
+                transition.decision.blocked,
+            )
+        review = review_result.review_task
+        assert review is not None
+        verdict = _landing_review_verdict_from_task(self.config, review)
+        return (
+            LandStep(
+                "post_rebase_review",
+                "completed",
+                f"current {review_result.need} post-rebase review {review.id} is {verdict}",
+                evidence_refs=_evidence_refs(review.id, identity.source_sha, identity.target_sha),
+            ),
+            None,
+        )
+
+    def _default_verify_action_context(self) -> AdvanceActionExecutionContext:
+        return AdvanceActionExecutionContext(
+            store=self.store,
+            trigger_source="manual_land",
+            dry_run=False,
+            max_resume_attempts=int(getattr(self.config, "max_resume_attempts", 0) or 0),
+            use_iterate_for_create_implement=False,
+            use_iterate_for_needs_rebase=False,
+            prepare_task_for_background_start=lambda task, _rollback: task,
+            prepare_create_review=lambda _task: _raise_unavailable("review creation"),
+            create_resume_task=lambda _task: _raise_unavailable("resume creation"),
+            create_rebase_task=lambda _task: _raise_unavailable("rebase creation"),
+            create_implement_task=lambda _task: _raise_unavailable("implement creation"),
+            spawn_worker=lambda _task, _kind: _raise_unavailable("worker launch"),
+            spawn_resume_worker=lambda _task, _kind: _raise_unavailable("resume worker launch"),
+            spawn_iterate_worker=lambda *_args, **_kwargs: _raise_unavailable("iterate worker launch"),
+            config=self.config,
+            git=self.git,
+            runtime_context=self.runtime_context,
+        )
+
+    def _member_tasks(self, identity: LandingResolvedIdentity) -> tuple[DbTask, ...]:
+        members: list[DbTask] = []
+        for task_id in identity.member_task_ids:
+            task = self.store.get(task_id)
+            if task is not None:
+                members.append(task)
+        return tuple(members)
+
+    def _post_rebase_review_request(
+        self,
+        identity: LandingResolvedIdentity,
+        facts: LandingPolicyFacts,
+    ) -> LandingPostRebaseReviewRequest:
+        outcome_identity = _rebase_outcome_identity_from_facts(facts)
+        rebase_task = _latest_landing_rebase_task(self.store, identity.owner_task)
+        return LandingPostRebaseReviewRequest(
+            impl_task=identity.owner_task,
+            source_head=identity.source_sha or "",
+            target_head=identity.target_sha or "",
+            pre_rebase_source_head=facts.rebase_attempted_source_head,
+            rebase_task=rebase_task,
+            rebase_outcome_identity=outcome_identity,
+            rebase_outcome_kind=_review_rebase_outcome_kind(facts),
+            changed_diff=facts.rebase_changed_diff,
+            conflict_resolved=facts.rebase_resolution_kind == "provider_resolved",
+            resolution_provenance_complete=rebase_task is not None,
+            review_budget_used=self.post_rebase_review_budget_used,
+            trigger_source="manual_land",
+        )
+
+    def _facts_with_preserved_review_if_eligible(
+        self,
+        facts: LandingPolicyFacts,
+        request: LandingPostRebaseReviewRequest,
+    ) -> LandingPolicyFacts:
+        if facts.review is None:
+            return facts
+        if not facts.review.parseable or facts.review.status != "completed" or not facts.review.review_id:
+            return facts
+        need = _post_rebase_review_need(request, source_head=request.source_head, target_head=request.target_head)
+        if need != "none":
+            return facts
+        return replace(
+            facts,
+            review=replace(
+                facts.review,
+                current=True,
+                identity_matched=True,
+                reviewed_head=facts.source_head,
+            ),
+        )
 
     def _blocked_result(
         self,
@@ -2285,6 +2529,77 @@ def _rebase_service_blocking_fact(status: str) -> str:
     if status == "identity_conflict":
         return "active task-backed rebase identity does not match the landing source and target"
     return f"task-backed rebase stopped with status {status}"
+
+
+def _raise_unavailable(label: str) -> NoReturn:
+    raise AssertionError(f"{label} should not run during landing verify acquisition")
+
+
+def _facts_identity_only(identity: LandingResolvedIdentity) -> LandingPolicyFacts:
+    return LandingPolicyFacts(
+        task_id=identity.owner_task_id,
+        merge_unit_state=identity.merge_unit_state,
+        has_active_merge_unit=identity.merge_unit_id is not None,
+        has_local_source=identity.source_ref is not None,
+        target_matches_checkout=identity.current_branch == identity.target_branch,
+        source_head=identity.source_sha,
+        target_head=identity.target_sha,
+    )
+
+
+def _review_rebase_outcome_kind(facts: LandingPolicyFacts) -> LandingRebaseOutcomeKind | str | None:
+    if facts.rebase_resolution_kind == "provider_resolved":
+        return "provider_resolved"
+    if facts.rebase_resolution_kind == "mechanical":
+        return "mechanical"
+    if facts.rebase_resolution_kind == "no_op":
+        return "no_op"
+    if facts.rebase_status == "completed":
+        return "recovered"
+    return None
+
+
+def _rebase_outcome_identity_from_facts(facts: LandingPolicyFacts) -> LandingRebaseOutcomeIdentity | None:
+    outcome_kind = _review_rebase_outcome_kind(facts)
+    if (
+        facts.rebase_outcome_id is None
+        or outcome_kind is None
+        or facts.rebase_attempted_source_head is None
+        or facts.rebase_attempted_target_head is None
+        or facts.source_head is None
+        or facts.target_head is None
+        or facts.rebase_target_contained is None
+        or facts.rebase_provider_resolution_proof is None
+    ):
+        return None
+    try:
+        return LandingRebaseOutcomeIdentity(
+            outcome_id=facts.rebase_outcome_id,
+            outcome_kind=outcome_kind,
+            attempted_source_head=facts.rebase_attempted_source_head,
+            attempted_target_head=facts.rebase_attempted_target_head,
+            live_source_head=facts.source_head,
+            live_target_head=facts.target_head,
+            target_contained=facts.rebase_target_contained,
+            provider_resolution_proof=facts.rebase_provider_resolution_proof,
+            changed_diff=facts.rebase_changed_diff,
+            no_op_subtype=facts.rebase_no_op_subtype,
+        )
+    except ValueError:
+        return None
+
+
+def _latest_landing_rebase_task(store: SqliteTaskStore, owner_task: DbTask) -> DbTask | None:
+    if owner_task.id is None:
+        return None
+    try:
+        children = get_same_branch_rebase_descendants_for_root(store, owner_task)
+    except Exception:
+        return None
+    rebases = [task for task in children if task.task_type == "rebase"]
+    if not rebases:
+        return None
+    return max(rebases, key=_task_recency_key)
 
 
 def _rev_parse_if_exists(git: Any, ref: str) -> str | None:

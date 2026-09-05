@@ -31,6 +31,7 @@ from gza.landing import (
     LandingSpecCoherenceFingerprint,
     LandingStateFingerprint,
     LandingTransitionLimitPolicy,
+    LandingVerifyAcquisitionResult,
     LandingVerifyEvidence,
     LandPostMergeVerifyFailure,
     LandRequest,
@@ -4042,6 +4043,259 @@ def test_landing_coordinator_stale_target_after_rebase_blocks_without_second_reb
     assert result.blocked is not None
     assert result.blocked.reason_code == "rebase-or-conflict"
     assert git.mutation_calls == []
+
+
+def test_landing_coordinator_invokes_canonical_verify_acquisition(monkeypatch, tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "verify acquisition", "feature/landing")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    calls: list[tuple[str | None, str | None]] = []
+    facts_calls = 0
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        nonlocal facts_calls
+        facts_calls += 1
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            verify=_verify(status="missing", current=False, identity_matched=False)
+            if facts_calls == 1
+            else _verify(),
+        )
+
+    def acquire(_store: Any, owner_task: Task, **kwargs: Any) -> LandingVerifyAcquisitionResult:
+        calls.append((owner_task.id, kwargs["source_head"]))
+        return LandingVerifyAcquisitionResult("ran_verify", _verify(), execution=SimpleNamespace(status="success"))
+
+    monkeypatch.setattr("gza.landing.acquire_landing_verify_evidence", acquire)
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        verify_action_context=SimpleNamespace(),  # type: ignore[arg-type]
+    ).run(LandRequest(task_id=impl.id))
+
+    assert calls == [(impl.id, "head-a")]
+    assert any(step.phase == "verify" and step.status == "completed" for step in result.steps)
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "merge-failed"
+
+
+def test_landing_coordinator_refuses_stale_verify_after_acquisition(monkeypatch, tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "stale verify acquisition", "feature/landing")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    blocked = LandBlocked(
+        "verify-unavailable-or-red",
+        "current green source verify evidence is unavailable after shared verify",
+        (impl.id, "old-verify", "head-a"),
+    )
+
+    def acquire(*_args: Any, **_kwargs: Any) -> LandingVerifyAcquisitionResult:
+        return LandingVerifyAcquisitionResult(
+            "blocked",
+            _verify(status="stale", current=False, identity_matched=False, epoch="old-verify"),
+            execution=SimpleNamespace(status="success"),
+            blocked=blocked,
+        )
+
+    monkeypatch.setattr("gza.landing.acquire_landing_verify_evidence", acquire)
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=lambda identity: _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            verify=_verify(status="stale", current=False, identity_matched=False),
+        ),
+        verify_action_context=SimpleNamespace(),  # type: ignore[arg-type]
+        create_full_review=_fail_improve_or_review_route,
+        create_resolution_review=_fail_improve_or_review_route,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked == blocked
+    assert result.steps[-1].phase == "verify"
+    _assert_no_improve_rows(store)
+
+
+def test_landing_coordinator_preserves_review_after_mechanical_unchanged_rebase(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "mechanical unchanged", "feature/landing")
+    assert impl.id is not None
+    review = _completed_full_review(store, impl, head="head-before", verdict="APPROVED")
+    git = _LandingSourceGit(
+        {"feature/landing": "head-after", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-after")},
+    )
+
+    facts = _green_facts(
+        task_id=impl.id,
+        source_head="head-after",
+        target_head="target-a",
+        rebase_status="completed",
+        rebase_resolution_kind="mechanical",
+        rebase_changed_diff=False,
+        rebase_outcome_id="rebase-outcome",
+        rebase_attempted_source_head="head-before",
+        rebase_attempted_target_head="target-a",
+        rebase_target_contained=True,
+        rebase_provider_resolution_proof=False,
+        review=_review(
+            review_id=review.id,
+            reviewed_head="head-before",
+            current=False,
+            identity_matched=False,
+        ),
+    )
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=lambda _identity: facts,
+        create_full_review=_fail_improve_or_review_route,
+        create_resolution_review=_fail_improve_or_review_route,
+    ).run(LandRequest(task_id=impl.id))
+
+    statuses = {step.phase: step.status for step in result.steps}
+    assert statuses["post_rebase_review"] == "skipped"
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "merge-failed"
+    _assert_no_review_or_improve_rows_after_landing_review(store, {review.id or ""})
+
+
+def test_landing_coordinator_requires_one_resolution_review_after_provider_rebase(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "provider resolved", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    rebase = store.add("provider rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    store.mark_completed(rebase, has_commits=True, branch="feature/landing", changed_diff=False)
+    _persist_landing_rebase_outcome(store, rebase, impl, source_after="head-a")
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    created: list[str] = []
+
+    def create_resolution(*_args: Any, **kwargs: Any) -> Task:
+        created.append(kwargs["resolved_head_sha"])
+        review = store.add("landing resolution review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_verify_head_sha = kwargs["resolved_head_sha"]
+        store.update(review)
+        return review
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        create_resolution_review=create_resolution,
+        create_full_review=_fail_improve_or_review_route,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert created == ["head-a"]
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "required-review-unavailable"
+    assert sum(1 for task in store.get_all() if task.task_type == "review") == 1
+    _assert_no_improve_rows(store)
+
+
+def test_landing_coordinator_falls_back_to_one_full_review_when_resolution_provenance_is_incomplete(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "fallback full", "feature/landing")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "source-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "source-a")},
+    )
+    created: list[str] = []
+
+    def create_full(_store: Any, _impl: Task, **_kwargs: Any) -> Task:
+        created.append("full")
+        review = store.add("landing full review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        store.update(review)
+        return review
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=lambda identity: _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            rebase_status="completed",
+            rebase_resolution_kind="provider_resolved",
+            rebase_changed_diff=True,
+            rebase_outcome_id="legacy-outcome",
+            rebase_attempted_source_head="source-before",
+            rebase_attempted_target_head="target-a",
+            rebase_target_contained=True,
+            rebase_provider_resolution_proof=True,
+            review=_review(status="unavailable", current=False, parseable=False, identity_matched=False),
+        ),
+        create_full_review=create_full,
+        create_resolution_review=_fail_improve_or_review_route,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert created == ["full"]
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "required-review-unavailable"
+    assert sum(1 for task in store.get_all() if task.task_type == "review") == 1
+    _assert_no_improve_rows(store)
+
+
+def test_landing_coordinator_strict_changes_requested_stops_without_review_or_improve(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "strict current changes requested", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        create_full_review=_fail_improve_or_review_route,
+        create_resolution_review=_fail_improve_or_review_route,
+    ).run(LandRequest(task_id=impl.id, policy="strict"))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "nondeferrable-blocker"
+    assert all(step.phase != "post_rebase_review" for step in result.steps)
+    _assert_no_review_or_improve_rows_after_landing_review(store, {review.id or ""})
 
 
 def test_land_cli_prints_concrete_dry_run_evidence(monkeypatch, capsys, tmp_path) -> None:
