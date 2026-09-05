@@ -64,18 +64,18 @@ Addressed in `2dab013c`, which scopes blocker criterion (3) on a re-review to co
 
 ## Convergence: reviews per merged unit
 
-The churn this report describes shows up here. A unit that converges is reviewed once or twice; one that does not accumulates reviews. `2dab013c` narrowed what a re-review may block on, so this mean should fall for units merged after it landed (`2026-09-04T15:08:45`).
+The churn this report describes shows up here. A unit that converges is reviewed once or twice; one that does not accumulates reviews. `2dab013c` narrowed what a re-review may block on, so p90 in particular should fall for units merged after it landed (`2026-09-04T15:08:45`).
 
-| month merged | units | mean reviews | median | units needing 4+ |
+| month merged | units | p50 reviews | p90 reviews | max |
 |---|---|---|---|---|
-| 2026-05 | 151 | 3.27 | 2 | 41 (27%) |
-| 2026-06 | 261 | 2.72 | 1 | 59 (23%) |
-| 2026-07 | 94 | 3.88 | 2 | 35 (37%) |
-| 2026-08 | 121 | 4.36 | 3 | 55 (45%) |
-| 2026-09 | 29 | 3.76 | 3 | 12 (41%) |
+| 2026-05 | 151 | 2 | 8 | 20 |
+| 2026-06 | 261 | 1 | 7 | 17 |
+| 2026-07 | 94 | 2 | 9 | 29 |
+| 2026-08 | 121 | 3 | 10 | 23 |
+| 2026-09 | 29 | 3 | 7 | 24 |
 
-**Before the bound:** 652 units, mean 3.37 reviews.
-**After the bound:** 4 units, mean 2.25 reviews.
+**Before the bound:** 652 units, p50 2 / p90 8 reviews.
+**After the bound:** 4 units, p50 1 / p90 5 reviews.
 
 > Only 4 units have merged since the change. Too few to conclude anything; re-run once this reaches ~50.
 

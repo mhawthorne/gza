@@ -5,6 +5,7 @@ Usage: uv run python scripts/analyze_fix_effectiveness.py docs/internal/gza-fix-
 """
 import collections
 import datetime
+import math
 import os
 import sqlite3
 import sys
@@ -39,8 +40,15 @@ def reviews_per_merged_unit(con):
     return [(r["merged_at"], r["reviews"]) for r in rows]
 
 
-def _mean(values):
-    return sum(values) / len(values) if values else 0.0
+def _pct(values, q):
+    """Nearest-rank percentile. Review counts are small integers with a long tail,
+    so a mean is dominated by a few runaway units; p50/p90 describe the typical
+    unit and the bad tail separately."""
+    if not values:
+        return 0
+    ordered = sorted(values)
+    rank = max(1, math.ceil(q / 100 * len(ordered)))
+    return ordered[rank - 1]
 
 
 def convergence_section(con):
@@ -49,30 +57,34 @@ def convergence_section(con):
     lines.append(
         "The churn this report describes shows up here. A unit that converges is reviewed "
         "once or twice; one that does not accumulates reviews. `2dab013c` narrowed what a "
-        "re-review may block on, so this mean should fall for units merged after it landed "
+        "re-review may block on, so p90 in particular should fall for units merged after it landed "
         f"(`{REREVIEW_BOUND_LANDED_AT}`).\n"
     )
 
     by_month = collections.defaultdict(list)
     for merged_at, reviews in data:
         by_month[merged_at[:7]].append(reviews)
-    lines.append("| month merged | units | mean reviews | median | units needing 4+ |")
+    lines.append("| month merged | units | p50 reviews | p90 reviews | max |")
     lines.append("|---|---|---|---|---|")
     for month in sorted(by_month):
-        counts = sorted(by_month[month])
-        median = counts[len(counts) // 2]
-        heavy = sum(1 for c in counts if c >= 4)
+        counts = by_month[month]
         lines.append(
-            f"| {month} | {len(counts)} | {_mean(counts):.2f} | {median} | "
-            f"{heavy} ({100 * heavy / len(counts):.0f}%) |"
+            f"| {month} | {len(counts)} | {_pct(counts, 50)} | {_pct(counts, 90)} | "
+            f"{max(counts)} |"
         )
     lines.append("")
 
     before = [r for merged_at, r in data if merged_at < REREVIEW_BOUND_LANDED_AT]
     after = [r for merged_at, r in data if merged_at >= REREVIEW_BOUND_LANDED_AT]
-    lines.append(f"**Before the bound:** {len(before)} units, mean {_mean(before):.2f} reviews.")
+    lines.append(
+        f"**Before the bound:** {len(before)} units, "
+        f"p50 {_pct(before, 50)} / p90 {_pct(before, 90)} reviews."
+    )
     if after:
-        lines.append(f"**After the bound:** {len(after)} units, mean {_mean(after):.2f} reviews.")
+        lines.append(
+            f"**After the bound:** {len(after)} units, "
+            f"p50 {_pct(after, 50)} / p90 {_pct(after, 90)} reviews."
+        )
         if len(after) < 30:
             lines.append(
                 f"\n> Only {len(after)} units have merged since the change. Too few to "
