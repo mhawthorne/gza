@@ -4563,6 +4563,7 @@ def test_landing_coordinator_runs_one_task_backed_rebase_when_source_is_behind(t
             task_id=identity.owner_task_id,
             source_head=identity.source_sha,
             target_head=identity.target_sha,
+            review=_review(reviewed_head=identity.source_sha),
             rebase_status="none",
             rebase_resolution_kind="none",
             rebase_target_contained=(identity.target_sha, identity.source_sha) in git.ancestors,
@@ -4796,6 +4797,7 @@ def test_landing_coordinator_invokes_canonical_verify_acquisition(monkeypatch, t
             task_id=identity.owner_task_id,
             source_head=identity.source_sha,
             target_head=identity.target_sha,
+            review=_review(reviewed_head=identity.source_sha),
             verify=_verify(status="missing", current=False, identity_matched=False)
             if facts_calls == 1
             else _verify(),
@@ -5027,6 +5029,124 @@ def test_landing_coordinator_strict_changes_requested_stops_without_review_or_im
     assert result.blocked.reason_code == "nondeferrable-blocker"
     assert all(step.phase != "post_rebase_review" for step in result.steps)
     _assert_no_review_or_improve_rows_after_landing_review(store, {review.id or ""})
+
+
+def test_landing_coordinator_guarded_defers_blockers_after_final_preflight_and_merges(tmp_path) -> None:
+    from gza.merge_services import ManualMergeExecutionResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "guarded deferral", "feature/landing")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    order: list[str] = []
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            parked_reason="review-max-cycles-reached",
+            review=_review(verdict="CHANGES_REQUESTED", reviewed_head=identity.source_sha),
+            open_blockers=(_blocker("B1", deferrable=True, blocker_class="out_of_scope"),),
+        )
+
+    def judge() -> LandingJudgment:
+        order.append("judge")
+        return LandingJudgment("LAND", artifact_id="judge-artifact", key="judge-key")
+
+    def merge(identity: Any, decision: LandingPolicyDecision, provenance: str) -> ManualMergeExecutionResult:
+        order.append("merge")
+        assert order == ["judge", "merge"]
+        assert provenance == "manual_land_escalated"
+        assert decision.allowed_overrides == (
+            "defer-review-blockers",
+            "parked:review-max-cycles-reached",
+        )
+        blocker = store.add("deferred B1", task_type="implement", depends_on=impl.id, create_pr=True, urgent=True)
+        return ManualMergeExecutionResult(
+            rc=0,
+            status="merged",
+            created_deferred_blockers=[blocker],
+        )
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        landing_judge=judge,
+        execute_merge=merge,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is None
+    assert result.merged is True
+    assert result.merge_provenance == "manual_land_escalated"
+    assert result.judgment_artifact_id == "judge-artifact"
+    assert result.judgment_key == "judge-key"
+    assert result.deferred_task_ids
+    deferred = store.get(result.deferred_task_ids[0])
+    assert deferred is not None
+    assert deferred.urgent is True
+    assert deferred.create_pr is True
+    assert [step.phase for step in result.steps[-3:]] == ["judge", "defer_blockers", "merge"]
+
+
+@pytest.mark.parametrize("changed_ref", ("source", "target"))
+def test_landing_coordinator_final_head_change_blocks_before_deferred_materialization(
+    tmp_path,
+    changed_ref: str,
+) -> None:
+    from gza.merge_services import ManualMergeExecutionResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "head invalidation", "feature/landing")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            parked_reason="review-max-cycles-reached",
+            review=_review(verdict="CHANGES_REQUESTED", reviewed_head=identity.source_sha),
+            open_blockers=(_blocker("B1", deferrable=True, blocker_class="out_of_scope"),),
+        )
+
+    def judge() -> LandingJudgment:
+        if changed_ref == "source":
+            git.heads["feature/landing"] = "head-b"
+        else:
+            git.heads["main"] = "target-b"
+        return LandingJudgment("LAND", artifact_id="judge-artifact", key="judge-key")
+
+    def merge(*_args: Any, **_kwargs: Any) -> ManualMergeExecutionResult:
+        raise AssertionError("deferred blockers and merge must not run after head invalidation")
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        landing_judge=judge,
+        execute_merge=merge,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "identity-proof-unavailable"
+    assert f"{changed_ref} head changed" in result.blocked.fact
+    assert all(step.phase != "defer_blockers" for step in result.steps)
+    assert all(task.prompt != "deferred B1" for task in store.get_all())
 
 
 def test_land_cli_prints_concrete_dry_run_evidence(monkeypatch, capsys, tmp_path) -> None:

@@ -16,6 +16,8 @@ import pytest
 
 from gza.db import (
     DB_UNSET,
+    MERGE_SOURCE_MANUAL_LAND,
+    MERGE_SOURCE_MANUAL_LAND_ESCALATED,
     MERGE_SOURCE_MAX_CYCLES_DEFERRED,
     MERGE_SOURCE_VALUES,
     SCHEMA_VERSION,
@@ -4902,6 +4904,25 @@ class TestMergeStatus:
 
     def test_max_cycles_deferred_is_valid_merge_source(self) -> None:
         assert MERGE_SOURCE_MAX_CYCLES_DEFERRED in MERGE_SOURCE_VALUES
+
+    @pytest.mark.parametrize(
+        "merge_source",
+        (MERGE_SOURCE_MANUAL_LAND, MERGE_SOURCE_MANUAL_LAND_ESCALATED),
+    )
+    def test_land_provenance_values_are_valid_merge_sources(self, tmp_path: Path, merge_source: str) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        impl = store.add(prompt=f"Implement {merge_source}", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch=f"feature/{merge_source}")
+        assert impl.id is not None
+        unit = store.resolve_merge_unit_for_task(impl.id)
+        assert unit is not None
+
+        store.set_merge_unit_state(unit.id, "merged", merged_by_task_id=impl.id, merge_source=merge_source)
+
+        refreshed = store.get_merge_unit(unit.id)
+        assert refreshed is not None
+        assert refreshed.merge_source == merge_source
 
     def test_set_merge_unit_state_sets_merged_state_and_provenance_together(self, tmp_path: Path) -> None:
         """Merged writes should stamp owner provenance and merged_at in one state change."""

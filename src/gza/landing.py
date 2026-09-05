@@ -24,7 +24,12 @@ from gza.cli.advance_executor import (
 )
 from gza.db import SqliteTaskStore, Task as DbTask, _task_is_actionable_merge_unit_member
 from gza.dependency_preconditions import dependency_readiness
-from gza.merge_services import ResolvedMergeSubject, check_manual_merge_preflight, resolve_merge_subject_query_only
+from gza.merge_services import (
+    ManualMergeExecutionResult,
+    ResolvedMergeSubject,
+    check_manual_merge_preflight,
+    resolve_merge_subject_query_only,
+)
 from gza.query import get_implementation_review_evidence, get_same_branch_rebase_descendants_for_root
 from gza.rebase_service import (
     COMPLETED_REBASE_EXECUTION_STATUSES,
@@ -342,10 +347,11 @@ class LandingTransitionLimitPolicy:
 
 @dataclass
 class LandingCoordinator:
-    """Initial landing coordinator skeleton.
+    """Bounded coordinator for operator-triggered landing.
 
-    This slice resolves identity, reconciles already-landed state, emits
-    query-only dry-run plans, and stops before execution-required phases.
+    The coordinator re-resolves state after mutating prerequisites, evaluates
+    strict/guarded policy against current evidence, and delegates the final
+    merge/materialization boundary to a shared merge executor.
     """
 
     store: SqliteTaskStore
@@ -366,6 +372,7 @@ class LandingCoordinator:
     create_full_review: Callable[..., DbTask] = create_review_task
     create_resolution_review: Callable[..., DbTask] = create_resolution_review_task
     landing_judge: LandingJudge | None = None
+    execute_merge: LandingMergeExecutor | None = None
     post_rebase_review_budget_used: bool = False
 
     def plan(self, request: LandRequest) -> LandResult:
@@ -512,17 +519,27 @@ class LandingCoordinator:
                 continue
 
             if first_boundary == "post_rebase_review":
-                step, blocked = self._run_post_rebase_review_phase(identity, facts, policy=request.policy)
+                step, blocked, decision = self._run_post_rebase_review_phase(identity, facts, policy=request.policy)
                 steps.append(step)
                 if blocked is not None:
                     return self._blocked_result(request, identity, steps, blocked)
-                blocked = LandBlocked(
-                    "merge-failed",
-                    self._boundary_fact("merge"),
-                    _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+                return self._run_policy_and_merge_phases(
+                    request=request,
+                    identity=identity,
+                    facts=facts,
+                    steps=steps,
+                    judge_required=False,
+                    decision=decision,
                 )
-                steps.append(LandStep("merge", "blocked", blocked.fact, blocked=blocked))
-                return self._blocked_result(request, identity, steps, blocked)
+
+            if first_boundary in {"judge", "merge"}:
+                return self._run_policy_and_merge_phases(
+                    request=request,
+                    identity=identity,
+                    facts=facts,
+                    steps=steps,
+                    judge_required=first_boundary == "judge",
+                )
 
             blocked = LandBlocked(
                 self._boundary_reason_code(first_boundary),
@@ -531,6 +548,220 @@ class LandingCoordinator:
             )
             steps.append(LandStep(first_boundary, "blocked", blocked.fact, blocked=blocked))
             return self._blocked_result(request, identity, steps, blocked)
+
+    def _run_policy_and_merge_phases(
+        self,
+        *,
+        request: LandRequest,
+        identity: LandingResolvedIdentity,
+        facts: LandingPolicyFacts,
+        steps: list[LandStep],
+        judge_required: bool,
+        decision: LandingPolicyDecision | None = None,
+    ) -> LandResult:
+        decision = decision or evaluate_landing_policy(policy=request.policy, facts=facts, judge=self.landing_judge)
+        if decision.blocked is not None:
+            steps.append(
+                LandStep(
+                    _phase_for_block(decision.blocked),
+                    "blocked",
+                    decision.blocked.fact,
+                    blocked=decision.blocked,
+                )
+            )
+            return self._blocked_result(request, identity, steps, decision.blocked)
+
+        escalated = bool(decision.allowed_overrides)
+        if judge_required or escalated:
+            steps.append(
+                LandStep(
+                    "judge",
+                    "completed",
+                    "guarded landing judgment authorized policy overrides",
+                    evidence_refs=_evidence_refs(decision.judgment_artifact_id, decision.judgment_key),
+                )
+            )
+        else:
+            steps.append(LandStep("judge", "skipped", "landing judgment is not required"))
+
+        final_preflight_block = self._final_preflight_block(identity)
+        if final_preflight_block is not None:
+            steps.append(
+                LandStep(
+                    _phase_for_block(final_preflight_block),
+                    "blocked",
+                    final_preflight_block.fact,
+                    blocked=final_preflight_block,
+                )
+            )
+            return self._blocked_result(request, identity, steps, final_preflight_block)
+
+        if self.execute_merge is None:
+            blocked = LandBlocked(
+                "merge-failed",
+                self._boundary_fact("merge"),
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+            steps.append(LandStep("merge", "blocked", blocked.fact, blocked=blocked))
+            return self._blocked_result(request, identity, steps, blocked)
+
+        provenance: Literal["manual_land", "manual_land_escalated"] = (
+            "manual_land_escalated" if escalated else "manual_land"
+        )
+        try:
+            merge_result = self.execute_merge(identity, decision, provenance)
+        except Exception as exc:
+            blocked = LandBlocked(
+                "merge-failed",
+                _exception_fact("shared merge execution failed", exc),
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+            steps.append(LandStep("merge", "blocked", blocked.fact, blocked=blocked))
+            return self._blocked_result(request, identity, steps, blocked)
+
+        created_deferred = tuple(task for task in (merge_result.created_deferred_blockers or []) if task.id)
+        reused_deferred = tuple(task for task in (merge_result.reused_deferred_blockers or []) if task.id)
+        created_followups = tuple(task for task in (merge_result.created_followups or []) if task.id)
+        reused_followups = tuple(task for task in (merge_result.reused_followups or []) if task.id)
+        deferred_ids = tuple(task.id or "" for task in (*created_deferred, *reused_deferred))
+        followup_ids = tuple(task.id or "" for task in (*created_followups, *reused_followups))
+
+        if escalated:
+            if "defer-review-blockers" in decision.allowed_overrides and not deferred_ids:
+                blocked = LandBlocked(
+                    "materialization-or-persistence-failed",
+                    "deferred blocker materialization produced no durable task",
+                    _evidence_refs(identity.owner_task_id, decision.judgment_artifact_id, decision.judgment_key),
+                )
+                steps.append(LandStep("defer_blockers", "blocked", blocked.fact, blocked=blocked))
+                return self._blocked_result(request, identity, steps, blocked)
+            steps.append(
+                LandStep(
+                    "defer_blockers",
+                    "completed" if deferred_ids else "skipped",
+                    "deferred blocker tasks were materialized or reused"
+                    if deferred_ids
+                    else "no review blocker deferral was required",
+                    evidence_refs=_evidence_refs(*deferred_ids, decision.judgment_artifact_id, decision.judgment_key),
+                )
+            )
+        elif followup_ids:
+            steps.append(
+                LandStep(
+                    "defer_blockers",
+                    "completed",
+                    "review follow-up tasks were materialized or reused",
+                    evidence_refs=_evidence_refs(*followup_ids),
+                )
+            )
+        else:
+            steps.append(
+                LandStep(
+                    "defer_blockers",
+                    "skipped",
+                    "no follow-up or deferred blocker materialization is required",
+                )
+            )
+
+        if merge_result.rc != 0 or merge_result.status != "merged":
+            reason_code: LandBlockedReasonCode = (
+                "materialization-or-persistence-failed"
+                if merge_result.status
+                in {"deferred_blocker_materialization_failed", "merge_side_effect_materialization_failed"}
+                else "merge-failed"
+            )
+            blocked = LandBlocked(
+                reason_code,
+                merge_result.block_reason or f"shared merge execution stopped with status {merge_result.status}",
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha, *deferred_ids, *followup_ids),
+            )
+            steps.append(LandStep(_phase_for_block(blocked), "blocked", blocked.fact, blocked=blocked))
+            return self._blocked_result(request, identity, steps, blocked)
+
+        steps.append(
+            LandStep(
+                "merge",
+                "completed",
+                f"source merged with {provenance} provenance",
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+        )
+        return LandResult(
+            request=request,
+            owner_task_id=identity.owner_task_id,
+            target_branch=identity.target_branch,
+            source_ref=identity.source_ref,
+            steps=tuple(steps),
+            merged=True,
+            merge_provenance=provenance,
+            judgment_artifact_id=decision.judgment_artifact_id,
+            judgment_key=decision.judgment_key,
+            deferred_task_ids=deferred_ids,
+            followup_task_ids=followup_ids,
+        )
+
+    def _final_preflight_block(self, identity: LandingResolvedIdentity) -> LandBlocked | None:
+        if identity.source_ref is None or identity.source_sha is None or identity.target_sha is None:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                "exact local source or target ref proof is unavailable",
+                _evidence_refs(identity.owner_task_id, identity.source_ref, identity.target_branch),
+            )
+        current_source_sha = _rev_parse_if_exists(self.git, identity.source_ref)
+        current_target_sha = _rev_parse_if_exists(self.git, identity.target_branch)
+        if current_source_sha != identity.source_sha:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                "source head changed after landing authorization",
+                _evidence_refs(identity.owner_task_id, identity.source_sha, current_source_sha, identity.source_ref),
+            )
+        if current_target_sha != identity.target_sha:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                "target head changed after landing authorization",
+                _evidence_refs(identity.owner_task_id, identity.target_sha, current_target_sha, identity.target_branch),
+            )
+        try:
+            current_branch = self.git.current_branch()
+        except Exception as exc:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                _exception_fact("current checkout branch proof is unavailable", exc),
+                _evidence_refs(identity.owner_task_id, identity.source_ref, identity.target_branch),
+            )
+        if current_branch != identity.target_branch:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                f"current checkout is {current_branch}, expected target {identity.target_branch}",
+                _evidence_refs(identity.owner_task_id, current_branch, identity.target_branch),
+            )
+        try:
+            preflight = check_manual_merge_preflight(
+                self.git,
+                merge_subject=identity.owner_task,
+                merge_source_ref=identity.source_ref,
+                current_branch=current_branch,
+                merge_preflight_target=identity.target_branch,
+            )
+        except Exception as exc:
+            return LandBlocked(
+                "rebase-or-conflict",
+                _exception_fact("final manual merge preflight proof is unavailable", exc),
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+        if preflight.ok:
+            return None
+        if preflight.status == "dirty_checkout":
+            return LandBlocked(
+                "dirty-checkout",
+                preflight.block_reason or "tracked checkout is not clean",
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+        return LandBlocked(
+            "rebase-or-conflict",
+            preflight.block_reason or "final clean-merge proof is unavailable",
+            _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+        )
 
     def _run_rebase_phase(
         self,
@@ -684,14 +915,14 @@ class LandingCoordinator:
         facts: LandingPolicyFacts,
         *,
         policy: LandingPolicyName,
-    ) -> tuple[LandStep, LandBlocked | None]:
+    ) -> tuple[LandStep, LandBlocked | None, LandingPolicyDecision | None]:
         if identity.source_sha is None or identity.target_sha is None:
             blocked = LandBlocked(
                 "identity-proof-unavailable",
                 "exact local source or target ref proof is unavailable",
                 _evidence_refs(identity.owner_task_id, identity.source_ref, identity.target_branch),
             )
-            return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked
+            return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None
         review_request = self._post_rebase_review_request(identity, facts)
         transition = run_landing_post_rebase_review_transition(
             self.store,
@@ -714,6 +945,7 @@ class LandingCoordinator:
                     blocked=review_result.blocked,
                 ),
                 review_result.blocked,
+                None,
             )
         if review_result.status in {"created", "pending", "in_progress"}:
             review = review_result.review_task
@@ -731,6 +963,7 @@ class LandingCoordinator:
                     evidence_refs=blocked.evidence_refs,
                 ),
                 blocked,
+                None,
             )
         if review_result.status == "not_required":
             if not transition.decision.allowed and transition.decision.blocked is not None:
@@ -742,6 +975,7 @@ class LandingCoordinator:
                         blocked=transition.decision.blocked,
                     ),
                     transition.decision.blocked,
+                    transition.decision,
                 )
             return (
                 LandStep(
@@ -751,6 +985,7 @@ class LandingCoordinator:
                     evidence_refs=_review_evidence(facts.review, facts),
                 ),
                 None,
+                transition.decision,
             )
         if not transition.decision.allowed and transition.decision.blocked is not None:
             return (
@@ -761,6 +996,7 @@ class LandingCoordinator:
                     blocked=transition.decision.blocked,
                 ),
                 transition.decision.blocked,
+                transition.decision,
             )
         review = review_result.review_task
         assert review is not None
@@ -773,6 +1009,7 @@ class LandingCoordinator:
                 evidence_refs=_evidence_refs(review.id, identity.source_sha, identity.target_sha),
             ),
             None,
+            transition.decision,
         )
 
     def _default_verify_action_context(self) -> AdvanceActionExecutionContext:
@@ -1910,6 +2147,10 @@ class LandingJudgment:
 
 LandingJudge = Callable[[], LandingJudgment | LandingJudgeVerdict]
 LandingLiveTreeResolver = Callable[[], str | None]
+LandingMergeExecutor = Callable[
+    [LandingResolvedIdentity, LandingPolicyDecision, Literal["manual_land", "manual_land_escalated"]],
+    ManualMergeExecutionResult,
+]
 
 
 @dataclass(frozen=True)
