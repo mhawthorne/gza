@@ -2,7 +2,7 @@
 name: gza-task-fix
 description: Rescue a stuck gza task inline — diagnoses review/improve churn, verifies each blocker against current code, addresses the open ones, runs verify, and commits. Runs entirely in Claude Code, no background worker.
 allowed-tools: Read, Edit, Write, Glob, Grep, Bash(uv run:*), Bash(git:*), Bash(mkdir:*), Bash(ls:*), Bash(cd:*), AskUserQuestion
-version: 2.1.0
+version: 2.2.0
 public: true
 ---
 
@@ -99,6 +99,24 @@ cd .gza-worktrees/<impl_branch>
 ```
 
 Use a fixed, git-ignored parent directory (`.gza-worktrees/`) so repeat rescues of the same branch land in the same place instead of piling up duplicates. All remaining steps run from this worktree, not from `<START_DIR>`.
+
+**Verify the new worktree resolves to the same task DB before running any `uv run` command in it.** A raw `git worktree add` only checks out tracked files — it does not carry over an untracked, project-relative task DB (e.g. `db_path: .gza/gza.db` in `gza.yaml`), so `SqliteTaskStore.from_config` can silently create a fresh, empty, throwaway DB in the new worktree instead of erroring. Any task lookup, rescue, or `clear_review_state` call made against that DB is a no-op on the real system and can be lost entirely.
+
+```bash
+uv run python -c "
+from pathlib import Path
+from gza.config import Config
+print(Config.load(Path.cwd()).db_path)
+"
+```
+
+Compare this to the same command run from `<START_DIR>`. If they differ and the DB path is project-relative (not an absolute path like `~/.gza/gza.db`), hardlink the real file in before doing anything else:
+
+```bash
+ln <START_DIR>/.gza/gza.db .gza-worktrees/<impl_branch>/.gza/gza.db
+```
+
+If the db paths already match (common when the project uses a global/absolute `db_path`), skip this — there is nothing to link.
 
 ### Step 4: Verify each blocker against the current code before editing
 
