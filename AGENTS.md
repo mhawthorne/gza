@@ -40,7 +40,7 @@ See `docs/` for detailed documentation:
 
 **Behavior changes are spec-governed.** Before changing lifecycle/recovery/watch/merge behavior, check `specs/behavior/` — it's the contract; a code/spec mismatch is a bug or spec gap, so land any needed spec edits with the code and keep `gza-behavior-check` green.
 
-**Run /gza-test-and-fix before completing any task.** This runs mypy and pytest, fixes failures, and commits. Do not mark a task done until it passes.
+**Run /gza-test-and-fix before completing any task, unless verify is already green for the current commit.** Run `uv run gza verify <task_id> --dry-run` first — if it reports the current epoch as already passed, skip re-running. Otherwise run /gza-test-and-fix, which runs mypy and pytest, fixes failures, and commits. Do not mark a task done until verify is passing for the current commit.
 
 **Test retry circuit breaker**: If the same test fails 3 times with the same error, stop and report instead of retrying.
 ## Pytest hangs
