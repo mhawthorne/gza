@@ -51,6 +51,7 @@ from ..config import DEFAULT_WATCH_MAIN_VERIFY_REMEDIATION_MAX_ATTEMPTS, Config,
 from ..console import console, prompt_available_width, shorten_prompt
 from ..db import (
     MERGE_SOURCE_WATCH,
+    MERGE_UNIT_ACTIONABLE_STATES,
     DuplicateActiveChildError,
     ExecutionProjectActivationError,
     ExecutionProjectDisabled,
@@ -6638,6 +6639,123 @@ def _format_cycle_accounting_message(accounting: _CycleTaskAccounting) -> str:
     )
 
 
+@dataclass(frozen=True)
+class _CycleUnitAccounting:
+    """Disjoint per-cycle classification of every in-scope, unresolved unit of work.
+
+    A "unit" is a merge unit for implement-rooted lineages (review/improve/
+    fix/rebase/verify_fix members are folded into their unit, not counted
+    separately) or, for plan-rooted lineages that never produce a merge unit,
+    the plan/plan_review/plan_improve/explore chain itself. Each unit lands in
+    exactly one bucket, driven by its single current "live" task:
+
+    - running: the live task is in_progress.
+    - pending: the live task is pending and not blocked.
+    - blocked: the live task is pending and blocked on a dependency.
+    - recovery: the live task failed and the recovery engine will retry it
+      automatically (resume/retry/reconcile).
+    - parked: the live task failed and the recovery engine will not touch it
+      again without a human (or a future auto-rearm policy).
+    - other: residual bucket. Should stay at zero; nonzero means a unit's live
+      task landed in a state this classification did not anticipate.
+
+    Units resolved by a route other than their own live task (e.g. the work
+    landed under a different, already-merged unit) are excluded entirely,
+    mirroring ``should_hide_failed_recovery_decision`` at the task level.
+    """
+
+    running: int
+    pending: int
+    blocked: int
+    parked: int
+    recovery: int
+    other: int
+
+    @property
+    def total(self) -> int:
+        return self.running + self.pending + self.blocked + self.parked + self.recovery + self.other
+
+
+def _bucket_unit_live_task(
+    task: DbTask,
+    *,
+    store: SqliteTaskStore,
+    analysis: "_WatchCycleAnalysis",
+    max_recovery_attempts: int,
+) -> str | None:
+    """Classify one unit's live task into a _CycleUnitAccounting bucket, or None to exclude it."""
+    if task.status == "in_progress":
+        return "running"
+    if task.status == "pending":
+        return "blocked" if store.is_task_blocked(task)[0] else "pending"
+    if task.status == "failed":
+        decision = decide_failed_task_recovery(
+            store,
+            task,
+            max_recovery_attempts=max_recovery_attempts,
+            read_context=analysis.watch_read_context,
+        )
+        if should_hide_failed_recovery_decision(decision):
+            return None
+        if decision.action in {"resume", "retry", "reconcile"}:
+            return "recovery"
+        return "parked"
+    return "other"
+
+
+def _compute_cycle_unit_accounting(
+    *,
+    store: SqliteTaskStore,
+    analysis: "_WatchCycleAnalysis",
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    max_recovery_attempts: int,
+) -> _CycleUnitAccounting:
+    counts = {"running": 0, "pending": 0, "blocked": 0, "parked": 0, "recovery": 0, "other": 0}
+
+    for unit in store.list_active_merge_units_for_recovery_scope(
+        states=tuple(sorted(MERGE_UNIT_ACTIONABLE_STATES)),
+        tags=tags,
+        any_tag=any_tag,
+    ):
+        live_task = store.resolve_merge_unit_representative_task(
+            unit, require_actionable=True
+        ) or store.resolve_merge_unit_representative_task(unit, require_actionable=False)
+        if live_task is None:
+            counts["other"] += 1
+            continue
+        bucket = _bucket_unit_live_task(
+            live_task, store=store, analysis=analysis, max_recovery_attempts=max_recovery_attempts
+        )
+        if bucket is not None:
+            counts[bucket] += 1
+
+    for task in store.get_all():
+        if task.task_type not in {"plan", "plan_review", "plan_improve", "explore"}:
+            continue
+        if task.status in {"completed", "dropped"}:
+            continue
+        if not task_matches_tag_filters(task_tags=task.tags, tag_filters=tags, any_tag=any_tag):
+            continue
+        if task.id is not None and store.resolve_merge_unit_for_task(task.id) is not None:
+            continue  # already counted via its merge unit above
+        bucket = _bucket_unit_live_task(
+            task, store=store, analysis=analysis, max_recovery_attempts=max_recovery_attempts
+        )
+        if bucket is not None:
+            counts[bucket] += 1
+
+    return _CycleUnitAccounting(**counts)
+
+
+def _format_cycle_unit_accounting_message(accounting: _CycleUnitAccounting) -> str:
+    return (
+        f"unit accounting: running={accounting.running} pending={accounting.pending} "
+        f"blocked={accounting.blocked} parked={accounting.parked} "
+        f"recovery={accounting.recovery} other={accounting.other}"
+    )
+
+
 def _pending_runnable_tasks(
     store: SqliteTaskStore,
     *,
@@ -7903,6 +8021,7 @@ class _WatchCyclePlan:
     analysis: "_WatchCycleAnalysis"
     starting_worker_count: int = 0
     task_accounting: "_CycleTaskAccounting | None" = None
+    unit_accounting: "_CycleUnitAccounting | None" = None
 
 
 @dataclass(frozen=True)
@@ -15647,6 +15766,17 @@ def _build_watch_cycle_plan(
             max_recovery_attempts=max_recovery_attempts,
         )
     )
+    unit_accounting = (
+        None
+        if scoped_owner_ids is not None
+        else _compute_cycle_unit_accounting(
+            store=store,
+            analysis=analysis,
+            tags=tags,
+            any_tag=any_tag,
+            max_recovery_attempts=max_recovery_attempts,
+        )
+    )
     return _WatchCyclePlan(
         running_task_ids=running_task_ids,
         anonymous_worker_count=anonymous_worker_count,
@@ -15658,6 +15788,7 @@ def _build_watch_cycle_plan(
         slots=slots,
         analysis=analysis,
         task_accounting=task_accounting,
+        unit_accounting=unit_accounting,
     )
 
 
@@ -15984,6 +16115,8 @@ def _run_cycle(
             )
             if plan.task_accounting is not None:
                 log.emit("INFO", _format_cycle_accounting_message(plan.task_accounting))
+            if plan.unit_accounting is not None:
+                log.emit("INFO", _format_cycle_unit_accounting_message(plan.unit_accounting))
             scope_message = _format_scope_message(tags, any_tag=any_tag, scoped_owner_ids=effective_scoped_owner_ids)
             if scope_message is not None:
                 log.emit("INFO", scope_message)
