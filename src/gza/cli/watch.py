@@ -107,6 +107,7 @@ from ..main_integration_verify import (
     main_integration_verify_attention_reason,
     persist_main_integration_verify_alert_message,
     persist_main_integration_verify_pending_retire_signatures,
+    persist_main_integration_verify_remediation_passed,
     promote_candidate_integration_verify_evidence,
     verify_gate_enabled,
 )
@@ -147,6 +148,11 @@ from ..recovery_transients import (
     compute_transient_recovery_backoff_seconds,
 )
 from ..review_tasks import CappedReviewBlockerMaterializationError, FollowupMaterializationError
+from ..review_verify_state import (
+    VERIFY_GATE_ARTIFACT_KIND,
+    VERIFY_GATE_ARTIFACT_SCHEMA_VERSION,
+    normalized_verify_command,
+)
 from ..runner import (
     LongPhaseHeartbeat,
     LongPhaseProgress,
@@ -407,6 +413,7 @@ class _MainVerifyRemediationIdentity:
 class _MainVerifyRemediationEnsureResult:
     task: DbTask | None
     outcome: Literal["created", "reused", "reused_live", "merge_ready", "exhausted", "not_consumed"]
+    refreshed_state: MainIntegrationVerifyState | None = None
     dispatch_state_changed: bool = False
 
 
@@ -718,6 +725,14 @@ def _main_verify_remediation_task_is_reusable(
     return False
 
 
+def _main_verify_remediation_task_is_moot_retirement_candidate(task: DbTask) -> bool:
+    if task.task_type != "implement":
+        return False
+    if task.trigger_source != MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE:
+        return False
+    return task.status in {"pending", "completed", "unmerged", "failed", "dropped"}
+
+
 def _main_verify_remediation_task_matches_identity(
     task: DbTask,
     identity: _MainVerifyRemediationIdentity,
@@ -769,6 +784,83 @@ def _main_verify_remediation_effective_merge_state(store: SqliteTaskStore, task:
 
 def _main_verify_remediation_task_is_effectively_merged(store: SqliteTaskStore, task: DbTask) -> bool:
     return _main_verify_remediation_effective_merge_state(store, task) in {"merged", "empty", "redundant"}
+
+
+@dataclass(frozen=True)
+class _MainVerifyRemediationGreenProof:
+    metadata: Mapping[str, Any]
+    captured_at: datetime
+
+
+def _parse_verify_artifact_captured_at(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _main_verify_remediation_same_tree_green_verify_proof(
+    *,
+    store: SqliteTaskStore,
+    task: DbTask,
+    state: MainIntegrationVerifyState,
+) -> _MainVerifyRemediationGreenProof | None:
+    if task.id is None:
+        return None
+    if task.status not in {"completed", "unmerged", "failed", "dropped"}:
+        return None
+    if task.review_verify_status != "passed" or task.review_verify_exit_status != "0":
+        return None
+    if normalized_verify_command(task.review_verify_command) != normalized_verify_command(state.verify_command):
+        return None
+    if not state.tree_fingerprint:
+        return None
+    for artifact in store.list_artifacts(task.id, kind=VERIFY_GATE_ARTIFACT_KIND):
+        metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
+        if metadata is None or metadata.get("schema_version") != VERIFY_GATE_ARTIFACT_SCHEMA_VERSION:
+            continue
+        if "reconciliation" in metadata:
+            continue
+        if metadata.get("source_task_id") != task.id:
+            continue
+        result = metadata.get("result")
+        if not isinstance(result, dict):
+            continue
+        if result.get("status") != "passed" or result.get("exit_status") != "0":
+            continue
+        if normalized_verify_command(result.get("command") if isinstance(result.get("command"), str) else None) != (
+            normalized_verify_command(state.verify_command)
+        ):
+            continue
+        epoch = metadata.get("verify_epoch")
+        if not isinstance(epoch, dict) or normalized_verify_command(
+            epoch.get("verify_command") if isinstance(epoch.get("verify_command"), str) else None
+        ) != normalized_verify_command(state.verify_command):
+            continue
+        aggregate_details = metadata.get("aggregate_details")
+        if (
+            not isinstance(aggregate_details, dict)
+            or aggregate_details.get("tree_fingerprint_complete") is not True
+            or aggregate_details.get("tree_fingerprint") != state.tree_fingerprint
+            or metadata.get("tree_fingerprint") != state.tree_fingerprint
+        ):
+            continue
+        result_head = result.get("reviewed_head_sha") if isinstance(result.get("reviewed_head_sha"), str) else None
+        result_branch = result.get("reviewed_branch") if isinstance(result.get("reviewed_branch"), str) else None
+        if not result_head or result_head != task.review_verify_head_sha:
+            continue
+        if result_branch != task.review_verify_branch:
+            continue
+        captured_at = _parse_verify_artifact_captured_at(result.get("captured_at"))
+        if captured_at is None or task.review_verify_captured_at is None or captured_at != task.review_verify_captured_at:
+            continue
+        artifact_head = artifact.head_sha if isinstance(artifact.head_sha, str) else None
+        if artifact_head is not None and artifact_head != result_head:
+            continue
+        return _MainVerifyRemediationGreenProof(metadata=metadata, captured_at=captured_at)
+    return None
 
 
 def _legacy_main_verify_remediation_rank(
@@ -899,20 +991,28 @@ def _retire_moot_main_verify_remediation_tasks(
 ) -> tuple[str, ...]:
     retired: list[str] = []
     for task in store.get_all():
-        if not _main_verify_remediation_task_is_reusable(store, task):
-            continue
-        if task.status == "in_progress":
+        if not _main_verify_remediation_task_is_moot_retirement_candidate(task):
             continue
         identity = _main_verify_remediation_identity_from_prompt(task.prompt)
         if identity is None or identity.signature != signature:
             continue
-        if _drop_main_verify_remediation_task(
-            store=store,
-            task_id=task.id,
-            reason=reason,
-        ):
-            assert task.id is not None
-            retired.append(task.id)
+        if task.id is None:
+            continue
+        fresh = store.get(task.id)
+        if fresh is None or not _main_verify_remediation_task_is_moot_retirement_candidate(fresh):
+            continue
+        fresh.status = "dropped"
+        fresh.started_at = None
+        fresh.running_pid = None
+        fresh.completed_at = datetime.now(UTC)
+        fresh.failure_reason = None
+        fresh.completion_reason = None
+        fresh.drop_reason = reason
+        fresh.urgent = False
+        fresh.queue_position = None
+        store.update(fresh)
+        store.drop_active_merge_units_owned_by(task.id)
+        retired.append(task.id)
     return tuple(retired)
 
 
@@ -1567,6 +1667,49 @@ def _ensure_main_verify_remediation_task(
         clear_invalid=False,
     )
     active_task_id = active_owner.id if active_owner is not None else None
+    check_state = cast(MainIntegrationVerifyState, state)
+    if active_owner is not None:
+        green_proof = _main_verify_remediation_same_tree_green_verify_proof(
+            store=store,
+            task=active_owner,
+            state=check_state,
+        )
+        if green_proof is not None:
+            refreshed_state = persist_main_integration_verify_remediation_passed(
+                store,
+                state=check_state,
+                remediation_task=active_owner,
+                proof_metadata=dict(green_proof.metadata),
+            )
+            store.clear_main_verify_remediation_active_task(
+                signature=identity.signature,
+                tree_fingerprint=ledger_fingerprint,
+                last_observed_head_sha=refreshed_state.head_sha,
+                last_observed_failure=None,
+            )
+            retirement = _retire_moot_main_verify_remediations(
+                store=store,
+                signature=identity.signature,
+                reason=MAIN_VERIFY_REMEDIATION_MOOT_GREEN_REASON,
+            )
+            green_phase = remediation.failing_phase or remediation.signature
+            log.emit(
+                "REMEDY",
+                f"{active_owner.id}: remediation verify passed for {green_phase} on "
+                f"{identity.tree_fingerprint or 'unavailable'}; cleared main verify red state",
+            )
+            if retirement.retired_ids:
+                log.emit(
+                    "REMEDY",
+                    f"retired moot main-verify remediation rows for {identity.signature}: "
+                    f"{', '.join(retirement.retired_ids)}",
+                )
+            return _MainVerifyRemediationEnsureResult(
+                task=None,
+                outcome="not_consumed",
+                refreshed_state=refreshed_state,
+                dispatch_state_changed=True,
+            )
     if (
         active_owner is not None
         and active_owner.status in {"completed", "unmerged", "dropped"}
@@ -1879,7 +2022,9 @@ def _transition_non_live_main_verify_remediations(
     transitioned: list[str] = []
     deferred_live: list[str] = []
     for task in store.get_all():
-        if not _main_verify_remediation_task_is_reusable(store, task):
+        if task.task_type != "implement":
+            continue
+        if task.trigger_source != MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE:
             continue
         identity = _main_verify_remediation_identity_from_prompt(task.prompt)
         if identity is None or identity.signature != signature or task.id is None:
@@ -1887,12 +2032,23 @@ def _transition_non_live_main_verify_remediations(
         if task.status == "in_progress":
             deferred_live.append(task.id)
             continue
-        if _drop_main_verify_remediation_task(
-            store=store,
-            task_id=task.id,
-            reason=reason,
-        ):
-            transitioned.append(task.id)
+        if not _main_verify_remediation_task_is_moot_retirement_candidate(task):
+            continue
+        fresh = store.get(task.id)
+        if fresh is None or not _main_verify_remediation_task_is_moot_retirement_candidate(fresh):
+            continue
+        fresh.status = "dropped"
+        fresh.started_at = None
+        fresh.running_pid = None
+        fresh.completed_at = datetime.now(UTC)
+        fresh.failure_reason = None
+        fresh.completion_reason = None
+        fresh.drop_reason = reason
+        fresh.urgent = False
+        fresh.queue_position = None
+        store.update(fresh)
+        store.drop_active_merge_units_owned_by(task.id)
+        transitioned.append(task.id)
     return _MainVerifyMootRetireResult(
         retired_ids=tuple(transitioned),
         deferred_live_ids=tuple(deferred_live),
@@ -1925,9 +2081,11 @@ def _apply_main_verify_green_cleanup(
     log: "_WatchLog",
     state: MainIntegrationVerifyState,
     resolved_signature: str | None,
+    use_signature_reason_for_resolved_signature: bool = False,
 ) -> bool:
+    pending_signatures = _collect_main_verify_pending_retirement_signatures(state)
     signatures_to_retire = {
-        *(_collect_main_verify_pending_retirement_signatures(state)),
+        *pending_signatures,
         *((resolved_signature,) if resolved_signature else ()),
     }
     remaining_pending_signatures: list[str] = []
@@ -1939,10 +2097,15 @@ def _apply_main_verify_green_cleanup(
             last_observed_head_sha=getattr(state, "head_sha", None),
             last_observed_failure=None,
         )
+        reason = (
+            f"main verify green for signature {signature}"
+            if signature in pending_signatures or (signature == resolved_signature and use_signature_reason_for_resolved_signature)
+            else MAIN_VERIFY_REMEDIATION_MOOT_GREEN_REASON
+        )
         retirement = _retire_moot_main_verify_remediations(
             store=store,
             signature=signature,
-            reason=f"main verify green for signature {signature}",
+            reason=reason,
         )
         if retirement.retired_ids:
             dispatch_state_changed = True
@@ -1959,7 +2122,7 @@ def _apply_main_verify_green_cleanup(
                 f"{', '.join(retirement.deferred_live_ids)}",
             )
     desired_pending_signatures = tuple(dict.fromkeys(remaining_pending_signatures))
-    if desired_pending_signatures != _collect_main_verify_pending_retirement_signatures(state):
+    if desired_pending_signatures != pending_signatures:
         persist_main_integration_verify_pending_retire_signatures(
             store,
             state=state,
@@ -1996,6 +2159,7 @@ def _maybe_file_main_verify_remediation(
             log=log,
             state=state,
             resolved_signature=resolved_signature,
+            use_signature_reason_for_resolved_signature=remediation is not None,
         )
     else:
         cleanup_changed = False
@@ -2030,6 +2194,7 @@ def _maybe_file_main_verify_remediation(
     if result.outcome == "not_consumed":
         return _return(
             _MainVerifyRemediationFileResult(
+                refreshed_state=result.refreshed_state,
                 dispatch_state_changed=cleanup_changed or result.dispatch_state_changed,
             )
         )
@@ -16631,7 +16796,7 @@ def _run_cycle(
             main_verify_state = main_verify_file_result.refreshed_state or getattr(main_verify, "state", None)
             latest_main_verify_state = main_verify_state
             latest_main_verify_git = git
-            if main_verify.merges_halted and main_verify_state is not None:
+            if main_verify_state is not None and main_verify_state_halts_merges(main_verify_state):
                 merge_halted_for_cycle = True
                 _emit_main_verify_attention(
                     log=log,
@@ -16642,7 +16807,9 @@ def _run_cycle(
                 )
                 remediation = getattr(main_verify, "remediation", None)
                 _set_active_main_verify_remediation(remediation)
-            elif getattr(main_verify, "needs_attention", False) and main_verify_state is not None:
+            elif main_verify_state is not None and main_verify_state_needs_non_red_attention(main_verify_state):
+                merge_halted_for_cycle = False
+                _set_active_main_verify_remediation(None)
                 _emit_main_verify_attention(
                     log=log,
                     state=main_verify_state,
@@ -16651,6 +16818,8 @@ def _run_cycle(
                     target_branch=target_branch,
                 )
             else:
+                merge_halted_for_cycle = False
+                _set_active_main_verify_remediation(None)
                 _clear_main_verify_attention(log=log, state=main_verify_state)
 
     active_main_verify_terminal_attempt_consumed = False
@@ -17208,7 +17377,7 @@ def _run_cycle(
                         )
                         latest_main_verify_state = main_verify_state
                         latest_main_verify_git = git
-                        if main_verify.merges_halted and main_verify_state is not None:
+                        if main_verify_state is not None and main_verify_state_halts_merges(main_verify_state):
                             merge_halted_for_cycle = True
                             _emit_main_verify_attention(
                                 log=log,
@@ -17222,7 +17391,9 @@ def _run_cycle(
                         else:
                             merge_halted_for_cycle = False
                             _set_active_main_verify_remediation(None)
-                            if getattr(main_verify, "needs_attention", False) and main_verify_state is not None:
+                            if main_verify_state is not None and main_verify_state_needs_non_red_attention(
+                                main_verify_state
+                            ):
                                 _emit_main_verify_attention(
                                     log=log,
                                     state=main_verify_state,

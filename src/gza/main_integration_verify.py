@@ -1069,26 +1069,27 @@ def _persist_main_integration_verify_payload(
     red_since: datetime | None,
     captured_at: datetime,
     schema_compatibility: SchemaCompatibilityDiagnostic | None = None,
+    reconciliation: dict[str, Any] | None = None,
 ) -> None:
-    task.output_content = json.dumps(
-        {
-            "gate_enabled": gate_enabled,
-            "verify_command": verify_command,
-            "verify_timeout_seconds": verify_timeout_seconds,
-            "verify_timeout_grace_seconds": verify_timeout_grace_seconds,
-            "environment_identity": environment_identity.to_payload() if environment_identity is not None else None,
-            "tree_fingerprint": tree_fingerprint,
-            "head_sha": head_sha,
-            "failure_signature": failure_signature,
-            "failing_phase": failing_phase,
-            "alert_message": alert_message,
-            "pending_retirement_signatures": list(pending_retirement_signatures),
-            "red_since": red_since.isoformat() if red_since is not None else None,
-            "captured_at": captured_at.isoformat(),
-            "schema_compatibility": schema_compatibility.to_payload() if schema_compatibility is not None else None,
-        },
-        sort_keys=True,
-    )
+    payload: dict[str, Any] = {
+        "gate_enabled": gate_enabled,
+        "verify_command": verify_command,
+        "verify_timeout_seconds": verify_timeout_seconds,
+        "verify_timeout_grace_seconds": verify_timeout_grace_seconds,
+        "environment_identity": environment_identity.to_payload() if environment_identity is not None else None,
+        "tree_fingerprint": tree_fingerprint,
+        "head_sha": head_sha,
+        "failure_signature": failure_signature,
+        "failing_phase": failing_phase,
+        "alert_message": alert_message,
+        "pending_retirement_signatures": list(pending_retirement_signatures),
+        "red_since": red_since.isoformat() if red_since is not None else None,
+        "captured_at": captured_at.isoformat(),
+        "schema_compatibility": schema_compatibility.to_payload() if schema_compatibility is not None else None,
+    }
+    if reconciliation is not None:
+        payload["reconciliation"] = reconciliation
+    task.output_content = json.dumps(payload, sort_keys=True)
     task.status = "completed"
     task.completed_at = captured_at
     task.has_commits = False
@@ -1202,6 +1203,65 @@ def persist_main_integration_verify_pending_retire_signatures(
         pending_retirement_signatures=pending_retirement_signatures,
         red_since=getattr(state, "red_since", None),
         captured_at=captured_at,
+    )
+    refreshed = load_main_integration_verify_state(store)
+    assert refreshed is not None
+    return refreshed
+
+
+def persist_main_integration_verify_remediation_passed(
+    store: SqliteTaskStore,
+    *,
+    state: MainIntegrationVerifyState,
+    remediation_task: Task,
+    proof_metadata: dict[str, Any] | None = None,
+) -> MainIntegrationVerifyState:
+    """Persist a same-tree remediation verify pass as the canonical main checkpoint."""
+    captured_at = remediation_task.review_verify_captured_at or datetime.now(UTC)
+    state.task.review_verify_command = remediation_task.review_verify_command or state.verify_command
+    state.task.review_verify_status = "passed"
+    state.task.review_verify_exit_status = remediation_task.review_verify_exit_status or "0"
+    state.task.review_verify_failure = None
+    state.task.review_verify_head_sha = remediation_task.review_verify_head_sha
+    state.task.review_verify_branch = remediation_task.review_verify_branch
+    state.task.review_verify_captured_at = captured_at
+    state.task.review_verify_artifact_file = remediation_task.review_verify_artifact_file
+
+    reconciliation: dict[str, Any] = {
+        "kind": "main_verify_remediation_same_tree_no_repro",
+        "target_head_sha": state.head_sha,
+        "target_tree_fingerprint": state.tree_fingerprint,
+        "remediation_task_id": remediation_task.id,
+        "remediation_review_verify_head_sha": remediation_task.review_verify_head_sha,
+        "remediation_review_verify_branch": remediation_task.review_verify_branch,
+        "remediation_review_verify_artifact_file": remediation_task.review_verify_artifact_file,
+    }
+    if proof_metadata is not None:
+        reconciliation["proof_source_task_id"] = proof_metadata.get("source_task_id")
+        reconciliation["proof_tree_fingerprint"] = proof_metadata.get("tree_fingerprint")
+        proof_result = proof_metadata.get("result")
+        if isinstance(proof_result, dict):
+            reconciliation["proof_reviewed_head_sha"] = proof_result.get("reviewed_head_sha")
+            reconciliation["proof_reviewed_branch"] = proof_result.get("reviewed_branch")
+            reconciliation["proof_captured_at"] = proof_result.get("captured_at")
+
+    _persist_main_integration_verify_payload(
+        store,
+        state.task,
+        gate_enabled=state.gate_enabled,
+        verify_command=state.verify_command,
+        verify_timeout_seconds=state.verify_timeout_seconds,
+        verify_timeout_grace_seconds=state.verify_timeout_grace_seconds,
+        environment_identity=state.environment_identity,
+        tree_fingerprint=state.tree_fingerprint,
+        head_sha=state.head_sha,
+        failure_signature=None,
+        failing_phase=None,
+        alert_message=None,
+        pending_retirement_signatures=_pending_retirement_signatures_from_state(state),
+        red_since=None,
+        captured_at=captured_at,
+        reconciliation=reconciliation,
     )
     refreshed = load_main_integration_verify_state(store)
     assert refreshed is not None

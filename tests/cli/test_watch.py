@@ -244,7 +244,11 @@ from gza.review_tasks import (
     format_followup_finding_context,
 )
 from gza.review_verdict import ParsedReviewReport, ReviewFinding, parse_review_report
-from gza.review_verify_state import VERIFY_GATE_ARTIFACT_KIND, persist_verify_gate_artifact
+from gza.review_verify_state import (
+    VERIFY_GATE_ARTIFACT_KIND,
+    VERIFY_GATE_ARTIFACT_SCHEMA_VERSION,
+    persist_verify_gate_artifact,
+)
 from gza.runner import LongPhaseProgress, _make_review_verify_result, _read_darwin_process_tree_cpu_seconds
 from gza.runtime_context import RuntimeExecutionContext
 from gza.sync_ops import BranchSyncResult
@@ -635,6 +639,112 @@ def _main_verify_red_check(
             alert_message=f"main verify RED at `{head_sha}` - merges halted; phase `{phase}` failing",
         ),
     )
+
+
+def _add_main_verify_remediation_with_green_artifact(
+    store: SqliteTaskStore,
+    config: Config,
+    *,
+    source_task: DbTask | None = None,
+    task_status: str = "completed",
+    merge_unit_state: str | None = None,
+    command: str = "./bin/tests",
+    tree_fingerprint: str = "fp-functional-a",
+    reviewed_branch: str = "feature/main-verify-no-repro",
+    reviewed_head_sha: str = "remediation-head",
+    captured_at: datetime = datetime(2026, 7, 5, 0, 4, tzinfo=UTC),
+    active: bool = True,
+    recredited: bool = False,
+) -> DbTask:
+    remediation_task = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                f"Tree fingerprint: {tree_fingerprint}",
+                "Observed main HEAD: feedfacecafe",
+                "Remediation attempts spent: 0/2",
+            ]
+        ),
+        task_type="implement",
+        trigger_source="watch-main-integration-verify-remediation",
+        urgent=True,
+    )
+    assert remediation_task.id is not None
+    remediation_task.status = task_status
+    remediation_task.completed_at = captured_at + timedelta(minutes=1)
+    remediation_task.review_verify_command = command
+    remediation_task.review_verify_status = "passed"
+    remediation_task.review_verify_exit_status = "0"
+    remediation_task.review_verify_head_sha = reviewed_head_sha
+    remediation_task.review_verify_branch = reviewed_branch
+    remediation_task.branch = reviewed_branch
+    remediation_task.review_verify_captured_at = captured_at
+    store.update(remediation_task)
+    if merge_unit_state is not None:
+        store.set_merge_status(remediation_task.id, "unmerged")
+        merge_unit = store.resolve_merge_unit_for_task(remediation_task.id)
+        assert merge_unit is not None
+        store.set_merge_unit_state(merge_unit.id, merge_unit_state)
+    if active:
+        store.record_main_verify_remediation_active_task(
+            signature="phase:functional",
+            tree_fingerprint=None,
+            task_id=remediation_task.id,
+            last_observed_head_sha="feedfacecafe",
+            last_observed_failure="verify_command failed twice",
+        )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=remediation_task,
+        source_task=source_task or remediation_task,
+        result=_make_review_verify_result(
+            command,
+            status="passed",
+            exit_status="0",
+            captured_at=captured_at,
+            reviewed_branch=reviewed_branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_tree_sha="remediation-tree",
+            working_directory=str(config.project_dir),
+            output="all good",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+        aggregate_details={"tree_fingerprint": tree_fingerprint, "tree_fingerprint_complete": True},
+    )
+    if recredited:
+        artifact = store.list_artifacts(remediation_task.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        metadata = dict(artifact.metadata)
+        metadata["reconciliation"] = {
+            "producer": "test",
+            "credited_owner_task_id": remediation_task.id,
+            "evidence_holder_task_id": (source_task or remediation_task).id,
+        }
+        store.add_artifact(
+            remediation_task.id,
+            kind=VERIFY_GATE_ARTIFACT_KIND,
+            label="Verify gate result",
+            path=artifact.path,
+            content_type="application/json",
+            byte_size=artifact.byte_size,
+            sha256=artifact.sha256,
+            created_at=captured_at + timedelta(seconds=1),
+            producer="test",
+            command=command,
+            status="passed",
+            exit_status="0",
+            head_sha=reviewed_head_sha,
+            metadata=metadata,
+            artifact_id=artifact.id,
+        )
+    return remediation_task
 
 
 def _main_verify_green_check(main_verify_task: DbTask, *, head_sha: str = "feedfacecafe") -> SimpleNamespace:
@@ -32793,6 +32903,73 @@ def test_watch_cycle_red_main_after_merge_halts_later_merges_and_emits_single_at
     assert f"SKIP      {skipped_task_id}: merges halted while local main verify is red" in log_text
 
 
+def test_watch_cycle_same_tree_remediation_green_unfreezes_current_merge_cycle(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    main_verify_task = _make_main_verify_internal_task(store, head_sha="feedfacecafe")
+    remediation_task = _add_main_verify_remediation_with_green_artifact(
+        store,
+        config,
+        merge_unit_state="empty",
+    )
+    merge_task = _make_completed_watch_merge_task(store, "Merge-ready task", branch="feature/watch-unfreeze")
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.current_branch = MagicMock(return_value="main")  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main", "main"} else None
+    )  # type: ignore[method-assign]
+    merge_calls: list[str] = []
+
+    def fake_execute_merge_action(*args, **_kwargs):
+        task = args[3]
+        merge_calls.append(task.id)
+        store.set_merge_status(task.id, "merged")
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            side_effect=[
+                _main_verify_red_check(main_verify_task, tree_fingerprint="fp-functional-a", head_sha="feedfacecafe"),
+                _main_verify_green_check(main_verify_task, head_sha="feedfacecafe"),
+            ],
+        ),
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert merge_calls == [merge_task.id]
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.consumed_attempt_count == 0
+    assert attempt_state.active_task_id is None
+    assert (store.get(remediation_task.id) or SimpleNamespace()).status == "dropped"
+    log_text = log_path.read_text()
+    assert "merges halted while local main verify is red" not in log_text
+    assert "cleared main verify red state" in log_text
+    assert "MERGE" in log_text
+
+
 def test_watch_cycle_green_main_after_merge_keeps_later_merges(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -41375,6 +41552,299 @@ def test_watch_stale_green_main_verify_rerun_retries_pending_retirement_after_li
     assert persisted_state.tree_fingerprint == "fp-current"
     assert persisted_state.pending_retirement_signatures == ()
     assert "retired moot remediation rows for phase:functional" in log_path.read_text()
+
+
+def test_main_verify_red_clears_when_remediation_verify_passes_same_command_and_tree(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store, head_sha="feedfacecafe")
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    remediation_task = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-functional-a",
+                "Observed main HEAD: feedfacecafe",
+                "Remediation attempts spent: 0/2",
+            ]
+        ),
+        task_type="implement",
+        trigger_source="watch-main-integration-verify-remediation",
+        urgent=True,
+    )
+    assert remediation_task.id is not None
+    remediation_task.status = "completed"
+    remediation_task.completed_at = datetime(2026, 7, 5, 0, 5, tzinfo=UTC)
+    remediation_task.review_verify_command = "./bin/tests"
+    remediation_task.review_verify_status = "passed"
+    remediation_task.review_verify_exit_status = "0"
+    remediation_task.review_verify_head_sha = "remediation-head"
+    remediation_task.review_verify_branch = "feature/main-verify-no-repro"
+    remediation_task.review_verify_captured_at = datetime(2026, 7, 5, 0, 4, tzinfo=UTC)
+    store.update(remediation_task)
+    store.record_main_verify_remediation_active_task(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        task_id=remediation_task.id,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure="verify_command failed twice",
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=remediation_task,
+        source_task=remediation_task,
+        result=_make_review_verify_result(
+            "./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 7, 5, 0, 4, tzinfo=UTC),
+            reviewed_branch="feature/main-verify-no-repro",
+            reviewed_head_sha="remediation-head",
+            working_directory=str(tmp_path),
+            output="all good",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+        aggregate_details={"tree_fingerprint": "fp-functional-a", "tree_fingerprint_complete": True},
+    )
+
+    check = _main_verify_red_check(
+        main_verify_task,
+        signature="phase:functional",
+        tree_fingerprint="fp-functional-a",
+        head_sha="feedfacecafe",
+    )
+
+    refreshed_state = _maybe_file_main_verify_remediation(
+        dry_run=False,
+        config=config,
+        store=store,
+        tags=("202606-recovery",),
+        any_tag=False,
+        log=log,
+        check=check,
+    )
+
+    assert refreshed_state is not None
+    assert refreshed_state.verify_status == "passed"
+    assert refreshed_state.verify_exit_status == "0"
+    assert refreshed_state.head_sha == "feedfacecafe"
+    assert refreshed_state.tree_fingerprint == "fp-functional-a"
+    assert refreshed_state.failure_signature is None
+    assert refreshed_state.alert_message is None
+    assert refreshed_state.red_since is None
+    dropped = store.get(remediation_task.id)
+    assert dropped is not None
+    assert dropped.status == "dropped"
+    assert dropped.drop_reason == MAIN_VERIFY_REMEDIATION_MOOT_GREEN_REASON
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.consumed_attempt_count == 0
+    assert attempt_state.active_task_id is None
+    assert attempt_state.last_consumed_task_id is None
+    assert "cleared main verify red state" in log_path.read_text()
+
+
+@pytest.mark.parametrize("merge_unit_state", ["empty", "redundant"])
+def test_active_main_verify_noop_remediation_green_retires_without_consuming_attempt(
+    tmp_path: Path,
+    merge_unit_state: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store, head_sha="feedfacecafe")
+    remediation_task = _add_main_verify_remediation_with_green_artifact(
+        store,
+        config,
+        merge_unit_state=merge_unit_state,
+    )
+    task_count_before = _task_count(store)
+    check = _main_verify_red_check(
+        main_verify_task,
+        signature="phase:functional",
+        tree_fingerprint="fp-functional-a",
+        head_sha="feedfacecafe",
+    )
+
+    refreshed_state = _maybe_file_main_verify_remediation(
+        dry_run=False,
+        config=config,
+        store=store,
+        tags=("202606-recovery",),
+        any_tag=False,
+        log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+        check=check,
+    )
+
+    assert refreshed_state is not None
+    assert refreshed_state.verify_status == "passed"
+    assert refreshed_state.verify_exit_status == "0"
+    assert refreshed_state.head_sha == "feedfacecafe"
+    assert refreshed_state.tree_fingerprint == "fp-functional-a"
+    retired = store.get(remediation_task.id)
+    assert retired is not None
+    assert retired.status == "dropped"
+    assert retired.drop_reason == MAIN_VERIFY_REMEDIATION_MOOT_GREEN_REASON
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.consumed_attempt_count == 0
+    assert attempt_state.active_task_id is None
+    assert _task_count(store) == task_count_before
+
+
+def test_main_verify_green_reconciliation_requires_active_owner_evidence(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store, head_sha="feedfacecafe")
+    non_active = _add_main_verify_remediation_with_green_artifact(store, config, active=False)
+    active_without_artifact = _add_main_verify_remediation_with_green_artifact(
+        store,
+        config,
+        reviewed_branch="feature/main-verify-active",
+        reviewed_head_sha="active-head",
+        active=True,
+    )
+    for artifact in store.list_artifacts(active_without_artifact.id, kind=VERIFY_GATE_ARTIFACT_KIND):
+        store.add_artifact(
+            active_without_artifact.id,
+            kind=artifact.kind,
+            label=artifact.label,
+            path=artifact.path,
+            content_type=artifact.content_type,
+            byte_size=artifact.byte_size,
+            sha256=artifact.sha256,
+            created_at=artifact.created_at,
+            producer=artifact.producer,
+            command=artifact.command,
+            status=artifact.status,
+            exit_status=artifact.exit_status,
+            head_sha=artifact.head_sha,
+            metadata={**artifact.metadata, "source_task_id": non_active.id},
+            artifact_id=artifact.id,
+        )
+
+    refreshed_state = _maybe_file_main_verify_remediation(
+        dry_run=False,
+        config=config,
+        store=store,
+        tags=("202606-recovery",),
+        any_tag=False,
+        log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+        check=_main_verify_red_check(main_verify_task),
+    )
+
+    assert refreshed_state is None
+    persisted_state = load_main_integration_verify_state(store)
+    assert persisted_state is None or persisted_state.verify_status != "passed"
+    assert (store.get(active_without_artifact.id) or SimpleNamespace()).status == "completed"
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.active_task_id == active_without_artifact.id
+    assert attempt_state.consumed_attempt_count == 0
+
+
+@pytest.mark.parametrize("negative_case", ["recredited", "historical_mismatch"])
+def test_main_verify_green_reconciliation_rejects_noncanonical_artifact_proof(
+    tmp_path: Path,
+    negative_case: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store, head_sha="feedfacecafe")
+    remediation_task = _add_main_verify_remediation_with_green_artifact(
+        store,
+        config,
+        recredited=negative_case == "recredited",
+    )
+    if negative_case == "historical_mismatch":
+        remediation_task.review_verify_head_sha = "newer-head"
+        remediation_task.review_verify_branch = "feature/newer-run"
+        remediation_task.review_verify_captured_at = datetime(2026, 7, 5, 0, 9, tzinfo=UTC)
+        store.update(remediation_task)
+
+    refreshed_state = _maybe_file_main_verify_remediation(
+        dry_run=False,
+        config=config,
+        store=store,
+        tags=("202606-recovery",),
+        any_tag=False,
+        log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+        check=_main_verify_red_check(main_verify_task),
+    )
+
+    assert refreshed_state is None
+    persisted_state = load_main_integration_verify_state(store)
+    assert persisted_state is None or persisted_state.verify_status != "passed"
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.consumed_attempt_count == 0
+    assert attempt_state.active_task_id == remediation_task.id
+
+
+def test_main_verify_green_reconciliation_preserves_remediation_provenance_and_target_identity(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store, head_sha="feedfacecafe")
+    remediation_task = _add_main_verify_remediation_with_green_artifact(
+        store,
+        config,
+        reviewed_branch="feature/main-verify-no-repro",
+        reviewed_head_sha="remediation-head",
+    )
+
+    refreshed_state = _maybe_file_main_verify_remediation(
+        dry_run=False,
+        config=config,
+        store=store,
+        tags=("202606-recovery",),
+        any_tag=False,
+        log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+        check=_main_verify_red_check(main_verify_task, head_sha="feedfacecafe"),
+    )
+
+    assert refreshed_state is not None
+    persisted_task = store.get(main_verify_task.id)
+    assert persisted_task is not None
+    assert persisted_task.review_verify_branch == "feature/main-verify-no-repro"
+    assert persisted_task.review_verify_head_sha == "remediation-head"
+    payload = json.loads(persisted_task.output_content or "{}")
+    assert payload["head_sha"] == "feedfacecafe"
+    assert payload["tree_fingerprint"] == "fp-functional-a"
+    assert payload["reconciliation"]["target_head_sha"] == "feedfacecafe"
+    assert payload["reconciliation"]["target_tree_fingerprint"] == "fp-functional-a"
+    assert payload["reconciliation"]["remediation_task_id"] == remediation_task.id
+    assert payload["reconciliation"]["proof_reviewed_head_sha"] == "remediation-head"
+    assert payload["reconciliation"]["proof_reviewed_branch"] == "feature/main-verify-no-repro"
 
 
 def test_watch_green_deflake_retires_stale_fix_row_and_files_one_runnable_deflake_row(

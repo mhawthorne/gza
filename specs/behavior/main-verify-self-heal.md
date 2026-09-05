@@ -205,6 +205,13 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   for the same identity MUST consume the merged remediation attempt. A post-merge rerun
   that is red for a different identity or lacks a trustworthy identity match MUST fail
   closed on reuse for the old task, but MUST NOT consume that old task's attempt budget.
+- If the local-target checkpoint is red for a failure signature but the active same-
+  signature remediation task has already completed its own verify run successfully for
+  the same normalized verify command and the same exact local-target tree fingerprint,
+  watch MUST treat the red/green disagreement as a non-reproduced main-verify failure:
+  persist main verify back to green for that tree, clear the active remediation state,
+  retire matching non-live remediation rows as moot, and MUST NOT consume another
+  remediation attempt or require a code change to land.
 - Reused or newly created remediation tasks for this gate MUST be bumped to the front of
   the runnable queue, because a red or flaky local-target verify is pipeline-critical
   system work.
