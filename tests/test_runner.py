@@ -3782,6 +3782,8 @@ class TestReviewContextFromChain:
                 f"gza-verify phase=passed name={phase} duration_seconds=1.0",
             )
         )
+        first_captured_at = datetime.now(UTC).replace(microsecond=0)
+        second_captured_at = first_captured_at + timedelta(hours=1)
 
         with patch(
             "gza.runner._run_review_verify_command",
@@ -3789,7 +3791,7 @@ class TestReviewContextFromChain:
                 command="./bin/tests",
                 status="passed",
                 exit_status="0",
-                captured_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+                captured_at=first_captured_at,
                 reviewed_branch="feature/cross-project",
                 reviewed_head_sha="deadbeef",
                 reviewed_base_sha="cafebabe",
@@ -3841,7 +3843,7 @@ class TestReviewContextFromChain:
         observation = latest_successful_full_verify_runtime_observation(
             child_store,
             task,
-            now=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
+            now=second_captured_at,
             max_age_hours=24,
         )
         assert observation is not None
@@ -3850,7 +3852,7 @@ class TestReviewContextFromChain:
         class _FixedDatetime(datetime):
             @classmethod
             def now(cls, tz=None):
-                return datetime(2026, 8, 28, 13, 0, tzinfo=UTC)
+                return second_captured_at
 
         with (
             patch("gza.runner.datetime", _FixedDatetime),
@@ -3860,7 +3862,7 @@ class TestReviewContextFromChain:
                     command="./bin/tests",
                     status="passed",
                     exit_status="0",
-                    captured_at=datetime(2026, 8, 28, 13, 0, tzinfo=UTC),
+                    captured_at=second_captured_at,
                     reviewed_branch="feature/cross-project",
                     reviewed_head_sha="deadbeef",
                     reviewed_base_sha="cafebabe",

@@ -610,14 +610,14 @@ Each watch cycle MUST execute these phases in order:
    pre-merge proof failures, and source refs that change after mandatory child
    materialization, MUST report that the target is unchanged and MUST NOT route through
    conflict/rebase handling.
-   With current default `on_max_cycles=park`, a `review-max-cycles-reached` action remains
-   a human-attention signal. With opt-in `on_max_cycles=merge_and_defer`, the shared
+   With default `on_max_cycles=merge_and_defer`, the shared
    lifecycle engine projects an eligible capped review as an annotated direct `merge`
    action. Watch MUST execute that action in this direct phase, render lifecycle summaries
    using merge-and-defer wording, create or reuse all mandatory deferred-blocker tasks
    before promotion, already-merged mutation, or merge-unit finalization, persist
    `max_cycles_deferred` merge provenance on success, and MUST NOT spawn an iterate
-   worker for that capped review. Missing or stale source verify evidence MUST run the
+   worker for that capped review. Under rollback `on_max_cycles=park`, a
+   `review-max-cycles-reached` action remains a human-attention signal. Missing or stale source verify evidence MUST run the
    normal pre-merge verify path before eligibility is reconsidered; red or unavailable
    source verify evidence, spec-coherence blockers, no-op/adjudication lanes,
    duplicate-blocker stops, and plan-review caps stay on their existing non-deferred

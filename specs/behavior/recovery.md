@@ -235,9 +235,9 @@ its stored action.
   cases, not content-rescue cases: they MUST recommend the parked-task rearm path (`uv run
   gza unstick <owner-id> --reason retry-limit`, optionally `--run`), not `uv run gza fix`.
   `gza fix` remains reserved for genuine content/review churn such as
-  `review-max-cycles-reached` under the current default `on_max_cycles=park` and for
+  `review-max-cycles-reached` under rollback `on_max_cycles=park` and for
   completed-implementation failed recovery whose terminal failure category is not
-  retryable. Under opt-in `on_max_cycles=merge_and_defer`, an eligible capped review is
+  retryable. Under default `on_max_cycles=merge_and_defer`, an eligible capped review is
   no longer a recovery handoff: it remains a direct annotated merge action only after the
   lifecycle engine proves fresh green current-head verify evidence plus deterministic
   persisted blocker payload. The merge executor then durably creates or reuses every

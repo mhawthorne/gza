@@ -13593,16 +13593,16 @@ def _attention_category(attention_key: str) -> str:
 def _emit_cycle_attention_summary(log: _WatchLog) -> None:
     """Log a per-cycle roundup of attention counts, grouped by category.
 
-    This is a repeating summary, not the place to act on individual tasks — use
-    ``gza incomplete --tag <tag>`` to list and copy the actual task IDs. Keeping
-    the roundup to counts (rather than one line per task, repeated every cycle)
-    keeps the log legible; the one-time ATTENTION line emitted when a task first
-    needs attention still carries the full per-task message.
+    The one-time ATTENTION line carries the detailed row for newly visible or
+    changed entries. Repeated unchanged entries stay compact so long-running
+    watch sessions do not replay the same task text every cycle.
     """
     items = log.visible_attention_items()
     if not items:
         return
-    if log._sticky_attention_this_cycle == log._sticky_attention_prev_cycle:  # noqa: SLF001 - watch-local sticky state
+    with log._lock:
+        unchanged = dict(items) == log._sticky_attention_prev_cycle
+    if unchanged:
         plural = "s" if len(items) != 1 else ""
         log.emit("INFO", f"{len(items)} task{plural} still need attention (unchanged)")
         return

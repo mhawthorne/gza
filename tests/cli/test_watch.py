@@ -15047,8 +15047,6 @@ def test_watch_cycle_manual_failed_recovery_emits_one_steady_attention_per_cycle
     assert text.count("1 task still need attention (unchanged)") == 1
     assert stdout.count("Needs attention (1 task):") == 1
     assert stdout.count("1 task still need attention (unchanged)") == 1
-    # The message now appears once (via the one-time ATTENTION line); the
-    # roundup is counts-only and no longer repeats it.
     assert text.count(f"{failed_leaf.id} implement") == 1
 
 
@@ -37097,8 +37095,6 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
     )
     assert log_text.count("ATTENTION") == 1
     assert log_text.count("Needs attention (1 task):") == 1
-    # The message now appears once (via the one-time ATTENTION line); the
-    # roundup is counts-only and no longer repeats it.
     assert log_text.count(expected_attention) == 1
     assert "red for" not in log_text
     assert expected_attention in log_text
@@ -37938,8 +37934,8 @@ def test_watch_cycle_emits_attention_for_main_verify_launch_issue_without_freezi
     log_text = log_path.read_text()
     assert sum(1 for line in log_text.splitlines() if " ATTENTION " in line) == 1
     assert log_text.count("Needs attention (1 task):") == 1
-    # The roundup is counts-only now; the message itself lives on the one-time
-    # ATTENTION line, captured in the log's current attention state.
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert len(messages) == 1
     assert messages[0].count("could not launch `ruff`") == 1
@@ -38114,7 +38110,6 @@ def test_watch_cycle_clears_main_verify_launch_issue_after_green_check(
     log_text = log_path.read_text()
     assert sum(1 for line in log_text.splitlines() if " ATTENTION " in line) == 1
     assert log_text.count("Needs attention (1 task):") == 1
-    assert "still need attention (unchanged)" not in log_text
     second_cycle_text = log_text.split("\n\n", maxsplit=1)[1]
     assert "Needs attention" not in second_cycle_text
     assert "could not launch `ruff`" not in second_cycle_text
@@ -38327,8 +38322,8 @@ def test_watch_cycle_replaces_buffered_main_verify_red_with_exhausted_after_reme
 
     assert merge_calls == [remediation_task.id]
     assert "INFO      Needs attention (1 task):" in log_path.read_text()
-    # The roundup is counts-only now; the currently-active message lives on
-    # the log's current attention state (the one-time ATTENTION line).
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert any(
         "main verify remediation exhausted for phase:functional after 2/2 attempts" in message
@@ -45470,7 +45465,8 @@ def test_watch_cycle_does_not_rerun_verify_only_noop_recovery_after_parked_atten
     assert execute_action.call_count == 1
     text = log_path.read_text()
     assert text.count("ATTENTION") == 1
-    assert "1 task still need attention (unchanged)" in text
+    assert text.count("Needs attention (1 task):") == 1
+    assert text.count("1 task still need attention (unchanged)") == 2
 
 
 def test_watch_cycle_logs_attention_for_rebase_did_not_unblock_merge_without_spawning_rebase(
@@ -56892,8 +56888,6 @@ def test_watch_cycle_surfaces_guarded_pending_skip_as_attention_then_roundup_onl
     assert text.count("Needs attention (1 task):") == 1
     assert text.count("1 task still need attention (unchanged)") == 1
     assert "Summary:" not in text
-    # The message now appears once (via the one-time ATTENTION line); the
-    # roundup is counts-only and no longer repeats it.
     assert (
         text.count(
             f'{pending_review.id} review "Pending review" reason=guarded-pending-skip '
@@ -58072,9 +58066,12 @@ def test_watch_log_suppresses_unchanged_attention_inline_across_cycles_but_keeps
         side_effect=[
             "18:08:47",
             "18:08:48",
+            "18:08:49",
             "18:13:47",
+            "18:13:48",
             "18:18:47",
             "18:18:48",
+            "18:18:49",
         ],
     ):
         log.begin_cycle()
@@ -58096,11 +58093,9 @@ def test_watch_log_suppresses_unchanged_attention_inline_across_cycles_but_keeps
     attention_lines = [line for line in text.splitlines() if " ATTENTION " in line]
     assert len(attention_lines) == 2
     assert attention_lines[0].startswith("18:08:47 ATTENTION")
-    assert attention_lines[1].startswith("18:18:47 ATTENTION")
+    assert attention_lines[1].startswith("18:13:47 ATTENTION")
     assert text.count("INFO      Needs attention (1 task): task-1=1") == 2
     assert text.count("INFO      1 task still need attention (unchanged)") == 1
-    # The roundup is counts-only now; each distinct message still appears once,
-    # via its one-time (unindented) ATTENTION line.
     assert text.count("gza-1 review needs manual attention") == 1
     assert text.count("gza-1 review still needs manual attention") == 1
 
@@ -58193,8 +58188,8 @@ def test_main_verify_attention_summary_replaces_matching_emission_when_render_he
     )
     _emit_cycle_attention_summary(log)
 
-    # The roundup is counts-only now; the message lives on the one-time
-    # ATTENTION line, captured in the log's current attention state.
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert any(
         "main verify red evidence unproven at current HEAD; current HEAD identity unavailable" in message
@@ -58231,8 +58226,8 @@ def test_main_verify_attention_summary_replaces_unproven_emission_when_render_he
     )
     _emit_cycle_attention_summary(log)
 
-    # The roundup is counts-only now; the message lives on the one-time
-    # ATTENTION line, captured in the log's current attention state.
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert any(
         "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing (red for 8m)" in message
@@ -58404,8 +58399,8 @@ def test_main_verify_attention_summary_ignores_ambiguous_short_target_ref(
     )
     _emit_cycle_attention_summary(log)
 
-    # The roundup is counts-only now; the message lives on the one-time
-    # ATTENTION line, captured in the log's current attention state.
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert any(expected in message for message in messages)
     assert any("feedfacecafe" not in message for message in messages)
@@ -58499,8 +58494,8 @@ def test_main_verify_attention_summary_fails_closed_for_malformed_unclassified_s
     )
     _emit_cycle_attention_summary(log)
 
-    # The roundup is counts-only now; the message lives on the one-time
-    # ATTENTION line, captured in the log's current attention state.
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert any(expected in message for message in messages)
     assert any("feedfacecafe" not in message for message in messages)
@@ -58536,8 +58531,8 @@ def test_main_verify_attention_summary_keeps_missing_evidence_attention_visible(
     )
     _emit_cycle_attention_summary(log)
 
-    # The roundup is counts-only now; the message lives on the one-time
-    # ATTENTION line, captured in the log's current attention state.
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert "Needs attention (1 task):" in log_path.read_text()
     assert any(
@@ -58576,8 +58571,8 @@ def test_main_verify_attention_summary_renders_current_unknown_status_as_unknown
     )
     _emit_cycle_attention_summary(log)
 
-    # The roundup is counts-only now; the message lives on the one-time
-    # ATTENTION line, captured in the log's current attention state.
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert any("main verify evidence unknown for current HEAD; unrecognized verify status `mystery`" in message for message in messages)
     assert any("feedfacecafe" not in message for message in messages)
@@ -58706,8 +58701,8 @@ def test_main_verify_attention_summary_surfaces_launch_failure_without_alert_mes
     )
     _emit_cycle_attention_summary(log)
 
-    # The roundup is counts-only now; the message lives on the one-time
-    # ATTENTION line, captured in the log's current attention state.
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert any("main verify misconfigured - verify command launch failed; fix the environment, not the code" in message for message in messages)
     assert any("feedfacecafe" not in message for message in messages)
@@ -58747,8 +58742,8 @@ def test_main_verify_attention_summary_sanitizes_launch_failure_with_legacy_red_
     )
     _emit_cycle_attention_summary(log)
 
-    # The roundup is counts-only now; the message lives on the one-time
-    # ATTENTION line, captured in the log's current attention state.
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert any("main verify misconfigured - verify command launch failed; fix the environment, not the code" in message for message in messages)
     assert any("feedfacecafe" not in message for message in messages)
@@ -58811,8 +58806,8 @@ def test_main_verify_attention_summary_prefers_structured_special_status_over_le
     )
     _emit_cycle_attention_summary(log)
 
-    # The roundup is counts-only now; the message lives on the one-time
-    # ATTENTION line, captured in the log's current attention state.
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert any(expected in message for message in messages)
     assert any("human intervention" not in message for message in messages)
@@ -58857,8 +58852,8 @@ def test_main_verify_attention_summary_rejects_legacy_exhaustion_for_unknown_inv
     )
     _emit_cycle_attention_summary(log)
 
-    # The roundup is counts-only now; the message lives on the one-time
-    # ATTENTION line, captured in the log's current attention state.
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert any("main verify evidence unknown for current HEAD" in message for message in messages)
     assert any(
@@ -58909,8 +58904,8 @@ def test_main_verify_attention_summary_weakens_stale_freshness_unavailable_claim
     )
     _emit_cycle_attention_summary(log)
 
-    # The roundup is counts-only now; the message lives on the one-time
-    # ATTENTION line, captured in the log's current attention state.
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert any(expected in message for message in messages)
     assert any("feedfacecafe" not in message for message in messages)
@@ -58942,8 +58937,8 @@ def test_main_verify_attention_summary_keeps_freshness_halt_when_head_matches(tm
     )
     _emit_cycle_attention_summary(log)
 
-    # The roundup is counts-only now; the message lives on the one-time
-    # ATTENTION line, captured in the log's current attention state.
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert any("main verify freshness unproven at `feedfacecafe` - merges halted" in message for message in messages)
     assert any("exact tree fingerprint unavailable" in message for message in messages)
@@ -58996,8 +58991,8 @@ def test_main_verify_attention_summary_limits_exhausted_duration_to_current_prov
     )
     _emit_cycle_attention_summary(log)
 
-    # The roundup is counts-only now; the message lives on the one-time
-    # ATTENTION line, captured in the log's current attention state.
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert any(
         "main verify remediation exhausted for phase:unit after 2/2 attempts; human intervention required" in message
@@ -59071,8 +59066,8 @@ def test_main_verify_missing_alert_exhaustion_finalizes_as_proof_free_human_atte
     )
     _emit_cycle_attention_summary(log)
 
-    # The roundup is counts-only now; the message lives on the one-time
-    # ATTENTION line, captured in the log's current attention state.
+    # The roundup repeats the per-task message; the log current attention state
+    # exposes the same active message for non-log consumers.
     messages = log.visible_attention_messages()
     assert any(
         "main verify remediation exhausted for phase:functional after 2/2 attempts; human intervention required"

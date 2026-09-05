@@ -85,7 +85,7 @@ as confidence grows.
 | `advance_off_topic_verify_unblock` | off | Whether the narrow legacy compatibility lane for verify-only review blockers MAY clear through the audited off-topic-failure contract instead of parking (§6, [off-topic-verify-failures.md](off-topic-verify-failures.md)). |
 | `auto_implement` (per lineage) | — | Whether a completed plan auto-creates its implement, vs holding for a human (§1). |
 | `max_review_cycles` | 3 | Bound on review→improve cycles before exhaustion handling (§6). |
-| `on_max_cycles` | `park` | Exhaustion policy for implementation review→improve cycles: `park` emits manual attention; opt-in `merge_and_defer` may emit an audited annotated merge only under §6/§8 prerequisites. |
+| `on_max_cycles` | `merge_and_defer` | Exhaustion policy for implementation review→improve cycles: `merge_and_defer` may emit an audited annotated merge only under §6/§8 prerequisites; `park` emits manual attention as the rollback switch. |
 | `max_noop_improve_cycles` | 1 | Bound on consecutive improves that change nothing (§6). |
 | plan-review failure circuit breaker | 3 | Bound on repeated failed automated `plan_review` attempts for one plan source before escalation (§1). |
 | rebase-failure circuit breaker | 3 | Bound on repeated failed rebases with no progress (§5). |
@@ -394,9 +394,7 @@ closed and be treated as changed.
   they completed after a changed-diff rebase; they are eligible only through the full
   live-head fallback above.
 - Stale-review refresh rules MUST run before `review_max_cycles` evaluation.
-- With current default `on_max_cycles=park`, capped review/improve churn remains a
-  `review-max-cycles-reached` manual-attention stop.
-- With opt-in `on_max_cycles=merge_and_defer`, a capped current ordinary plain-full or
+- With default `on_max_cycles=merge_and_defer`, a capped current ordinary plain-full or
   resolution `CHANGES_REQUESTED` review MAY enter the existing pre-merge verify
   gate before `review_max_cycles` handling only after local merge-source proof
   and readable deterministic blocker content are established. This candidate
@@ -625,13 +623,13 @@ When a current review exists for the implementation lineage:
 **Bounds (see [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 2), each a policy knob:**
 
 - Review→improve cycles reach `max_review_cycles` within the current merge-unit
-  scope/base boundary → `max_cycles_reached` under current default
-  `on_max_cycles=park`; under opt-in `on_max_cycles=merge_and_defer`, eligible
+  scope/base boundary → under default `on_max_cycles=merge_and_defer`, eligible
   ordinary current-head candidates first prove local merge source and readable
   deterministic blocker content, then traverse the pre-merge verify gate above,
   and emit the existing `merge` action annotated with max-cycle deferral metadata
   only when fresh green verify evidence and validated persisted `BLOCKER` metadata
-  are available. Missing merge source or unavailable/invalid review content
+  are available. Under rollback `on_max_cycles=park`, this emits
+  `max_cycles_reached`. Missing merge source or unavailable/invalid review content
   surfaces its own attention reason instead of falling through to the generic cap
   park; if both are present, missing merge source wins. Plan-review cap exhaustion
   is separate: it accepts the latest plan revision and moves to implementation, and
@@ -824,7 +822,7 @@ failure *and* actionable merge/review work remains eligible for the latter.
   Missing or stale verify evidence MUST run the normal pre-merge verify path before
   eligibility is reconsidered; spec-coherence reviews, red or unavailable verify gates,
   no-op/adjudication lanes, and other parked gates remain non-deferable. Automation MUST
-  NOT otherwise auto-merge `CHANGES_REQUESTED` reviews by deferring blockers, and it MUST
+  NOT auto-merge `CHANGES_REQUESTED` reviews by deferring blockers outside this capped-review path, and it MUST
   NOT bypass parked lifecycle `needs_attention` / `needs_discussion` merge gates.
   Manual `gza merge --force` MAY override those parked
   lifecycle gates for the local merge path only, but it MUST still refuse any real git
@@ -1393,7 +1391,7 @@ is a spec change. The accompanying human message is free text.
 | `improve-no-op` | needs_discussion | §6 consecutive no-op improves ≥ bound after adjudication/compatibility handling is exhausted |
 | `review-blocker-adjudication-needed` | needs_discussion | §6 adjudication for a disputed non-verify CODE blocker returned `NEEDS_HUMAN`, failed, or could not be parsed safely |
 | `duplicate-blocker-no-progress` | needs_discussion | §6 same primary blocker repeats across cycles |
-| `review-max-cycles-reached` | max_cycles_reached | §6 merge-unit review→improve cycles since the current scope/base boundary ≥ `max_review_cycles` with no stale-review refresh available under current default `on_max_cycles=park`; opt-in `merge_and_defer` candidates first prove local merge source and readable deterministic blocker content, then traverse pre-merge verify gating and emit annotated `merge` only after green verify plus validated persisted blocker metadata |
+| `review-max-cycles-reached` | max_cycles_reached | §6 merge-unit review→improve cycles since the current scope/base boundary ≥ `max_review_cycles` with no stale-review refresh available under rollback `on_max_cycles=park`; default `merge_and_defer` candidates first prove local merge source and readable deterministic blocker content, then traverse pre-merge verify gating and emit annotated `merge` only after green verify plus validated persisted blocker metadata |
 | `review-max-cycles-review-content-unavailable` | needs_discussion | §6 `merge_and_defer` candidate review content is missing, blank, unreadable, or undecodable, so deferred blocker tasks cannot preserve authoritative review text |
 | `review-max-cycles-review-content-invalid` | needs_discussion | §6 `merge_and_defer` candidate review content is readable but parsed blocker identity, blocker summary, or capped-review validation is nondeterministic or unsafe |
 | `review-verdict-needs-manual-attention` | needs_discussion | §6 verdict unclassifiable, or `APPROVED_WITH_FOLLOWUPS` with zero parsed follow-ups |

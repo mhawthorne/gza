@@ -8,7 +8,7 @@
 
 ## Scope note (gza-956)
 
-The shared rule engine introduced for `advance` is also the decision source for `iterate` (`determine_next_action` in `src/gza/cli/advance_engine.py` wraps the same `evaluate_advance_rules()` chain). Keeping both commands on one rule evaluator is intentional to preserve the project learning: avoid diverging procedural forks between lifecycle commands.
+The shared rule engine introduced for `advance` is also the decision source for `iterate` (`determine_next_action` in `src/gza/advance_engine.py` wraps the same `evaluate_advance_rules()` chain). Keeping both commands on one rule evaluator is intentional to preserve the project learning: avoid diverging procedural forks between lifecycle commands.
 
 As a result, this change set includes iterate-facing contract alignment where needed (status wording, help text, and regressions) in the same patch as the engine migration, rather than splitting into a separate task with duplicated decision logic changes.
 
@@ -24,12 +24,14 @@ urgent PR-required follow-up tasks, and can pass `--force` to override parked
 needs-attention lifecycle gates such as malformed resolution-review metadata. It still
 refuses ordinary actionable gates such as rebase, verify, or improve work, and
 behavior-spec coherence review blockers are not deferable with `--defer-blockers`. The
-automated lifecycle remains stricter for ordinary review handling and does not share
-manual `--defer-blockers` or `--force`; its only automated `CHANGES_REQUESTED` deferral
-exception is `on_max_cycles=merge_and_defer`, where an ordinary plain-full or resolution
-review at the review-cycle cap may merge only with current-head review proof, fresh green
-verify evidence, a resolvable live merge source, and validated persisted blocker content
-that must be materialized as deferred work before merge finalization.
+automated lifecycle does not share manual `--defer-blockers` or `--force`, but the
+shipped default `on_max_cycles=merge_and_defer` gives it one audited
+`CHANGES_REQUESTED` deferral path: an ordinary plain-full or resolution review at the
+review-cycle cap may merge only with current-head review proof, fresh green verify
+evidence, a resolvable live merge source, and validated persisted blocker content that
+must be materialized as deferred work before merge finalization. Set
+`on_max_cycles=park` as the rollback switch to restore the older manual-attention park at
+the cap.
 
 ## Usage
 
@@ -72,7 +74,8 @@ Task-scoped `advance <task-id> --repeat` runs the same lifecycle engine in a for
 | `require_review_before_merge` | `true` | Implement tasks must have a valid current review before merge |
 | `advance_create_reviews` | `true` | Auto-create review tasks for implements when review gating still requires them; otherwise lifecycle parks for manual attention instead of creating reviews. |
 | `max_resume_attempts` | `1` | Shared automatic failed-task recovery toggle (`0` disables; any positive value enables the fixed bounded resume/retry policy) |
-| `max_review_cycles` | `3` | Max review→improve cycles for a merge unit since the current deliberate scope/base boundary before flagging for manual intervention |
+| `max_review_cycles` | `3` | Max review→improve cycles for a merge unit since the current deliberate scope/base boundary before applying the configured max-cycle exhaustion policy |
+| `on_max_cycles` | `merge_and_defer` | Default cap policy. Eligible ordinary current-head capped reviews with fresh green verify merge and materialize deferred blocker tasks; set `park` as the rollback switch to stop for manual attention instead. |
 | `max_noop_improve_cycles` | `1` | Max consecutive no-op improves before lifecycle automation stops for discussion |
 | `advance_off_topic_verify_unblock` | `false` | Whether the narrow legacy compatibility lane for verify-only blocked reviews MAY clear through the audited off-topic verify-failure path instead of parking |
 | `autonomous_verify_timeout_seconds` | `120` | Configured floor for lifecycle/automation-initiated `verify_command` runs; recent full-suite observations can derive a larger effective timeout |
@@ -455,7 +458,15 @@ For worker-spawning actions that first create or reuse a child task (`create_pla
 
 For `clear_off_topic_verify_blocker`, operator output should include the created and/or reused investigation task IDs in the success line so the off-topic clearance remains auditable without opening the DB or artifact store. A persistence failure while creating or reusing those investigation records must surface as an error and leave the review uncleared. For the downstream investigation itself, `gza flaky reproduce` is the only supported reproduce helper: it keeps the run bounded, records every attempt, and automatically writes a structured inconclusive artifact when the exact signature does not reproduce within budget. The workflow intentionally forbids blanket sleeps, blanket retries, `@flaky`, or broad timeout inflation as the default remedy.
 
-With `on_max_cycles: park`, capped implementation reviews park for attention:
+By default, eligible capped implementation reviews project as `merge_and_defer_blockers`
+direct merge work after they satisfy the current-head review, merge-source, blocker
+content, and fresh green verify preconditions. Successful source units persist
+`merge_source=max_cycles_deferred`; mandatory follow-up tasks carry the
+`deferred-review-blocker` tag as a durable debt/audit identity. Outstanding debt is
+determined by the canonical `gza incomplete` and watch count, which filters that tagged
+population to exclude landed, empty, redundant, dropped, and superseded follow-ups rather
+than relying on tag removal at terminality. With the rollback switch `on_max_cycles: park`,
+capped implementation reviews park for attention instead:
 
 ```
 Will advance N task(s):
