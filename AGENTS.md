@@ -51,6 +51,7 @@ See `docs/` for detailed documentation:
 
 - Do NOT create summary/documentation files (`IMPLEMENTATION_SUMMARY.md`, `CHANGES.md`, etc.)
 - Do NOT create README files unless explicitly requested
+- Do NOT hand-edit files under `docs/internal/generated/` — they're derived from source; see that directory's README
 - Do NOT create one-off utility scripts in the project root
 - Do NOT create setup docs in the project root (use `docs/internal/` if needed)
 - Do NOT delete git branches unless explicitly asked
