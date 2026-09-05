@@ -96,6 +96,7 @@ from gza.cli.watch import (
     _collect_completed_transition_ids,
     _collect_live_running_state,
     _collect_unhandled_failures,
+    _bucket_unit_live_task,
     _compute_cycle_unit_accounting,
     _compute_failure_backoff_seconds,
     _count_live_workers,
@@ -22737,7 +22738,7 @@ def test_compute_cycle_unit_accounting_classifies_failed_units(tmp_path: Path) -
     )
     store.attach_task_to_merge_unit(recovery_task.id, recovery_unit.id, "owner")
 
-    analysis = SimpleNamespace(watch_read_context=RecoveryReadContext())
+    analysis = SimpleNamespace(watch_read_context=RecoveryReadContext(), owner_rows=())
     accounting = _compute_cycle_unit_accounting(
         store=store,
         analysis=analysis,
@@ -22750,6 +22751,51 @@ def test_compute_cycle_unit_accounting_classifies_failed_units(tmp_path: Path) -
     assert accounting.recovery == 1
     assert accounting.other == 0
     assert accounting.total == 2
+
+
+def test_bucket_unit_live_task_completed_but_stuck_owner_is_parked_not_pending() -> None:
+    """A completed owner whose lineage needs_attention is parked, not pending.
+
+    Regression: max review cycles reached, or a rebase failing and needing
+    manual resolution, leave the owner task's own status as ``completed`` -
+    the implement itself finished fine, it's a later review/rebase attempt
+    that's stuck. Guessing "completed => ready to advance" from raw task
+    status alone misses this; the lineage's own next_action classification
+    (what `gza incomplete --needs-attention` reads) must win when it says the
+    unit needs a human.
+    """
+    owner_task = SimpleNamespace(id="gza-1", status="completed")
+    analysis = SimpleNamespace(watch_read_context=RecoveryReadContext())
+    unit = SimpleNamespace(state="unmerged")
+
+    stuck_row = SimpleNamespace(
+        owner_task=owner_task,
+        next_action={"type": "skip", "needs_attention_reason": "max_review_cycles_reached"},
+    )
+    assert (
+        _bucket_unit_live_task(
+            owner_task,
+            store=None,
+            analysis=analysis,
+            max_recovery_attempts=3,
+            unit=unit,
+            owner_row=stuck_row,
+        )
+        == "parked"
+    )
+
+    ready_row = SimpleNamespace(owner_task=owner_task, next_action={"type": "create_review"})
+    assert (
+        _bucket_unit_live_task(
+            owner_task,
+            store=None,
+            analysis=analysis,
+            max_recovery_attempts=3,
+            unit=unit,
+            owner_row=ready_row,
+        )
+        == "pending"
+    )
 
 
 def test_compute_cycle_unit_accounting_counts_units_not_tasks(tmp_path: Path) -> None:
@@ -22808,7 +22854,7 @@ def test_compute_cycle_unit_accounting_counts_units_not_tasks(tmp_path: Path) ->
     )
     store.attach_task_to_merge_unit(running_impl.id, running_unit.id, "owner")
 
-    analysis = SimpleNamespace(watch_read_context=RecoveryReadContext())
+    analysis = SimpleNamespace(watch_read_context=RecoveryReadContext(), owner_rows=())
     accounting = _compute_cycle_unit_accounting(
         store=store,
         analysis=analysis,

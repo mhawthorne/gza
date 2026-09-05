@@ -6768,6 +6768,7 @@ def _bucket_unit_live_task(
     analysis: "_WatchCycleAnalysis",
     max_recovery_attempts: int,
     unit: MergeUnit | None = None,
+    owner_row: "LineageOwnerRow | None" = None,
 ) -> str | None:
     """Classify one unit's live task into a _CycleUnitAccounting bucket, or None to exclude it."""
     if task.status == "in_progress":
@@ -6787,9 +6788,16 @@ def _bucket_unit_live_task(
             return "recovery"
         return "parked"
     if task.status == "completed":
-        # The live task finished but the unit isn't merged yet - it's ready to
-        # advance to its next lifecycle step (create review, merge, ...)
-        # unless the unit itself is blocked on a prerequisite.
+        # The live task finished but the unit isn't merged yet. That's usually
+        # "ready to advance to its next lifecycle step" (create review, merge,
+        # ...), but it can also be genuinely stuck - e.g. max review cycles
+        # reached, or a rebase failed needing manual resolution - in which
+        # case the lineage's own next_action classification (the same one
+        # `gza incomplete --needs-attention` reads) already says
+        # needs_attention. Trust that over guessing from raw task status.
+        if owner_row is not None and owner_row.next_action is not None:
+            if classify_advance_action(owner_row.next_action) == "needs_attention":
+                return "parked"
         return "blocked" if unit is not None and unit.state == "blocked" else "pending"
     return "other"
 
@@ -6803,6 +6811,9 @@ def _compute_cycle_unit_accounting(
     max_recovery_attempts: int,
 ) -> _CycleUnitAccounting:
     counts = {"running": 0, "pending": 0, "blocked": 0, "parked": 0, "recovery": 0, "other": 0}
+    owner_row_by_id = {
+        row.owner_task.id: row for row in analysis.owner_rows if row.owner_task.id is not None
+    }
 
     for unit in store.list_active_merge_units_for_recovery_scope(
         states=tuple(sorted(MERGE_UNIT_ACTIONABLE_STATES)),
@@ -6821,6 +6832,7 @@ def _compute_cycle_unit_accounting(
             analysis=analysis,
             max_recovery_attempts=max_recovery_attempts,
             unit=unit,
+            owner_row=owner_row_by_id.get(unit.owner_task_id) if unit.owner_task_id else None,
         )
         if bucket is not None:
             counts[bucket] += 1
