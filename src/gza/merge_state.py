@@ -452,6 +452,7 @@ def classify_branch_merge_state_for_target(
     source_branch: str | None,
     source_ref: str | None = None,
     target_branch: str,
+    resolved_target_sha: str | None = None,
     persisted_state: str | None = None,
     merged_proof: bool | None = None,
     source_has_commits: bool | None = None,
@@ -463,9 +464,11 @@ def classify_branch_merge_state_for_target(
     if source_ref is None and source_branch:
         source_ref = resolve_task_merge_source(git, source_branch).ref
     source_resolution = resolve_ref_if_possible(git, source_ref)
-    target_resolution = resolve_ref_if_possible(git, target_branch)
     source_sha = source_resolution.sha
-    target_sha = target_resolution.sha
+    target_sha = resolved_target_sha
+    if target_sha is None:
+        target_resolution = resolve_ref_if_possible(git, target_branch)
+        target_sha = target_resolution.sha
 
     def _terminal_classification(state: MergeBranchState, reason: str) -> BranchMergeClassification:
         assert source_ref is not None

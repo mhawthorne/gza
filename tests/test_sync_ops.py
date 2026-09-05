@@ -2756,6 +2756,9 @@ def test_reconcile_reproves_branch_when_target_sha_moved(tmp_path):
 
     git = Mock()
     git.resolve_refs.return_value = {"feature/target-moved": "head-sha", "main": "new-base-sha"}
+    git.rev_parse_if_exists.side_effect = (
+        lambda ref: "head-sha" if ref == "feature/target-moved" else "new-base-sha" if ref == "main" else None
+    )
     git.branch_exists.return_value = True
     git.is_merged.return_value = True
 
@@ -2768,6 +2771,8 @@ def test_reconcile_reproves_branch_when_target_sha_moved(tmp_path):
     )
 
     assert "reused unchanged-ref merge proof" not in results[0].actions
+    assert results[0].base_sha == "new-base-sha"
+    assert _git_reconcile_update(results[0]).base_sha == "new-base-sha"
     git.is_merged.assert_called()
 
 

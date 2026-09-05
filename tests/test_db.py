@@ -15143,6 +15143,26 @@ class TestExecutionProjectResolver:
         assert version == SCHEMA_VERSION
         assert "watch_failed_recovery_scans" in tables
 
+    def test_auto_migration_v70_to_v71_adds_watch_failed_recovery_scan_unit_fingerprint(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("ALTER TABLE watch_failed_recovery_scans DROP COLUMN unit_fingerprint")
+            conn.execute("UPDATE schema_version SET version = 70")
+            conn.commit()
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(watch_failed_recovery_scans)")}
+
+        assert version == SCHEMA_VERSION
+        assert "unit_fingerprint" in columns
+
     def test_auto_migration_v56_to_v57_adds_last_edited_at(self, tmp_path: Path) -> None:
         import sqlite3
 
@@ -15221,11 +15241,13 @@ class TestExecutionProjectResolver:
         first = store.record_watch_failed_recovery_scan(
             target_branch="main",
             target_sha="abc123",
+            unit_fingerprint="fp1",
             scanned_at=scanned_at,
         )
         assert first == WatchFailedRecoveryScanState(
             target_branch="main",
             target_sha="abc123",
+            unit_fingerprint="fp1",
             scanned_at=scanned_at,
         )
         assert store.get_watch_failed_recovery_scan_state(target_branch="main") == first
@@ -15233,10 +15255,12 @@ class TestExecutionProjectResolver:
         second = store.record_watch_failed_recovery_scan(
             target_branch="main",
             target_sha="def456",
+            unit_fingerprint="fp2",
             scanned_at=scanned_at + timedelta(minutes=5),
         )
         assert second is not None
         assert second.target_sha == "def456"
+        assert second.unit_fingerprint == "fp2"
         assert second.scanned_at == scanned_at + timedelta(minutes=5)
 
     def test_parked_task_manual_rearm_round_trip_and_increment(self, tmp_path: Path) -> None:
