@@ -4,7 +4,9 @@
 
 set -euo pipefail
 
-DEFAULT_PROVIDER="claude"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/agent-defaults.sh"
+DEFAULT_PROVIDER="$DEFAULT_AGENT"
 CLAUDE_MODEL="haiku"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

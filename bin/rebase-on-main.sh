@@ -7,7 +7,8 @@ set -euo pipefail
 
 MAIN_BRANCH="main"
 REMOTE="origin"
-DEFAULT_AGENT="claude"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/agent-defaults.sh"
 
 # Colors
 RED='\033[0;31m'
