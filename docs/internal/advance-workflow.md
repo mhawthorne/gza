@@ -133,6 +133,8 @@ only the direct-implement fallback continues into the created implement child.
 | Completed task has no branch | `skip` — completed `<type>` task has no branch; no mergeable commits found |
 | Non-completed task has no branch | `skip` — `<status>` `<type>` task has no branch; no merge action available |
 
+Branchless completed review rows are resolved through their implementation review root before this table applies. If the linked implementation root has a branch, lifecycle uses that branch for merge-source, review, and verify planning instead of reporting the review row as having no mergeable commits.
+
 ### Strict project scope
 
 Before advance queues rebase, review, improve, or merge work for a code-changing branch, it checks the branch diff against the task's strict project scope. This uses the existing project-boundary machinery, but for this verdict only the configured project subdirectory is writable unless the task is explicitly tagged `cross-project` or the project sets `default_cross_project: true`. Cross-project tasks still fail closed if the branch touches paths outside all discovered project roots or any new roots declared by changed branch-local `gza.yaml` files. Nested project discovery includes ancestor project configs for parent-owned path attribution, while most-specific path matching prevents ancestor projects from being selected merely because a descendant project changed.

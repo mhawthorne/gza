@@ -6829,7 +6829,8 @@ class TestShowCommand:
             producer="review_verify",
         )
 
-        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Verify Status:" in result.stdout

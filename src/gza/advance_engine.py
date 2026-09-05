@@ -18,6 +18,7 @@ from gza.console import prompt_available_width, shorten_prompt
 from gza.cross_project import CROSS_PROJECT_TAG, task_is_cross_project
 from gza.db import (
     TASK_COMMENT_KIND_FEEDBACK,
+    MergeUnitResolutionDiagnostic,
     SqliteTaskStore,
     Task as DbTask,
     TaskArtifact,
@@ -541,6 +542,7 @@ class AdvanceContext:
 
     reviews: list[DbTask] | None = None
     review_root_task: DbTask | None = None
+    review_root_resolution_diagnostic: MergeUnitResolutionDiagnostic | None = None
     active_review: DbTask | None = None
     latest_completed_review: DbTask | None = None
     latest_completed_code_change: DbTask | None = None
@@ -3107,6 +3109,21 @@ def _no_branch_description(ctx: AdvanceContext) -> str:
     return f"SKIP: {ctx.task.status} {ctx.task_type} task has no branch; no merge action available"
 
 
+def _review_root_resolution_diagnostic_action(ctx: AdvanceContext) -> dict[str, Any]:
+    diagnostic = getattr(ctx, "review_root_resolution_diagnostic", None)
+    if diagnostic is None:
+        return {"type": "skip", "description": "SKIP: review root resolution succeeded"}
+    message = diagnostic.message
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": f"SKIP: {message}",
+        },
+        reason="review-root-resolution-failed",
+        subject_task_id=ctx.task.id,
+    )
+
+
 def _target_already_merged_description(ctx: AdvanceContext) -> str:
     state = ctx.post_merge_rebase_state
     reason = state.reason if state is not None else None
@@ -3396,12 +3413,12 @@ def _noop_improve_limit_action(ctx: AdvanceContext) -> dict[str, Any]:
         and ctx.current_review_head_sha is not None
         and ctx.current_review_head_sha == ctx.latest_reviewed_head_sha
         and _latest_review_is_verify_blocked_only(ctx)
-        and _task_has_current_passing_review_verify_evidence(
-            task=ctx.latest_noop_improve,
-            review_task=ctx.latest_completed_review,
-            current_branch=ctx.task.branch,
-            current_head_sha=ctx.current_review_head_sha,
-        )
+            and _task_has_current_passing_review_verify_evidence(
+                task=ctx.latest_noop_improve,
+                review_task=ctx.latest_completed_review,
+                current_branch=_effective_lifecycle_branch(ctx),
+                current_head_sha=ctx.current_review_head_sha,
+            )
     ):
         return {
             "type": "create_review",
@@ -4281,7 +4298,7 @@ def _missing_local_merge_source_requires_manual_resolution(ctx: AdvanceContext) 
         return False
     if ctx.merge_source_ref is not None:
         return False
-    branch_name = ctx.task.branch
+    branch_name = _effective_lifecycle_branch(ctx)
     if not branch_name:
         return False
     if ctx.post_merge_rebase_state is not None and ctx.post_merge_rebase_state.already_merged:
@@ -4322,7 +4339,7 @@ def _review_automation_blocked_by_missing_local_merge_source(ctx: AdvanceContext
 
 def _merge_source_unavailable_manual_resolution_action(ctx: AdvanceContext) -> dict[str, Any]:
     """Park lifecycle when a live auto-merge path lacks a resolvable local source."""
-    branch_name = ctx.task.branch or "<unknown>"
+    branch_name = _effective_lifecycle_branch(ctx) or "<unknown>"
     description = (
         f"SKIP: fresh merge source for branch '{branch_name}' is unavailable; "
         "cannot auto-merge without a resolvable local source"
@@ -5668,6 +5685,12 @@ def _resolve_impl_ancestor_by_based_on(store: SqliteTaskStore, task: DbTask) -> 
     return None
 
 
+@dataclass(frozen=True)
+class ReviewRootResolution:
+    task: DbTask
+    diagnostic: MergeUnitResolutionDiagnostic | None = None
+
+
 def _resolve_fix_review_target(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
     """Resolve the implementation ancestor for fix lineages using based_on only."""
     visited: set[str] = set()
@@ -6157,6 +6180,7 @@ def _verify_failure_already_rebased_for_epoch(ctx: AdvanceContext) -> bool:
     result = getattr(getattr(decision, "lookup", None), "result", None)
     captured_at = getattr(result, "captured_at", None)
     reviewed_branch = getattr(result, "reviewed_branch", None)
+    effective_branch = _effective_lifecycle_branch(ctx)
     reviewed_head_sha = _normalize_sha(getattr(result, "reviewed_head_sha", None))
     reviewed_base_sha = _normalize_sha(getattr(result, "reviewed_base_sha", None))
     latest_rebase = ctx.latest_completed_rebase
@@ -6164,8 +6188,8 @@ def _verify_failure_already_rebased_for_epoch(ctx: AdvanceContext) -> bool:
         latest_rebase is None
         or captured_at is None
         or not reviewed_branch
-        or not ctx.task.branch
-        or latest_rebase.branch != ctx.task.branch
+        or not effective_branch
+        or latest_rebase.branch != effective_branch
         or latest_rebase.branch != reviewed_branch
         or reviewed_head_sha is None
         or reviewed_base_sha is None
@@ -7571,7 +7595,7 @@ def _closing_review_invariant_action(ctx: AdvanceContext) -> dict[str, Any]:
     return _default_subject_for_attention_action(ctx, ctx.closing_review_action)
 
 
-def _resolve_review_root_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
+def _resolve_review_root_task_result(store: SqliteTaskStore, task: DbTask) -> ReviewRootResolution:
     """Resolve the implementation task whose review state gates this branch lineage."""
     candidate = task
     if task.id is not None:
@@ -7589,10 +7613,33 @@ def _resolve_review_root_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
                 if owner is not None:
                     candidate = owner
 
+    if candidate.task_type == "review":
+        plan_result = store.resolve_merge_unit_plan_result_for_task(candidate)
+        if plan_result.diagnostic is not None:
+            return ReviewRootResolution(candidate, plan_result.diagnostic)
+        if plan_result.plan is not None:
+            plan_owner = plan_result.plan.owner_task
+            impl_ancestor = _resolve_impl_ancestor_by_based_on(store, plan_owner)
+            if impl_ancestor is not None:
+                return ReviewRootResolution(impl_ancestor)
+            if plan_owner.task_type == "implement":
+                return ReviewRootResolution(plan_owner)
+
     impl_ancestor = _resolve_impl_ancestor_by_based_on(store, candidate)
     if impl_ancestor is not None:
-        return impl_ancestor
-    return candidate
+        return ReviewRootResolution(impl_ancestor)
+    return ReviewRootResolution(candidate)
+
+
+def _resolve_review_root_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    """Resolve the implementation task whose review state gates this branch lineage."""
+    return _resolve_review_root_task_result(store, task).task
+
+
+def _effective_lifecycle_branch(ctx: AdvanceContext) -> str | None:
+    """Return the branch identity used by lifecycle decisions for this context."""
+    review_root_task = getattr(ctx, "review_root_task", None)
+    return ctx.task.branch or (review_root_task.branch if review_root_task is not None else None)
 
 
 def _get_same_branch_rebase_descendants_for_root(store: SqliteTaskStore, root_task: DbTask) -> list[DbTask]:
@@ -7720,6 +7767,9 @@ def _resolve_pre_closing_review_git_context(
     review_root_task = ctx.review_root_task
     if review_root_task is None:
         raise AssertionError("git phase requires review_root_task")
+    branch_context_task = task
+    if not branch_context_task.branch and review_root_task.branch:
+        branch_context_task = review_root_task
 
     def _resolve_current_review_head_state() -> tuple[str | None, str | None, bool]:
         branch_name = review_root_task.branch or task.branch
@@ -7734,12 +7784,12 @@ def _resolve_pre_closing_review_git_context(
                 return merge_unit.head_sha, None, False
         return None, None, False
 
-    merge_source = _resolve_current_merge_source(git, task.branch or "")
+    merge_source = _resolve_current_merge_source(git, branch_context_task.branch or "")
     if persist_post_merge_rebase_state:
         post_merge_rebase_state = _resolve_and_persist_post_merge_rebase_state(
             store,
             git,
-            task,
+            branch_context_task,
             target_branch,
             config=config,
             merge_source=merge_source,
@@ -7748,7 +7798,7 @@ def _resolve_pre_closing_review_git_context(
         post_merge_rebase_state = resolve_post_merge_rebase_state(
             store,
             git,
-            task,
+            branch_context_task,
             target_branch,
             merge_source=merge_source,
         )
@@ -7757,7 +7807,7 @@ def _resolve_pre_closing_review_git_context(
         if persist_post_merge_rebase_state
         else resolve_task_merge_state_for_target(
             store=store,
-            task=task,
+            task=branch_context_task,
             git=git,
             target_branch=target_branch,
         )
@@ -7765,7 +7815,7 @@ def _resolve_pre_closing_review_git_context(
     strict_scope_inspection = _resolve_strict_scope_inspection(
         config,
         git,
-        task,
+        branch_context_task,
         merge_source_ref=merge_source.ref,
         target_branch=target_branch,
     )
@@ -8413,7 +8463,11 @@ def resolve_advance_context(
             **_resolve_plan_review_state(config=config, store=store, task=task),
         )
 
-    if not task.branch:
+    review_root_resolution = _resolve_review_root_task_result(store, task)
+    review_root_task = review_root_resolution.task
+    resolved_branch = task.branch or (review_root_task.branch if task.task_type == "review" else None)
+
+    if not resolved_branch:
         return replace(
             _build_base_advance_context(
                 config=config,
@@ -8437,9 +8491,10 @@ def resolve_advance_context(
                 persist_derived_state=persist_post_merge_rebase_state,
             ),
             selected_for_merge=selected_for_merge,
+            review_root_task=review_root_task,
+            review_root_resolution_diagnostic=review_root_resolution.diagnostic,
         )
 
-    review_root_task = _resolve_review_root_task(store, task)
     (
         reviews,
         active_review,
@@ -8512,6 +8567,7 @@ def resolve_advance_context(
         selected_for_merge=selected_for_merge,
         reviews=reviews,
         review_root_task=review_root_task,
+        review_root_resolution_diagnostic=review_root_resolution.diagnostic,
         active_review=active_review,
         latest_completed_review=latest_completed_review,
         latest_completed_code_change=latest_completed_code_change,
@@ -9057,6 +9113,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
         ),
     ),
     AdvanceRule(
+        name="review_root_resolution_failed",
+        matches=lambda ctx: getattr(ctx, "review_root_resolution_diagnostic", None) is not None,
+        action=_review_root_resolution_diagnostic_action,
+    ),
+    AdvanceRule(
         name="no_branch",
         matches=lambda ctx: not ctx.has_branch,
         action=lambda ctx: {"type": "skip", "description": _no_branch_description(ctx)},
@@ -9067,8 +9128,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
         action=lambda ctx: {
             "type": "reconcile_branch_divergence",
             "description": (
-                f"Reconcile diverged local/origin refs for '{ctx.task.branch}'"
-                if ctx.task.branch
+                f"Reconcile diverged local/origin refs for '{ctx.task.branch or ctx.merge_source_ref}'"
+                if ctx.task.branch or ctx.merge_source_ref
                 else "Reconcile diverged local/origin refs"
             ),
         },
@@ -9684,7 +9745,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and not _task_has_current_passing_review_verify_evidence(
                 task=ctx.latest_noop_improve,
                 review_task=ctx.latest_completed_review,
-                current_branch=ctx.task.branch,
+                current_branch=_effective_lifecycle_branch(ctx),
                 current_head_sha=ctx.current_review_head_sha,
             )
             and ctx.current_review_head_probe_warning is None

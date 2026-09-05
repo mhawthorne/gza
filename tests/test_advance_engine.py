@@ -3336,6 +3336,365 @@ def test_evaluate_runs_pending_review_when_no_in_progress_exists(tmp_path: Path)
     assert action["verify_gate_phase"] == "pre_review"
 
 
+def test_branchless_approved_review_resolves_implementation_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/review-branchless",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = store.add(
+        f"Review {impl.id}",
+        task_type="review",
+        based_on=impl.id,
+        depends_on=impl.id,
+    )
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    review.branch = None
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+    monkeypatch.setattr(
+        advance_engine_module,
+        "resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "branch-sha", "main": "target-sha"},
+    )
+
+    ctx = resolve_advance_context(config, store, git, review, "main")
+    action = evaluate_advance_rules(config, store, git, review, "main")
+
+    assert review.branch is None
+    assert ctx.has_branch is True
+    assert ctx.review_root_task is not None
+    assert ctx.review_root_task.id == impl.id
+    assert ctx.merge_source_ref == impl.branch
+    assert git.can_merge_calls == [(impl.branch, "main"), (impl.branch, "main")]
+    assert action["type"] != "skip"
+    assert "no branch; no mergeable commits found" not in action["description"]
+
+
+def _add_branchless_completed_review(
+    store: SqliteTaskStore,
+    *,
+    based_on: str | None = None,
+    depends_on: str | None = None,
+    when: datetime = datetime(2026, 5, 10, 11, 0, tzinfo=UTC),
+    output_content: str = "## Verdict\n\nVerdict: APPROVED\n",
+) -> DbTask:
+    review = store.add("Branchless review", task_type="review", based_on=based_on, depends_on=depends_on)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = when
+    review.branch = None
+    review.output_content = output_content
+    store.update(review)
+    return review
+
+
+@pytest.mark.parametrize("link_field", ("based_on", "depends_on"))
+def test_branchless_review_resolves_implementation_from_single_canonical_link(
+    tmp_path: Path,
+    link_field: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/review-{link_field}",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_branchless_completed_review(
+        store,
+        based_on=impl.id if link_field == "based_on" else None,
+        depends_on=impl.id if link_field == "depends_on" else None,
+    )
+
+    ctx = resolve_advance_context(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "branch-sha", "main": "target-sha"},
+        ),
+        review,
+        "main",
+    )
+
+    assert ctx.review_root_resolution_diagnostic is None
+    assert ctx.review_root_task is not None
+    assert ctx.review_root_task.id == impl.id
+    assert ctx.has_branch is True
+    assert ctx.merge_source_ref == impl.branch
+
+
+def test_branchless_nested_review_resolves_implementation_from_canonical_links(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/review-nested",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    first_review = _add_branchless_completed_review(store, depends_on=impl.id)
+    recovery_review = _add_branchless_completed_review(
+        store,
+        based_on=first_review.id,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+    )
+
+    ctx = resolve_advance_context(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "branch-sha", "main": "target-sha"},
+        ),
+        recovery_review,
+        "main",
+    )
+
+    assert ctx.review_root_resolution_diagnostic is None
+    assert ctx.review_root_task is not None
+    assert ctx.review_root_task.id == impl.id
+    assert ctx.merge_source_ref == impl.branch
+
+
+def test_branchless_pure_review_cycle_fails_closed_with_canonical_diagnostic(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    review_a = _add_branchless_completed_review(store)
+    review_b = _add_branchless_completed_review(store, based_on=review_a.id)
+    review_a.based_on = review_b.id
+    store.update(review_a)
+
+    git = _FakeGit(can_merge=True)
+    ctx = resolve_advance_context(config, store, git, review_a, "main")
+    action = evaluate_advance_rules(config, store, git, review_a, "main")
+
+    assert ctx.has_branch is False
+    assert ctx.merge_source_ref is None
+    assert ctx.review_root_resolution_diagnostic is not None
+    assert ctx.review_root_resolution_diagnostic.reason == "lineage_cycle"
+    assert "lineage cycle while resolving merge-unit plan" in ctx.review_root_resolution_diagnostic.message
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "review-root-resolution-failed"
+    assert "lineage cycle while resolving merge-unit plan" in action["description"]
+
+
+def test_branchless_conflicting_cycle_does_not_select_alternate_implementation_edge(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/review-conflicting-cycle",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review_a = _add_branchless_completed_review(store, depends_on=impl.id)
+    review_b = _add_branchless_completed_review(store, based_on=review_a.id)
+    review_a.based_on = review_b.id
+    store.update(review_a)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "branch-sha", "main": "target-sha"},
+    )
+    ctx = resolve_advance_context(config, store, git, review_a, "main")
+    action = evaluate_advance_rules(config, store, git, review_a, "main")
+
+    assert ctx.has_branch is False
+    assert ctx.merge_source_ref is None
+    assert ctx.review_root_task is not None
+    assert ctx.review_root_task.id != impl.id
+    assert ctx.review_root_resolution_diagnostic is not None
+    assert ctx.review_root_resolution_diagnostic.reason == "lineage_cycle"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "review-root-resolution-failed"
+    assert action["type"] != "merge"
+
+
+def test_branchless_approved_review_missing_implementation_source_parks_with_real_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/review-missing-local-source",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_branchless_completed_review(store, depends_on=impl.id)
+    monkeypatch.setattr(
+        advance_engine_module,
+        "resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, assume_local_branch_exists=False),
+        review,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert impl.branch in action["description"]
+    assert "<unknown>" not in action["description"]
+    assert action["type"] != "merge"
+
+
+def test_branchless_review_stale_failed_verify_matching_completed_rebase_does_not_rebase_again(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/review-stale-verify-rebased",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 7, 6, 12, 10, tzinfo=UTC),
+        changed_diff=False,
+    )
+    _add_rebase_diff_provenance(
+        store,
+        rebase,
+        resolved_head_sha="verify-head",
+        resolved_target_sha="old-target-head",
+    )
+    _add_matching_verify_gate_preflight_provenance(
+        store,
+        rebase,
+        impl,
+        reviewed_head_sha="verify-head",
+        target_tip_sha="current-target-head",
+    )
+    _persist_pre_review_failed_verify(
+        store,
+        config,
+        impl,
+        tmp_path,
+        reviewed_base_sha="old-target-head",
+        captured_at=datetime(2026, 7, 6, 12, 20, tzinfo=UTC),
+    )
+    review = _add_branchless_completed_review(store, depends_on=impl.id)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "verify-head", "main": "current-target-head"},
+            ancestor_pairs={("old-target-head", "current-target-head"): True},
+        ),
+        review,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-gate-preflight-rebase"
+
+
+def test_branchless_verify_only_noop_review_uses_root_green_evidence_without_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 1
+    monkeypatch.setattr(advance_engine_module, "_latest_review_is_verify_blocked_only", lambda _ctx: True)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/review-branchless-green-noop",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    review = _add_branchless_completed_review(
+        store,
+        depends_on=impl.id,
+        when=datetime(2026, 5, 14, 10, 0, tzinfo=UTC),
+        output_content=_verify_failure_only_review_report(),
+    )
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head-sha"
+    store.update(review)
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    improve.review_verify_status = "passed"
+    improve.review_verify_branch = impl.branch
+    improve.review_verify_head_sha = "same-head-sha"
+    improve.review_verify_captured_at = review.completed_at + timedelta(seconds=30)
+    store.update(improve)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            behind_count=0,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "same-head-sha"},
+        ),
+        review,
+        "main",
+    )
+
+    assert action["type"] == "create_review"
+    assert action["type"] != "recover_verify_only_noop_review"
+
+
 def test_rebase_after_review_with_unchanged_diff_preserves_approved_review(tmp_path: Path, monkeypatch) -> None:
     from gza import advance_engine as advance_engine_module
 

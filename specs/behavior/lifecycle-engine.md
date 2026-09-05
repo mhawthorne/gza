@@ -174,6 +174,9 @@ and default to **off**.
 ### §2 — No actionable branch
 
 - A completed task with no branch (nothing to land) MUST `skip`.
+- A branchless `review` task MUST first resolve its implementation review root via
+  merge-unit membership or its implementation-linked `based_on`/`depends_on` edge;
+  if that root has a branch, the review MUST NOT take this no-branch skip.
 - A completed branch-backed task whose authoritative merge-unit state is `empty` or
   `redundant` is also terminal no-action work: it MUST `skip` merge/review creation, and
   any merge-required dependent MUST treat it as satisfied under `lineage.md` L1.
