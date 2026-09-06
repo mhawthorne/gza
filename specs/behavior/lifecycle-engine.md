@@ -1350,6 +1350,10 @@ not cross the execution boundary to repair metadata, refresh checkpoints, create
 verify, review, judge, materialize, mark merged, or merge. Dry-run wording MUST preserve
 the same distinction as writable results: `empty` and `redundant` are terminal no-work,
 not landed success.
+If query-only state finds an exact pending-finalization proof for a Git merge that
+already occurred, dry-run MUST report that pending state and label post-merge checkpoint
+refresh plus merged-state finalization as conditional; it MUST NOT invoke either
+collaborator or write any task, artifact, merge-unit, worker, or ref state.
 
 Writable `land` MUST be bounded and idempotent. It MUST enforce a named, swappable
 per-invocation maximum-transition policy, `LandingTransitionLimitPolicy`, in addition to

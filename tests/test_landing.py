@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -40,6 +40,7 @@ from gza.landing import (
     LandRequest,
     LandResult,
     LandStep,
+    MergeLandingAuthorization,
     MergeUnitProofIdentity,
     TerminalProof,
     acquire_landing_verify_evidence,
@@ -2428,6 +2429,71 @@ def _sqlite_merge_unit_snapshot(store: SqliteTaskStore) -> tuple[tuple[Any, ...]
             """
         ).fetchall()
     return tuple(tuple(row) for row in rows)
+
+
+def _sqlite_artifact_snapshot(store: SqliteTaskStore) -> tuple[tuple[Any, ...], ...]:
+    with store._connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, task_id, kind, label, path, byte_size, sha256, status, head_sha, metadata_json
+            FROM task_artifacts
+            ORDER BY id
+            """
+        ).fetchall()
+    return tuple(tuple(row) for row in rows)
+
+
+def _persist_exact_landing_pending_finalization(
+    store: SqliteTaskStore,
+    *,
+    impl: Task,
+    unit_id: str,
+    source_ref: str,
+    source_sha: str,
+    target_branch: str,
+    target_sha: str,
+    provenance: Literal["manual_land", "manual_land_escalated"] = "manual_land",
+    deferred_task_ids: tuple[str, ...] = (),
+    followup_task_ids: tuple[str, ...] = (),
+) -> Any:
+    assert impl.id is not None
+    authorization = MergeLandingAuthorization(
+        owner_task_id=impl.id,
+        merge_unit_id=unit_id,
+        source_ref=source_ref,
+        target_branch=target_branch,
+        source_sha=source_sha,
+        target_sha=target_sha,
+        representative_task_id=impl.id,
+        member_task_ids=(impl.id,),
+        policy_version="strict.v1" if provenance == "manual_land" else "guarded.v1",
+        schema_version="landing.strict.v1" if provenance == "manual_land" else "landing_judge.v1",
+        allowed_overrides=()
+        if provenance == "manual_land"
+        else ("defer-review-blockers", "parked:review-max-cycles-reached"),
+        judgment_artifact_id=None if provenance == "manual_land" else "judge-artifact",
+        judgment_key=None if provenance == "manual_land" else "judge-key",
+    )
+    payload = {
+        "kind": "landing_pending_finalization",
+        "authorization": authorization.__dict__,
+        "provenance": provenance,
+        "post_merge_target_sha": target_sha,
+        "deferred_task_ids": deferred_task_ids,
+        "followup_task_ids": followup_task_ids,
+    }
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return store.add_artifact(
+        impl.id,
+        kind="landing_pending_finalization",
+        label="landing_pending_finalization",
+        path=f".gza/artifacts/{impl.id}/landing-pending-finalization-test.json",
+        byte_size=len(body.encode()),
+        sha256=sha256(body.encode()).hexdigest(),
+        metadata=payload,
+        status="pending",
+        head_sha=target_sha,
+    )
 
 
 def _assert_single_terminal_sentence(blocked: LandBlocked, task_id: str) -> None:
@@ -5751,6 +5817,88 @@ def test_landing_coordinator_guarded_rerun_replays_pending_no_ff_merge_without_d
     assert refreshed.merge_source == "manual_land_escalated"
 
 
+def test_landing_coordinator_dry_run_reports_pending_finalization_without_replay_side_effects(
+    tmp_path,
+) -> None:
+    from gza.merge_services import ManualMergeExecutionResult
+
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "pending dry-run", "feature/landing")
+    assert impl.id is not None
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    deferred = store.add("Deferred B1", task_type="implement", depends_on=impl.id, urgent=True, create_pr=True)
+    assert deferred.id is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "merge-a"},
+        local_branches={"feature/landing"},
+        ancestors={("head-a", "merge-a")},
+    )
+    _persist_exact_landing_pending_finalization(
+        store,
+        impl=impl,
+        unit_id=unit.id,
+        source_ref="feature/landing",
+        source_sha="head-a",
+        target_branch="main",
+        target_sha="merge-a",
+        provenance="manual_land_escalated",
+        deferred_task_ids=(deferred.id,),
+    )
+    before_tasks = _sqlite_task_snapshot(store)
+    before_artifacts = _sqlite_artifact_snapshot(store)
+    before_units = _sqlite_merge_unit_snapshot(store)
+    before_refs = dict(git.heads)
+    verifier_calls: list[str] = []
+    finalizer_calls: list[str] = []
+
+    def post_merge_verify(_identity: Any) -> LandPostMergeVerifySuccess:
+        verifier_calls.append("verify")
+        return LandPostMergeVerifySuccess(
+            checkpoint_id="checkpoint-green",
+            target_head="merge-a",
+            tree_fingerprint=TREE_A,
+            gate_identity="main",
+        )
+
+    def finalize(*_args: Any, **_kwargs: Any) -> ManualMergeExecutionResult:
+        finalizer_calls.append("finalize")
+        return ManualMergeExecutionResult(rc=0, status="merged")
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        post_merge_verifier=post_merge_verify,
+        finalize_merge=finalize,
+        inspect_policy_facts=lambda _identity: (_ for _ in ()).throw(
+            AssertionError("pending dry-run must not reload policy facts")
+        ),
+    ).run(LandRequest(task_id=impl.id, dry_run=True))
+
+    assert result.blocked is None
+    assert result.post_merge_verify_failure is None
+    assert result.merged is False
+    assert result.deferred_task_ids == (deferred.id,)
+    assert result.judgment_artifact_id == "judge-artifact"
+    assert result.judgment_key == "judge-key"
+    assert [step.phase for step in result.steps] == [
+        "resolve",
+        "merge",
+        "post_merge_verify",
+        "merge",
+    ]
+    assert result.steps[1].status == "completed"
+    assert result.steps[2].status == "conditional"
+    assert result.steps[3].status == "conditional"
+    assert verifier_calls == []
+    assert finalizer_calls == []
+    assert _sqlite_task_snapshot(store) == before_tasks
+    assert _sqlite_artifact_snapshot(store) == before_artifacts
+    assert _sqlite_merge_unit_snapshot(store) == before_units
+    assert git.heads == before_refs
+    assert git.mutation_calls == []
+
+
 @pytest.mark.parametrize("mutation", ("target", "source", "checkout"))
 def test_landing_coordinator_post_checkpoint_mutation_blocks_merged_state(
     tmp_path,
@@ -6196,6 +6344,82 @@ def test_cmd_land_reports_state_persistence_failure_without_cannot_land_and_reru
     assert "manual_land provenance" in second_output
     assert merge_calls == ["git_merge"]
     assert mark_calls == ["manual_land", "manual_land"]
+
+
+def test_cmd_land_dry_run_reports_pending_finalization_without_replay_side_effects(
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    from gza.cli import land as land_cli
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "CLI pending dry-run", "feature/landing")
+    assert impl.id is not None
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    deferred = store.add("Deferred B1", task_type="implement", depends_on=impl.id, urgent=True, create_pr=True)
+    assert deferred.id is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "merge-a"},
+        local_branches={"feature/landing"},
+        ancestors={("head-a", "merge-a")},
+    )
+    _persist_exact_landing_pending_finalization(
+        store,
+        impl=impl,
+        unit_id=unit.id,
+        source_ref="feature/landing",
+        source_sha="head-a",
+        target_branch="main",
+        target_sha="merge-a",
+        provenance="manual_land_escalated",
+        deferred_task_ids=(deferred.id,),
+    )
+    before_tasks = _sqlite_task_snapshot(store)
+    before_artifacts = _sqlite_artifact_snapshot(store)
+    before_units = _sqlite_merge_unit_snapshot(store)
+    before_refs = dict(git.heads)
+    opened_modes: list[str] = []
+    verifier_calls: list[str] = []
+    finalizer_calls: list[str] = []
+
+    def get_store_query_only(_config: Config, open_mode: str = "readwrite") -> SqliteTaskStore:
+        opened_modes.append(open_mode)
+        return store
+
+    def main_verify(*_args: Any, **_kwargs: Any) -> Any:
+        verifier_calls.append("verify")
+        raise AssertionError("dry-run pending finalization must not verify")
+
+    def mark(*_args: Any, **_kwargs: Any) -> None:
+        finalizer_calls.append("finalize")
+        raise AssertionError("dry-run pending finalization must not finalize")
+
+    monkeypatch.setattr(land_cli.Config, "load", lambda _project_dir: config)
+    monkeypatch.setattr(land_cli, "get_store", get_store_query_only)
+    monkeypatch.setattr(land_cli, "resolve_id", lambda _config, task_id: task_id)
+    monkeypatch.setattr(land_cli, "Git", lambda _project_dir: git)
+    monkeypatch.setattr(land_cli, "mark_merge_subject_merged", mark)
+    monkeypatch.setattr("gza.main_integration_verify.check_main_integration_verify", main_verify)
+
+    rc = land_cli.cmd_land(argparse.Namespace(project_dir=tmp_path, task_id=impl.id, policy="guarded", dry_run=True))
+    output = capsys.readouterr().out
+
+    assert rc == 0
+    assert opened_modes == ["query_only"]
+    assert "post_merge_verify: conditional" in output
+    assert "would refresh the post-merge target verification checkpoint" in output
+    assert "would finalize authoritative merged state only after a green post-merge checkpoint" in output
+    assert "Dry run for" in output
+    assert verifier_calls == []
+    assert finalizer_calls == []
+    assert _sqlite_task_snapshot(store) == before_tasks
+    assert _sqlite_artifact_snapshot(store) == before_artifacts
+    assert _sqlite_merge_unit_snapshot(store) == before_units
+    assert git.heads == before_refs
+    assert git.mutation_calls == []
 
 
 def _persist_test_landing_judgment(

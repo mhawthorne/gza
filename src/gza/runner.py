@@ -3185,7 +3185,8 @@ def disposable_verify_db_snapshot_env(
 
     gza_dir = cwd / ".gza"
     tmp_parent = gza_dir / "tmp"
-    tmp_parent.mkdir(parents=True, exist_ok=True)
+    gza_dir.mkdir(parents=True, exist_ok=True)
+    tmp_parent.mkdir(exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(prefix="verify-db-", dir=tmp_parent))
     snapshot_path = tmp_dir / "gza.db"
     traversal_leases: list[_PathModeLeaseHandle] = []

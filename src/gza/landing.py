@@ -464,13 +464,20 @@ class LandResult:
         if self.merged and self.merge_provenance is None:
             raise ValueError("newly merged result requires land provenance")
         if self.deferred_task_ids and not (
-            self.merge_provenance == "manual_land_escalated" or self.post_merge_verify_failure is not None
+            self.merge_provenance == "manual_land_escalated"
+            or self.post_merge_verify_failure is not None
+            or self.request.dry_run
         ):
             raise ValueError("deferred blocker task IDs require escalated provenance or pending post-merge failure")
         judgment_refs = _normalize_evidence_refs((self.judgment_artifact_id, self.judgment_key))
         if self.merge_provenance == "manual_land_escalated" and len(judgment_refs) != 2:
             raise ValueError("manual_land_escalated result requires judgment artifact and key")
-        if self.merge_provenance != "manual_land_escalated" and judgment_refs and self.post_merge_verify_failure is None:
+        if (
+            self.merge_provenance != "manual_land_escalated"
+            and judgment_refs
+            and self.post_merge_verify_failure is None
+            and not self.request.dry_run
+        ):
             raise ValueError("landing judgment identity requires manual_land_escalated provenance")
         object.__setattr__(self, "judgment_artifact_id", judgment_refs[0] if judgment_refs else None)
         object.__setattr__(self, "judgment_key", judgment_refs[1] if judgment_refs else None)
@@ -1428,6 +1435,56 @@ class LandingCoordinator:
             )
             steps.append(LandStep("merge", "blocked", blocked.fact, blocked=blocked))
             return self._blocked_result(request, identity, steps, blocked)
+        if request.dry_run:
+            steps.append(
+                LandStep(
+                    "merge",
+                    "completed",
+                    "source already present on target with pending landing finalization proof",
+                    evidence_refs=_evidence_refs(
+                        pending.artifact_id,
+                        identity.owner_task_id,
+                        identity.source_sha,
+                        pending.post_merge_target_sha,
+                    ),
+                )
+            )
+            steps.append(
+                LandStep(
+                    "post_merge_verify",
+                    "conditional",
+                    "would refresh the post-merge target verification checkpoint before finalization",
+                    evidence_refs=_evidence_refs(
+                        pending.artifact_id,
+                        identity.owner_task_id,
+                        pending.post_merge_target_sha,
+                    ),
+                )
+            )
+            steps.append(
+                LandStep(
+                    "merge",
+                    "conditional",
+                    "would finalize authoritative merged state only after a green post-merge checkpoint",
+                    evidence_refs=_evidence_refs(
+                        pending.artifact_id,
+                        identity.merge_unit_id,
+                        identity.owner_task_id,
+                    ),
+                )
+            )
+            return LandResult(
+                request=request,
+                owner_task_id=identity.owner_task_id,
+                target_branch=identity.target_branch,
+                source_ref=identity.source_ref,
+                merge_unit_id=identity.merge_unit_id,
+                steps=tuple(steps),
+                judgment_artifact_id=pending.authorization.judgment_artifact_id,
+                judgment_key=pending.authorization.judgment_key,
+                deferred_task_ids=pending.deferred_task_ids,
+                followup_task_ids=pending.followup_task_ids,
+            )
         decision = LandingPolicyDecision(
             allowed=True,
             allowed_overrides=tuple(
