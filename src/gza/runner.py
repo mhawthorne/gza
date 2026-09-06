@@ -385,6 +385,14 @@ _DOCKER_VERIFY_SNAPSHOT_PERMISSION_STATE_FILENAME = ".verify-db-snapshot-permiss
 _DOCKER_VERIFY_SNAPSHOT_PERMISSION_LOCK_SUFFIX = ".lock"
 
 
+class _DockerVerifySnapshotPermissionStateError(RuntimeError):
+    """Raised when the durable Docker snapshot permission lease state is unusable."""
+
+
+class _DockerVerifySnapshotPermissionPersistedError(RuntimeError):
+    """Raised when replacement reached the authoritative state file but durability failed."""
+
+
 def _git_error_failure() -> ResolvedRunFailure:
     return ResolvedRunFailure(
         reason="GIT_ERROR",
@@ -3008,9 +3016,15 @@ def _load_docker_verify_snapshot_permission_state(state_path: Path) -> dict[str,
     else:
         try:
             parsed = json.loads(raw_state)
-        except json.JSONDecodeError:
-            parsed = {}
-        loaded = parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError as exc:
+            raise _DockerVerifySnapshotPermissionStateError(
+                f"Docker verify snapshot permission lease state is malformed: {state_path}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise _DockerVerifySnapshotPermissionStateError(
+                f"Docker verify snapshot permission lease state is not an object: {state_path}"
+            )
+        loaded = parsed
     if not isinstance(loaded.get("leases"), dict):
         loaded["leases"] = {}
     return loaded
@@ -3037,22 +3051,29 @@ def _persist_docker_verify_snapshot_permission_state(state_path: Path, state: di
         text=True,
     )
     tmp_path = Path(tmp_name)
+    replaced = False
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             _dump_docker_verify_snapshot_permission_state(state, handle)
             _flush_docker_verify_snapshot_permission_state(handle)
             _fsync_docker_verify_snapshot_permission_state(handle.fileno())
         os.replace(tmp_path, state_path)
+        replaced = True
         dir_fd = os.open(state_path.parent, os.O_RDONLY)
         try:
             _fsync_docker_verify_snapshot_permission_state(dir_fd)
         finally:
             os.close(dir_fd)
-    except BaseException:
+    except BaseException as exc:
         try:
             tmp_path.unlink()
         except FileNotFoundError:
             pass
+        if replaced:
+            raise _DockerVerifySnapshotPermissionPersistedError(
+                "Docker verify snapshot permission lease state was replaced but not durably fsynced"
+                f" at {state_path}: {exc}"
+            ) from exc
         raise
 
 
@@ -3073,6 +3094,8 @@ def _docker_verify_snapshot_permission_state_path(tmp_parent: Path) -> Path:
 def _docker_verify_snapshot_holder() -> tuple[int, str, int | None]:
     pid = os.getpid()
     proc_stat = _read_linux_proc_stat(pid)
+    if sys.platform.startswith("linux") and proc_stat is None:
+        raise RuntimeError("cannot acquire Docker verify snapshot permission lease without strong process identity")
     pid_start_ticks = proc_stat[1] if proc_stat is not None else None
     return pid, f"{pid}:{time.time_ns()}", pid_start_ticks
 
@@ -3089,9 +3112,15 @@ def _docker_verify_snapshot_holder_is_live(holder: object) -> bool:
         if state == "Z":
             return False
         holder_start_ticks = holder.get("pid_start_ticks")
-        if isinstance(holder_start_ticks, int) and holder_start_ticks != start_ticks:
+        if not isinstance(holder_start_ticks, int):
+            return False
+        if holder_start_ticks != start_ticks:
             return False
         return True
+    if not isinstance(holder.get("pid_start_ticks"), int):
+        return False
+    if sys.platform.startswith("linux"):
+        return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -3151,6 +3180,49 @@ def _release_docker_verify_snapshot_traversal_leases(leases: list[_PathModeLease
             _restore_docker_verify_snapshot_empty_leases(state)
 
 
+def _remove_docker_verify_snapshot_holder_from_state(
+    *,
+    state_path: Path,
+    path: Path,
+    holder_pid: int,
+    holder_token: str,
+) -> None:
+    state = _load_docker_verify_snapshot_permission_state(state_path)
+    records = state.get("leases")
+    record = records.get(str(path)) if isinstance(records, dict) else None
+    if isinstance(record, dict):
+        record["holders"] = [
+            active_holder
+            for active_holder in record.get("holders", [])
+            if not (
+                isinstance(active_holder, dict)
+                and active_holder.get("pid") == holder_pid
+                and active_holder.get("token") == holder_token
+            )
+        ]
+    _restore_docker_verify_snapshot_empty_leases(state)
+    _persist_docker_verify_snapshot_permission_state(state_path, state)
+
+
+def _remove_durable_docker_verify_snapshot_holder_after_failure(
+    *,
+    state_path: Path,
+    path: Path,
+    holder_pid: int,
+    holder_token: str,
+    original_exc: BaseException,
+) -> None:
+    try:
+        _remove_docker_verify_snapshot_holder_from_state(
+            state_path=state_path,
+            path=path,
+            holder_pid=holder_pid,
+            holder_token=holder_token,
+        )
+    except BaseException as cleanup_exc:
+        original_exc.__context__ = cleanup_exc
+
+
 def _acquire_docker_verify_snapshot_traversal_lease(
     path: Path,
     *,
@@ -3170,27 +3242,27 @@ def _acquire_docker_verify_snapshot_traversal_lease(
             original_mode = int(record["mode"])
             gid = int(record["gid"])
             record.setdefault("holders", []).append(holder)
-            _persist_docker_verify_snapshot_permission_state(state_path, state)
+            try:
+                _persist_docker_verify_snapshot_permission_state(state_path, state)
+            except _DockerVerifySnapshotPermissionPersistedError as exc:
+                _remove_durable_docker_verify_snapshot_holder_after_failure(
+                    state_path=state_path,
+                    path=key,
+                    holder_pid=holder_pid,
+                    holder_token=holder_token,
+                    original_exc=exc,
+                )
+                raise
             try:
                 if not stat.S_IMODE(path.stat().st_mode) & stat.S_IXGRP:
                     path.chmod(original_mode | stat.S_IXGRP)
             except BaseException:
-                state = _load_docker_verify_snapshot_permission_state(state_path)
-                records = state.get("leases")
-                record = records.get(str(key)) if isinstance(records, dict) else None
-                if not isinstance(record, dict):
-                    raise
-                record["holders"] = [
-                    active_holder
-                    for active_holder in record.get("holders", [])
-                    if not (
-                        isinstance(active_holder, dict)
-                        and active_holder.get("pid") == holder_pid
-                        and active_holder.get("token") == holder_token
-                    )
-                ]
-                _restore_docker_verify_snapshot_empty_leases(state)
-                _persist_docker_verify_snapshot_permission_state(state_path, state)
+                _remove_docker_verify_snapshot_holder_from_state(
+                    state_path=state_path,
+                    path=key,
+                    holder_pid=holder_pid,
+                    holder_token=holder_token,
+                )
                 raise
             return _PathModeLeaseHandle(
                 path=key,
@@ -3213,16 +3285,26 @@ def _acquire_docker_verify_snapshot_traversal_lease(
             "mode": original_mode,
             "holders": [holder],
         }
-        _persist_docker_verify_snapshot_permission_state(state_path, state)
+        try:
+            _persist_docker_verify_snapshot_permission_state(state_path, state)
+        except _DockerVerifySnapshotPermissionPersistedError as exc:
+            _remove_durable_docker_verify_snapshot_holder_after_failure(
+                state_path=state_path,
+                path=key,
+                holder_pid=holder_pid,
+                holder_token=holder_token,
+                original_exc=exc,
+            )
+            raise
         try:
             path.chmod(original_mode | stat.S_IXGRP)
         except BaseException:
-            state = _load_docker_verify_snapshot_permission_state(state_path)
-            records = state.get("leases")
-            if isinstance(records, dict):
-                records.pop(str(key), None)
-            _restore_docker_verify_snapshot_empty_leases(state)
-            _persist_docker_verify_snapshot_permission_state(state_path, state)
+            _remove_docker_verify_snapshot_holder_from_state(
+                state_path=state_path,
+                path=key,
+                holder_pid=holder_pid,
+                holder_token=holder_token,
+            )
             raise
         return _PathModeLeaseHandle(
             path=key,

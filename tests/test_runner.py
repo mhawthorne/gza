@@ -7414,6 +7414,27 @@ class TestDisposableVerifyDbSnapshotEnv:
         assert isinstance(state, dict)
         return state
 
+    def _docker_permission_state_path(self, verify_cwd: Path) -> Path:
+        return (
+            verify_cwd
+            / ".gza"
+            / "tmp"
+            / runner._DOCKER_VERIFY_SNAPSHOT_PERMISSION_STATE_FILENAME
+        )
+
+    def _fail_next_permission_state_dir_fsync(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        original_fsync = runner._fsync_docker_verify_snapshot_permission_state
+        failed = False
+
+        def fail_once_on_directory(fd: int) -> None:
+            nonlocal failed
+            if not failed and stat.S_ISDIR(os.fstat(fd).st_mode):
+                failed = True
+                raise RuntimeError("directory fsync failed")
+            original_fsync(fd)
+
+        monkeypatch.setattr(runner, "_fsync_docker_verify_snapshot_permission_state", fail_once_on_directory)
+
     def _drain_process_messages(self, messages: Any) -> list[tuple[str, str]]:
         drained = []
         while True:
@@ -8012,6 +8033,84 @@ class TestDisposableVerifyDbSnapshotEnv:
         assert state.get("leases", {}) == {}
         assert not any((verify_cwd / ".gza" / "tmp").glob("verify-db-*"))
 
+    def test_docker_snapshot_new_record_post_replace_fsync_failure_removes_new_holder(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        verify_cwd, tracked_paths, original_modes, original_gids = self._prepare_distinct_docker_snapshot_hierarchy(
+            tmp_path,
+            monkeypatch,
+        )
+        state_path = self._docker_permission_state_path(verify_cwd)
+        earlier = runner._acquire_docker_verify_snapshot_traversal_lease(verify_cwd / ".gza", state_path=state_path)
+        assert earlier is not None
+        self._fail_next_permission_state_dir_fsync(monkeypatch)
+
+        with pytest.raises(runner._DockerVerifySnapshotPermissionPersistedError, match="directory fsync failed"):
+            runner._acquire_docker_verify_snapshot_traversal_lease(verify_cwd, state_path=state_path)
+
+        state = self._docker_permission_state(verify_cwd)
+        assert set(state["leases"]) == {str((verify_cwd / ".gza").resolve())}
+        self._assert_group_traversal_present((verify_cwd / ".gza",))
+
+        runner._release_docker_verify_snapshot_traversal_leases([earlier])
+        self._assert_metadata(tracked_paths, original_modes, original_gids)
+        assert self._docker_permission_state(verify_cwd).get("leases", {}) == {}
+
+    def test_docker_snapshot_existing_record_post_replace_fsync_failure_preserves_live_holder(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        verify_cwd, tracked_paths, original_modes, original_gids = self._prepare_distinct_docker_snapshot_hierarchy(
+            tmp_path,
+            monkeypatch,
+        )
+        state_path = self._docker_permission_state_path(verify_cwd)
+        earlier = runner._acquire_docker_verify_snapshot_traversal_lease(verify_cwd / ".gza", state_path=state_path)
+        existing = runner._acquire_docker_verify_snapshot_traversal_lease(verify_cwd, state_path=state_path)
+        assert earlier is not None
+        assert existing is not None
+        self._fail_next_permission_state_dir_fsync(monkeypatch)
+
+        with pytest.raises(runner._DockerVerifySnapshotPermissionPersistedError, match="directory fsync failed"):
+            runner._acquire_docker_verify_snapshot_traversal_lease(verify_cwd, state_path=state_path)
+
+        state = self._docker_permission_state(verify_cwd)
+        record = state["leases"][str(verify_cwd.resolve())]
+        assert [holder["token"] for holder in record["holders"]] == [existing.holder_token]
+        assert str((verify_cwd / ".gza").resolve()) in state["leases"]
+        self._assert_group_traversal_present((verify_cwd, verify_cwd / ".gza"))
+
+        runner._release_docker_verify_snapshot_traversal_leases([existing, earlier])
+        self._assert_metadata(tracked_paths, original_modes, original_gids)
+        assert self._docker_permission_state(verify_cwd).get("leases", {}) == {}
+
+    def test_malformed_docker_snapshot_permission_state_fails_closed_without_mutating_permissions(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        verify_cwd, tracked_paths, original_modes, original_gids = self._prepare_distinct_docker_snapshot_hierarchy(
+            tmp_path,
+            monkeypatch,
+        )
+        state_path = self._docker_permission_state_path(verify_cwd)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        verify_cwd.chmod(original_modes[verify_cwd] | stat.S_IXGRP)
+        widened_mode = stat.S_IMODE(verify_cwd.stat().st_mode)
+        state_path.write_text("{malformed", encoding="utf-8")
+
+        with pytest.raises(runner._DockerVerifySnapshotPermissionStateError, match="malformed"):
+            runner._acquire_docker_verify_snapshot_traversal_lease(verify_cwd, state_path=state_path)
+
+        assert state_path.read_text(encoding="utf-8") == "{malformed"
+        assert stat.S_IMODE(verify_cwd.stat().st_mode) == widened_mode
+        assert verify_cwd.stat().st_gid == original_gids[verify_cwd]
+        assert stat.S_IMODE((verify_cwd / ".gza").stat().st_mode) == original_modes[verify_cwd / ".gza"]
+        assert stat.S_IMODE((verify_cwd / ".gza" / "tmp").stat().st_mode) == original_modes[verify_cwd / ".gza" / "tmp"]
+
     def test_docker_snapshot_chmod_failure_rolls_back_durable_holder(
         self,
         tmp_path: Path,
@@ -8042,128 +8141,75 @@ class TestDisposableVerifyDbSnapshotEnv:
         assert state.get("leases", {}) == {}
         assert not any((verify_cwd / ".gza" / "tmp").glob("verify-db-*"))
 
-    def test_docker_snapshot_release_prunes_holder_killed_after_durable_acquire(
+    def test_docker_snapshot_release_prunes_zombie_holder_without_losing_live_holder(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        db_path = self._create_live_db(tmp_path)
         verify_cwd, tracked_paths, original_modes, original_gids = self._prepare_distinct_docker_snapshot_hierarchy(
             tmp_path,
             monkeypatch,
         )
-        runtime_context = self._runtime_context(db_path)
-        config = self._docker_config()
-        ctx = multiprocessing.get_context("spawn")
-        messages = ctx.Queue()
-        first_entered = ctx.Event()
-        first_release = ctx.Event()
-        first_process = ctx.Process(
-            target=_docker_verify_snapshot_process_worker,
-            kwargs={
-                "db_path_text": str(db_path),
-                "verify_cwd_text": str(verify_cwd),
-                "docker_workdir": "/workspace",
-                "entered": first_entered,
-                "release": first_release,
-                "messages": messages,
-                "pause_first_traversal_chmod": True,
-            },
+        state_path = self._docker_permission_state_path(verify_cwd)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        verify_cwd.chmod(original_modes[verify_cwd] | stat.S_IXGRP)
+        live_holder = {"pid": 222, "token": "live-release", "pid_start_ticks": 2220}
+        survivor_holder = {"pid": 333, "token": "live-survivor", "pid_start_ticks": 3330}
+        state_path.write_text(
+            json.dumps(
+                {
+                    "leases": {
+                        str(verify_cwd.resolve()): {
+                            "path": str(verify_cwd.resolve()),
+                            "gid": original_gids[verify_cwd],
+                            "mode": original_modes[verify_cwd],
+                            "holders": [
+                                {"pid": 111, "token": "zombie", "pid_start_ticks": 1110},
+                                live_holder,
+                                survivor_holder,
+                            ],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
         )
-        first_process.start()
-        try:
-            assert first_entered.wait(timeout=10)
-            assert any(message[0] == "pre-chmod" for message in self._drain_process_messages(messages))
-            assert stat.S_IMODE(verify_cwd.stat().st_mode) == original_modes[verify_cwd]
-            assert self._docker_permission_state(verify_cwd).get("leases")
 
-            assert first_process.pid is not None
-            os.kill(first_process.pid, signal.SIGTERM)
-            first_process.join(timeout=10)
-            assert first_process.exitcode is not None
-            assert first_process.exitcode != 0
+        def proc_stat(pid: int) -> tuple[str, int] | None:
+            return {
+                111: ("Z", 1110),
+                222: ("S", 2220),
+                333: ("S", 3330),
+            }.get(pid)
 
-            with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config) as snapshot:
-                self._assert_group_traversal_present(tracked_paths)
-                self._commit_with_wal_sidecars(snapshot.host_path)
-        finally:
-            if first_process.is_alive():
-                first_process.terminate()
-                first_process.join(timeout=10)
+        monkeypatch.setattr(runner, "_read_linux_proc_stat", proc_stat)
+        live_handle = runner._PathModeLeaseHandle(
+            path=verify_cwd.resolve(),
+            gid=original_gids[verify_cwd],
+            mode=original_modes[verify_cwd],
+            state_path=state_path,
+            holder_pid=222,
+            holder_token="live-release",
+        )
+        survivor_handle = runner._PathModeLeaseHandle(
+            path=verify_cwd.resolve(),
+            gid=original_gids[verify_cwd],
+            mode=original_modes[verify_cwd],
+            state_path=state_path,
+            holder_pid=333,
+            holder_token="live-survivor",
+        )
 
+        runner._release_docker_verify_snapshot_traversal_leases([live_handle])
+
+        state = self._docker_permission_state(verify_cwd)
+        record = state["leases"][str(verify_cwd.resolve())]
+        assert record["holders"] == [survivor_holder]
+        assert stat.S_IMODE(verify_cwd.stat().st_mode) & stat.S_IXGRP
+
+        runner._release_docker_verify_snapshot_traversal_leases([survivor_handle])
         self._assert_metadata(tracked_paths, original_modes, original_gids)
-        self._assert_no_active_docker_permission_leases(verify_cwd)
-
-    def test_docker_snapshot_release_prunes_dead_holder_without_losing_live_holder(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        db_path = self._create_live_db(tmp_path)
-        verify_cwd, tracked_paths, original_modes, original_gids = self._prepare_distinct_docker_snapshot_hierarchy(
-            tmp_path,
-            monkeypatch,
-        )
-        ctx = multiprocessing.get_context("spawn")
-        messages = ctx.Queue()
-        first_entered = ctx.Event()
-        second_entered = ctx.Event()
-        release_first = ctx.Event()
-        release_second = ctx.Event()
-        first_process = ctx.Process(
-            target=_docker_verify_snapshot_process_worker,
-            kwargs={
-                "db_path_text": str(db_path),
-                "verify_cwd_text": str(verify_cwd),
-                "docker_workdir": "/workspace",
-                "entered": first_entered,
-                "release": release_first,
-                "messages": messages,
-            },
-        )
-        second_process = ctx.Process(
-            target=_docker_verify_snapshot_process_worker,
-            kwargs={
-                "db_path_text": str(db_path),
-                "verify_cwd_text": str(verify_cwd),
-                "docker_workdir": "/workspace",
-                "entered": second_entered,
-                "release": release_second,
-                "messages": messages,
-                "commit_after_release": True,
-            },
-        )
-        first_joined = False
-        try:
-            first_process.start()
-            assert first_entered.wait(timeout=10)
-            second_process.start()
-            assert second_entered.wait(timeout=10)
-            self._assert_group_traversal_present(tracked_paths)
-
-            assert first_process.pid is not None
-            os.kill(first_process.pid, signal.SIGTERM)
-            first_process.join(timeout=10)
-            first_joined = True
-            assert first_process.exitcode is not None
-            assert first_process.exitcode != 0
-
-            release_second.set()
-            second_process.join(timeout=10)
-            assert second_process.exitcode == 0
-            self._assert_metadata(tracked_paths, original_modes, original_gids)
-        finally:
-            for process in (first_process, second_process):
-                if process.is_alive():
-                    process.terminate()
-                    process.join(timeout=10)
-            if not first_joined and not first_process.is_alive():
-                first_process.join(timeout=10)
-
-        drained = self._drain_process_messages(messages)
-        assert any(message[0] == "committed" for message in drained)
-        assert not [message for message in drained if message[0] == "error"]
-        self._assert_no_active_docker_permission_leases(verify_cwd)
+        assert self._docker_permission_state(verify_cwd).get("leases", {}) == {}
 
     def test_docker_snapshot_holder_liveness_rejects_zombie_pid(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(runner, "_read_linux_proc_stat", lambda _pid: ("Z", 999))
@@ -8178,6 +8224,33 @@ class TestDisposableVerifyDbSnapshotEnv:
         assert not runner._docker_verify_snapshot_holder_is_live(
             {"pid": os.getpid(), "token": "old", "pid_start_ticks": 123}
         )
+
+    def test_docker_snapshot_holder_liveness_rejects_legacy_pid_without_start_tick(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(runner, "_read_linux_proc_stat", lambda _pid: ("S", 999))
+
+        assert not runner._docker_verify_snapshot_holder_is_live({"pid": os.getpid(), "token": "legacy"})
+
+    def test_docker_snapshot_holder_liveness_rejects_legacy_pid_when_proc_stat_unavailable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(runner, "_read_linux_proc_stat", lambda _pid: None)
+
+        assert not runner._docker_verify_snapshot_holder_is_live({"pid": os.getpid(), "token": "legacy"})
+
+    def test_docker_snapshot_holder_requires_strong_process_identity_on_linux(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if not sys.platform.startswith("linux"):
+            pytest.skip("strong process identity is required only on Linux")
+        monkeypatch.setattr(runner, "_read_linux_proc_stat", lambda _pid: None)
+
+        with pytest.raises(RuntimeError, match="strong process identity"):
+            runner._docker_verify_snapshot_holder()
 
     def test_overlapping_docker_snapshot_keeps_traversal_after_second_context_exits_first(
         self,
