@@ -3,13 +3,16 @@
 import json
 import logging
 import math
+import multiprocessing
 import os
+import queue
 import selectors
 import signal
 import sqlite3
 import stat
 import subprocess
 import sys
+import threading
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -158,6 +161,67 @@ from gza.schema_compat import (
 )
 from gza.verify_fix_outcome import effective_verify_fix_completion_outcome
 from gza.worktree_roots import managed_worktree_root_paths
+
+
+def _commit_sqlite_wal_sidecars(snapshot_path: Path) -> None:
+    conn = sqlite3.connect(str(snapshot_path))
+    try:
+        journal_mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        assert journal_mode == ("wal",)
+        conn.execute("CREATE TABLE committed_by_verify (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO committed_by_verify (name) VALUES ('ok')")
+        conn.commit()
+        assert Path(f"{snapshot_path}-wal").exists()
+        assert Path(f"{snapshot_path}-shm").exists()
+    finally:
+        conn.close()
+
+
+def _docker_verify_snapshot_process_worker(
+    *,
+    db_path_text: str,
+    verify_cwd_text: str,
+    docker_workdir: str,
+    entered: Any,
+    release: Any,
+    messages: Any,
+    commit_after_release: bool = False,
+    fail_tmp_parent_chmod: bool = False,
+) -> None:
+    db_path = Path(db_path_text)
+    verify_cwd = Path(verify_cwd_text)
+    runtime_context = RuntimeExecutionContext(
+        cwd=db_path.parent.parent,
+        env={"GZA_DB_PATH": str(db_path)},
+        project_id="project",
+        db_path=db_path,
+    )
+    config = SimpleNamespace(use_docker=True, docker_workdir=docker_workdir)
+    original_chmod = Path.chmod
+    tmp_parent = verify_cwd / ".gza" / "tmp"
+
+    def chmod_with_failure(path: Path, mode: int) -> None:
+        if path == tmp_parent and mode == 0o730:
+            raise RuntimeError("permission setup failed")
+        original_chmod(path, mode)
+
+    if fail_tmp_parent_chmod:
+        Path.chmod = chmod_with_failure  # type: ignore[method-assign]
+    try:
+        with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config) as snapshot:
+            messages.put(("entered", str(snapshot.host_path)))
+            entered.set()
+            if not release.wait(timeout=10):
+                messages.put(("error", "release timeout"))
+                return
+            if commit_after_release:
+                _commit_sqlite_wal_sidecars(snapshot.host_path)
+                messages.put(("committed", str(snapshot.host_path)))
+    except BaseException as exc:
+        messages.put(("error", repr(exc)))
+        entered.set()
+    finally:
+        Path.chmod = original_chmod  # type: ignore[method-assign]
 
 
 def _runner_verify_failure_only_review_report() -> str:
@@ -6485,6 +6549,108 @@ class TestSnapshotTaskDbToWorktree:
 class TestDisposableVerifyDbSnapshotEnv:
     """Tests for disposable verify DB snapshot environments."""
 
+    def _create_live_db(self, tmp_path: Path) -> Path:
+        db_path = tmp_path / "repo" / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO items (name) VALUES ('live')")
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def _runtime_context(self, db_path: Path) -> RuntimeExecutionContext:
+        return RuntimeExecutionContext(
+            cwd=db_path.parent.parent,
+            env={"GZA_DB_PATH": str(db_path)},
+            project_id="project",
+            db_path=db_path,
+        )
+
+    def _docker_config(self) -> SimpleNamespace:
+        return SimpleNamespace(use_docker=True, docker_workdir="/workspace")
+
+    def _prepare_distinct_docker_snapshot_hierarchy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[Path, tuple[Path, Path, Path], dict[Path, int], dict[Path, int]]:
+        verify_cwd = tmp_path / "worktree"
+        gza_dir = verify_cwd / ".gza"
+        tmp_parent = gza_dir / "tmp"
+        tmp_parent.mkdir(parents=True)
+        modes = {
+            verify_cwd: 0o700,
+            gza_dir: 0o701,
+            tmp_parent: 0o720,
+        }
+        for path, mode in modes.items():
+            path.chmod(mode)
+        fake_gids = {
+            verify_cwd: 6001,
+            gza_dir: 6002,
+            tmp_parent: 6003,
+        }
+        original_stat = Path.stat
+
+        class StatWithGid:
+            def __init__(self, wrapped: os.stat_result, gid: int) -> None:
+                self._wrapped = wrapped
+                self.st_gid = gid
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._wrapped, name)
+
+        def stat_with_distinct_gids(path: Path, *, follow_symlinks: bool = True) -> os.stat_result | StatWithGid:
+            stat_result = original_stat(path, follow_symlinks=follow_symlinks)
+            gid = fake_gids.get(path)
+            if gid is None:
+                return stat_result
+            return StatWithGid(stat_result, gid)
+
+        monkeypatch.setattr(Path, "stat", stat_with_distinct_gids)
+        tracked_paths = (verify_cwd, gza_dir, tmp_parent)
+        original_modes = {path: stat.S_IMODE(path.stat().st_mode) for path in tracked_paths}
+        original_gids = {path: path.stat().st_gid for path in tracked_paths}
+        return verify_cwd, tracked_paths, original_modes, original_gids
+
+    def _assert_metadata(
+        self,
+        tracked_paths: tuple[Path, Path, Path],
+        modes: dict[Path, int],
+        gids: dict[Path, int],
+    ) -> None:
+        for path in tracked_paths:
+            assert stat.S_IMODE(path.stat().st_mode) == modes[path]
+            assert path.stat().st_gid == gids[path]
+
+    def _assert_group_traversal_present(self, tracked_paths: tuple[Path, Path, Path]) -> None:
+        for path in tracked_paths:
+            assert stat.S_IMODE(path.stat().st_mode) & stat.S_IXGRP
+
+    def _commit_with_wal_sidecars(self, snapshot_path: Path) -> None:
+        _commit_sqlite_wal_sidecars(snapshot_path)
+
+    def _assert_no_active_docker_permission_leases(self, verify_cwd: Path) -> None:
+        state_path = (
+            verify_cwd
+            / ".gza"
+            / "tmp"
+            / runner._DOCKER_VERIFY_SNAPSHOT_PERMISSION_STATE_FILENAME
+        )
+        if not state_path.exists():
+            return
+        state = json.loads(state_path.read_text(encoding="utf-8") or "{}")
+        assert state.get("leases", {}) == {}
+
+    def _drain_process_messages(self, messages: Any) -> list[tuple[str, str]]:
+        drained = []
+        while True:
+            try:
+                drained.append(messages.get_nowait())
+            except queue.Empty:
+                return drained
+
     def test_clones_runtime_db_to_fresh_writable_snapshot_without_mutating_env(
         self,
         tmp_path: Path,
@@ -6540,6 +6706,161 @@ class TestDisposableVerifyDbSnapshotEnv:
         assert runtime_env["GZA_DB_PATH"] == str(db_path)
         assert os.environ["GZA_DB_PATH"] == str(tmp_path / "ambient.db")
         assert not snapshot_path.exists()
+
+    def test_concurrent_missing_parent_creation_yields_isolated_snapshots(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / "project" / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO items (name) VALUES ('live')")
+        conn.commit()
+        conn.close()
+        verify_cwd = tmp_path / "worktree"
+        verify_cwd.mkdir()
+        verify_cwd.chmod(0o751)
+        original_cwd_mode = stat.S_IMODE(verify_cwd.stat().st_mode)
+        original_cwd_gid = verify_cwd.stat().st_gid
+        runtime_context = RuntimeExecutionContext(
+            cwd=tmp_path / "project",
+            env={"GZA_DB_PATH": str(db_path)},
+            project_id="project",
+            db_path=db_path,
+        )
+        tmp_parent = verify_cwd / ".gza" / "tmp"
+        mkdir_barrier = threading.Barrier(2)
+        original_mkdir = Path.mkdir
+
+        def mkdir_with_barrier(
+            path: Path,
+            mode: int = 0o777,
+            parents: bool = False,
+            exist_ok: bool = False,
+        ) -> None:
+            if path == tmp_parent:
+                mkdir_barrier.wait(timeout=5)
+            original_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+        monkeypatch.setattr(Path, "mkdir", mkdir_with_barrier)
+        results: queue.Queue[Path | BaseException] = queue.Queue()
+
+        def enter_snapshot() -> None:
+            try:
+                with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd) as snapshot:
+                    assert snapshot.host_path.exists()
+                    results.put(snapshot.host_path)
+            except BaseException as exc:
+                results.put(exc)
+
+        threads = [threading.Thread(target=enter_snapshot) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert not any(thread.is_alive() for thread in threads)
+        yielded = [results.get_nowait() for _ in threads]
+        failures = [item for item in yielded if isinstance(item, BaseException)]
+        assert not failures
+        snapshot_paths = [item for item in yielded if isinstance(item, Path)]
+        assert len({path.parent for path in snapshot_paths}) == 2
+        assert all(not path.exists() for path in snapshot_paths)
+        assert tmp_parent.exists()
+        assert not any(tmp_parent.glob("verify-db-*"))
+        assert stat.S_IMODE(verify_cwd.stat().st_mode) == original_cwd_mode
+        assert verify_cwd.stat().st_gid == original_cwd_gid
+
+    def test_creator_cleanup_preserves_parent_for_waiting_concurrent_snapshot(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / "project" / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO items (name) VALUES ('live')")
+        conn.commit()
+        conn.close()
+        verify_cwd = tmp_path / "worktree"
+        verify_cwd.mkdir()
+        verify_cwd.chmod(0o751)
+        original_cwd_mode = stat.S_IMODE(verify_cwd.stat().st_mode)
+        original_cwd_gid = verify_cwd.stat().st_gid
+        runtime_context = RuntimeExecutionContext(
+            cwd=tmp_path / "project",
+            env={"GZA_DB_PATH": str(db_path)},
+            project_id="project",
+            db_path=db_path,
+        )
+        tmp_parent = verify_cwd / ".gza" / "tmp"
+        first_inside = threading.Event()
+        second_at_mkdtemp = threading.Event()
+        release_second_mkdtemp = threading.Event()
+        mkdtemp_lock = threading.Lock()
+        mkdtemp_calls = 0
+        original_mkdtemp = runner.tempfile.mkdtemp
+
+        def mkdtemp_with_second_attempt_pause(
+            suffix: str | None = None,
+            prefix: str | None = None,
+            dir: str | os.PathLike[str] | None = None,
+        ) -> str:
+            nonlocal mkdtemp_calls
+            with mkdtemp_lock:
+                mkdtemp_calls += 1
+                call_index = mkdtemp_calls
+            if call_index == 2:
+                assert Path(cast(str, dir)) == tmp_parent
+                second_at_mkdtemp.set()
+                assert release_second_mkdtemp.wait(timeout=5)
+            return original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir)
+
+        monkeypatch.setattr(runner.tempfile, "mkdtemp", mkdtemp_with_second_attempt_pause)
+        results: queue.Queue[tuple[str, Path] | BaseException] = queue.Queue()
+
+        def first_snapshot() -> None:
+            try:
+                with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd) as snapshot:
+                    results.put(("first", snapshot.host_path))
+                    first_inside.set()
+                    assert second_at_mkdtemp.wait(timeout=5)
+            except BaseException as exc:
+                results.put(exc)
+
+        def second_snapshot() -> None:
+            try:
+                with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd) as snapshot:
+                    results.put(("second", snapshot.host_path))
+            except BaseException as exc:
+                results.put(exc)
+
+        first_thread = threading.Thread(target=first_snapshot)
+        first_thread.start()
+        assert first_inside.wait(timeout=5)
+        second_thread = threading.Thread(target=second_snapshot)
+        second_thread.start()
+        assert second_at_mkdtemp.wait(timeout=5)
+        first_thread.join(timeout=5)
+        assert not first_thread.is_alive()
+        assert tmp_parent.exists()
+        release_second_mkdtemp.set()
+        second_thread.join(timeout=5)
+
+        assert not second_thread.is_alive()
+        yielded = [results.get_nowait() for _ in range(2)]
+        failures = [item for item in yielded if isinstance(item, BaseException)]
+        assert not failures
+        snapshot_paths = [item[1] for item in yielded if isinstance(item, tuple)]
+        assert len({path.parent for path in snapshot_paths}) == 2
+        assert all(not path.exists() for path in snapshot_paths)
+        assert tmp_parent.exists()
+        assert not any(tmp_parent.glob("verify-db-*"))
+        assert stat.S_IMODE(verify_cwd.stat().st_mode) == original_cwd_mode
+        assert verify_cwd.stat().st_gid == original_cwd_gid
 
     def test_creates_fresh_snapshot_for_each_entry(self, tmp_path: Path) -> None:
         db_path = tmp_path / "project" / ".gza" / "gza.db"
@@ -6620,6 +6941,17 @@ class TestDisposableVerifyDbSnapshotEnv:
         )
         config = SimpleNamespace(use_docker=True, docker_workdir="/workspace/services/foo")
         verify_cwd.chmod(0o700)
+        (verify_cwd / ".gza" / "tmp").mkdir(parents=True)
+        (verify_cwd / ".gza").chmod(0o750)
+        (verify_cwd / ".gza" / "tmp").chmod(0o770)
+        original_modes = {
+            path: stat.S_IMODE(path.stat().st_mode)
+            for path in (verify_cwd, verify_cwd / ".gza", verify_cwd / ".gza" / "tmp")
+        }
+        original_gids = {
+            path: path.stat().st_gid
+            for path in (verify_cwd, verify_cwd / ".gza", verify_cwd / ".gza" / "tmp")
+        }
 
         with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config) as snapshot:
             assert snapshot.host_path.exists()
@@ -6627,12 +6959,371 @@ class TestDisposableVerifyDbSnapshotEnv:
             assert snapshot.env["GZA_DB_PATH"] == str(snapshot.subprocess_path)
             assert snapshot.env["PATH"] == "/runtime/bin"
             assert stat.S_IMODE(verify_cwd.stat().st_mode) == 0o710
-            assert stat.S_IMODE((verify_cwd / ".gza").stat().st_mode) & stat.S_IXGRP
-            assert stat.S_IMODE((verify_cwd / ".gza" / "tmp").stat().st_mode) & stat.S_IXGRP
+            assert stat.S_IMODE((verify_cwd / ".gza").stat().st_mode) == 0o750
+            assert stat.S_IMODE((verify_cwd / ".gza" / "tmp").stat().st_mode) == 0o770
             assert stat.S_IMODE(snapshot.host_path.parent.stat().st_mode) == 0o730
             assert stat.S_IMODE(snapshot.host_path.stat().st_mode) == 0o660
+            assert set(snapshot.docker_group_ids) == {
+                verify_cwd.stat().st_gid,
+                (verify_cwd / ".gza").stat().st_gid,
+                (verify_cwd / ".gza" / "tmp").stat().st_gid,
+                snapshot.host_path.parent.stat().st_gid,
+                snapshot.host_path.stat().st_gid,
+            }
 
         assert runtime_env["GZA_DB_PATH"] == str(db_path)
+        for path, original_mode in original_modes.items():
+            assert stat.S_IMODE(path.stat().st_mode) == original_mode
+        for path, original_gid in original_gids.items():
+            assert path.stat().st_gid == original_gid
+
+    def test_overlapping_docker_snapshot_keeps_traversal_after_first_context_exits(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = self._create_live_db(tmp_path)
+        verify_cwd, tracked_paths, original_modes, original_gids = self._prepare_distinct_docker_snapshot_hierarchy(
+            tmp_path,
+            monkeypatch,
+        )
+        runtime_context = self._runtime_context(db_path)
+        config = self._docker_config()
+
+        first_context = disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config)
+        first = first_context.__enter__()
+        second_context = disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config)
+        second = second_context.__enter__()
+        try:
+            self._assert_group_traversal_present(tracked_paths)
+            assert set(first.docker_group_ids) == {
+                6001,
+                6002,
+                6003,
+                first.host_path.parent.stat().st_gid,
+                first.host_path.stat().st_gid,
+            }
+            assert set(second.docker_group_ids) == {
+                6001,
+                6002,
+                6003,
+                second.host_path.parent.stat().st_gid,
+                second.host_path.stat().st_gid,
+            }
+
+            first_context.__exit__(None, None, None)
+            self._assert_group_traversal_present(tracked_paths)
+            self._commit_with_wal_sidecars(second.host_path)
+            first_exited = True
+        finally:
+            if not locals().get("first_exited", False):
+                first_context.__exit__(None, None, None)
+            second_context.__exit__(None, None, None)
+
+        assert not first.host_path.exists()
+        assert not second.host_path.exists()
+        self._assert_metadata(tracked_paths, original_modes, original_gids)
+        self._assert_no_active_docker_permission_leases(verify_cwd)
+
+    def test_overlapping_docker_snapshot_processes_keep_traversal_after_first_process_exits(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = self._create_live_db(tmp_path)
+        verify_cwd, tracked_paths, original_modes, original_gids = self._prepare_distinct_docker_snapshot_hierarchy(
+            tmp_path,
+            monkeypatch,
+        )
+        ctx = multiprocessing.get_context("spawn")
+        messages = ctx.Queue()
+        first_entered = ctx.Event()
+        second_entered = ctx.Event()
+        release_first = ctx.Event()
+        release_second = ctx.Event()
+        first_process = ctx.Process(
+            target=_docker_verify_snapshot_process_worker,
+            kwargs={
+                "db_path_text": str(db_path),
+                "verify_cwd_text": str(verify_cwd),
+                "docker_workdir": "/workspace",
+                "entered": first_entered,
+                "release": release_first,
+                "messages": messages,
+            },
+        )
+        second_process = ctx.Process(
+            target=_docker_verify_snapshot_process_worker,
+            kwargs={
+                "db_path_text": str(db_path),
+                "verify_cwd_text": str(verify_cwd),
+                "docker_workdir": "/workspace",
+                "entered": second_entered,
+                "release": release_second,
+                "messages": messages,
+                "commit_after_release": True,
+            },
+        )
+        try:
+            first_process.start()
+            assert first_entered.wait(timeout=10)
+            second_process.start()
+            assert second_entered.wait(timeout=10)
+            self._assert_group_traversal_present(tracked_paths)
+
+            release_first.set()
+            first_process.join(timeout=10)
+            assert first_process.exitcode == 0
+            self._assert_group_traversal_present(tracked_paths)
+
+            release_second.set()
+            second_process.join(timeout=10)
+            assert second_process.exitcode == 0
+        finally:
+            for process in (first_process, second_process):
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=10)
+
+        drained = self._drain_process_messages(messages)
+        assert [message[0] for message in drained].count("entered") == 2
+        assert any(message[0] == "committed" for message in drained)
+        assert not [message for message in drained if message[0] == "error"]
+        self._assert_metadata(tracked_paths, original_modes, original_gids)
+        self._assert_no_active_docker_permission_leases(verify_cwd)
+
+    def test_docker_snapshot_process_release_prunes_abrupt_dead_holder(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = self._create_live_db(tmp_path)
+        verify_cwd, tracked_paths, original_modes, original_gids = self._prepare_distinct_docker_snapshot_hierarchy(
+            tmp_path,
+            monkeypatch,
+        )
+        ctx = multiprocessing.get_context("spawn")
+        messages = ctx.Queue()
+        first_entered = ctx.Event()
+        second_entered = ctx.Event()
+        release_first = ctx.Event()
+        release_second = ctx.Event()
+        first_process = ctx.Process(
+            target=_docker_verify_snapshot_process_worker,
+            kwargs={
+                "db_path_text": str(db_path),
+                "verify_cwd_text": str(verify_cwd),
+                "docker_workdir": "/workspace",
+                "entered": first_entered,
+                "release": release_first,
+                "messages": messages,
+            },
+        )
+        second_process = ctx.Process(
+            target=_docker_verify_snapshot_process_worker,
+            kwargs={
+                "db_path_text": str(db_path),
+                "verify_cwd_text": str(verify_cwd),
+                "docker_workdir": "/workspace",
+                "entered": second_entered,
+                "release": release_second,
+                "messages": messages,
+                "commit_after_release": True,
+            },
+        )
+        try:
+            first_process.start()
+            assert first_entered.wait(timeout=10)
+            second_process.start()
+            assert second_entered.wait(timeout=10)
+            self._assert_group_traversal_present(tracked_paths)
+
+            first_process.terminate()
+            first_process.join(timeout=10)
+            assert first_process.exitcode is not None
+            assert first_process.exitcode != 0
+            self._assert_group_traversal_present(tracked_paths)
+
+            release_second.set()
+            second_process.join(timeout=10)
+            assert second_process.exitcode == 0
+        finally:
+            for process in (first_process, second_process):
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=10)
+
+        drained = self._drain_process_messages(messages)
+        assert any(message[0] == "committed" for message in drained)
+        assert not [message for message in drained if message[0] == "error"]
+        self._assert_metadata(tracked_paths, original_modes, original_gids)
+        self._assert_no_active_docker_permission_leases(verify_cwd)
+
+    def test_docker_snapshot_process_partial_setup_failure_removes_lease_record(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = self._create_live_db(tmp_path)
+        verify_cwd, tracked_paths, original_modes, original_gids = self._prepare_distinct_docker_snapshot_hierarchy(
+            tmp_path,
+            monkeypatch,
+        )
+        ctx = multiprocessing.get_context("spawn")
+        messages = ctx.Queue()
+        entered = ctx.Event()
+        release = ctx.Event()
+        process = ctx.Process(
+            target=_docker_verify_snapshot_process_worker,
+            kwargs={
+                "db_path_text": str(db_path),
+                "verify_cwd_text": str(verify_cwd),
+                "docker_workdir": "/workspace",
+                "entered": entered,
+                "release": release,
+                "messages": messages,
+                "fail_tmp_parent_chmod": True,
+            },
+        )
+        try:
+            process.start()
+            assert entered.wait(timeout=10)
+            process.join(timeout=10)
+            assert process.exitcode == 0
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+
+        drained = self._drain_process_messages(messages)
+        assert any(message[0] == "error" and "permission setup failed" in message[1] for message in drained)
+        self._assert_metadata(tracked_paths, original_modes, original_gids)
+        assert not any((verify_cwd / ".gza" / "tmp").glob("verify-db-*"))
+        self._assert_no_active_docker_permission_leases(verify_cwd)
+
+    def test_overlapping_docker_snapshot_keeps_traversal_after_second_context_exits_first(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = self._create_live_db(tmp_path)
+        verify_cwd, tracked_paths, original_modes, original_gids = self._prepare_distinct_docker_snapshot_hierarchy(
+            tmp_path,
+            monkeypatch,
+        )
+        runtime_context = self._runtime_context(db_path)
+        config = self._docker_config()
+
+        first_context = disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config)
+        first = first_context.__enter__()
+        second_context = disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config)
+        second = second_context.__enter__()
+        try:
+            second_context.__exit__(None, None, None)
+            self._assert_group_traversal_present(tracked_paths)
+            self._commit_with_wal_sidecars(first.host_path)
+            second_exited = True
+        finally:
+            if not locals().get("second_exited", False):
+                second_context.__exit__(None, None, None)
+            first_context.__exit__(None, None, None)
+
+        assert not first.host_path.exists()
+        assert not second.host_path.exists()
+        self._assert_metadata(tracked_paths, original_modes, original_gids)
+
+    def test_overlapping_docker_snapshot_keeps_traversal_after_body_exception(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = self._create_live_db(tmp_path)
+        verify_cwd, tracked_paths, original_modes, original_gids = self._prepare_distinct_docker_snapshot_hierarchy(
+            tmp_path,
+            monkeypatch,
+        )
+        runtime_context = self._runtime_context(db_path)
+        config = self._docker_config()
+
+        with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config) as first:
+            with pytest.raises(RuntimeError, match="verify body failed"):
+                with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config) as second:
+                    second_path = second.host_path
+                    raise RuntimeError("verify body failed")
+
+            assert not second_path.exists()
+            self._assert_group_traversal_present(tracked_paths)
+            self._commit_with_wal_sidecars(first.host_path)
+
+        assert not first.host_path.exists()
+        self._assert_metadata(tracked_paths, original_modes, original_gids)
+
+    def test_docker_snapshot_permissions_restore_metadata_after_body_exception(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "repo" / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+        verify_cwd = tmp_path / "worktree"
+        (verify_cwd / ".gza" / "tmp").mkdir(parents=True)
+        verify_cwd.chmod(0o700)
+        (verify_cwd / ".gza").chmod(0o750)
+        (verify_cwd / ".gza" / "tmp").chmod(0o700)
+        tracked_paths = (verify_cwd, verify_cwd / ".gza", verify_cwd / ".gza" / "tmp")
+        original_modes = {path: stat.S_IMODE(path.stat().st_mode) for path in tracked_paths}
+        original_gids = {path: path.stat().st_gid for path in tracked_paths}
+        runtime_context = RuntimeExecutionContext(
+            cwd=tmp_path / "repo",
+            env={"GZA_DB_PATH": str(db_path)},
+            project_id="project",
+            db_path=db_path,
+        )
+        config = SimpleNamespace(use_docker=True, docker_workdir="/workspace")
+
+        with pytest.raises(RuntimeError, match="verify body failed"):
+            with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config) as snapshot:
+                snapshot_path = snapshot.host_path
+                assert stat.S_IMODE(verify_cwd.stat().st_mode) == 0o710
+                raise RuntimeError("verify body failed")
+
+        assert not snapshot_path.exists()
+        for path, original_mode in original_modes.items():
+            assert stat.S_IMODE(path.stat().st_mode) == original_mode
+        for path, original_gid in original_gids.items():
+            assert path.stat().st_gid == original_gid
+
+    def test_docker_snapshot_permissions_restore_metadata_after_partial_setup_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = self._create_live_db(tmp_path)
+        verify_cwd, tracked_paths, original_modes, original_gids = self._prepare_distinct_docker_snapshot_hierarchy(
+            tmp_path,
+            monkeypatch,
+        )
+        runtime_context = self._runtime_context(db_path)
+        config = self._docker_config()
+        original_chmod = Path.chmod
+        tmp_parent = verify_cwd / ".gza" / "tmp"
+
+        def chmod_with_failure(path: Path, mode: int) -> None:
+            if path == tmp_parent and mode == 0o730:
+                raise RuntimeError("permission setup failed")
+            original_chmod(path, mode)
+
+        monkeypatch.setattr(Path, "chmod", chmod_with_failure)
+
+        with pytest.raises(RuntimeError, match="permission setup failed"):
+            with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config):
+                pass
+
+        for path, original_mode in original_modes.items():
+            assert stat.S_IMODE(path.stat().st_mode) == original_mode
+        for path, original_gid in original_gids.items():
+            assert path.stat().st_gid == original_gid
+        assert not any((verify_cwd / ".gza" / "tmp").glob("verify-db-*"))
 
 
 class TestStageWorktreeAgentResources:

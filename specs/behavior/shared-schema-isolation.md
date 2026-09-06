@@ -118,6 +118,13 @@ commands can run nested gza commands, but their writes MUST be discarded when th
 attempt ends. Each verify attempt MUST receive a fresh isolated copy so a rerun cannot
 inherit mutations from a prior failed attempt.
 
+For Docker verify snapshots, any temporary traversal permission added to pre-existing
+checkout path components MUST be coordinated across overlapping snapshot attempts,
+including attempts running in separate gza processes. A path's exact original mode MUST
+be restored only after the last active snapshot lease that depends on that path exits,
+including normal exit, verify-body exceptions, abrupt holder death, and partial setup
+failures. Ownership of pre-existing path components MUST NOT be changed.
+
 ### SSI6 — Schema-runtime skew is unavailable, not code-red
 
 When a runtime cannot use a database because the database schema is newer than the
