@@ -26,9 +26,8 @@ Usage:
     scripts/revive_stuck.py --tag a --tag b       # match-ANY (repeatable or comma-separated)
 
 Tag filtering is a client-side narrowing of the ``gza incomplete --json`` envelope's
-``rows`` field on lineage-owner tags. The envelope also includes ``summary`` metadata
-such as ``deferred_blockers_outstanding``; that debt is operator-visible but is not a
-lineage row for this reviver to act on.
+``rows`` field on lineage-owner tags. The reviver fetches all incomplete rows first so
+its log can report the global live-row total before narrowing actionable candidates.
 """
 
 from __future__ import annotations
@@ -63,8 +62,9 @@ def _gza(args: list[str], project: Path) -> tuple[int, str, str]:
 def _parse_tags(raw_tags: list[str] | None) -> set[str] | None:
     """Normalize repeatable ``--tag`` values (comma-separated allowed) to a set.
 
-    Returns None when no tags were given. Short-term client-side filter until
-    ``gza incomplete`` learns ``--tag`` natively (tracked by gza-6466).
+    Returns None when no tags were given. The reviver intentionally fetches the
+    unfiltered ``gza incomplete --json`` envelope so it can log the global
+    incomplete-row total before narrowing actionable candidates locally.
     """
     if not raw_tags:
         return None
@@ -221,8 +221,8 @@ def main() -> int:
         dest="tags",
         metavar="TAG",
         help="Only revive tasks whose lineage-owner tags match (repeatable; comma-separated "
-             "values allowed). Match-ANY. Short-term client-side filter until `gza incomplete "
-             "--tag` lands (gza-6466).",
+             "values allowed). Match-ANY. The reviver fetches the full JSON envelope first "
+             "so it can report the global incomplete-row total before narrowing candidate rows locally.",
     )
     args = parser.parse_args()
 
