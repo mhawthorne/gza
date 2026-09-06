@@ -1324,15 +1324,18 @@ guarded escalation that deferred blockers or overrode an eligible churn park MUS
 deferred task IDs so the override is directly auditable. Successful output SHOULD name the
 canonical owner, target branch, whether rebase/review/judgment were used, any follow-up
 task IDs, any deferred task IDs, and the final merge provenance. After merge, the command
-MUST refresh or reuse the same
-canonical post-merge target verification checkpoint required by §8 before reporting the
-authoritative merged result. Configured-gate completion means fresh or reused `passed`
-evidence for the exact final target tree and current gate identity. Projects with no
-configured `verify_command` keep §8's explicit no-gate exception. If the merge mutation
-already occurred but the post-merge checkpoint is red, unavailable, malformed, stale, or
-missing after the refresh/reuse attempt, `land` MUST return non-success with wording that
-truthfully states the merge occurred but integration verification failed; it MUST NOT use
-the pre-merge `Cannot land ...` refusal template for that post-merge state.
+MUST refresh or reuse the same canonical post-merge target verification checkpoint required
+by §8 before reporting the authoritative merged result. Configured-gate completion means
+fresh or reused `passed` evidence for the exact final target tree and current gate identity,
+represented as a typed post-merge verification success. Projects with no configured
+`verify_command` keep §8's explicit no-gate exception only when the canonical checkpoint
+service returns typed no-gate success evidence for that configured state. Missing, `None`,
+or otherwise malformed checkpoint callback output MUST be converted to typed post-merge
+verification failure evidence and MUST NOT synthesize success from the current Git target.
+If the merge mutation already occurred but the post-merge checkpoint is red, unavailable,
+malformed, stale, or missing after the refresh/reuse attempt, `land` MUST return non-success
+with wording that truthfully states the merge occurred but integration verification failed;
+it MUST NOT use the pre-merge `Cannot land ...` refusal template for that post-merge state.
 
 #### Dry run, idempotency, and refusal output
 

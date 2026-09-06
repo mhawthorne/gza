@@ -1324,6 +1324,7 @@ class LandingCoordinator:
                 followup_ids=followup_ids,
                 failure=post_merge_verify_failure,
             )
+        assert post_merge_success is not None
         if self.finalize_merge is None:
             failure = LandPostMergeVerifyFailure(
                 status="state_persistence_failed",
@@ -1526,6 +1527,7 @@ class LandingCoordinator:
                 followup_ids=pending.followup_task_ids,
                 failure=post_merge_failure,
             )
+        assert post_merge_success is not None
         if self.finalize_merge is None:
             failure = LandPostMergeVerifyFailure(
                 status="state_persistence_failed",
@@ -1652,13 +1654,19 @@ class LandingCoordinator:
     def _run_post_merge_verify_phase(
         self,
         identity: LandingResolvedIdentity,
-    ) -> tuple[LandPostMergeVerifySuccess, LandPostMergeVerifyFailure | None]:
+    ) -> tuple[LandPostMergeVerifySuccess | None, LandPostMergeVerifyFailure | None]:
         if self.post_merge_verifier is None:
-            return self._implicit_post_merge_verify_success(identity), None
+            return None, LandPostMergeVerifyFailure(
+                status="unavailable",
+                fact="canonical post-merge target verifier is unavailable",
+                target_head=identity.target_sha,
+                gate_identity=identity.target_branch,
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.target_branch, identity.target_sha),
+            )
         try:
             result = self.post_merge_verifier(identity)
         except Exception as exc:
-            return self._implicit_post_merge_verify_success(identity), LandPostMergeVerifyFailure(
+            return None, LandPostMergeVerifyFailure(
                 status="unavailable",
                 fact=_exception_fact("post-merge target verification is unavailable", exc),
                 target_head=identity.target_sha,
@@ -1668,19 +1676,13 @@ class LandingCoordinator:
         if isinstance(result, LandPostMergeVerifySuccess):
             return result, None
         if isinstance(result, LandPostMergeVerifyFailure):
-            return self._implicit_post_merge_verify_success(identity), result
-        return self._implicit_post_merge_verify_success(identity), None
-
-    def _implicit_post_merge_verify_success(self, identity: LandingResolvedIdentity) -> LandPostMergeVerifySuccess:
-        target_sha = self._current_target_sha(identity) or identity.target_sha
-        if target_sha is None:
-            target_sha = "unknown-post-merge-target"
-        return LandPostMergeVerifySuccess(
-            checkpoint_id=None,
-            target_head=target_sha,
-            tree_fingerprint=None,
+            return None, result
+        return None, LandPostMergeVerifyFailure(
+            status="malformed",
+            fact=f"post-merge target verifier returned malformed result {type(result).__name__}",
+            target_head=identity.target_sha,
             gate_identity=identity.target_branch,
-            evidence_refs=_evidence_refs(identity.owner_task_id, identity.target_branch, target_sha),
+            evidence_refs=_evidence_refs(identity.owner_task_id, identity.target_branch, identity.target_sha),
         )
 
     def _current_target_sha(self, identity: LandingResolvedIdentity) -> str | None:
@@ -3530,7 +3532,7 @@ LandingMergeFinalizer = Callable[
 ]
 LandingPostMergeVerifier = Callable[
     [LandingResolvedIdentity],
-    LandPostMergeVerifyFailure | LandPostMergeVerifySuccess | None,
+    LandPostMergeVerifyFailure | LandPostMergeVerifySuccess,
 ]
 
 
