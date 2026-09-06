@@ -117,7 +117,12 @@ Existing orphan recovery branches created before this behavior was fixed are lef
 ## Relationship to `gza rebase` CLI command
 
 `gza rebase` operates entirely within dedicated temporary checkouts — it never modifies the
-main working tree. Bare `gza rebase <task-id>` now only creates the pending child task. When invoked with `--run`:
+main working tree. Bare `gza rebase <task-id>` now only creates the pending child task.
+Use `gza rebase <task-id> --run` when the operator wants only the standalone task-backed
+rebase. Use `gza land <task-id>` when the operator wants the full landing sequence:
+rebase when needed, source verification, post-rebase review when required, guarded
+judgment when policy permits, audit task materialization, merge, and post-merge target
+verification. When invoked with `--run`:
 
 1. Any stale worktree for the task's branch is force-removed.
 2. A fresh worktree is created at `config.worktree_path / task.id`.
@@ -136,7 +141,7 @@ main working tree. Bare `gza rebase <task-id>` now only creates the pending chil
    no-op rather than the losing isolated summary, fails closed on local/remote ref lookup
    uncertainty, surfaces ancestry-proof failures as `GIT_ERROR` diagnostics instead of
    only the stale-import mismatch, and force-pushes host-side.
-7. The completed rebase row persists the same `changed_diff` signal used by runner-owned rebase tasks, and review invalidation only happens when that signal is not `False`. Foreground service-backed execution also persists the generic `rebase_execution_outcome` artifact described above for landing/review-selection identity.
+7. The completed rebase row persists the same `changed_diff` signal used by runner-owned rebase tasks, and review invalidation only happens when that signal is not `False`. Foreground service-backed execution also persists the generic `rebase_execution_outcome` artifact described above for landing/review-selection identity. Landing uses that artifact rather than task log prose to distinguish mechanical/no-op rebases from provider-resolved conflict work.
 8. After rebase publication succeeds and the task is ready to be recorded as completed, the host reconciles the parent implementation merge unit through the shared task-scoped sync path using the canonical local target branch as the merge-proof ref. Publication mode can still differ (`--remote` may publish to `origin` host-side before completion is recorded), but completion-time merge proof does not switch to any `origin/*` ref. This lets empty-net-diff, squash-merged, or cherry-picked rebases flip the implementation back to authoritative `merged` state before the next `advance`, `watch`, or `iterate` pass reads the lineage.
 9. The canonical temporary worktree and the private rebase checkout are both removed on all
    exit paths (success, failure, exception) via cleanup in the host flow.
@@ -164,7 +169,10 @@ For legacy verify-only `CHANGES_REQUESTED` reviews, the preserved-rebase path is
 
 Resumed or recovered rebase runs are intentionally fail-closed. This includes direct provider resumes and automatic failed-task recovery descendants such as retry-created rebase children. The runner records those baselines with `recovered=True`, so completion persists `changed_diff = 1` and surfaces a warning instead of claiming the diff was preserved from the original pre-rebase state.
 
-The `--resolve` and `--force` flags are accepted for backward compatibility but are no-ops — conflict resolution is always attempted automatically, and existing worktrees are always force-removed before creating a fresh one.
+The `--resolve` and `--force` flags remain accepted for compatibility with the public
+rebase surface. Foreground service-backed rebase execution currently always uses the
+task-backed conflict-resolution route when conflicts need provider help, and the managed
+temporary worktree is recreated by the host flow.
 
 With `--background`, `gza rebase` creates a rebase task via `_create_rebase_task()` and runs it through the standard runner, which already manages its own worktree lifecycle.
 

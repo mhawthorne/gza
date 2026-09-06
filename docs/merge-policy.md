@@ -63,6 +63,19 @@ Fail-closed cases include:
 - With `on_max_cycles=merge_and_defer`, an ordinary current-head capped review may merge only after local merge-source proof, readable deterministic review content, fresh green pre-merge verify evidence, and validated persisted `BLOCKER` metadata; unavailable or invalid content surfaces a dedicated attention reason before verify handling. The resulting action remains `type="merge"` and carries max-cycle deferral metadata for mandatory follow-up task creation.
 - `gza land --policy guarded` is the operator-triggered exception path: after deterministic prerequisites pass, it may defer only current plain-full or resolution review blockers that the landing policy and exact landing judgment authorize. It records `manual_land_escalated` provenance when it defers blockers or overrides an eligible churn park; non-escalated landings record `manual_land`.
 
+Guarded landing is not a general downgrade from `BLOCKER` to `FOLLOWUP`. It can defer a blocker only when the exact landing judgment says the original graded ask is already satisfied and the blocker is adjacent to or beyond that authoritative scope. The deferred work is still materialized as urgent PR-required implementation work before any merge-state mutation.
+
+The following classes are nondeferrable even under `gza land --policy guarded`:
+- Correctness regressions or behavior regressions in the graded scope.
+- Repository-rule, project-rule, dependency, or project-scope violations.
+- Integration-contract defects or unsafe conflict-resolution defects.
+- Behavior-spec coherence findings.
+- Red, unavailable, stale, malformed, or missing verify evidence.
+- Missing source/target proof, dirty checkout, unresolved conflicts, failed rebase/recovery work, or other actionable lifecycle work.
+- `NEEDS_DISCUSSION`, malformed, unknown, or stale review states.
+
+`gza land --policy strict` never defers blockers and never overrides parked lifecycle gates. Ordinary `advance` and `watch` also remain strict except for the separately configured capped-review `on_max_cycles=merge_and_defer` path described above; they do not create landing judgments or use guarded landing authority.
+
 ## Operator Audit Policy
 
 Operators should periodically sample `APPROVED_WITH_FOLLOWUPS` reviews to catch under-grading drift. The goal is to verify that real merge blockers are not being mislabeled as non-gating follow-ups.
