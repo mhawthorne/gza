@@ -36,7 +36,7 @@ from gza.branch_resolution import resolve_rebase_target_branch
 from gza.canonical_checkout import CanonicalCheckoutStatus
 from gza.cli import _create_improve_task, _create_rebase_task
 from gza.cli.advance_engine import determine_next_action
-from gza.config import BranchStrategy, Config, ConfigError
+from gza.config import DEFAULT_WORKTREE_DIR, BranchStrategy, Config, ConfigError
 from gza.db import DuplicateActiveChildError, SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError, ResolvedMergeSourceRef
 from gza.github import GitHub, GitHubError, PullRequestDetails
@@ -260,6 +260,36 @@ def _runner_verify_failure_plus_code_blocker_review_report() -> str:
         "## Questions / Assumptions\n\nNone.\n\n"
         "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
     )
+
+
+def _make_tmp_scoped_verify_fix_config(
+    tmp_path: Path,
+    *,
+    project_dir: Path | None = None,
+    project_name: str = "test-project",
+    verify_command: str = "./bin/tests",
+) -> Config:
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    config = Config(
+        project_dir=project_dir or tmp_path,
+        project_name=project_name,
+        verify_command=verify_command,
+        worktree_dir=str(worktree_dir),
+        autonomous_verify_timeout_seconds=120,
+        review_verify_timeout_grace_seconds=5.0,
+    )
+    config.log_path.mkdir(parents=True, exist_ok=True)
+    config.worktree_path.mkdir(parents=True, exist_ok=True)
+    return config
+
+
+def _assert_tmp_scoped_verify_fix_worktree(config: Config, worktree_path: Path, tmp_path: Path) -> None:
+    expected_root = tmp_path / ".gza-test-worktrees" / config.project_name
+    assert config.worktree_path == expected_root
+    assert Path(DEFAULT_WORKTREE_DIR) not in config.worktree_path.parents
+    assert config.worktree_path != Path(DEFAULT_WORKTREE_DIR)
+    assert worktree_path.is_relative_to(expected_root)
+    assert worktree_path.is_dir()
 
 
 class TestGetTaskOutputPaths:
@@ -20289,15 +20319,7 @@ class TestExtractedRunInnerHelpers:
         tmp_path: Path,
     ) -> tuple[SqliteTaskStore, Config, Task, Task, VerifyEpoch, Mock]:
         store = SqliteTaskStore(tmp_path / "test.db")
-        config = Config(
-            project_dir=tmp_path,
-            project_name="test-project",
-            verify_command="./bin/tests",
-            autonomous_verify_timeout_seconds=120,
-            review_verify_timeout_grace_seconds=5.0,
-        )
-        config.log_path.mkdir(parents=True, exist_ok=True)
-        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config = _make_tmp_scoped_verify_fix_config(tmp_path)
 
         impl = store.add("Implement feature", task_type="implement")
         assert impl.id is not None
@@ -20359,7 +20381,9 @@ class TestExtractedRunInnerHelpers:
         store.update(verify_fix)
         (tmp_path / verify_fix.log_file).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / verify_fix.log_file).write_text("")
-        (config.worktree_path / verify_fix.slug).mkdir(parents=True, exist_ok=True)
+        worktree_path = config.worktree_path / verify_fix.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        _assert_tmp_scoped_verify_fix_worktree(config, worktree_path, tmp_path)
 
         git = Mock(spec=Git)
         git.default_branch.return_value = "main"
@@ -28351,15 +28375,7 @@ class TestProviderPromptSanitization:
         tmp_path: Path,
     ) -> None:
         store = SqliteTaskStore(tmp_path / "test.db")
-        config = Config(
-            project_dir=tmp_path,
-            project_name="test-project",
-            verify_command="./bin/tests",
-            autonomous_verify_timeout_seconds=120,
-            review_verify_timeout_grace_seconds=5.0,
-        )
-        config.log_path.mkdir(parents=True, exist_ok=True)
-        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config = _make_tmp_scoped_verify_fix_config(tmp_path)
 
         impl = store.add("Implement feature", task_type="implement")
         assert impl.id is not None
@@ -28416,6 +28432,7 @@ class TestProviderPromptSanitization:
 
         worktree_path = config.worktree_path / verify_fix.slug
         worktree_path.mkdir(parents=True, exist_ok=True)
+        _assert_tmp_scoped_verify_fix_worktree(config, worktree_path, tmp_path)
         log_file = tmp_path / ".gza" / "logs" / "verify-fix.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
         summary_dir = tmp_path / ".gza" / "summaries"
@@ -30943,15 +30960,7 @@ class TestProviderPromptSanitization:
         pre_run_status: set[tuple[str, str]],
     ) -> None:
         store = SqliteTaskStore(tmp_path / "test.db")
-        config = Config(
-            project_dir=tmp_path,
-            project_name="test-project",
-            verify_command="./bin/tests",
-            autonomous_verify_timeout_seconds=120,
-            review_verify_timeout_grace_seconds=5.0,
-        )
-        config.log_path.mkdir(parents=True, exist_ok=True)
-        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config = _make_tmp_scoped_verify_fix_config(tmp_path)
 
         impl = store.add("Implement feature", task_type="implement")
         assert impl.id is not None
@@ -31008,6 +31017,7 @@ class TestProviderPromptSanitization:
 
         worktree_path = config.worktree_path / verify_fix.slug
         worktree_path.mkdir(parents=True, exist_ok=True)
+        _assert_tmp_scoped_verify_fix_worktree(config, worktree_path, tmp_path)
         log_file = tmp_path / ".gza" / "logs" / "verify-fix-pre-run-dirty.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
         summary_dir = tmp_path / ".gza" / "summaries"
@@ -31075,15 +31085,7 @@ class TestProviderPromptSanitization:
         failure_site: str,
     ) -> None:
         store = SqliteTaskStore(tmp_path / "test.db")
-        config = Config(
-            project_dir=tmp_path,
-            project_name="test-project",
-            verify_command="./bin/tests",
-            autonomous_verify_timeout_seconds=120,
-            review_verify_timeout_grace_seconds=5.0,
-        )
-        config.log_path.mkdir(parents=True, exist_ok=True)
-        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config = _make_tmp_scoped_verify_fix_config(tmp_path)
 
         impl = store.add("Implement feature", task_type="implement")
         assert impl.id is not None
@@ -31143,6 +31145,7 @@ class TestProviderPromptSanitization:
 
         worktree_path = config.worktree_path / verify_fix.slug
         worktree_path.mkdir(parents=True, exist_ok=True)
+        _assert_tmp_scoped_verify_fix_worktree(config, worktree_path, tmp_path)
         log_file = tmp_path / ".gza" / "logs" / f"verify-fix-{failure_site}.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
         summary_dir = tmp_path / ".gza" / "summaries"
@@ -31261,15 +31264,7 @@ class TestProviderPromptSanitization:
         tmp_path: Path,
     ) -> None:
         store = SqliteTaskStore(tmp_path / "test.db")
-        config = Config(
-            project_dir=tmp_path,
-            project_name="test-project",
-            verify_command="./bin/tests",
-            autonomous_verify_timeout_seconds=120,
-            review_verify_timeout_grace_seconds=5.0,
-        )
-        config.log_path.mkdir(parents=True, exist_ok=True)
-        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config = _make_tmp_scoped_verify_fix_config(tmp_path)
 
         impl = store.add("Implement feature", task_type="implement")
         assert impl.id is not None
@@ -31319,6 +31314,7 @@ class TestProviderPromptSanitization:
 
         worktree_path = config.worktree_path / verify_fix.slug
         worktree_path.mkdir(parents=True, exist_ok=True)
+        _assert_tmp_scoped_verify_fix_worktree(config, worktree_path, tmp_path)
         log_file = tmp_path / ".gza" / "logs" / "verify-fix-prior-commit.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
         summary_dir = tmp_path / ".gza" / "summaries"
@@ -33094,15 +33090,7 @@ class TestProviderModelParityGate:
 
 def _timeout_verify_fix_fixture(tmp_path: Path, *, cross_project: bool = False):
     store = SqliteTaskStore(tmp_path / "test.db")
-    config = Config(
-        project_dir=tmp_path,
-        project_name="test-project",
-        verify_command="./bin/tests",
-        autonomous_verify_timeout_seconds=120,
-        review_verify_timeout_grace_seconds=5.0,
-    )
-    config.log_path.mkdir(parents=True, exist_ok=True)
-    config.worktree_path.mkdir(parents=True, exist_ok=True)
+    config = _make_tmp_scoped_verify_fix_config(tmp_path)
 
     impl = store.add("Implement feature", task_type="implement")
     assert impl.id is not None
@@ -33161,8 +33149,16 @@ def _timeout_verify_fix_fixture(tmp_path: Path, *, cross_project: bool = False):
     store.update(verify_fix)
     (tmp_path / verify_fix.log_file).parent.mkdir(parents=True, exist_ok=True)
     (tmp_path / verify_fix.log_file).write_text("")
-    (config.worktree_path / verify_fix.slug).mkdir(parents=True, exist_ok=True)
+    worktree_path = config.worktree_path / verify_fix.slug
+    worktree_path.mkdir(parents=True, exist_ok=True)
+    _assert_tmp_scoped_verify_fix_worktree(config, worktree_path, tmp_path)
     return store, config, impl, verify_fix, verify_epoch
+
+
+def test_timeout_verify_fix_fixture_scopes_worktree_state_to_tmp_path(tmp_path: Path) -> None:
+    _store, config, _impl, verify_fix, _verify_epoch = _timeout_verify_fix_fixture(tmp_path)
+
+    _assert_tmp_scoped_verify_fix_worktree(config, config.worktree_path / verify_fix.slug, tmp_path)
 
 
 @pytest.mark.parametrize("entrypoint", ["pr_required_retry", "branch_reconcile"])

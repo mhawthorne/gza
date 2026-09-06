@@ -14172,9 +14172,11 @@ def _attention_category(attention_key: str) -> str:
 def _emit_cycle_attention_summary(log: _WatchLog) -> None:
     """Log a per-cycle roundup of attention counts, grouped by category.
 
-    The one-time ATTENTION line carries the detailed row for newly visible or
-    changed entries. Repeated unchanged entries stay compact so long-running
-    watch sessions do not replay the same task text every cycle.
+    This is a repeating summary, not the place to act on individual tasks — use
+    ``gza incomplete --tag <tag>`` to list and copy the actual task IDs. Keeping
+    the roundup to counts (rather than one line per task, repeated every cycle)
+    keeps the log legible; the one-time ATTENTION line emitted when a task first
+    needs attention still carries the full per-task message.
     """
     items = log.visible_attention_items()
     if not items:
