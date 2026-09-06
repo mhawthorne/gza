@@ -59,10 +59,13 @@ from gza.review_verdict import ParsedReviewReport, ReviewFinding, parse_review_r
 from gza.review_verify_state import (
     VERIFY_GATE_ARTIFACT_KIND,
     VerifyEpoch,
+    _aggregate_phase_summary_from_details,
+    _phase_summary_from_diagnostics_details,
     latest_successful_full_verify_runtime_observation,
     latest_verify_result_for_epoch,
     persist_verify_gate_artifact,
     summarize_verify_phases,
+    validate_verify_phase_summary,
 )
 from gza.runner import (
     BACKUP_DIR,
@@ -28868,11 +28871,46 @@ class TestProviderPromptSanitization:
                 ["ruff", "ty", "mypy", "checks", "unit"],
             ),
             (
-                "gza-verify phase=start name=unit\ngza-verify phase=passed name=unit",
+                "gza-verify phase=start name=unit",
                 "timeout",
                 "needs_discussion",
                 PARK_REASON_VERIFY_BUDGET_EXCEEDED,
-                ["unit"],
+                [],
+            ),
+            (
+                "gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=abc",
+                "timeout",
+                "needs_discussion",
+                PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID,
+                [],
+            ),
+            (
+                "gza-verify phase=start name=unit\ngza-verify phase=passed name=unit",
+                "timeout",
+                "needs_discussion",
+                PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID,
+                [],
+            ),
+            (
+                "gza-verify phase=start name=unit\ngza-verify phase=failed name=unit",
+                "timeout",
+                "needs_discussion",
+                PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID,
+                [],
+            ),
+            (
+                "gza-verify phase=start name=unit\ngza-verify phase=unknown name=unit",
+                "timeout",
+                "needs_discussion",
+                PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID,
+                [],
+            ),
+            (
+                "gza-verify phase=start name=unit duration_seconds=0.0",
+                "timeout",
+                "needs_discussion",
+                PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID,
+                [],
             ),
             (
                 "gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=3.25",
@@ -28883,13 +28921,6 @@ class TestProviderPromptSanitization:
             ),
             (
                 "gza-verify phase=start name=unit\ngza-verify phase=failed name=unit duration_seconds=3.25",
-                "timeout",
-                "create_verify_fix",
-                None,
-                [],
-            ),
-            (
-                "gza-verify phase=start name=unit\ngza-verify phase=failed name=unit",
                 "timeout",
                 "create_verify_fix",
                 None,
@@ -28973,6 +29004,9 @@ class TestProviderPromptSanitization:
             verify_timeout_grace_seconds=5.0,
             producer="test",
         )
+        artifact = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert artifact.metadata is not None
+        routing_validation = validate_verify_phase_evidence_from_metadata(artifact.metadata)
 
         lifecycle_git = Mock()
         lifecycle_git.can_merge.return_value = True
@@ -28989,6 +29023,10 @@ class TestProviderPromptSanitization:
 
         action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
 
+        if expected_reason == PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID:
+            assert routing_validation.state == PHASE_EVIDENCE_INDETERMINATE
+        else:
+            assert routing_validation.state != PHASE_EVIDENCE_INDETERMINATE
         assert action["type"] == expected_action_type, action
         if expected_reason is not None:
             assert action["needs_attention_reason"] == expected_reason
@@ -29087,6 +29125,163 @@ class TestProviderPromptSanitization:
         assert action["needs_attention_reason"] == PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID
         assert "phase_summary.failed must be a list" in action["description"]
         assert "verify_phase_summary" not in action
+        assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
+
+    @pytest.mark.parametrize(
+        ("representation", "expected_reason"),
+        [
+            ("direct_phase_summary", "phase_summary.completed entries require non-negative duration_seconds"),
+            ("phase_diagnostics", "phase diagnostics phase_results entries require non-negative duration_seconds"),
+            ("legacy_aggregate_details", "malformed phase duration"),
+            (
+                "scoped_aggregate_details",
+                "aggregate scope services/foo: phase_summary.completed entries require non-negative duration_seconds",
+            ),
+            ("shared_metadata_routing", "phase_summary.completed entries require non-negative duration_seconds"),
+        ],
+    )
+    def test_oversized_verify_phase_duration_fails_closed_for_validation_representations(
+        self,
+        representation: str,
+        expected_reason: str,
+    ) -> None:
+        oversized_duration = 10**400
+        direct_summary = {
+            "completed": [{"name": "unit", "status": "passed", "duration_seconds": oversized_duration}],
+            "passed": ["unit"],
+            "failed": [],
+            "running": [],
+            "never_started": [],
+            "last_observed": "unit",
+            "observed_count": 1,
+            "completed_count": 1,
+            "total_duration_seconds": 1.0,
+        }
+        diagnostics = {
+            "phase_results": [{"name": "unit", "status": "passed", "duration_seconds": oversized_duration}],
+            "started_phase_names": ["unit"],
+            "completed_phase_names": ["unit"],
+            "failed_phase_names": [],
+            "expected_phase_names": ["unit"],
+            "expected_phase_partition": "known",
+            "not_started_phase_names": [],
+        }
+        legacy_aggregate_details = {
+            "phase_results": [{"name": "unit", "status": "passed", "duration_seconds": oversized_duration}],
+            "started_phase_names": ["unit"],
+            "completed_phase_names": ["unit"],
+            "failed_phase_names": [],
+            "expected_phase_names": ["unit"],
+            "not_started_phase_names": [],
+        }
+        metadata = {
+            "result": {
+                "command": "./bin/custom-verify",
+                "status": "failed",
+                "exit_status": "timed out",
+                "failure_origin": "timeout",
+            },
+            "phase_summary": direct_summary,
+        }
+
+        if representation == "direct_phase_summary":
+            _summary, invalid_reason = validate_verify_phase_summary(direct_summary)
+            assert invalid_reason == expected_reason
+        elif representation == "phase_diagnostics":
+            _summary, invalid_reason = _phase_summary_from_diagnostics_details(diagnostics)
+            assert invalid_reason == expected_reason
+        elif representation == "legacy_aggregate_details":
+            _summary, invalid_reason = _aggregate_phase_summary_from_details(legacy_aggregate_details)
+            assert invalid_reason == expected_reason
+        elif representation == "scoped_aggregate_details":
+            scoped_details = {
+                "runnable_count": 1,
+                "scopes": [
+                    {
+                        "scope": "services/foo",
+                        "working_directory": "services/foo",
+                        "status": "failed",
+                        "exit_status": "timed out",
+                        "failure_origin": "timeout",
+                        "command_identity": "./bin/custom-verify",
+                        "phase_summary": direct_summary,
+                    },
+                ],
+            }
+            _summary, invalid_reason = _aggregate_phase_summary_from_details(scoped_details)
+            assert invalid_reason == expected_reason
+        else:
+            validation = validate_verify_phase_evidence_from_metadata(metadata)
+            assert validation.state == PHASE_EVIDENCE_INDETERMINATE
+            assert validation.reason == expected_reason
+
+    def test_verify_gate_timeout_with_oversized_phase_summary_duration_parks_invalid_without_verify_fix(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, config, impl, review = self._setup_approved_impl_for_verify_gate(tmp_path)
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 28, 18, 37, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 600s",
+                output="gza-verify phase=start name=unit\n",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=600,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        gate = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert gate.metadata is not None
+        metadata = dict(gate.metadata)
+        metadata["phase_summary"] = {
+            "completed": [{"name": "ruff", "status": "passed", "duration_seconds": 10**400}],
+            "passed": ["ruff"],
+            "failed": [],
+            "running": ["ty"],
+            "never_started": ["mypy", "checks", "unit", "functional"],
+            "last_observed": "ty",
+            "observed_count": 2,
+            "completed_count": 1,
+            "total_duration_seconds": 1.0,
+        }
+        store.add_artifact(
+            impl.id,
+            kind=gate.kind,
+            label=gate.label,
+            path=gate.path,
+            content_type=gate.content_type,
+            byte_size=gate.byte_size,
+            sha256=gate.sha256,
+            created_at=gate.created_at,
+            producer=gate.producer,
+            command=gate.command,
+            status=gate.status,
+            exit_status=gate.exit_status,
+            head_sha=gate.head_sha,
+            metadata=metadata,
+            artifact_id=gate.id,
+        )
+
+        validation = validate_verify_phase_evidence_from_metadata(metadata)
+        assert validation.state == PHASE_EVIDENCE_INDETERMINATE
+        assert validation.reason == "phase_summary.completed entries require non-negative duration_seconds"
+        action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
+
+        assert action["type"] == "needs_discussion"
+        assert action["needs_attention_reason"] == PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID
+        assert "phase_summary.completed entries require non-negative duration_seconds" in action["description"]
         assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
 
     def _lifecycle_git_for_head(self, branch: str) -> Mock:
@@ -29251,8 +29446,8 @@ class TestProviderPromptSanitization:
             ),
             (
                 "gza-verify phase=start name=unit\ngza-verify phase=failed name=unit",
-                "create_verify_fix",
-                None,
+                "needs_discussion",
+                PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID,
             ),
             (
                 "gza-verify phase=passed name=unit duration_seconds=3.25",
@@ -29294,12 +29489,13 @@ class TestProviderPromptSanitization:
             assert (
                 "persisted verify output is unavailable" in action["description"]
                 or "terminal phase lacks start" in action["description"]
+                or "terminal phase record requires duration_seconds" in action["description"]
             )
             assert "verify_phase_summary" not in action
         if expected_action_type != "create_verify_fix":
             assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
 
-    def test_verify_gate_timeout_with_direct_phase_summary_without_duration_uses_budget_route(
+    def test_verify_gate_timeout_with_direct_phase_summary_without_duration_parks_invalid(
         self,
         tmp_path: Path,
     ) -> None:
@@ -29362,9 +29558,9 @@ class TestProviderPromptSanitization:
         action = evaluate_advance_rules(config, store, self._lifecycle_git_for_head(impl.branch or ""), impl, "main")
 
         assert action["type"] == "needs_discussion"
-        assert action["needs_attention_reason"] == PARK_REASON_VERIFY_BUDGET_EXCEEDED
-        assert action["verify_phase_summary"]["completed"] == [{"name": "unit", "status": "passed"}]
-        assert action["verify_phase_summary"]["failed"] == []
+        assert action["needs_attention_reason"] == PARK_REASON_VERIFY_PHASE_EVIDENCE_INVALID
+        assert "duration_seconds" in action["description"]
+        assert "verify_phase_summary" not in action
         assert store.get_based_on_children_by_type(impl.id, "verify_fix") == []
 
     def test_verify_gate_legacy_scoped_aggregate_rejects_terminal_order_contradiction(
@@ -29405,8 +29601,8 @@ class TestProviderPromptSanitization:
                         "command_identity": "./bin/foo-verify",
                         "phase_diagnostics": {
                             "phase_results": [
-                                {"name": "unit", "status": "passed"},
-                                {"name": "functional", "status": "passed"},
+                                {"name": "unit", "status": "passed", "duration_seconds": 1.0},
+                                {"name": "functional", "status": "passed", "duration_seconds": 1.0},
                             ],
                             "started_phase_names": ["functional", "unit"],
                             "completed_phase_names": ["unit", "functional"],

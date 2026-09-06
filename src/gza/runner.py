@@ -192,6 +192,7 @@ from .review_verify_state import (
     VERIFY_GATE_ARTIFACT_KIND,
     VerifyEpoch,
     _extract_verify_phase_events,
+    coerce_non_negative_finite_duration,
     latest_successful_full_verify_runtime_observation,
     latest_verify_result_for_epoch,
     normalized_verify_command,
@@ -4822,17 +4823,13 @@ def _validate_phase_summary_details(
             return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase result")
         name = phase.get("name")
         status = phase.get("status")
-        duration = phase.get("duration_seconds")
+        duration = coerce_non_negative_finite_duration(phase.get("duration_seconds"))
         if not isinstance(name, str) or not name:
             return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase name")
         if status not in {"passed", "failed"}:
             return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase status")
-        if duration is not None:
-            if isinstance(duration, bool) or not isinstance(duration, int | float):
-                return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase duration")
-            duration_value = float(duration)
-            if not math.isfinite(duration_value) or duration_value < 0:
-                return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase duration")
+        if duration is None:
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase duration")
         phase_result = cast(dict[str, Any], phase)
         phase_results.append(phase_result)
         scope = phase.get("scope")
@@ -6641,10 +6638,8 @@ def _timeout_seconds_from_metadata(metadata: dict[str, Any], *, scope_entry: dic
         candidates.append(verify_epoch.get("verify_timeout_seconds"))
     candidates.append(metadata.get("timeout_seconds"))
     for candidate in candidates:
-        if isinstance(candidate, bool) or not isinstance(candidate, int | float):
-            continue
-        value = float(candidate)
-        if math.isfinite(value) and value >= 0:
+        value = coerce_non_negative_finite_duration(candidate)
+        if value is not None:
             return value
     return None
 
@@ -6734,9 +6729,10 @@ def _phase_duration_observation_from_artifact(
         return None
     durations: list[float] = []
     for phase in validation.phase_results:
-        duration = phase.get("duration_seconds")
-        if duration is not None:
-            durations.append(float(duration))
+        duration = coerce_non_negative_finite_duration(phase.get("duration_seconds"))
+        if duration is None:
+            return None
+        durations.append(duration)
     if result_status == "passed":
         if validation.state != PHASE_EVIDENCE_VALID_ZERO_RED or validation.completed_phase_names != expected_names:
             return None

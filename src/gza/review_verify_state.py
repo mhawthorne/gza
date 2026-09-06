@@ -27,6 +27,16 @@ VERIFY_GATE_ARTIFACT_LABEL = "verify_gate_result"
 VERIFY_GATE_ARTIFACT_SCHEMA_VERSION = 1
 INVALID_STRUCTURED_FAILURE_ORIGIN = "__invalid_structured_failure_origin__"
 KNOWN_FULL_VERIFY_PHASES = ("ruff", "ty", "mypy", "checks", "unit", "functional")
+_VERIFY_PHASE_NAME_RE = r"[A-Za-z0-9_.-]+"
+_VERIFY_PHASE_DURATION_RE = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+_VERIFY_PHASE_START_RE = re.compile(
+    rf"^gza-verify phase=start name=(?P<name>{_VERIFY_PHASE_NAME_RE})$"
+)
+_VERIFY_PHASE_TERMINAL_RE = re.compile(
+    rf"^gza-verify phase=(?P<status>passed|failed) name=(?P<name>{_VERIFY_PHASE_NAME_RE}) "
+    rf"duration_seconds=(?P<duration>{_VERIFY_PHASE_DURATION_RE})"
+    r"(?: tree_fingerprint=(?P<tree_fingerprint>[0-9a-f]{64}))?$"
+)
 
 
 @dataclass(frozen=True)
@@ -202,11 +212,11 @@ def latest_successful_full_verify_runtime_observation(
             or never_started != []
         ):
             continue
-        duration = _coerce_optional_float(result.duration_seconds)
-        if isinstance(duration, bool) or not isinstance(duration, int | float) or duration < 0:
+        duration = coerce_non_negative_finite_duration(result.duration_seconds)
+        if duration is None:
             continue
         return FullVerifyRuntimeObservation(
-            duration_seconds=float(duration),
+            duration_seconds=duration,
             captured_at=result.captured_at,
             artifact_id=artifact.id,
             task_id=artifact.task_id,
@@ -214,29 +224,53 @@ def latest_successful_full_verify_runtime_observation(
     return None
 
 
-def _extract_verify_phase_events(output: str | None) -> list[dict[str, Any]]:
+def _invalid_verify_phase_line_reason(line: str, line_number: int) -> str:
+    status_match = re.match(r"^gza-verify phase=(?P<status>\S+)", line)
+    status = status_match.group("status") if status_match else None
+    detail = "malformed verify phase record"
+    if status == "start":
+        detail = "start phase record permits only phase and name"
+    elif status in {"passed", "failed"}:
+        if " duration_seconds=" not in line:
+            detail = "terminal phase record requires duration_seconds"
+        else:
+            detail = "terminal phase record requires numeric non-negative duration_seconds"
+    elif status is not None:
+        detail = "unknown verify phase status"
+    return f"{detail} at line {line_number}"
+
+
+def _extract_verify_phase_events_with_validation(output: str | None) -> tuple[list[dict[str, Any]], str | None]:
     if not output:
-        return []
-    matches = re.finditer(
-        r"^gza-verify phase=(?P<status>start|passed|failed) name=(?P<name>[A-Za-z0-9_.-]+)"
-        r"(?: duration_seconds=(?P<duration>[0-9.]+))?"
-        r"(?: tree_fingerprint=(?P<tree_fingerprint>[0-9a-f]{64}))?$",
-        output,
-        re.MULTILINE,
-    )
+        return [], None
     events: list[dict[str, Any]] = []
-    for match in matches:
-        event: dict[str, Any] = {
-            "name": match.group("name"),
-            "status": match.group("status"),
-        }
-        duration = match.group("duration")
-        if duration is not None:
-            event["duration_seconds"] = float(duration)
-        tree_fingerprint = match.group("tree_fingerprint")
+    invalid_reason: str | None = None
+    for line_number, line in enumerate(output.splitlines(), start=1):
+        if not line.startswith("gza-verify phase="):
+            continue
+        start_match = _VERIFY_PHASE_START_RE.match(line)
+        if start_match is not None:
+            events.append({"name": start_match.group("name"), "status": "start"})
+            continue
+        terminal_match = _VERIFY_PHASE_TERMINAL_RE.match(line)
+        if terminal_match is None:
+            invalid_reason = invalid_reason or _invalid_verify_phase_line_reason(line, line_number)
+            continue
+        duration = float(terminal_match.group("duration"))
+        if not math.isfinite(duration):
+            invalid_reason = invalid_reason or _invalid_verify_phase_line_reason(line, line_number)
+            continue
+        event: dict[str, Any] = {"name": terminal_match.group("name"), "status": terminal_match.group("status")}
+        event["duration_seconds"] = duration
+        tree_fingerprint = terminal_match.group("tree_fingerprint")
         if tree_fingerprint:
             event["tree_fingerprint"] = tree_fingerprint
         events.append(event)
+    return events, invalid_reason
+
+
+def _extract_verify_phase_events(output: str | None) -> list[dict[str, Any]]:
+    events, _invalid_reason = _extract_verify_phase_events_with_validation(output)
     return events
 
 
@@ -288,9 +322,9 @@ def _summarize_verify_phase_events(
     total_duration_seconds = 0.0
     duration_seen = False
     for phase in completed:
-        duration = phase.get("duration_seconds")
-        if isinstance(duration, int | float):
-            total_duration_seconds += float(duration)
+        duration = coerce_non_negative_finite_duration(phase.get("duration_seconds"))
+        if duration is not None:
+            total_duration_seconds += duration
             duration_seen = True
 
     return {
@@ -318,8 +352,9 @@ def summarize_verify_phases_with_validation(
     output: str | None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Summarize structured verify output while preserving lifecycle-order validation."""
-    events = _extract_verify_phase_events(output)
-    return _summarize_verify_phase_events(events, command=command)
+    events, invalid_reason = _extract_verify_phase_events_with_validation(output)
+    summary, lifecycle_invalid_reason = _summarize_verify_phase_events(events, command=command)
+    return summary, invalid_reason or lifecycle_invalid_reason
 
 
 def validate_verify_phase_summary(
@@ -353,7 +388,7 @@ def validate_verify_phase_summary(
         return None, "phase_summary.last_observed must be a string or null"
     total_duration = value_dict.get("total_duration_seconds")
     if total_duration is not None:
-        if isinstance(total_duration, bool) or not isinstance(total_duration, int | float) or total_duration < 0:
+        if coerce_non_negative_finite_duration(total_duration) is None:
             return None, "phase_summary.total_duration_seconds must be a non-negative number or null"
     completed_names: list[str] = []
     for phase in completed_list:
@@ -365,10 +400,9 @@ def validate_verify_phase_summary(
             return None, "phase_summary.completed entries require string name"
         if status not in {"passed", "failed"}:
             return None, "phase_summary.completed entries require passed or failed status"
-        duration = phase.get("duration_seconds")
-        if duration is not None:
-            if isinstance(duration, bool) or not isinstance(duration, int | float) or duration < 0:
-                return None, "phase_summary.completed duration_seconds must be non-negative"
+        duration = coerce_non_negative_finite_duration(phase.get("duration_seconds"))
+        if duration is None:
+            return None, "phase_summary.completed entries require non-negative duration_seconds"
         completed_names.append(name)
     for field, names in (
         ("passed", passed_list),
@@ -546,11 +580,26 @@ def _coerce_optional_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def coerce_non_negative_finite_duration(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            duration = float(value)
+        except OverflowError:
+            return None
+        return duration if math.isfinite(duration) and duration >= 0 else None
+    return None
+
+
 def _coerce_optional_float(value: object) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        try:
+            return float(value)
+        except OverflowError:
+            return None
     return None
 
 
@@ -748,6 +797,9 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
             return None, "phase diagnostics phase_results entries require string name"
         if status not in {"passed", "failed"}:
             return None, "phase diagnostics phase_results entries require passed or failed status"
+        duration = coerce_non_negative_finite_duration(phase.get("duration_seconds"))
+        if duration is None:
+            return None, "phase diagnostics phase_results entries require non-negative duration_seconds"
         if name not in started_name_set:
             return None, f"terminal phase lacks start: {name}"
         if name in terminal_names:
@@ -759,10 +811,8 @@ def _phase_summary_from_diagnostics_details(value: object) -> tuple[dict[str, An
             passed.append(name)
         else:
             failed.append(name)
-        duration = phase.get("duration_seconds")
-        if isinstance(duration, int | float) and not isinstance(duration, bool):
-            total_duration += float(duration)
-            duration_seen = True
+        total_duration += duration
+        duration_seen = True
     if completed_names != [str(phase["name"]) for phase in completed]:
         return None, "phase diagnostics completed_phase_names contradict phase_results"
     if supplied_failed_names != failed:
@@ -852,16 +902,17 @@ def _aggregate_phase_summary_from_details(value: object) -> tuple[dict[str, Any]
                 return None, "malformed phase name"
             if status not in {"passed", "failed"}:
                 return None, "malformed phase status"
+            duration = coerce_non_negative_finite_duration(phase.get("duration_seconds"))
+            if duration is None:
+                return None, "malformed phase duration"
             aggregate_completed.append(cast(dict[str, Any], deepcopy(phase)))
             aggregate_completed_names.add(name)
             if status == "passed":
                 aggregate_passed.append(name)
             else:
                 aggregate_failed.append(name)
-            duration = phase.get("duration_seconds")
-            if isinstance(duration, int | float) and not isinstance(duration, bool):
-                aggregate_total_duration += float(duration)
-                aggregate_duration_seen = True
+            aggregate_total_duration += duration
+            aggregate_duration_seen = True
         started_names_raw = value.get("started_phase_names")
         if not isinstance(started_names_raw, list):
             return None, "malformed phase name summary"
@@ -994,10 +1045,11 @@ def _aggregate_phase_summary_from_details(value: object) -> tuple[dict[str, Any]
             scoped_phase = deepcopy(phase)
             scoped_phase["name"] = _scoped(str(phase["name"]))
             completed.append(scoped_phase)
-            duration = phase.get("duration_seconds")
-            if isinstance(duration, int | float) and not isinstance(duration, bool):
-                total_duration += float(duration)
-                duration_seen = True
+            duration = coerce_non_negative_finite_duration(phase.get("duration_seconds"))
+            if duration is None:
+                return None, f"aggregate scope {scope_identity}: malformed phase duration"
+            total_duration += duration
+            duration_seen = True
         passed.extend(_scoped(str(name)) for name in scope_valid_summary["passed"])
         failed.extend(_scoped(str(name)) for name in scope_valid_summary["failed"])
         running.extend(_scoped(str(name)) for name in scope_valid_summary["running"])
@@ -1067,12 +1119,10 @@ def _phase_summary_from_canonical_validation(validation: object) -> dict[str, An
             passed.append(completed_name)
         elif copied.get("status") == "failed":
             failed.append(completed_name)
-        duration = copied.get("duration_seconds")
-        if isinstance(duration, int | float) and not isinstance(duration, bool):
-            duration_value = float(duration)
-            if math.isfinite(duration_value) and duration_value >= 0:
-                total_duration += duration_value
-                duration_seen = True
+        duration_value = coerce_non_negative_finite_duration(copied.get("duration_seconds"))
+        if duration_value is not None:
+            total_duration += duration_value
+            duration_seen = True
     completed_name_set = set(completed_phase_names)
     running = [name for name in started_phase_names if name not in completed_name_set]
     last_observed = running[-1] if running else (completed[-1]["name"] if completed else None)
