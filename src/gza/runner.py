@@ -1886,6 +1886,9 @@ class WorkspaceSetupResult:
         return self.ok
 
 
+BRANCH_CREATION_COLLISION_RECOVERY_LIMIT = 3
+
+
 @dataclass(frozen=True)
 class StartupFailureRecord:
     """Structured startup failure persisted before normal task execution begins."""
@@ -1966,9 +1969,7 @@ def _record_startup_failure(
     log_file = ensure_task_log_path(config, store, task)
     provider_name = provider if isinstance(provider, str) else provider.name
     branch = failure.branch or task.branch
-    if branch and task.branch != branch:
-        task.branch = branch
-        store.update(task)
+    durable_branch = task.branch
 
     if not prelude_written:
         write_worker_start_event(log_file, resumed=resume)
@@ -2038,7 +2039,7 @@ def _record_startup_failure(
         config=config,
         store=store,
         log_file=log_file,
-        branch=branch,
+        branch=durable_branch,
         explicit_reason=failure.failure_reason,
         error_type=None,
         exit_code=exit_code,
@@ -11068,6 +11069,12 @@ def run(
                 except TaskDispatchBlockedError as exc:
                     error_message(f"Error: {exc}")
                     return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+                if _is_code_task(task) and not task.branch and task.has_commits is not True:
+                    error_message(
+                        f"Error: Task {task.id} has no persisted owned branch to resume. "
+                        "Start a fresh retry instead."
+                    )
+                    return 1
                 task.status = "in_progress"
                 task.started_at = datetime.now(UTC)
                 task.completed_at = None
@@ -11410,6 +11417,12 @@ def _resolve_code_task_branch_name(
         return branch_name
 
     if resume:
+        if task.status == "failed" and task.has_commits is not True:
+            error_message(
+                f"Error: Task {task.id} has no persisted owned branch to resume. "
+                "Start a fresh retry instead."
+            )
+            return None
         # Resume but branch wasn't saved - derive from task_id using branch naming strategy
         assert config.branch_strategy is not None
         assert task.slug is not None
@@ -11515,6 +11528,65 @@ def _resolve_code_task_branch_name(
         f"→ [blue]{branch_name}[/blue]"
     )
     return branch_name
+
+
+def _is_recoverable_branch_creation_collision(
+    task: Task,
+    config: Config,
+    git: Git,
+    setup_result: WorkspaceSetupResult,
+    *,
+    resume: bool,
+) -> bool:
+    """Return whether a failed fresh worktree add lost the slug/create branch race."""
+    if (
+        resume
+        or task.same_branch
+        or config.branch_mode != "multi"
+        or setup_result.ok
+        or setup_result.phase != "worktree_add"
+        or not setup_result.branch
+    ):
+        return False
+    try:
+        return git.branch_exists(setup_result.branch) is True
+    except GitError:
+        return False
+
+
+def _regenerate_code_task_slug_after_branch_collision(
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+) -> tuple[str, Path]:
+    """Regenerate a fresh slug/branch pair after a concurrent creator claimed the branch."""
+    assert task.slug is not None
+    new_slug = generate_slug(
+        task.prompt,
+        existing_id=task.slug,
+        log_path=config.log_path,
+        git=git,
+        store=store,
+        exclude_task_id=task.id,
+        project_name=config.project_name,
+        project_prefix=config.project_prefix,
+        branch_strategy=config.branch_strategy,
+        explicit_type=task.task_type_hint,
+        task_id_for_branch=task.id,
+    )
+    if new_slug == task.slug:
+        raise ConfigError(f"Branch collision recovery did not produce a new slug for task {task.id}")
+
+    task.slug = new_slug
+    branch_name = _resolve_code_task_branch_name(task, config, store, git, resume=False)
+    if branch_name is None:
+        raise ConfigError(f"Branch collision recovery could not resolve a branch for task {task.id}")
+
+    task.log_file = task_log_storage_path(config, config.log_path / f"{task.slug}.log")
+    store.update(task)
+    ensure_task_log_path(config, store, task)
+    return branch_name, config.worktree_path / task.slug
 
 
 def _select_worktree_base_ref(git: Git, default_branch: str) -> str:
@@ -11733,6 +11805,18 @@ def _setup_code_task_worktree(
         base_ref = task.base_branch or _select_worktree_base_ref(git, default_branch)
         if task.base_branch:
             console.print(f"Creating retry branch from base branch: [blue]{task.base_branch}[/blue]")
+        if config.branch_mode == "multi" and worktree_path.exists() and git.branch_exists(branch_name):
+            message = (
+                f"Branch {branch_name} and candidate worktree path {worktree_path} "
+                "were claimed concurrently; retrying with a fresh slug."
+            )
+            error_message(f"Error: {message}")
+            return WorkspaceSetupResult(
+                ok=False,
+                message=message,
+                phase="worktree_add",
+                branch=branch_name,
+            )
         console.print(f"Creating worktree: {worktree_path}")
         git.worktree_add(worktree_path, branch_name, base_ref)
         return WorkspaceSetupResult(ok=True, branch=branch_name)
@@ -12947,16 +13031,58 @@ def _run_inner(
         worktree_git = isolated_checkout.git
         rebase_provider_target_ref = getattr(isolated_checkout, "provider_target_ref", None)
     else:
-        setup_result = _setup_code_task_worktree(
-            task,
-            config,
-            git,
-            store=store,
-            branch_name=branch_name,
-            worktree_path=worktree_path,
-            default_branch=default_branch,
-            resume=resume,
-        )
+        collision_recovery_attempts = 0
+        while True:
+            # TODO(gza-10242): replace this probe/create recovery loop with an
+            # atomic branch-creation claim if concurrent task start coordination
+            # grows beyond bounded slug regeneration.
+            setup_result = _setup_code_task_worktree(
+                task,
+                config,
+                git,
+                store=store,
+                branch_name=branch_name,
+                worktree_path=worktree_path,
+                default_branch=default_branch,
+                resume=resume,
+            )
+            if setup_result or not isinstance(setup_result, WorkspaceSetupResult):
+                break
+            if not _is_recoverable_branch_creation_collision(
+                task,
+                config,
+                git,
+                setup_result,
+                resume=resume,
+            ):
+                break
+            if collision_recovery_attempts >= BRANCH_CREATION_COLLISION_RECOVERY_LIMIT:
+                break
+            collision_recovery_attempts += 1
+            old_branch = branch_name
+            try:
+                branch_name, worktree_path = _regenerate_code_task_slug_after_branch_collision(
+                    task,
+                    config,
+                    store,
+                    git,
+                )
+            except (ConfigError, GitError, OSError) as exc:
+                setup_result = WorkspaceSetupResult(
+                    ok=False,
+                    message=str(exc),
+                    failure_reason="GIT_ERROR",
+                    phase="branch_collision_recovery",
+                    branch=old_branch,
+                    error_type=exc.__class__.__name__,
+                    error_detail=str(exc),
+                )
+                break
+            log_file = ensure_task_log_path(config, store, task)
+            console.print(
+                f"Branch {old_branch} was claimed concurrently; retrying with "
+                f"[blue]{branch_name}[/blue]"
+            )
         if not setup_result:
             if isinstance(setup_result, WorkspaceSetupResult):
                 message = setup_result.message or f"Could not create worktree for branch {branch_name}"

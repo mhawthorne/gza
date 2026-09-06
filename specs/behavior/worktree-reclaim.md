@@ -108,6 +108,16 @@ The asymmetry is deliberate and narrow: the *only* thing that can be auto-reclai
 **clean** worktree, and only when the knob permits it. Anything with unsaved work is off
 limits, always.
 
+Fresh multi-branch task starts have one additional bounded collision case. If a candidate
+slug renders to a branch/path pair that another creator has already claimed, the runner
+MUST treat the candidate as unowned by the losing task. It MUST NOT remove, clean, or
+re-check out the existing candidate path, even when that path is inside a managed root and
+even when the competing worktree is dirty. If the candidate branch exists, the loser MAY
+regenerate the slug and retry up to the configured branch-creation collision bound. If the
+bound is exhausted, the task MUST fail while preserving its previously proven-owned branch
+state, or `None` when no such branch exists; the failed candidate branch may appear only in
+structured startup-failure evidence.
+
 > **Note — foreign worktrees (outside managed roots).** A worktree that lives outside the
 > directories gza manages for task workspaces is never reclaimed by this gate, clean or not.
 > A worktree a human created by hand in some other location is theirs; the runner MUST refuse

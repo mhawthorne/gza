@@ -69,6 +69,7 @@ from gza.review_verify_state import (
 )
 from gza.runner import (
     BACKUP_DIR,
+    BRANCH_CREATION_COLLISION_RECOVERY_LIMIT,
     BRANCH_UNPUSHABLE_FAILURE_REASON,
     DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
     PHASE_EVIDENCE_INDETERMINATE,
@@ -13614,6 +13615,9 @@ class TestTaskClaimSafety:
         task = store.add(prompt=f"{command} provenance parity", task_type="implement")
         if resume:
             task.status = "failed"
+            task.slug = "20260906-resume-provenance-parity"
+            task.branch = "gza/20260906-resume-provenance-parity"
+            task.has_commits = True
             task.session_id = "resume-session-123"
             store.update(task)
 
@@ -13668,6 +13672,9 @@ class TestTaskClaimSafety:
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Inline mode interactive", task_type="implement")
         task.status = "failed"
+        task.slug = "20260906-inline-mode-interactive"
+        task.branch = "gza/20260906-inline-mode-interactive"
+        task.has_commits = True
         task.session_id = "sess-123"
         store.update(task)
 
@@ -13700,6 +13707,38 @@ class TestTaskClaimSafety:
         assert result == 0
         assert mock_run_inner.call_count == 1
         assert mock_run_inner.call_args.kwargs["interaction_mode"] == "interactive"
+
+    def test_pending_code_resume_without_branch_still_dispatches(self, tmp_path: Path):
+        """Pending session resumes may still claim the task before branch derivation."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Pending session resume", task_type="implement")
+        task.session_id = "pending-session-123"
+        store.update(task)
+
+        config = self._make_config(tmp_path, db_path)
+
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner._run_inner", return_value=0) as mock_run_inner,
+            patch("gza.runner.get_provider") as mock_get_provider,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "Claude"
+            mock_provider.supports_interactive_foreground = True
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = True
+            mock_get_provider.return_value = mock_provider
+
+            result = run(config, task_id=task.id, resume=True)
+
+        assert result == 0
+        assert mock_run_inner.call_count == 1
+        claimed_task = mock_run_inner.call_args.args[0]
+        assert claimed_task.status == "in_progress"
+        assert claimed_task.branch is None
+        assert mock_run_inner.call_args.kwargs["resume"] is True
 
     def test_run_inline_prints_interactive_message_only_when_interactive_mode_used(
         self,
@@ -25934,6 +25973,276 @@ class TestExceptionHandlerMarkFailed:
         outcome = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
         assert outcome["phase"] == "runner_startup"
         assert outcome["setup_phase"] == "default_branch"
+
+    def test_run_regenerates_slug_when_branch_is_claimed_after_slug_probe(self, tmp_path: Path) -> None:
+        """A branch claim between slug probing and worktree_add should retry with a fresh slug."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='testproject'\n", encoding="utf-8")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "tests").mkdir()
+
+        config = Config.load(tmp_path)
+        config.worktree_dir = str(tmp_path / "worktrees")
+        config.branch_strategy = BranchStrategy(pattern="{project}/{task_slug}", default_type="feature")
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(prompt="Implement racy branch", task_type="implement")
+        assert task.id is not None
+
+        provider = Mock()
+        provider.name = "TestProvider"
+        provider.check_credentials.return_value = True
+        provider.verify_credentials.return_value = PreflightCheckResult.success()
+
+        git = Mock(spec=Git)
+        git.env = {}
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=1)
+        claimed_branches: set[str] = set()
+        git.branch_exists.side_effect = lambda branch: branch in claimed_branches
+        worktree_add_calls: list[tuple[Path, str, str]] = []
+
+        def worktree_add(path: Path, branch: str, base_ref: str) -> Path:
+            worktree_add_calls.append((path, branch, base_ref))
+            if len(worktree_add_calls) == 1:
+                claimed_branches.add(branch)
+                raise GitError(f"fatal: a branch named '{branch}' already exists")
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        git.worktree_add.side_effect = worktree_add
+
+        with (
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider", return_value=provider),
+            patch("gza.runner.Git", return_value=git),
+            patch(
+                "gza.runner._stage_worktree_agent_resources",
+                side_effect=AssertionError("provider prep should not run"),
+            ),
+            patch("gza.runner._copy_learnings_to_worktree", side_effect=AssertionError("provider prep should not run")),
+            patch("gza.runner.build_prompt", side_effect=AssertionError("provider should not run")),
+        ):
+            rc = run(config, task_id=task.id)
+
+        assert rc == 1
+        assert len(worktree_add_calls) == 2
+        first_path, first_branch, first_base = worktree_add_calls[0]
+        second_path, second_branch, second_base = worktree_add_calls[1]
+        assert first_base == "main"
+        assert second_base == "main"
+        first_slug = first_branch.split("/", 1)[1]
+        assert second_branch == f"testproject/{first_slug}-2"
+        assert second_path.name == f"{first_path.name}-2"
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.slug == f"{first_slug}-2"
+        assert refreshed.branch == second_branch
+        assert refreshed.failure_reason == "WORKSPACE_NOT_POPULATED"
+        assert provider.run.call_count == 0
+
+    def test_run_regenerates_slug_without_removing_concurrent_winner_worktree(self, tmp_path: Path) -> None:
+        """A same-slug branch/path winner must be preserved while the loser regenerates."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='testproject'\n", encoding="utf-8")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "tests").mkdir()
+
+        config = Config.load(tmp_path)
+        config.worktree_dir = str(tmp_path / "worktrees")
+        config.branch_strategy = BranchStrategy(pattern="{project}/{task_slug}", default_type="feature")
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(prompt="Implement dirty same slug winner", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260906-testproject-dirty-same-slug-winner"
+        store.update(task)
+
+        first_branch = "testproject/20260906-testproject-dirty-same-slug-winner"
+        first_path = config.worktree_path / task.slug
+        dirty_file = first_path / "scratch.txt"
+        dirty_file.parent.mkdir(parents=True)
+        dirty_file.write_text("winner dirty content", encoding="utf-8")
+        claimed_branches = {first_branch}
+
+        provider = Mock()
+        provider.name = "TestProvider"
+        provider.check_credentials.return_value = True
+        provider.verify_credentials.return_value = PreflightCheckResult.success()
+
+        git = Mock(spec=Git)
+        git.env = {}
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=1)
+        git.branch_exists.side_effect = lambda branch: branch in claimed_branches
+        worktree_add_calls: list[tuple[Path, str, str]] = []
+
+        def worktree_add(path: Path, branch: str, base_ref: str) -> Path:
+            worktree_add_calls.append((path, branch, base_ref))
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        git.worktree_add.side_effect = worktree_add
+
+        with (
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider", return_value=provider),
+            patch("gza.runner.Git", return_value=git),
+            patch(
+                "gza.runner._stage_worktree_agent_resources",
+                side_effect=AssertionError("provider prep should not run"),
+            ),
+            patch("gza.runner._copy_learnings_to_worktree", side_effect=AssertionError("provider prep should not run")),
+            patch("gza.runner.build_prompt", side_effect=AssertionError("provider should not run")),
+        ):
+            rc = run(config, task_id=task.id)
+
+        assert rc == 1
+        assert dirty_file.read_text(encoding="utf-8") == "winner dirty content"
+        git.worktree_remove.assert_not_called()
+        assert worktree_add_calls == [
+            (
+                config.worktree_path / "20260906-testproject-dirty-same-slug-winner-2",
+                "testproject/20260906-testproject-dirty-same-slug-winner-2",
+                "main",
+            )
+        ]
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.slug == "20260906-testproject-dirty-same-slug-winner-2"
+        assert refreshed.branch == "testproject/20260906-testproject-dirty-same-slug-winner-2"
+        assert refreshed.branch not in claimed_branches
+        assert provider.run.call_count == 0
+
+    def test_run_collision_exhaustion_preserves_branch_and_resume_refuses_candidate_cleanup(
+        self, tmp_path: Path
+    ) -> None:
+        """Exhausted concurrent branch claims must not persist or later resume a foreign branch."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n",
+            encoding="utf-8",
+        )
+        config = Config.load(tmp_path)
+        config.worktree_dir = str(tmp_path / "worktrees")
+        config.branch_strategy = BranchStrategy(pattern="{project}/{task_slug}", default_type="feature")
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(prompt="Implement exhausted branch race", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260906-testproject-exhausted-branch-race"
+        store.update(task)
+
+        provider = Mock()
+        provider.name = "TestProvider"
+        provider.check_credentials.return_value = True
+        provider.verify_credentials.return_value = PreflightCheckResult.success()
+
+        git = Mock(spec=Git)
+        git.env = {}
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=1)
+        claimed_branches: set[str] = set()
+        git.branch_exists.side_effect = lambda branch: branch in claimed_branches
+        worktree_add_calls: list[tuple[Path, str, str]] = []
+
+        def lose_branch_race(path: Path, branch: str, base_ref: str) -> Path:
+            worktree_add_calls.append((path, branch, base_ref))
+            claimed_branches.add(branch)
+            dirty_file = path / "scratch.txt"
+            dirty_file.parent.mkdir(parents=True, exist_ok=True)
+            dirty_file.write_text(f"foreign content for {branch}", encoding="utf-8")
+            raise GitError(f"fatal: a branch named '{branch}' already exists")
+
+        git.worktree_add.side_effect = lose_branch_race
+
+        with (
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider", return_value=provider),
+            patch("gza.runner.Git", return_value=git),
+            patch(
+                "gza.runner._stage_worktree_agent_resources",
+                side_effect=AssertionError("provider prep should not run"),
+            ),
+            patch("gza.runner._copy_learnings_to_worktree", side_effect=AssertionError("provider prep should not run")),
+            patch("gza.runner.build_prompt", side_effect=AssertionError("provider should not run")),
+        ):
+            rc = run(config, task_id=task.id)
+
+        assert rc == 1
+        expected_attempts = BRANCH_CREATION_COLLISION_RECOVERY_LIMIT + 1
+        assert len(worktree_add_calls) == expected_attempts
+        attempted_branches = [branch for _path, branch, _base in worktree_add_calls]
+        assert attempted_branches == [
+            "testproject/20260906-testproject-exhausted-branch-race",
+            "testproject/20260906-testproject-exhausted-branch-race-2",
+            "testproject/20260906-testproject-exhausted-branch-race-3",
+            "testproject/20260906-testproject-exhausted-branch-race-4",
+        ]
+        git.worktree_remove.assert_not_called()
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.branch is None
+        assert refreshed.branch not in attempted_branches
+        assert refreshed.log_file is not None
+        refreshed.session_id = "resume-after-branch-race"
+        store.update(refreshed)
+
+        log_file = config.project_dir / refreshed.log_file
+        conversation_entries = [json.loads(line) for line in log_file.read_text().splitlines() if line.strip()]
+        startup_entry = next(entry for entry in conversation_entries if entry.get("subtype") == "startup_failure")
+        assert startup_entry["branch"] == attempted_branches[-1]
+        assert startup_entry["setup_phase"] == "worktree_add"
+
+        resume_git = Mock(spec=Git)
+        resume_git.env = {}
+        resume_git.default_branch.return_value = "main"
+        resume_git._run.return_value = Mock(returncode=1)
+        resume_git.worktree_list.return_value = [
+            {
+                "path": str(worktree_add_calls[0][0]),
+                "branch": f"refs/heads/{attempted_branches[0]}",
+            }
+        ]
+        resume_git.branch_exists.side_effect = lambda branch: branch in claimed_branches
+
+        with (
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider", return_value=provider),
+            patch("gza.runner.Git", return_value=resume_git),
+            patch(
+                "gza.runner._stage_worktree_agent_resources",
+                side_effect=AssertionError("worktree setup should not run"),
+            ),
+            patch(
+                "gza.runner._copy_learnings_to_worktree",
+                side_effect=AssertionError("worktree setup should not run"),
+            ),
+            patch("gza.runner.build_prompt", side_effect=AssertionError("provider should not run")),
+        ):
+            resume_rc = run(config, task_id=task.id, resume=True)
+
+        assert resume_rc == 1
+        resume_git.worktree_remove.assert_not_called()
+        resume_git.worktree_add_existing.assert_not_called()
+        resume_git.worktree_add.assert_not_called()
+        for path, branch, _base in worktree_add_calls:
+            assert (path / "scratch.txt").read_text(encoding="utf-8") == f"foreign content for {branch}"
 
     def test_run_records_structured_workspace_setup_failure_before_execution(self, tmp_path: Path) -> None:
         """Workspace setup GitErrors should preserve structured startup-failure fields."""
