@@ -848,6 +848,7 @@ def test_land_cli_refuses_malformed_pending_finalization_proof_before_verify_or_
     authorization = MergeLandingAuthorization(
         owner_task_id=task_id,
         merge_unit_id=unit_id,
+        source_branch=unit.source_branch,
         source_ref=unit.source_branch,
         target_branch=unit.target_branch,
         source_sha="b" * 40,

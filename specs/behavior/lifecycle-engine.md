@@ -1317,6 +1317,13 @@ urgent or PR-required handling. Guarded deferred-blocker tasks MUST preserve bot
 handling and PR-required semantics. Any follow-up or deferred-blocker creation failure,
 reuse-validation failure, property-reconciliation failure, or persistence failure MUST
 block landing and MUST occur before any merge-state mutation.
+Pending-finalization replay MUST re-resolve the merge unit and every stored follow-up or
+deferred-task ID immediately before mark-merged persistence, validate that each live row
+still matches its authorized review/implementation/finding identity, prompt/scope
+content, and required `urgent`/`create_pr` properties, and persist merged state only with
+an identity-conditional merge-unit write. Missing or mutated handoff rows, changed
+merge-unit identity, or a failed conditional write MUST refuse finalization without
+overwriting the concurrent state.
 
 A successful non-escalated land MUST record `manual_land` merge provenance. A successful
 guarded escalation that deferred blockers or overrode an eligible churn park MUST record

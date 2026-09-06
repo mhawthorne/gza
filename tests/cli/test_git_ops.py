@@ -1313,10 +1313,13 @@ def _landing_authorization(**overrides: Any) -> MergeLandingAuthorization:
     values: dict[str, Any] = {
         "owner_task_id": "testproject-1",
         "merge_unit_id": "mu-1",
+        "source_branch": "feature/landing-auth",
         "source_ref": "feature/landing-auth",
         "target_branch": "main",
         "source_sha": "source-sha",
         "target_sha": "target-sha",
+        "merge_unit_head_sha": "source-sha",
+        "merge_unit_base_sha": "target-sha",
         "representative_task_id": "testproject-1",
         "member_task_ids": ("testproject-1",),
         "policy_version": "guarded.v1",

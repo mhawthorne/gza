@@ -61,9 +61,13 @@ from gza.review_scope import (
 from gza.review_tasks import (
     DuplicateReviewError,
     build_deferred_blocker_prompt,
+    build_followup_prompt,
     create_resolution_review_task,
     create_review_task,
+    extract_deferred_blocker_prompt_parts,
+    extract_followup_prompt_parts,
     format_blocker_finding_context,
+    format_followup_finding_context,
 )
 from gza.review_verdict import (
     ReviewFinding,
@@ -253,6 +257,7 @@ class LandingStore(Protocol):
         state: str,
         *,
         expected_identity: MergeUnitProofIdentity,
+        merge_source: str | None | object = ...,
     ) -> bool: ...
 
 
@@ -266,6 +271,7 @@ class MergeUnitProofIdentity:
     owner_task_id: str | None
     head_sha: str | None
     base_sha: str | None
+    member_task_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -417,6 +423,14 @@ class LandingPendingFinalization:
 
 
 @dataclass(frozen=True)
+class _PendingTaskValidation:
+    """Live task rows revalidated against a pending-finalization authorization."""
+
+    deferred_task_ids: tuple[str, ...]
+    followup_task_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class LandStep:
     """A queryable or executed landing phase result."""
 
@@ -503,6 +517,8 @@ class LandingResolvedIdentity:
     target_sha: str | None
     current_branch: str | None
     member_task_ids: tuple[str, ...] = ()
+    merge_unit_proof: MergeUnitProofIdentity | None = None
+    pending_finalization: LandingPendingFinalization | None = None
     checkout_clean: bool = True
     checkout_clean_block: LandBlocked | None = None
     already_merged: bool = False
@@ -913,13 +929,12 @@ class LandingCoordinator:
 
             terminal_unit = self.store.get_merge_unit(identity.merge_unit_id) if identity.merge_unit_id else None
             if terminal_unit is not None:
-                if terminal_unit.state == "unmerged" and request.dry_run and self._load_pending_finalization(identity) is not None:
-                    return self._run_pending_finalization_replay(
-                        request=request,
-                        identity=identity,
-                        steps=steps,
-                    )
-                if (
+                pending_finalization = (
+                    self._load_pending_finalization(identity)
+                    if terminal_unit.state == "unmerged"
+                    else None
+                )
+                if pending_finalization is not None or (
                     terminal_unit.state == "unmerged"
                     and (
                         identity.already_merged
@@ -1087,7 +1102,7 @@ class LandingCoordinator:
                     decision=decision,
                 )
 
-            if first_boundary in {"judge", "merge"}:
+            if first_boundary in {"judge", "defer_blockers", "merge"}:
                 return self._run_policy_and_merge_phases(
                     request=request,
                     identity=identity,
@@ -1593,7 +1608,8 @@ class LandingCoordinator:
                 failure=final_preflight_failure,
             )
         try:
-            finalization = self.finalize_merge(identity, decision, pending.provenance)
+            finalization_identity = replace(identity, pending_finalization=pending)
+            finalization = self.finalize_merge(finalization_identity, decision, pending.provenance)
         except Exception as exc:
             failure = LandPostMergeVerifyFailure(
                 status="state_persistence_failed",
@@ -1632,6 +1648,27 @@ class LandingCoordinator:
                 followup_ids=pending.followup_task_ids,
                 failure=failure,
             )
+        post_finalization_validation = self._validate_pending_finalization_handoffs(finalization_identity, pending)
+        if isinstance(post_finalization_validation, LandPostMergeVerifyFailure):
+            self._restore_pending_finalization_unmerged(finalization_identity, pending)
+            failure = LandPostMergeVerifyFailure(
+                status="state_persistence_failed",
+                fact=post_finalization_validation.fact,
+                checkpoint_id=post_merge_success.checkpoint_id,
+                target_head=post_merge_success.target_head,
+                gate_identity=post_merge_success.gate_identity,
+                evidence_refs=post_finalization_validation.evidence_refs,
+            )
+            steps.append(LandStep("merge", "blocked", failure.fact, evidence_refs=failure.evidence_refs))
+            return self._post_merge_non_success_result(
+                request=request,
+                identity=identity,
+                steps=steps,
+                decision=decision,
+                deferred_ids=pending.deferred_task_ids,
+                followup_ids=pending.followup_task_ids,
+                failure=failure,
+            )
         steps.append(
             LandStep(
                 "post_merge_verify",
@@ -1651,6 +1688,47 @@ class LandingCoordinator:
             merge_provenance=pending.provenance,
             judgment_artifact_id=pending.authorization.judgment_artifact_id,
             judgment_key=pending.authorization.judgment_key,
+            deferred_task_ids=pending.deferred_task_ids,
+            followup_task_ids=pending.followup_task_ids,
+            )
+
+    def _restore_pending_finalization_unmerged(
+        self,
+        identity: LandingResolvedIdentity,
+        pending: LandingPendingFinalization,
+    ) -> None:
+        if identity.merge_unit_id is None:
+            return
+        refreshed = self.store.get_merge_unit(identity.merge_unit_id)
+        if refreshed is None or refreshed.state != "merged":
+            return
+        authorization = pending.authorization
+        self.store.set_merge_unit_state_if_identity(
+            identity.merge_unit_id,
+            "unmerged",
+            expected_identity=MergeUnitProofIdentity(
+                source_branch=authorization.source_branch,
+                target_branch=authorization.target_branch,
+                state="merged",
+                owner_task_id=authorization.owner_task_id,
+                head_sha=authorization.merge_unit_head_sha,
+                base_sha=authorization.merge_unit_base_sha,
+                member_task_ids=tuple(sorted(authorization.member_task_ids)),
+            ),
+        )
+
+    def _validate_pending_finalization_handoffs(
+        self,
+        identity: LandingResolvedIdentity,
+        pending: LandingPendingFinalization,
+    ) -> _PendingTaskValidation | LandPostMergeVerifyFailure:
+        deferred_failure = self._validate_pending_deferred_tasks(identity, pending)
+        if deferred_failure is not None:
+            return deferred_failure
+        followup_failure = self._validate_pending_followup_tasks(identity, pending)
+        if followup_failure is not None:
+            return followup_failure
+        return _PendingTaskValidation(
             deferred_task_ids=pending.deferred_task_ids,
             followup_task_ids=pending.followup_task_ids,
         )
@@ -1812,10 +1890,13 @@ class LandingCoordinator:
             authorization = MergeLandingAuthorization(
                 owner_task_id=str(authorization_payload["owner_task_id"]),
                 merge_unit_id=cast(str | None, authorization_payload.get("merge_unit_id")),
+                source_branch=str(authorization_payload["source_branch"]),
                 source_ref=str(authorization_payload["source_ref"]),
                 target_branch=str(authorization_payload["target_branch"]),
                 source_sha=str(authorization_payload["source_sha"]),
                 target_sha=str(authorization_payload["target_sha"]),
+                merge_unit_head_sha=cast(str | None, authorization_payload.get("merge_unit_head_sha")),
+                merge_unit_base_sha=cast(str | None, authorization_payload.get("merge_unit_base_sha")),
                 representative_task_id=cast(str | None, authorization_payload.get("representative_task_id")),
                 member_task_ids=tuple(str(item) for item in authorization_payload.get("member_task_ids", ())),
                 policy_version=cast(str | None, authorization_payload.get("policy_version")),
@@ -1865,6 +1946,8 @@ class LandingCoordinator:
             return None
         if authorization.merge_unit_id != identity.merge_unit_id:
             return None
+        if authorization.source_branch != identity.source_branch:
+            return None
         if authorization.source_ref != identity.source_ref:
             return None
         if authorization.source_sha != identity.source_sha:
@@ -1913,6 +1996,14 @@ class LandingCoordinator:
             replay_target_sha = current_target_sha
         deferred_ids = tuple(str(item) for item in metadata.get("deferred_task_ids", ()) if str(item).strip())
         followup_ids = tuple(str(item) for item in metadata.get("followup_task_ids", ()) if str(item).strip())
+        if artifact_stage == "prepared":
+            if not deferred_ids:
+                deferred_ids = self._recover_prepared_pending_deferred_task_ids(authorization)
+            if not followup_ids:
+                followup_ids = self._recover_prepared_pending_followup_task_ids(
+                    authorization,
+                    provenance=cast(Literal["manual_land", "manual_land_escalated"], provenance),
+                )
         return LandingPendingFinalization(
             artifact_id=artifact_id,
             authorization=authorization,
@@ -1922,6 +2013,60 @@ class LandingCoordinator:
             deferred_task_ids=deferred_ids,
             followup_task_ids=followup_ids,
         )
+
+    def _recover_prepared_pending_deferred_task_ids(
+        self,
+        authorization: MergeLandingAuthorization,
+    ) -> tuple[str, ...]:
+        expected = _authorized_deferred_task_payloads(authorization)
+        if not expected:
+            return ()
+        recovered: list[str] = []
+        for task in self.store.get_all():
+            if task.id is None:
+                continue
+            parsed = extract_deferred_blocker_prompt_parts(task.prompt)
+            if parsed is None or parsed not in expected:
+                continue
+            expected_payload = expected[parsed]
+            if _landing_sha256_text(task.prompt) != expected_payload.get("prompt_sha256"):
+                continue
+            if _landing_sha256_text(task.review_scope or "") != expected_payload.get("review_scope_sha256"):
+                continue
+            recovered.append(task.id)
+        return tuple(sorted(recovered))
+
+    def _recover_prepared_pending_followup_task_ids(
+        self,
+        authorization: MergeLandingAuthorization,
+        *,
+        provenance: Literal["manual_land", "manual_land_escalated"],
+    ) -> tuple[str, ...]:
+        expected, expected_error = self._expected_pending_followup_payloads(authorization, provenance=provenance)
+        if expected_error is not None or not expected:
+            return ()
+        recovered: list[str] = []
+        for task in self.store.get_all():
+            if task.id is None:
+                continue
+            parsed = extract_followup_prompt_parts(task.prompt)
+            if parsed is None:
+                continue
+            finding_id, review_id, impl_task_id = parsed
+            source = f"review:{review_id}"
+            expected_for_finding = _pending_followup_payload_for_finding(expected, review_id, source, finding_id)
+            if expected_for_finding is None or impl_task_id != authorization.owner_task_id:
+                continue
+            if task.prompt != expected_for_finding.get("prompt"):
+                continue
+            if task.review_scope != expected_for_finding.get("review_scope"):
+                continue
+            if task.urgent is not expected_for_finding.get("urgent"):
+                continue
+            if task.create_pr is not expected_for_finding.get("create_pr"):
+                continue
+            recovered.append(task.id)
+        return tuple(sorted(recovered))
 
     def _post_merge_final_preflight_failure(
         self,
@@ -1960,6 +2105,10 @@ class LandingCoordinator:
                 gate_identity=verified.gate_identity,
                 evidence_refs=_evidence_refs(identity.owner_task_id, pending.artifact_id, pending.post_merge_target_sha, current_target_sha),
             )
+        if pending is not None:
+            pending_task_validation = self._validate_pending_finalization_tasks(identity, pending)
+            if isinstance(pending_task_validation, LandPostMergeVerifyFailure):
+                return pending_task_validation
         current_source_sha = _rev_parse_if_exists(git, identity.source_ref) if identity.source_ref is not None else None
         if current_source_sha != identity.source_sha:
             return LandPostMergeVerifyFailure(
@@ -2030,6 +2179,287 @@ class LandingCoordinator:
                 evidence_refs=_evidence_refs(identity.owner_task_id, identity.source_ref, identity.target_branch, verified.target_head),
             )
         return None
+
+    def _validate_pending_finalization_tasks(
+        self,
+        identity: LandingResolvedIdentity,
+        pending: LandingPendingFinalization,
+    ) -> _PendingTaskValidation | LandPostMergeVerifyFailure:
+        unit_failure = self._validate_pending_finalization_merge_unit(identity, pending)
+        if unit_failure is not None:
+            return unit_failure
+
+        deferred_failure = self._validate_pending_deferred_tasks(identity, pending)
+        if deferred_failure is not None:
+            return deferred_failure
+        followup_failure = self._validate_pending_followup_tasks(identity, pending)
+        if followup_failure is not None:
+            return followup_failure
+        return _PendingTaskValidation(
+            deferred_task_ids=pending.deferred_task_ids,
+            followup_task_ids=pending.followup_task_ids,
+        )
+
+    def _validate_pending_finalization_merge_unit(
+        self,
+        identity: LandingResolvedIdentity,
+        pending: LandingPendingFinalization,
+    ) -> LandPostMergeVerifyFailure | None:
+        authorization = pending.authorization
+        if identity.merge_unit_id is None:
+            return None
+        try:
+            selected_unit = self.store.resolve_merge_unit_subject(identity.selected_task_id)
+        except Exception as exc:
+            return self._pending_finalization_preflight_failure(
+                identity,
+                pending,
+                _exception_fact("canonical merge-unit identity is unavailable before pending-finalization replay", exc),
+                extra_refs=(identity.selected_task_id,),
+            )
+        if selected_unit is None:
+            return self._pending_finalization_preflight_failure(
+                identity,
+                pending,
+                "selected task no longer resolves to the authorized active merge unit",
+                extra_refs=(identity.selected_task_id, identity.merge_unit_id),
+            )
+        if selected_unit.id != identity.merge_unit_id:
+            return self._pending_finalization_preflight_failure(
+                identity,
+                pending,
+                "selected task no longer resolves to the authorized active merge unit",
+                extra_refs=(identity.selected_task_id, identity.merge_unit_id, selected_unit.id),
+            )
+        proof = MergeUnitProofIdentity(
+            source_branch=authorization.source_branch,
+            target_branch=authorization.target_branch,
+            state="unmerged",
+            owner_task_id=authorization.owner_task_id,
+            head_sha=authorization.merge_unit_head_sha,
+            base_sha=authorization.merge_unit_base_sha,
+            member_task_ids=tuple(sorted(authorization.member_task_ids)),
+        )
+        live_proof = _proof_identity_for_unit(selected_unit, member_task_ids=identity.member_task_ids)
+        if live_proof != proof:
+            return self._pending_finalization_preflight_failure(
+                identity,
+                pending,
+                "merge unit identity changed before pending-finalization replay",
+                extra_refs=(identity.merge_unit_id,),
+            )
+        return None
+
+    def _validate_pending_deferred_tasks(
+        self,
+        identity: LandingResolvedIdentity,
+        pending: LandingPendingFinalization,
+    ) -> LandPostMergeVerifyFailure | None:
+        authorization = pending.authorization
+        expected = _authorized_deferred_task_payloads(authorization)
+        actual: dict[tuple[str, str, str], str] = {}
+        mismatches: list[str] = []
+        for task_id in pending.deferred_task_ids:
+            task = self.store.get(task_id)
+            if task is None:
+                mismatches.append(f"{task_id}:missing")
+                continue
+            parsed = extract_deferred_blocker_prompt_parts(task.prompt)
+            if parsed is None:
+                mismatches.append(f"{task_id}:identity")
+                continue
+            finding_id, review_id, impl_task_id = parsed
+            key = (finding_id, review_id, impl_task_id)
+            if key in actual:
+                mismatches.append(f"{task_id}:duplicate")
+            actual[key] = task_id
+            expected_payload = expected.get(key)
+            if task.task_type != "implement":
+                mismatches.append(f"{task_id}:task_type")
+            if task.based_on != review_id:
+                mismatches.append(f"{task_id}:based_on")
+            if task.depends_on != impl_task_id:
+                mismatches.append(f"{task_id}:depends_on")
+            if task.urgent is not True:
+                mismatches.append(f"{task_id}:urgent")
+            if task.create_pr is not True:
+                mismatches.append(f"{task_id}:create_pr")
+            if expected_payload is None:
+                mismatches.append(f"{task_id}:unauthorized")
+                continue
+            if _landing_sha256_text(task.prompt) != expected_payload.get("prompt_sha256"):
+                mismatches.append(f"{task_id}:prompt")
+            if _landing_sha256_text(task.review_scope or "") != expected_payload.get("review_scope_sha256"):
+                mismatches.append(f"{task_id}:review_scope")
+        expected_keys = set(expected)
+        if not expected and pending.deferred_task_ids:
+            mismatches.append("authorization:deferred_blocker_identity")
+        missing = sorted(expected_keys - set(actual))
+        unexpected = sorted(set(actual) - expected_keys)
+        if missing:
+            mismatches.append(f"missing:{len(missing)}")
+        if unexpected:
+            mismatches.append(f"unexpected:{len(unexpected)}")
+        if mismatches:
+            return self._pending_finalization_preflight_failure(
+                identity,
+                pending,
+                "pending deferred blocker task identity no longer matches landing authorization: "
+                + ", ".join(sorted(mismatches)),
+                extra_refs=tuple(pending.deferred_task_ids),
+            )
+        return None
+
+    def _validate_pending_followup_tasks(
+        self,
+        identity: LandingResolvedIdentity,
+        pending: LandingPendingFinalization,
+    ) -> LandPostMergeVerifyFailure | None:
+        expected, expected_error = self._expected_pending_followup_payloads(
+            pending.authorization,
+            provenance=pending.provenance,
+        )
+        if expected_error is not None:
+            return self._pending_finalization_preflight_failure(
+                identity,
+                pending,
+                expected_error,
+                extra_refs=tuple(pending.followup_task_ids),
+            )
+        actual: dict[str, str] = {}
+        mismatches: list[str] = []
+        for task_id in pending.followup_task_ids:
+            task = self.store.get(task_id)
+            if task is None:
+                mismatches.append(f"{task_id}:missing")
+                continue
+            parsed = extract_followup_prompt_parts(task.prompt)
+            if parsed is None:
+                mismatches.append(f"{task_id}:identity")
+                continue
+            finding_id, review_id, impl_task_id = parsed
+            source = f"review:{review_id}"
+            expected_for_finding = _pending_followup_payload_for_finding(expected, review_id, source, finding_id)
+            raw_key = expected_for_finding.get("key") if expected_for_finding is not None else None
+            key = raw_key if isinstance(raw_key, str) else ""
+            if key:
+                if key in actual:
+                    mismatches.append(f"{task_id}:duplicate")
+                actual[key] = task_id
+            expected_payload = expected.get(key)
+            if task.task_type != "implement":
+                mismatches.append(f"{task_id}:task_type")
+            if task.based_on != review_id:
+                mismatches.append(f"{task_id}:based_on")
+            if task.depends_on != impl_task_id:
+                mismatches.append(f"{task_id}:depends_on")
+            if expected_payload is None:
+                mismatches.append(f"{task_id}:unauthorized")
+                continue
+            if task.urgent is not expected_payload.get("urgent"):
+                mismatches.append(f"{task_id}:urgent")
+            if task.create_pr is not expected_payload.get("create_pr"):
+                mismatches.append(f"{task_id}:create_pr")
+            if impl_task_id != identity.owner_task_id:
+                mismatches.append(f"{task_id}:impl_task_id")
+            if task.prompt != expected_payload.get("prompt"):
+                mismatches.append(f"{task_id}:prompt")
+            if task.review_scope != expected_payload.get("review_scope"):
+                mismatches.append(f"{task_id}:review_scope")
+        expected_keys = set(expected)
+        if not expected and pending.followup_task_ids:
+            mismatches.append("authorization:followup_identity")
+        missing = sorted(expected_keys - set(actual))
+        unexpected = sorted(set(actual) - expected_keys)
+        if missing:
+            mismatches.append(f"missing:{len(missing)}")
+        if unexpected:
+            mismatches.append(f"unexpected:{len(unexpected)}")
+        if mismatches:
+            return self._pending_finalization_preflight_failure(
+                identity,
+                pending,
+                "pending follow-up task identity no longer matches landing authorization: "
+                + ", ".join(sorted(mismatches)),
+                extra_refs=tuple(pending.followup_task_ids),
+            )
+        return None
+
+    def _expected_pending_followup_payloads(
+        self,
+        authorization: MergeLandingAuthorization,
+        *,
+        provenance: Literal["manual_land", "manual_land_escalated"],
+    ) -> tuple[dict[str, dict[str, Any]], str | None]:
+        if not authorization.followup_identities:
+            return {}, None
+        if not authorization.review_id:
+            return {}, "pending follow-up authorization is missing review identity"
+        review_task = self.store.get(authorization.review_id)
+        if review_task is None:
+            return {}, "pending follow-up authorization review task disappeared"
+        report = get_review_report(Path(getattr(self.config, "project_dir", ".")), review_task)
+        findings = tuple(
+            finding
+            for finding in report.findings
+            if isinstance(finding, ReviewFinding) and finding.severity == "FOLLOWUP"
+        )
+        if not findings:
+            return {}, "pending follow-up authorization review no longer contains follow-up findings"
+        required_urgent, required_create_pr = _pending_followup_property_requirements(
+            authorization,
+            provenance=provenance,
+        )
+        expected: dict[str, dict[str, Any]] = {}
+        for finding in findings:
+            fingerprint = _landing_review_finding_fingerprint(finding)
+            if fingerprint is None:
+                return {}, "pending follow-up authorization review contains an unidentifiable follow-up finding"
+            key = json.dumps(
+                {
+                    "review": authorization.review_id,
+                    "source": f"review:{authorization.review_id}",
+                    "finding": finding.id,
+                    "content": fingerprint,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if key in authorization.followup_identities:
+                expected[key] = {
+                    "key": key,
+                    "review_id": authorization.review_id,
+                    "source": f"review:{authorization.review_id}",
+                    "finding_id": finding.id,
+                    "prompt": build_followup_prompt(authorization.review_id, authorization.owner_task_id, finding),
+                    "review_scope": format_followup_finding_context(finding),
+                    "urgent": required_urgent,
+                    "create_pr": required_create_pr,
+                }
+        if set(expected) != set(authorization.followup_identities):
+            return {}, "pending follow-up authorization no longer matches review follow-up findings"
+        return expected, None
+
+    def _pending_finalization_preflight_failure(
+        self,
+        identity: LandingResolvedIdentity,
+        pending: LandingPendingFinalization,
+        fact: str,
+        *,
+        extra_refs: tuple[str, ...] = (),
+    ) -> LandPostMergeVerifyFailure:
+        return LandPostMergeVerifyFailure(
+            status="final_preflight_failed",
+            fact=fact,
+            target_head=pending.post_merge_target_sha,
+            gate_identity=identity.target_branch,
+            evidence_refs=_evidence_refs(
+                identity.owner_task_id,
+                identity.merge_unit_id,
+                pending.artifact_id,
+                *extra_refs,
+            ),
+        )
 
     def _missing_post_merge_verifier_block(self, identity: LandingResolvedIdentity) -> LandBlocked:
         return LandBlocked(
@@ -2560,6 +2990,7 @@ class LandingCoordinator:
                 target_sha=target_sha,
                 current_branch=None,
                 member_task_ids=member_task_ids,
+                merge_unit_proof=_proof_identity_for_unit(unit, member_task_ids=member_task_ids),
                 checkout_clean=True,
                 already_merged=unit.state == "merged",
                 merge_truth=None,
@@ -2688,6 +3119,7 @@ class LandingCoordinator:
             target_sha=target_sha,
             current_branch=current_branch,
             member_task_ids=member_task_ids,
+            merge_unit_proof=_proof_identity_for_unit(unit, member_task_ids=member_task_ids),
             checkout_clean=not dirty,
             checkout_clean_block=checkout_clean_block,
             already_merged=already_merged,
@@ -3410,10 +3842,13 @@ def landing_merge_authorization_from_facts(
     return MergeLandingAuthorization(
         owner_task_id=identity.owner_task_id,
         merge_unit_id=identity.merge_unit_id,
+        source_branch=identity.source_branch,
         source_ref=identity.source_ref,
         target_branch=identity.target_branch,
         source_sha=identity.source_sha,
         target_sha=identity.target_sha,
+        merge_unit_head_sha=identity.merge_unit_proof.head_sha if identity.merge_unit_proof is not None else None,
+        merge_unit_base_sha=identity.merge_unit_proof.base_sha if identity.merge_unit_proof is not None else None,
         representative_task_id=identity.representative_task.id,
         member_task_ids=identity.member_task_ids,
         policy_version=LANDING_GUARDED_POLICY_VERSION if decision.allowed_overrides else "strict.v1",
@@ -5906,6 +6341,71 @@ def _landing_authorization_deferred_blocker_task_identity(
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
+def _authorized_deferred_task_payloads(
+    authorization: MergeLandingAuthorization,
+) -> dict[tuple[str, str, str], dict[str, str]]:
+    expected: dict[tuple[str, str, str], dict[str, str]] = {}
+    if not authorization.deferred_blocker_task_identities:
+        return expected
+    for raw in authorization.deferred_blocker_task_identities:
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        finding_id = payload.get("finding_id")
+        review_id = payload.get("review_id")
+        impl_task_id = payload.get("impl_task_id")
+        prompt_sha256 = payload.get("prompt_sha256")
+        review_scope_sha256 = payload.get("review_scope_sha256")
+        if (
+            not isinstance(finding_id, str)
+            or not finding_id.strip()
+            or review_id != authorization.review_id
+            or impl_task_id != authorization.owner_task_id
+            or not isinstance(prompt_sha256, str)
+            or not prompt_sha256.strip()
+            or not isinstance(review_scope_sha256, str)
+            or not review_scope_sha256.strip()
+        ):
+            return {}
+        expected[(finding_id.strip(), str(review_id), str(impl_task_id))] = {
+            "prompt_sha256": prompt_sha256,
+            "review_scope_sha256": review_scope_sha256,
+        }
+    return expected
+
+
+def _pending_followup_payload_for_finding(
+    expected: Mapping[str, Mapping[str, Any]],
+    review_id: str,
+    source: str,
+    finding_id: str,
+) -> Mapping[str, Any] | None:
+    for payload in expected.values():
+        if (
+            payload.get("review_id") == review_id
+            and payload.get("source") == source
+            and payload.get("finding_id") == finding_id
+        ):
+            return payload
+    return None
+
+
+def _pending_followup_property_requirements(
+    authorization: MergeLandingAuthorization,
+    *,
+    provenance: Literal["manual_land", "manual_land_escalated"],
+) -> tuple[bool, bool]:
+    escalated_changes_requested = (
+        provenance == "manual_land_escalated"
+        and authorization.review_verdict == "CHANGES_REQUESTED"
+        and "defer-review-blockers" in authorization.allowed_overrides
+    )
+    return escalated_changes_requested, escalated_changes_requested
+
+
 def _landing_deferred_task_prompt_sha256(
     review_id: str | None,
     impl_task_id: str | None,
@@ -6685,7 +7185,11 @@ def _terminal_result_for_unit(
     )
 
 
-def _proof_identity_for_unit(unit: MergeUnit) -> MergeUnitProofIdentity:
+def _proof_identity_for_unit(
+    unit: MergeUnit,
+    *,
+    member_task_ids: tuple[str, ...] = (),
+) -> MergeUnitProofIdentity:
     return MergeUnitProofIdentity(
         source_branch=unit.source_branch,
         target_branch=unit.target_branch,
@@ -6693,6 +7197,7 @@ def _proof_identity_for_unit(unit: MergeUnit) -> MergeUnitProofIdentity:
         owner_task_id=unit.owner_task_id,
         head_sha=unit.head_sha,
         base_sha=unit.base_sha,
+        member_task_ids=tuple(sorted(member_task_ids)),
     )
 
 
@@ -6918,12 +7423,51 @@ def create_production_landing_coordinator(
         provenance: Literal["manual_land", "manual_land_escalated"],
     ) -> ManualMergeExecutionResult:
         try:
-            mark_merge_subject_merged(
-                store,
-                merge_subject=identity.owner_task,
-                merge_unit_id=identity.merge_unit_id,
-                merge_source=provenance,
-            )
+            if identity.merge_unit_id is None:
+                mark_merge_subject_merged(
+                    store,
+                    merge_subject=identity.owner_task,
+                    merge_unit_id=None,
+                    merge_source=provenance,
+                )
+            else:
+                pending = identity.pending_finalization
+                expected_identity = None
+                authorization = getattr(pending, "authorization", None)
+                if authorization is not None:
+                    expected_identity = MergeUnitProofIdentity(
+                        source_branch=authorization.source_branch,
+                        target_branch=authorization.target_branch,
+                        state="unmerged",
+                        owner_task_id=authorization.owner_task_id,
+                        head_sha=authorization.merge_unit_head_sha,
+                        base_sha=authorization.merge_unit_base_sha,
+                        member_task_ids=tuple(authorization.member_task_ids),
+                    )
+                if expected_identity is None:
+                    expected_identity = identity.merge_unit_proof
+                if expected_identity is None:
+                    expected_identity = MergeUnitProofIdentity(
+                        source_branch=identity.source_branch,
+                        target_branch=identity.target_branch,
+                        state="unmerged",
+                        owner_task_id=identity.owner_task_id,
+                        head_sha=None,
+                        base_sha=None,
+                        member_task_ids=tuple(identity.member_task_ids),
+                    )
+                persisted = store.set_merge_unit_state_if_identity(
+                    identity.merge_unit_id,
+                    "merged",
+                    expected_identity=expected_identity,
+                    merge_source=provenance,
+                )
+                if not persisted:
+                    return ManualMergeExecutionResult(
+                        rc=1,
+                        status="post_merge_state_persistence_failed",
+                        block_reason="landing merge state identity changed before persistence",
+                    )
         except Exception as exc:
             return ManualMergeExecutionResult(
                 rc=1,

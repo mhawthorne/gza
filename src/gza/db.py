@@ -14053,6 +14053,7 @@ class SqliteTaskStore:
         state: str,
         *,
         expected_identity: Any,
+        merge_source: str | None | object = DB_UNSET,
     ) -> bool:
         """Update merge-unit state only when proof-bearing identity still matches."""
         if not self.supports_merge_units():
@@ -14061,6 +14062,9 @@ class SqliteTaskStore:
         current_unit = self.get_merge_unit(unit_id)
         if current_unit is None:
             raise ValueError(f"Merge unit {unit_id} not found")
+        typed_merge_source = cast("str | None", merge_source) if merge_source is not DB_UNSET else None
+        if typed_merge_source is not None and typed_merge_source not in MERGE_SOURCE_VALUES:
+            raise ValueError(f"merge_source must be one of {sorted(MERGE_SOURCE_VALUES)!r}; got {typed_merge_source!r}")
         updates: list[str] = [
             "state = ?",
             "updated_at = ?",
@@ -14076,11 +14080,13 @@ class SqliteTaskStore:
                 [
                     _format_db_timestamp(current_unit.merged_at or now),
                     owner_task_id,
-                    current_unit.merge_source,
+                    typed_merge_source if merge_source is not DB_UNSET else current_unit.merge_source,
                 ]
             )
         else:
             params.extend([None, None, None])
+        expected_member_task_ids = tuple(sorted(str(item) for item in getattr(expected_identity, "member_task_ids", ())))
+        member_predicate = ""
         params.extend(
             [
                 self._project_id,
@@ -14093,6 +14099,38 @@ class SqliteTaskStore:
                 expected_identity.base_sha,
             ]
         )
+        if expected_member_task_ids:
+            member_placeholders = ",".join("?" for _ in expected_member_task_ids)
+            member_predicate = f"""
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM merge_unit_tasks mut_other
+                      JOIN merge_units mu_other
+                        ON mu_other.project_id = mut_other.project_id
+                       AND mu_other.id = mut_other.merge_unit_id
+                      WHERE mut_other.project_id = merge_units.project_id
+                        AND mut_other.task_id IN ({member_placeholders})
+                        AND mut_other.merge_unit_id != merge_units.id
+                        AND mu_other.superseded_by_unit_id IS NULL
+                        AND mu_other.state NOT IN ('dropped', 'superseded')
+                  )
+                  AND (
+                      SELECT COUNT(*)
+                      FROM merge_unit_tasks mut_expected
+                      WHERE mut_expected.project_id = merge_units.project_id
+                        AND mut_expected.merge_unit_id = merge_units.id
+                        AND mut_expected.task_id IN ({member_placeholders})
+                  ) = ?
+                  AND (
+                      SELECT COUNT(*)
+                      FROM merge_unit_tasks mut_all
+                      WHERE mut_all.project_id = merge_units.project_id
+                        AND mut_all.merge_unit_id = merge_units.id
+                  ) = ?
+            """
+            params.extend(expected_member_task_ids)
+            params.extend(expected_member_task_ids)
+            params.extend([len(expected_member_task_ids), len(expected_member_task_ids)])
         with self._write_transaction() as conn:
             cursor = conn.execute(
                 f"""
@@ -14106,6 +14144,7 @@ class SqliteTaskStore:
                   AND owner_task_id IS ?
                   AND head_sha IS ?
                   AND base_sha IS ?
+                  {member_predicate}
                 """,
                 tuple(params),
             )

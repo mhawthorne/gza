@@ -69,10 +69,13 @@ class MergeLandingAuthorization:
 
     owner_task_id: str
     merge_unit_id: str | None
+    source_branch: str
     source_ref: str
     target_branch: str
     source_sha: str
     target_sha: str
+    merge_unit_head_sha: str | None = None
+    merge_unit_base_sha: str | None = None
     representative_task_id: str | None = None
     member_task_ids: tuple[str, ...] = ()
     policy_version: str | None = None
