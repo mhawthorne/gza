@@ -225,6 +225,7 @@ from .task_slug import (
     strip_derived_implement_prefixes,
 )
 from .verify_fix_outcome import apply_verify_fix_completion_outcome
+from .workers import _read_linux_proc_stat
 from .worktree_roots import managed_worktree_root_paths
 
 logger = logging.getLogger(__name__)
@@ -381,6 +382,7 @@ class _PathModeLeaseHandle:
 
 _DOCKER_VERIFY_SNAPSHOT_PERMISSION_LOCK = threading.Lock()
 _DOCKER_VERIFY_SNAPSHOT_PERMISSION_STATE_FILENAME = ".verify-db-snapshot-permission-leases.json"
+_DOCKER_VERIFY_SNAPSHOT_PERMISSION_LOCK_SUFFIX = ".lock"
 
 
 def _git_error_failure() -> ResolvedRunFailure:
@@ -2984,41 +2986,95 @@ def _cleanup_sqlite_file_with_companions(db_path: Path) -> None:
 
 
 @contextmanager
+def _docker_verify_snapshot_permission_state_lock(state_path: Path) -> Iterator[None]:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = Path(f"{state_path}{_DOCKER_VERIFY_SNAPSHOT_PERMISSION_LOCK_SUFFIX}")
+    with _DOCKER_VERIFY_SNAPSHOT_PERMISSION_LOCK:
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _load_docker_verify_snapshot_permission_state(state_path: Path) -> dict[str, Any]:
+    try:
+        raw_state = state_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        raw_state = ""
+    if not raw_state:
+        loaded: dict[str, Any] = {}
+    else:
+        try:
+            parsed = json.loads(raw_state)
+        except json.JSONDecodeError:
+            parsed = {}
+        loaded = parsed if isinstance(parsed, dict) else {}
+    if not isinstance(loaded.get("leases"), dict):
+        loaded["leases"] = {}
+    return loaded
+
+
+def _dump_docker_verify_snapshot_permission_state(state: dict[str, Any], handle: Any) -> None:
+    json.dump(state, handle, sort_keys=True)
+
+
+def _flush_docker_verify_snapshot_permission_state(handle: Any) -> None:
+    handle.flush()
+
+
+def _fsync_docker_verify_snapshot_permission_state(fd: int) -> None:
+    os.fsync(fd)
+
+
+def _persist_docker_verify_snapshot_permission_state(state_path: Path, state: dict[str, Any]) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{state_path.name}.",
+        suffix=".tmp",
+        dir=state_path.parent,
+        text=True,
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            _dump_docker_verify_snapshot_permission_state(state, handle)
+            _flush_docker_verify_snapshot_permission_state(handle)
+            _fsync_docker_verify_snapshot_permission_state(handle.fileno())
+        os.replace(tmp_path, state_path)
+        dir_fd = os.open(state_path.parent, os.O_RDONLY)
+        try:
+            _fsync_docker_verify_snapshot_permission_state(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+@contextmanager
 def _locked_docker_verify_snapshot_permission_state(
     state_path: Path,
 ) -> Iterator[dict[str, Any]]:
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    with _DOCKER_VERIFY_SNAPSHOT_PERMISSION_LOCK:
-        with state_path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                handle.seek(0)
-                raw_state = handle.read().strip()
-                if raw_state:
-                    loaded = json.loads(raw_state)
-                    if not isinstance(loaded, dict):
-                        loaded = {}
-                else:
-                    loaded = {}
-                leases = loaded.get("leases")
-                if not isinstance(leases, dict):
-                    loaded["leases"] = {}
-                yield loaded
-                handle.seek(0)
-                handle.truncate()
-                json.dump(loaded, handle, sort_keys=True)
-                handle.flush()
-                os.fsync(handle.fileno())
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    with _docker_verify_snapshot_permission_state_lock(state_path):
+        loaded = _load_docker_verify_snapshot_permission_state(state_path)
+        yield loaded
+        _persist_docker_verify_snapshot_permission_state(state_path, loaded)
 
 
 def _docker_verify_snapshot_permission_state_path(tmp_parent: Path) -> Path:
     return tmp_parent / _DOCKER_VERIFY_SNAPSHOT_PERMISSION_STATE_FILENAME
 
 
-def _docker_verify_snapshot_holder() -> tuple[int, str]:
-    return os.getpid(), f"{os.getpid()}:{time.time_ns()}"
+def _docker_verify_snapshot_holder() -> tuple[int, str, int | None]:
+    pid = os.getpid()
+    proc_stat = _read_linux_proc_stat(pid)
+    pid_start_ticks = proc_stat[1] if proc_stat is not None else None
+    return pid, f"{pid}:{time.time_ns()}", pid_start_ticks
 
 
 def _docker_verify_snapshot_holder_is_live(holder: object) -> bool:
@@ -3027,6 +3083,15 @@ def _docker_verify_snapshot_holder_is_live(holder: object) -> bool:
     pid = holder.get("pid")
     if not isinstance(pid, int) or pid <= 0:
         return False
+    proc_stat = _read_linux_proc_stat(pid)
+    if proc_stat is not None:
+        state, start_ticks = proc_stat
+        if state == "Z":
+            return False
+        holder_start_ticks = holder.get("pid_start_ticks")
+        if isinstance(holder_start_ticks, int) and holder_start_ticks != start_ticks:
+            return False
+        return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -3092,9 +3157,12 @@ def _acquire_docker_verify_snapshot_traversal_lease(
     state_path: Path,
 ) -> _PathModeLeaseHandle | None:
     key = path.resolve(strict=True)
-    holder_pid, holder_token = _docker_verify_snapshot_holder()
-    holder = {"pid": holder_pid, "token": holder_token}
-    with _locked_docker_verify_snapshot_permission_state(state_path) as state:
+    holder_pid, holder_token, holder_start_ticks = _docker_verify_snapshot_holder()
+    holder: dict[str, Any] = {"pid": holder_pid, "token": holder_token}
+    if holder_start_ticks is not None:
+        holder["pid_start_ticks"] = holder_start_ticks
+    with _docker_verify_snapshot_permission_state_lock(state_path):
+        state = _load_docker_verify_snapshot_permission_state(state_path)
         _restore_docker_verify_snapshot_empty_leases(state)
         records = state["leases"]
         record = records.get(str(key))
@@ -3102,10 +3170,16 @@ def _acquire_docker_verify_snapshot_traversal_lease(
             original_mode = int(record["mode"])
             gid = int(record["gid"])
             record.setdefault("holders", []).append(holder)
+            _persist_docker_verify_snapshot_permission_state(state_path, state)
             try:
                 if not stat.S_IMODE(path.stat().st_mode) & stat.S_IXGRP:
                     path.chmod(original_mode | stat.S_IXGRP)
             except BaseException:
+                state = _load_docker_verify_snapshot_permission_state(state_path)
+                records = state.get("leases")
+                record = records.get(str(key)) if isinstance(records, dict) else None
+                if not isinstance(record, dict):
+                    raise
                 record["holders"] = [
                     active_holder
                     for active_holder in record.get("holders", [])
@@ -3116,6 +3190,7 @@ def _acquire_docker_verify_snapshot_traversal_lease(
                     )
                 ]
                 _restore_docker_verify_snapshot_empty_leases(state)
+                _persist_docker_verify_snapshot_permission_state(state_path, state)
                 raise
             return _PathModeLeaseHandle(
                 path=key,
@@ -3138,10 +3213,16 @@ def _acquire_docker_verify_snapshot_traversal_lease(
             "mode": original_mode,
             "holders": [holder],
         }
+        _persist_docker_verify_snapshot_permission_state(state_path, state)
         try:
             path.chmod(original_mode | stat.S_IXGRP)
         except BaseException:
-            records.pop(str(key), None)
+            state = _load_docker_verify_snapshot_permission_state(state_path)
+            records = state.get("leases")
+            if isinstance(records, dict):
+                records.pop(str(key), None)
+            _restore_docker_verify_snapshot_empty_leases(state)
+            _persist_docker_verify_snapshot_permission_state(state_path, state)
             raise
         return _PathModeLeaseHandle(
             path=key,
