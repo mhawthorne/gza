@@ -46,9 +46,11 @@ from gza.landing import (
     TerminalProof,
     acquire_landing_verify_evidence,
     acquire_one_post_rebase_review,
+    create_production_landing_coordinator,
     dry_run_steps_until_boundary,
     evaluate_landing_policy,
     inspect_current_landing_verify_evidence,
+    refresh_landing_authorization,
     run_landing_post_rebase_review_transition,
 )
 from gza.merge_services import MergeLandingAuthorization
@@ -6437,31 +6439,24 @@ def test_landing_coordinator_final_head_change_blocks_before_deferred_materializ
 def test_land_cli_prints_concrete_dry_run_evidence(monkeypatch, capsys, tmp_path) -> None:
     from gza.cli import land as land_cli
 
-    class FakeCoordinator:
-        def __init__(self, *, store: Any, git: Any, config: Any, **_kwargs: Any) -> None:
-            self.store = store
-            self.git = git
-            self.config = config
-
-        def run(self, request: LandRequest) -> LandResult:
-            return LandResult(
-                request=request,
-                owner_task_id="gza-9316",
-                target_branch="main",
-                source_ref="feature/landing",
-                steps=(
-                    LandStep("resolve", "completed", "resolved gza-9316 to owner gza-9316 on feature/landing -> main"),
-                    LandStep("verify", "completed", "current green source verify evidence verify-1 passed for gate gate-a"),
-                    LandStep("post_rebase_review", "completed", "current plain_full review gza-10158 is APPROVED"),
-                    LandStep("merge", "conditional", "execution required before later outcomes are knowable"),
-                ),
-            )
+    result = LandResult(
+        request=LandRequest(task_id="gza-9316", policy="guarded", dry_run=True),
+        owner_task_id="gza-9316",
+        target_branch="main",
+        source_ref="feature/landing",
+        steps=(
+            LandStep("resolve", "completed", "resolved gza-9316 to owner gza-9316 on feature/landing -> main"),
+            LandStep("verify", "completed", "current green source verify evidence verify-1 passed for gate gate-a"),
+            LandStep("post_rebase_review", "completed", "current plain_full review gza-10158 is APPROVED"),
+            LandStep("merge", "conditional", "execution required before later outcomes are knowable"),
+        ),
+    )
 
     monkeypatch.setattr(land_cli.Config, "load", lambda project_dir: SimpleNamespace(project_dir=project_dir))
     monkeypatch.setattr(land_cli, "get_store", lambda _config, open_mode: SimpleNamespace(open_mode=open_mode))
     monkeypatch.setattr(land_cli, "Git", lambda project_dir: SimpleNamespace(project_dir=project_dir))
     monkeypatch.setattr(land_cli, "resolve_id", lambda _config, task_id: task_id)
-    monkeypatch.setattr("gza.landing.LandingCoordinator", FakeCoordinator)
+    monkeypatch.setattr("gza.landing.run_production_landing", lambda **_kwargs: result)
 
     status = land_cli.cmd_land(
         land_cli.argparse.Namespace(project_dir=tmp_path, task_id="gza-9316", policy="guarded", dry_run=True)
@@ -6471,6 +6466,80 @@ def test_land_cli_prints_concrete_dry_run_evidence(monkeypatch, capsys, tmp_path
     assert status == 0
     assert "verify-1 passed for gate gate-a" in output
     assert "review gza-10158 is APPROVED" in output
+
+
+def test_production_landing_factory_wires_service_collaborators(monkeypatch, tmp_path) -> None:
+    from gza.cli import _common as common_cli, git_ops
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    def create_rebase(*_args: Any, **_kwargs: Any) -> Task:
+        raise AssertionError("factory wiring test should not execute rebase creation")
+
+    def run_rebase(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("factory wiring test should not execute rebase")
+
+    monkeypatch.setattr(common_cli, "_create_rebase_task", create_rebase)
+    monkeypatch.setattr(git_ops, "_run_task_backed_rebase", run_rebase)
+
+    coordinator = create_production_landing_coordinator(
+        config=config,
+        store=store,
+        git=git,
+        policy="guarded",
+    )
+
+    assert coordinator.store is store
+    assert coordinator.git is git
+    assert coordinator.config is config
+    assert coordinator.create_rebase_task is create_rebase
+    assert coordinator.rebase_executor is run_rebase
+    assert coordinator.inspect_policy_facts is not None
+    assert coordinator.landing_judge is not None
+    assert coordinator.execute_merge is not None
+    assert coordinator.finalize_merge is not None
+    assert coordinator.post_merge_verifier is not None
+    assert coordinator.collaborators is None
+
+
+def test_refresh_landing_authorization_rechecks_current_policy_facts_before_merge(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "service authorization refresh", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="APPROVED")
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    coordinator = create_production_landing_coordinator(
+        config=config,
+        store=store,
+        git=git,
+        policy="strict",
+    )
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id, policy="strict"), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    facts = coordinator._landing_policy_facts(identity)
+    decision = evaluate_landing_policy(policy="strict", facts=facts, judge=None)
+    assert decision.allowed is True
+    assert refresh_landing_authorization(coordinator, identity, decision, policy="strict") is not None
+
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", "Now-required current defect", "src/gza/landing.py:1"),),
+    )
+    store.update(review)
+
+    assert refresh_landing_authorization(coordinator, identity, decision, policy="strict") is None
 
 
 def test_cmd_land_guarded_uses_durable_judge_and_typed_authorization_to_reach_merge(
@@ -6654,7 +6723,7 @@ def test_cmd_land_reports_state_persistence_failure_without_cannot_land_and_reru
     monkeypatch.setattr(land_cli, "get_store", lambda _config, open_mode="readwrite": store)
     monkeypatch.setattr(land_cli, "resolve_id", lambda _config, task_id: task_id)
     monkeypatch.setattr(land_cli, "Git", lambda _project_dir: git)
-    monkeypatch.setattr(land_cli, "mark_merge_subject_merged", mark)
+    monkeypatch.setattr("gza.landing.mark_merge_subject_merged", mark)
     monkeypatch.setattr("gza.cli.git_ops._merge_single_task", merge_single)
     monkeypatch.setattr("gza.main_integration_verify.check_main_integration_verify", main_verify)
 
@@ -6734,7 +6803,7 @@ def test_cmd_land_dry_run_reports_pending_finalization_without_replay_side_effec
     monkeypatch.setattr(land_cli, "get_store", get_store_query_only)
     monkeypatch.setattr(land_cli, "resolve_id", lambda _config, task_id: task_id)
     monkeypatch.setattr(land_cli, "Git", lambda _project_dir: git)
-    monkeypatch.setattr(land_cli, "mark_merge_subject_merged", mark)
+    monkeypatch.setattr("gza.landing.mark_merge_subject_merged", mark)
     monkeypatch.setattr("gza.main_integration_verify.check_main_integration_verify", main_verify)
 
     rc = land_cli.cmd_land(argparse.Namespace(project_dir=tmp_path, task_id=impl.id, policy="guarded", dry_run=True))
@@ -6820,7 +6889,7 @@ def test_cmd_land_recovers_prepared_pending_identity_after_post_merge_artifact_f
     monkeypatch.setattr(land_cli, "get_store", lambda _config, open_mode="readwrite": store)
     monkeypatch.setattr(land_cli, "resolve_id", lambda _config, task_id: task_id)
     monkeypatch.setattr(land_cli, "Git", lambda _project_dir: git)
-    monkeypatch.setattr(land_cli, "mark_merge_subject_merged", mark)
+    monkeypatch.setattr("gza.landing.mark_merge_subject_merged", mark)
     monkeypatch.setattr(store, "add_artifact", flaky_add_artifact)
     monkeypatch.setattr("gza.cli.git_ops._merge_single_task", merge_single)
     monkeypatch.setattr("gza.main_integration_verify.check_main_integration_verify", main_verify)

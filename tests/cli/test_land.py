@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
@@ -7,15 +8,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from gza.cli.land import cmd_land
+from gza.config import Config
 from gza.db import MergeUnit, SqliteTaskStore
 from gza.landing import (
     LandBlocked,
-    LandResult,
     LandingCollaborators,
     LandingCoordinator,
     LandingPolicyFacts,
     LandingStore,
     LandRequest,
+    LandResult,
+    LandStep,
     LandTerminalResult,
     MergeUnitProofIdentity,
     TerminalProof,
@@ -896,7 +900,7 @@ def test_land_cli_refuses_malformed_pending_finalization_proof_before_verify_or_
             side_effect=AssertionError("post-merge verification must not run for malformed replay proof"),
         ),
         patch(
-            "gza.cli.land.mark_merge_subject_merged",
+            "gza.landing.mark_merge_subject_merged",
             side_effect=AssertionError("merged state must not be finalized for malformed replay proof"),
         ),
     ):
@@ -926,16 +930,25 @@ def test_land_cli_coordinator_path_uses_production_terminal_reconciler_after_pre
     with (
         patch("gza.cli.land.Git", return_value=proof_git),
         patch(
-            "gza.cli.land.land_terminal_state",
+            "gza.landing.land_terminal_state",
             return_value=LandBlocked(
                 "required-review-unavailable",
                 "forced coordinator path",
                 (unit_id,),
             ),
-        ),
+        ) as terminal_precheck,
     ):
         result = invoke_gza(*args, cwd=tmp_path)
 
+    terminal_precheck.assert_called_once()
+    precheck_store, precheck_request = terminal_precheck.call_args.args
+    assert isinstance(precheck_store, SqliteTaskStore)
+    assert precheck_store.db_path == store.db_path
+    assert precheck_request == LandRequest(task_id=task_id, policy="guarded", dry_run=False)
+    assert terminal_precheck.call_args.kwargs["git"] is proof_git
+    collaborators = terminal_precheck.call_args.kwargs["collaborators"]
+    assert isinstance(collaborators, LandingCollaborators)
+    assert collaborators.reconcile_terminal_state is not None
     assert result.returncode == 0
     assert f"known outcome {state}" in result.stdout
     assert f"terminal no-work state {state}" in result.stdout
@@ -1023,3 +1036,222 @@ def test_land_run_reroutes_terminal_no_work_seen_after_coordinator_reresolution_
     expected_reconcile_calls = 2 if dry_run else 4
     assert collaborators.reconcile_terminal_state.call_count == expected_reconcile_calls
     _assert_zero_downstream_activity(collaborators)
+
+
+def test_land_cli_success_output_reports_policy_usage_deferred_ids_and_provenance(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    coordinator = MagicMock()
+    coordinator.run.return_value = LandResult(
+        request=LandRequest(task_id="test-project-1", policy="guarded"),
+        owner_task_id="test-project-1",
+        target_branch="main",
+        source_ref="feature/land-test",
+        merge_unit_id="mu-1",
+        steps=(
+            LandStep("resolve", "completed", "resolved"),
+            LandStep("rebase", "completed", "rebased"),
+            LandStep("post_rebase_review", "completed", "reviewed"),
+            LandStep("judge", "completed", "judged"),
+            LandStep("merge", "completed", "merged"),
+        ),
+        merged=True,
+        merge_provenance="manual_land_escalated",
+        judgment_artifact_id="42",
+        judgment_key="judge-key",
+        deferred_task_ids=("test-project-20", "test-project-21"),
+    )
+    args = argparse.Namespace(project_dir=tmp_path, task_id="test-project-1", policy="guarded", dry_run=False)
+
+    with (
+        patch("gza.cli.land.Config.load", return_value=config),
+        patch("gza.cli.land.get_store", return_value=object()),
+        patch("gza.cli.land.Git"),
+        patch("gza.cli.land.resolve_id", return_value="test-project-1"),
+        patch("gza.landing.run_production_landing", return_value=coordinator.run.return_value) as land,
+    ):
+        rc = cmd_land(args)
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    request = land.call_args.kwargs["request"]
+    assert request.policy == "guarded"
+    assert request.dry_run is False
+    assert "Landed test-project-1: owner test-project-1 -> main" in output
+    assert "rebase used, review used, judgment used" in output
+    assert "deferred task IDs test-project-20, test-project-21" in output
+    assert "final provenance manual_land_escalated" in output
+
+
+def test_land_cli_success_output_reports_unused_optional_phases_and_no_deferred_ids(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    coordinator = MagicMock()
+    coordinator.run.return_value = LandResult(
+        request=LandRequest(task_id="test-project-1", policy="strict"),
+        owner_task_id="test-project-1",
+        target_branch="main",
+        source_ref="feature/land-test",
+        merge_unit_id="mu-1",
+        steps=(
+            LandStep("resolve", "completed", "resolved"),
+            LandStep("rebase", "skipped", "already current"),
+            LandStep("post_rebase_review", "skipped", "review current"),
+            LandStep("judge", "skipped", "not required"),
+            LandStep("merge", "completed", "merged"),
+        ),
+        merged=True,
+        merge_provenance="manual_land",
+    )
+    args = argparse.Namespace(project_dir=tmp_path, task_id="test-project-1", policy="strict", dry_run=False)
+
+    with (
+        patch("gza.cli.land.Config.load", return_value=config),
+        patch("gza.cli.land.get_store", return_value=object()),
+        patch("gza.cli.land.Git"),
+        patch("gza.cli.land.resolve_id", return_value="test-project-1"),
+        patch("gza.landing.run_production_landing", return_value=coordinator.run.return_value) as land,
+    ):
+        rc = cmd_land(args)
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    request = land.call_args.kwargs["request"]
+    assert request.policy == "strict"
+    assert "rebase not used, review not used, judgment not used" in output
+    assert "deferred task IDs none" in output
+    assert "final provenance manual_land" in output
+
+
+def test_land_cli_blocked_result_prints_exactly_one_terminal_cannot_land_sentence(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    coordinator = MagicMock()
+    blocker = LandBlocked(
+        "nondeferrable-blocker",
+        "resolution review B1 identifies a non-deferable conflict-resolution defect at src/example.py:42",
+        ("review-1",),
+    )
+    coordinator.run.return_value = LandResult(
+        request=LandRequest(task_id="test-project-1", policy="guarded"),
+        owner_task_id="test-project-1",
+        target_branch="main",
+        source_ref="feature/land-test",
+        merge_unit_id="mu-1",
+        steps=(LandStep("post_rebase_review", "blocked", blocker.fact, blocked=blocker),),
+        blocked=blocker,
+    )
+    args = argparse.Namespace(project_dir=tmp_path, task_id="test-project-1", policy="guarded", dry_run=False)
+
+    with (
+        patch("gza.cli.land.Config.load", return_value=config),
+        patch("gza.cli.land.get_store", return_value=object()),
+        patch("gza.cli.land.Git"),
+        patch("gza.cli.land.resolve_id", return_value="test-project-1"),
+        patch("gza.landing.run_production_landing", return_value=coordinator.run.return_value),
+    ):
+        rc = cmd_land(args)
+
+    assert rc == 1
+    output = capsys.readouterr().out
+    cannot_land_lines = [line for line in output.splitlines() if line.startswith("Cannot land ")]
+    assert cannot_land_lines == [
+        "Cannot land test-project-1: resolution review B1 identifies a non-deferable "
+        "conflict-resolution defect at src/example.py:42."
+    ]
+
+
+def test_land_cli_dry_run_uses_query_only_store_and_prints_conditional_steps(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    coordinator = MagicMock()
+    coordinator.run.return_value = LandResult(
+        request=LandRequest(task_id="test-project-1", policy="guarded", dry_run=True),
+        owner_task_id="test-project-1",
+        target_branch="main",
+        source_ref="feature/land-test",
+        merge_unit_id="mu-1",
+        steps=(
+            LandStep("resolve", "completed", "resolved current landing identity"),
+            LandStep("rebase", "conditional", "would run task-backed rebase if target is not contained"),
+            LandStep("post_rebase_review", "conditional", "unknown until rebase execution completes"),
+        ),
+    )
+    args = argparse.Namespace(project_dir=tmp_path, task_id="test-project-1", policy="guarded", dry_run=True)
+
+    with (
+        patch("gza.cli.land.Config.load", return_value=config),
+        patch("gza.cli.land.get_store", return_value=object()) as get_store,
+        patch("gza.cli.land.Git"),
+        patch("gza.cli.land.resolve_id", return_value="test-project-1"),
+        patch("gza.landing.run_production_landing", return_value=coordinator.run.return_value) as land,
+    ):
+        rc = cmd_land(args)
+
+    assert rc == 0
+    get_store.assert_called_once_with(config, open_mode="query_only")
+    request = land.call_args.kwargs["request"]
+    assert request.dry_run is True
+    output = capsys.readouterr().out
+    assert "rebase: conditional - would run task-backed rebase if target is not contained" in output
+    assert "post_rebase_review: conditional - unknown until rebase execution completes" in output
+    assert (
+        "Dry run for test-project-1: owner test-project-1 on feature/land-test -> main; "
+        "later outcomes stop at the first execution-required boundary."
+    ) in output
+
+
+def test_cmd_land_delegates_one_typed_request_to_public_landing_facade(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = MagicMock()
+    config.project_dir = tmp_path
+    store = object()
+    git = object()
+    result = LandResult(
+        request=LandRequest(task_id="test-project-42", policy="strict", dry_run=True),
+        owner_task_id="test-project-42",
+        target_branch="main",
+        source_ref="feature/land-test",
+        merge_unit_id="mu-42",
+        steps=(),
+    )
+    args = argparse.Namespace(project_dir=tmp_path, task_id="42", policy="strict", dry_run=True)
+
+    with (
+        patch("gza.cli.land.Config.load", return_value=config) as load_config,
+        patch("gza.cli.land.get_store", return_value=store) as get_store,
+        patch("gza.cli.land.Git", return_value=git) as git_cls,
+        patch("gza.cli.land.resolve_id", return_value="test-project-42") as resolve_id,
+        patch("gza.landing.run_production_landing", return_value=result) as land,
+    ):
+        rc = cmd_land(args)
+
+    assert rc == 0
+    load_config.assert_called_once_with(tmp_path)
+    get_store.assert_called_once_with(config, open_mode="query_only")
+    git_cls.assert_called_once_with(tmp_path)
+    resolve_id.assert_called_once_with(config, "42")
+    land.assert_called_once()
+    assert land.call_args.kwargs["config"] is config
+    assert land.call_args.kwargs["store"] is store
+    assert land.call_args.kwargs["git"] is git
+    assert land.call_args.kwargs["request"] == LandRequest(
+        task_id="test-project-42",
+        policy="strict",
+        dry_run=True,
+    )
+    assert "Dry run for test-project-42" in capsys.readouterr().out
