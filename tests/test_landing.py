@@ -16,6 +16,7 @@ from gza.db import SqliteTaskStore, Task, WatchProgressObservation
 from gza.landing import (
     LANDING_PHASES,
     LandBlocked,
+    LandingCollaborators,
     LandingCoordinator,
     LandingFollowupFinding,
     LandingFollowupMaterializationIdentity,
@@ -38,6 +39,8 @@ from gza.landing import (
     LandRequest,
     LandResult,
     LandStep,
+    MergeUnitProofIdentity,
+    TerminalProof,
     acquire_landing_verify_evidence,
     acquire_one_post_rebase_review,
     dry_run_steps_until_boundary,
@@ -2598,6 +2601,94 @@ def test_landing_coordinator_reconciles_already_landed_through_merge_truth(tmp_p
     assert result.blocked is None
     assert refreshed_unit is not None
     assert refreshed_unit.state == "merged"
+
+
+@pytest.mark.parametrize("state", ("empty", "redundant"))
+def test_landing_coordinator_completed_rebase_reroutes_unmerged_terminal_no_work_before_downstream_phases(
+    tmp_path,
+    state: str,
+) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, f"post rebase {state}", f"feature/post-rebase-{state}")
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None and impl.id is not None
+    git = _LandingSourceGit(
+        {impl.branch or "": "source-before", "main": "target-a"},
+        local_branches={impl.branch or ""},
+        ancestors=set(),
+    )
+    rebase_done = False
+    rebase_calls: list[RebaseServiceRequest] = []
+
+    def _reconcile(_store: Any, current_unit: Any) -> TerminalProof | None:
+        if not rebase_done:
+            return None
+        return TerminalProof(
+            state=state,  # type: ignore[arg-type]
+            identity=MergeUnitProofIdentity(
+                source_branch=current_unit.source_branch,
+                target_branch=current_unit.target_branch,
+                state=current_unit.state,
+                owner_task_id=current_unit.owner_task_id,
+                head_sha=current_unit.head_sha,
+                base_sha=current_unit.base_sha,
+            ),
+            source_sha="source-after",
+            target_sha="target-a",
+        )
+
+    def _facts(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            rebase_target_contained=(identity.target_sha, identity.source_sha) in git.ancestors,
+        )
+
+    def _execute_rebase_service(**kwargs: Any) -> RebaseServiceResult:
+        nonlocal rebase_done
+        request = kwargs["request"]
+        rebase_calls.append(request)
+        rebase_done = True
+        git.heads[request.branch] = "source-after"
+        return RebaseServiceResult(
+            status="completed_mechanical",
+            parent_task_id=request.parent_task_id,
+            branch=request.branch,
+            target_ref=request.target_branch,
+            rebase_task_id="gza-9999",
+            changed_diff=False,
+            artifact_id=42,
+            artifact_key="rebase-outcome",
+            source_head_before="source-before",
+            target_head_before="target-a",
+            source_head_after="source-after",
+            target_head_after="target-a",
+        )
+
+    collaborators = LandingCollaborators(reconcile_terminal_state=_reconcile)
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=_facts,
+        create_rebase_task=_unused_rebase_factory,
+        rebase_executor=_unused_rebase_executor,
+        execute_rebase_service=_execute_rebase_service,
+        collaborators=collaborators,
+    ).run(LandRequest(task_id=impl.id))
+
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert result.blocked is None
+    assert result.terminal_outcome == state
+    assert result.terminal_reconciled is True
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == state
+    assert rebase_calls and rebase_calls[0].parent_task_id == impl.id
+    assert [step.phase for step in result.steps] == ["resolve", "rebase", "resolve", "merge"]
+    assert git.mutation_calls == []
 
 
 @pytest.mark.parametrize("dry_run", (False, True))

@@ -5,13 +5,28 @@ from __future__ import annotations
 import argparse
 import json
 from hashlib import sha256
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from gza.cli._common import get_store, resolve_id
 from gza.config import Config
 from gza.git import Git
 from gza.merge_services import ManualMergeExecutionResult, ResolvedMergeSubject
 from gza.review_verdict import ReviewFinding, get_review_content
+
+if TYPE_CHECKING:
+    from gza.landing import LandResult, LandTerminalResult
+
+
+def land_terminal_state(*args: Any, **kwargs: Any) -> Any:
+    from gza.landing import land_terminal_state as _land_terminal_state
+
+    return _land_terminal_state(*args, **kwargs)
+
+
+def reconcile_terminal_merge_truth(git: Git) -> Any:
+    from gza.landing import reconcile_terminal_merge_truth as _reconcile_terminal_merge_truth
+
+    return _reconcile_terminal_merge_truth(git)
 
 
 def cmd_land(args: argparse.Namespace) -> int:
@@ -22,9 +37,11 @@ def cmd_land(args: argparse.Namespace) -> int:
     from gza.cli.git_ops import _merge_single_task, _run_task_backed_rebase
     from gza.landing import (
         LANDING_POLICIES,
+        LandingCollaborators,
         LandingCoordinator,
         LandingJudgment,
         LandRequest,
+        LandTerminalResult,
     )
     from gza.landing_judge import (
         LandingJudgeBlockerIdentity,
@@ -41,6 +58,23 @@ def cmd_land(args: argparse.Namespace) -> int:
     if policy not in LANDING_POLICIES:
         print(f"Error: unknown landing policy {policy!r}")
         return 2
+
+    coordinator_collaborators: LandingCollaborators | None = None
+    if hasattr(store, "resolve_merge_unit_subject"):
+        terminal_collaborators = LandingCollaborators(
+            reconcile_terminal_state=reconcile_terminal_merge_truth(git),
+        )
+        terminal_result = land_terminal_state(
+            store,
+            LandRequest(task_id=task_id, policy=policy, dry_run=bool(args.dry_run)),
+            git=git,
+            collaborators=terminal_collaborators,
+        )
+        if isinstance(terminal_result, LandTerminalResult):
+            print(_format_terminal_result(terminal_result))
+            return 0
+        if getattr(terminal_result, "reason_code", None) == "required-review-unavailable":
+            coordinator_collaborators = terminal_collaborators
 
     latest_identity: dict[str, Any] = {}
     latest_facts: dict[str, Any] = {}
@@ -177,6 +211,7 @@ def cmd_land(args: argparse.Namespace) -> int:
         inspect_policy_facts=inspect_policy_facts,
         landing_judge=durable_judge,
         execute_merge=execute_land_merge,
+        collaborators=coordinator_collaborators,
     )
     result = coordinator.run(LandRequest(task_id=task_id, policy=policy, dry_run=bool(args.dry_run)))
     for step in result.steps:
@@ -185,6 +220,10 @@ def cmd_land(args: argparse.Namespace) -> int:
     if result.blocked is not None:
         print(result.blocked.terminal_sentence(task_id))
         return 1
+    terminal_output = _format_terminal_result(result)
+    if terminal_output is not None:
+        print(terminal_output)
+        return 0
     if result.already_merged:
         print(
             f"Already landed {task_id}: owner {result.owner_task_id} "
@@ -425,3 +464,57 @@ def _review_finding_fingerprint(finding: ReviewFinding) -> str | None:
 def _exception_identity(exc: Exception) -> str:
     message = " ".join(str(exc).replace("\r", "\n").split()).strip()
     return message or exc.__class__.__name__
+
+
+def _format_terminal_result(result: LandResult | LandTerminalResult) -> str | None:
+    from gza.landing import LandResult
+
+    if isinstance(result, LandResult):
+        if result.terminal_outcome is None:
+            return None
+        prefix = "Dry run: " if result.request.dry_run else ""
+        merge_unit_id = result.merge_unit_id or result.owner_task_id or "unknown"
+        owner = result.owner_task_id or "unknown"
+        source = result.source_ref or "unknown"
+        target = result.target_branch or "unknown"
+        outcome = result.terminal_outcome
+        reconciled = result.terminal_reconciled
+    else:
+        prefix = "Dry run: " if result.dry_run else ""
+        merge_unit_id = result.merge_unit_id
+        owner = result.owner_task_id or "unknown"
+        source = result.source_branch
+        target = result.target_branch
+        outcome = result.outcome
+        reconciled = result.reconciled
+
+    identity = f"owner {owner}, source {source}, target {target}, known outcome {outcome}"
+    if outcome == "merged":
+        if reconciled and prefix:
+            return (
+                f"{prefix}Merge unit {merge_unit_id} ({identity}) would reconcile "
+                "to already merged; no landing activity was run."
+            )
+        if reconciled:
+            return (
+                f"{prefix}Merge unit {merge_unit_id} ({identity}) reconciled "
+                "to already merged; no landing activity was run."
+            )
+        return (
+            f"{prefix}Merge unit {merge_unit_id} ({identity}) is already merged; "
+            "no landing activity was run."
+        )
+    if reconciled and prefix:
+        return (
+            f"{prefix}Merge unit {merge_unit_id} ({identity}) would reconcile to terminal "
+            f"no-work state {outcome}; no landing activity was run."
+        )
+    if reconciled:
+        return (
+            f"{prefix}Merge unit {merge_unit_id} ({identity}) reconciled to terminal "
+            f"no-work state {outcome}; no landing activity was run."
+        )
+    return (
+        f"{prefix}Merge unit {merge_unit_id} ({identity}) is terminal no-work state "
+        f"{outcome}; no landing activity was run."
+    )
