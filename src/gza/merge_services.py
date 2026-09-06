@@ -174,6 +174,7 @@ class ManualMergeExecutionRequest:
     no_followups: bool = False
     quiet_mechanics: bool = False
     materialize_side_effects: bool = True
+    finalize_merge_state: bool = True
     authorized_source_ref_sha: str | None = None
     expected_preflight_target_sha: str | None = None
     pre_materialized_deferred_blockers: tuple[list[DbTask], list[DbTask]] | None = None
@@ -795,7 +796,11 @@ def execute_manual_merge(
             except GitError as exc:
                 hooks.emit(f"Warning: Could not delete branch: {exc}")
 
-        if request.git.repo_dir == request.config.project_dir and request.materialize_side_effects:
+        if (
+            request.git.repo_dir == request.config.project_dir
+            and request.materialize_side_effects
+            and request.finalize_merge_state
+        ):
             mark_merge_subject_merged(
                 request.store,
                 merge_subject=request.merge_subject,

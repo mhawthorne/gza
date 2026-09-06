@@ -111,7 +111,15 @@ LandingRebaseNoOpSubtype = Literal[
     "unchanged_target",
     "moot",
 ]
-LandingPostMergeVerifyStatus = Literal["failed", "unavailable", "stale", "malformed", "missing"]
+LandingPostMergeVerifyStatus = Literal[
+    "failed",
+    "unavailable",
+    "stale",
+    "malformed",
+    "missing",
+    "state_persistence_failed",
+    "final_preflight_failed",
+]
 LandingPolicyOverride = Literal[
     "parked:review-max-cycles-reached",
     "parked:duplicate-blocker-no-progress",
@@ -366,7 +374,42 @@ class LandPostMergeVerifyFailure:
             raise ValueError("post-merge verification failure requires checkpoint evidence")
 
     def terminal_sentence(self, task_id: str) -> str:
-        return f"Merged {task_id}, but integration verification failed: {self.fact}."
+        if self.status in {"state_persistence_failed", "final_preflight_failed"}:
+            return f"Git merged {task_id}, but merged-state finalization failed: {self.fact}."
+        return f"Git merged {task_id}, but integration verification failed before recording merged state: {self.fact}."
+
+
+@dataclass(frozen=True)
+class LandPostMergeVerifySuccess:
+    """Head/tree/gate-bound success proof for the post-merge target checkpoint."""
+
+    checkpoint_id: str | None
+    target_head: str
+    tree_fingerprint: str | None
+    gate_identity: str
+    evidence_refs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "target_head", _normalize_required_ref(self.target_head, "post-merge target head"))
+        object.__setattr__(self, "gate_identity", _normalize_required_ref(self.gate_identity, "post-merge gate identity"))
+        if not self.evidence_refs:
+            refs = tuple(ref for ref in (self.checkpoint_id, self.target_head, self.tree_fingerprint, self.gate_identity) if ref)
+            object.__setattr__(self, "evidence_refs", refs)
+        object.__setattr__(self, "evidence_refs", _normalize_evidence_refs(self.evidence_refs))
+        if not self.evidence_refs:
+            raise ValueError("post-merge verification success requires checkpoint evidence")
+
+
+@dataclass(frozen=True)
+class LandingPendingFinalization:
+    """Durable identity proving a Git merge is awaiting finalization."""
+
+    artifact_id: str
+    authorization: MergeLandingAuthorization
+    provenance: Literal["manual_land", "manual_land_escalated"]
+    post_merge_target_sha: str
+    deferred_task_ids: tuple[str, ...] = ()
+    followup_task_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -414,18 +457,20 @@ class LandResult:
             self.merge_provenance is not None or self.deferred_task_ids or self.followup_task_ids
         ):
             raise ValueError("pre-merge blocked result cannot carry merge success metadata")
-        if self.post_merge_verify_failure is not None and not (self.merged or self.already_merged):
-            raise ValueError("post-merge verification failure requires a merged terminal state")
+        if self.post_merge_verify_failure is not None and (self.merged or self.already_merged):
+            raise ValueError("post-merge verification failure cannot carry authoritative merged state")
         if self.merge_provenance is not None and not self.merged:
             raise ValueError("merge provenance requires merged=True")
         if self.merged and self.merge_provenance is None:
             raise ValueError("newly merged result requires land provenance")
-        if self.deferred_task_ids and self.merge_provenance != "manual_land_escalated":
-            raise ValueError("deferred blocker task IDs require manual_land_escalated provenance")
+        if self.deferred_task_ids and not (
+            self.merge_provenance == "manual_land_escalated" or self.post_merge_verify_failure is not None
+        ):
+            raise ValueError("deferred blocker task IDs require escalated provenance or pending post-merge failure")
         judgment_refs = _normalize_evidence_refs((self.judgment_artifact_id, self.judgment_key))
         if self.merge_provenance == "manual_land_escalated" and len(judgment_refs) != 2:
             raise ValueError("manual_land_escalated result requires judgment artifact and key")
-        if self.merge_provenance != "manual_land_escalated" and judgment_refs:
+        if self.merge_provenance != "manual_land_escalated" and judgment_refs and self.post_merge_verify_failure is None:
             raise ValueError("landing judgment identity requires manual_land_escalated provenance")
         object.__setattr__(self, "judgment_artifact_id", judgment_refs[0] if judgment_refs else None)
         object.__setattr__(self, "judgment_key", judgment_refs[1] if judgment_refs else None)
@@ -497,6 +542,8 @@ class LandingCoordinator:
     create_resolution_review: Callable[..., DbTask] = create_resolution_review_task
     landing_judge: LandingJudge | None = None
     execute_merge: LandingMergeExecutor | None = None
+    finalize_merge: LandingMergeFinalizer | None = None
+    post_merge_verifier: LandingPostMergeVerifier | None = None
     post_rebase_review_budget_used: bool = False
     collaborators: LandingCollaborators | None = None
 
@@ -855,6 +902,27 @@ class LandingCoordinator:
 
             terminal_unit = self.store.get_merge_unit(identity.merge_unit_id) if identity.merge_unit_id else None
             if terminal_unit is not None:
+                has_pending_finalization = (
+                    terminal_unit.state == "unmerged"
+                    and self._load_pending_finalization(identity) is not None
+                )
+                if (
+                    terminal_unit.state == "unmerged"
+                    and (
+                        has_pending_finalization
+                        or
+                        identity.already_merged
+                        or (
+                            identity.merge_truth is not None
+                            and identity.merge_truth.merge_status == "merged"
+                        )
+                    )
+                ):
+                    return self._run_pending_finalization_replay(
+                        request=request,
+                        identity=identity,
+                        steps=steps,
+                    )
                 terminal = self._terminal_result_for_current_unit(terminal_unit, dry_run=request.dry_run)
                 if isinstance(terminal, LandTerminalResult):
                     steps.append(
@@ -890,7 +958,7 @@ class LandingCoordinator:
                         continue
                     steps.append(LandStep("merge", "blocked", terminal.fact, blocked=terminal))
                     return self._blocked_result(request, identity, steps, terminal)
-                if terminal_unit.state == "unmerged":
+                if terminal_unit.state == "unmerged" and not identity.already_merged:
                     terminal = self._reconcile_unmerged_terminal_boundary(terminal_unit, request=request)
                     if isinstance(terminal, LandTerminalResult):
                         steps.append(
@@ -1072,7 +1140,7 @@ class LandingCoordinator:
             )
             return self._blocked_result(request, identity, steps, final_preflight_block)
 
-        if self.execute_merge is None:
+        if self.execute_merge is None and not identity.already_merged:
             blocked = LandBlocked(
                 "merge-failed",
                 self._boundary_fact("merge"),
@@ -1081,19 +1149,33 @@ class LandingCoordinator:
             steps.append(LandStep("merge", "blocked", blocked.fact, blocked=blocked))
             return self._blocked_result(request, identity, steps, blocked)
 
+        if self.post_merge_verifier is None:
+            blocked = self._missing_post_merge_verifier_block(identity)
+            steps.append(LandStep("post_merge_verify", "blocked", blocked.fact, blocked=blocked))
+            return self._blocked_result(request, identity, steps, blocked)
+
         provenance: Literal["manual_land", "manual_land_escalated"] = (
             "manual_land_escalated" if escalated else "manual_land"
         )
+        authorization: MergeLandingAuthorization | None = None
         try:
-            merge_result = self.execute_merge(identity, decision, provenance)
-        except Exception as exc:
-            blocked = LandBlocked(
-                "merge-failed",
-                _exception_fact("shared merge execution failed", exc),
-                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
-            )
-            steps.append(LandStep("merge", "blocked", blocked.fact, blocked=blocked))
-            return self._blocked_result(request, identity, steps, blocked)
+            authorization = landing_merge_authorization_from_facts(identity=identity, facts=facts, decision=decision)
+        except ValueError:
+            authorization = None
+        if identity.already_merged:
+            merge_result = ManualMergeExecutionResult(rc=0, status="merged")
+        else:
+            try:
+                assert self.execute_merge is not None
+                merge_result = self.execute_merge(identity, decision, provenance)
+            except Exception as exc:
+                blocked = LandBlocked(
+                    "merge-failed",
+                    _exception_fact("shared merge execution failed", exc),
+                    _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+                )
+                steps.append(LandStep("merge", "blocked", blocked.fact, blocked=blocked))
+                return self._blocked_result(request, identity, steps, blocked)
 
         created_deferred = tuple(task for task in (merge_result.created_deferred_blockers or []) if task.id)
         reused_deferred = tuple(task for task in (merge_result.reused_deferred_blockers or []) if task.id)
@@ -1158,15 +1240,169 @@ class LandingCoordinator:
             LandStep(
                 "merge",
                 "completed",
-                f"source merged with {provenance} provenance",
+                "source already present on target; reusing prior git merge"
+                if identity.already_merged
+                else "source git merge completed; durable merged state awaits post-merge verification",
                 evidence_refs=_evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
             )
         )
+        observed_post_merge_target_sha = self._current_target_sha(identity)
+        if observed_post_merge_target_sha is None:
+            post_merge_failure = LandPostMergeVerifyFailure(
+                status="final_preflight_failed",
+                fact="post-merge target head proof is unavailable",
+                target_head=identity.target_sha,
+                gate_identity=identity.target_branch,
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.target_branch, identity.target_sha),
+            )
+            steps.append(
+                LandStep(
+                    "post_merge_verify",
+                    "blocked",
+                    post_merge_failure.fact,
+                    evidence_refs=post_merge_failure.evidence_refs,
+                )
+            )
+            return self._post_merge_non_success_result(
+                request=request,
+                identity=identity,
+                steps=steps,
+                decision=decision,
+                deferred_ids=deferred_ids,
+                followup_ids=followup_ids,
+                failure=post_merge_failure,
+            )
+        pending_failure = self._persist_pending_finalization(
+            identity=identity,
+            authorization=authorization,
+            provenance=provenance,
+            post_merge_target_sha=observed_post_merge_target_sha,
+            deferred_ids=deferred_ids,
+            followup_ids=followup_ids,
+        )
+        if pending_failure is not None:
+            steps.append(
+                LandStep(
+                    "post_merge_verify",
+                    "blocked",
+                    pending_failure.fact,
+                    evidence_refs=pending_failure.evidence_refs,
+                )
+            )
+            return self._post_merge_non_success_result(
+                request=request,
+                identity=identity,
+                steps=steps,
+                decision=decision,
+                deferred_ids=deferred_ids,
+                followup_ids=followup_ids,
+                failure=pending_failure,
+            )
+        post_merge_success, post_merge_verify_failure = self._run_post_merge_verify_phase(identity)
+        if post_merge_verify_failure is not None:
+            steps.append(
+                LandStep(
+                    "post_merge_verify",
+                    "blocked",
+                    post_merge_verify_failure.fact,
+                    evidence_refs=post_merge_verify_failure.evidence_refs,
+                )
+            )
+            return self._post_merge_non_success_result(
+                request=request,
+                identity=identity,
+                steps=steps,
+                decision=decision,
+                deferred_ids=deferred_ids,
+                followup_ids=followup_ids,
+                failure=post_merge_verify_failure,
+            )
+        if self.finalize_merge is None:
+            failure = LandPostMergeVerifyFailure(
+                status="state_persistence_failed",
+                fact="landing merge finalization is unavailable after green post-merge verification",
+                checkpoint_id=post_merge_success.checkpoint_id,
+                target_head=post_merge_success.target_head,
+                gate_identity=post_merge_success.gate_identity,
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.merge_unit_id, post_merge_success.target_head),
+            )
+            steps.append(LandStep("merge", "blocked", failure.fact, evidence_refs=failure.evidence_refs))
+            return self._post_merge_non_success_result(
+                request=request,
+                identity=identity,
+                steps=steps,
+                decision=decision,
+                deferred_ids=deferred_ids,
+                followup_ids=followup_ids,
+                failure=failure,
+            )
+        final_preflight_failure = self._post_merge_final_preflight_failure(identity, verified=post_merge_success)
+        if final_preflight_failure is not None:
+            steps.append(LandStep("merge", "blocked", final_preflight_failure.fact, evidence_refs=final_preflight_failure.evidence_refs))
+            return self._post_merge_non_success_result(
+                request=request,
+                identity=identity,
+                steps=steps,
+                decision=decision,
+                deferred_ids=deferred_ids,
+                followup_ids=followup_ids,
+                failure=final_preflight_failure,
+            )
+        try:
+            finalization = self.finalize_merge(identity, decision, provenance)
+        except Exception as exc:
+            failure = LandPostMergeVerifyFailure(
+                status="state_persistence_failed",
+                fact=_exception_fact("landing merge finalization failed", exc),
+                checkpoint_id=post_merge_success.checkpoint_id,
+                target_head=post_merge_success.target_head,
+                gate_identity=post_merge_success.gate_identity,
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.merge_unit_id, post_merge_success.target_head),
+            )
+            steps.append(LandStep("merge", "blocked", failure.fact, evidence_refs=failure.evidence_refs))
+            return self._post_merge_non_success_result(
+                request=request,
+                identity=identity,
+                steps=steps,
+                decision=decision,
+                deferred_ids=deferred_ids,
+                followup_ids=followup_ids,
+                failure=failure,
+            )
+        if finalization.rc != 0 or finalization.status != "merged":
+            failure = LandPostMergeVerifyFailure(
+                status="state_persistence_failed",
+                fact=finalization.block_reason or f"landing merge finalization stopped with status {finalization.status}",
+                checkpoint_id=post_merge_success.checkpoint_id,
+                target_head=post_merge_success.target_head,
+                gate_identity=post_merge_success.gate_identity,
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.merge_unit_id, post_merge_success.target_head),
+            )
+            steps.append(LandStep("merge", "blocked", failure.fact, evidence_refs=failure.evidence_refs))
+            return self._post_merge_non_success_result(
+                request=request,
+                identity=identity,
+                steps=steps,
+                decision=decision,
+                deferred_ids=deferred_ids,
+                followup_ids=followup_ids,
+                failure=failure,
+            )
+        if self.post_merge_verifier is not None:
+            steps.append(
+                LandStep(
+                    "post_merge_verify",
+                    "completed",
+                    "post-merge target verification checkpoint is current and green",
+                    evidence_refs=post_merge_success.evidence_refs,
+                )
+            )
         return LandResult(
             request=request,
             owner_task_id=identity.owner_task_id,
             target_branch=identity.target_branch,
             source_ref=identity.source_ref,
+            merge_unit_id=identity.merge_unit_id,
             steps=tuple(steps),
             merged=True,
             merge_provenance=provenance,
@@ -1174,6 +1410,485 @@ class LandingCoordinator:
             judgment_key=decision.judgment_key,
             deferred_task_ids=deferred_ids,
             followup_task_ids=followup_ids,
+        )
+
+    def _run_pending_finalization_replay(
+        self,
+        *,
+        request: LandRequest,
+        identity: LandingResolvedIdentity,
+        steps: list[LandStep],
+    ) -> LandResult:
+        pending = self._load_pending_finalization(identity)
+        if pending is None:
+            blocked = LandBlocked(
+                "merge-proof-unavailable",
+                "source is already present on target, but no exact pending-finalization proof exists",
+                _evidence_refs(identity.owner_task_id, identity.merge_unit_id, identity.source_sha, identity.target_sha),
+            )
+            steps.append(LandStep("merge", "blocked", blocked.fact, blocked=blocked))
+            return self._blocked_result(request, identity, steps, blocked)
+        decision = LandingPolicyDecision(
+            allowed=True,
+            allowed_overrides=tuple(
+                cast(tuple[LandingPolicyOverride, ...], pending.authorization.allowed_overrides)
+            ),
+            judgment_verdict="LAND" if pending.authorization.allowed_overrides else None,
+            judgment_artifact_id=pending.authorization.judgment_artifact_id,
+            judgment_key=pending.authorization.judgment_key,
+        )
+        steps.append(
+            LandStep(
+                "merge",
+                "completed",
+                "source already present on target; replaying pending landing finalization",
+                evidence_refs=_evidence_refs(
+                    pending.artifact_id,
+                    identity.owner_task_id,
+                    identity.source_sha,
+                    pending.post_merge_target_sha,
+                ),
+            )
+        )
+        post_merge_success, post_merge_failure = self._run_post_merge_verify_phase(identity)
+        if post_merge_failure is not None:
+            steps.append(
+                LandStep(
+                    "post_merge_verify",
+                    "blocked",
+                    post_merge_failure.fact,
+                    evidence_refs=post_merge_failure.evidence_refs,
+                )
+            )
+            return self._post_merge_non_success_result(
+                request=request,
+                identity=identity,
+                steps=steps,
+                decision=decision,
+                deferred_ids=pending.deferred_task_ids,
+                followup_ids=pending.followup_task_ids,
+                failure=post_merge_failure,
+            )
+        if self.finalize_merge is None:
+            failure = LandPostMergeVerifyFailure(
+                status="state_persistence_failed",
+                fact="landing merge finalization is unavailable after green post-merge verification",
+                checkpoint_id=post_merge_success.checkpoint_id,
+                target_head=post_merge_success.target_head,
+                gate_identity=post_merge_success.gate_identity,
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.merge_unit_id, pending.artifact_id),
+            )
+            steps.append(LandStep("merge", "blocked", failure.fact, evidence_refs=failure.evidence_refs))
+            return self._post_merge_non_success_result(
+                request=request,
+                identity=identity,
+                steps=steps,
+                decision=decision,
+                deferred_ids=pending.deferred_task_ids,
+                followup_ids=pending.followup_task_ids,
+                failure=failure,
+            )
+        final_preflight_failure = self._post_merge_final_preflight_failure(
+            identity,
+            verified=post_merge_success,
+            pending=pending,
+        )
+        if final_preflight_failure is not None:
+            steps.append(LandStep("merge", "blocked", final_preflight_failure.fact, evidence_refs=final_preflight_failure.evidence_refs))
+            return self._post_merge_non_success_result(
+                request=request,
+                identity=identity,
+                steps=steps,
+                decision=decision,
+                deferred_ids=pending.deferred_task_ids,
+                followup_ids=pending.followup_task_ids,
+                failure=final_preflight_failure,
+            )
+        try:
+            finalization = self.finalize_merge(identity, decision, pending.provenance)
+        except Exception as exc:
+            failure = LandPostMergeVerifyFailure(
+                status="state_persistence_failed",
+                fact=_exception_fact("landing merge finalization failed", exc),
+                checkpoint_id=post_merge_success.checkpoint_id,
+                target_head=post_merge_success.target_head,
+                gate_identity=post_merge_success.gate_identity,
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.merge_unit_id, pending.artifact_id),
+            )
+            steps.append(LandStep("merge", "blocked", failure.fact, evidence_refs=failure.evidence_refs))
+            return self._post_merge_non_success_result(
+                request=request,
+                identity=identity,
+                steps=steps,
+                decision=decision,
+                deferred_ids=pending.deferred_task_ids,
+                followup_ids=pending.followup_task_ids,
+                failure=failure,
+            )
+        if finalization.rc != 0 or finalization.status != "merged":
+            failure = LandPostMergeVerifyFailure(
+                status="state_persistence_failed",
+                fact=finalization.block_reason or f"landing merge finalization stopped with status {finalization.status}",
+                checkpoint_id=post_merge_success.checkpoint_id,
+                target_head=post_merge_success.target_head,
+                gate_identity=post_merge_success.gate_identity,
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.merge_unit_id, pending.artifact_id),
+            )
+            steps.append(LandStep("merge", "blocked", failure.fact, evidence_refs=failure.evidence_refs))
+            return self._post_merge_non_success_result(
+                request=request,
+                identity=identity,
+                steps=steps,
+                decision=decision,
+                deferred_ids=pending.deferred_task_ids,
+                followup_ids=pending.followup_task_ids,
+                failure=failure,
+            )
+        steps.append(
+            LandStep(
+                "post_merge_verify",
+                "completed",
+                "post-merge target verification checkpoint is current and green",
+                evidence_refs=post_merge_success.evidence_refs,
+            )
+        )
+        return LandResult(
+            request=request,
+            owner_task_id=identity.owner_task_id,
+            target_branch=identity.target_branch,
+            source_ref=identity.source_ref,
+            merge_unit_id=identity.merge_unit_id,
+            steps=tuple(steps),
+            merged=True,
+            merge_provenance=pending.provenance,
+            judgment_artifact_id=pending.authorization.judgment_artifact_id,
+            judgment_key=pending.authorization.judgment_key,
+            deferred_task_ids=pending.deferred_task_ids,
+            followup_task_ids=pending.followup_task_ids,
+        )
+
+    def _post_merge_non_success_result(
+        self,
+        *,
+        request: LandRequest,
+        identity: LandingResolvedIdentity,
+        steps: list[LandStep],
+        decision: LandingPolicyDecision,
+        deferred_ids: tuple[str, ...],
+        followup_ids: tuple[str, ...],
+        failure: LandPostMergeVerifyFailure,
+    ) -> LandResult:
+        return LandResult(
+            request=request,
+            owner_task_id=identity.owner_task_id,
+            target_branch=identity.target_branch,
+            source_ref=identity.source_ref,
+            merge_unit_id=identity.merge_unit_id,
+            steps=tuple(steps),
+            judgment_artifact_id=decision.judgment_artifact_id,
+            judgment_key=decision.judgment_key,
+            deferred_task_ids=deferred_ids,
+            followup_task_ids=followup_ids,
+            post_merge_verify_failure=failure,
+        )
+
+    def _run_post_merge_verify_phase(
+        self,
+        identity: LandingResolvedIdentity,
+    ) -> tuple[LandPostMergeVerifySuccess, LandPostMergeVerifyFailure | None]:
+        if self.post_merge_verifier is None:
+            return self._implicit_post_merge_verify_success(identity), None
+        try:
+            result = self.post_merge_verifier(identity)
+        except Exception as exc:
+            return self._implicit_post_merge_verify_success(identity), LandPostMergeVerifyFailure(
+                status="unavailable",
+                fact=_exception_fact("post-merge target verification is unavailable", exc),
+                target_head=identity.target_sha,
+                gate_identity=identity.target_branch,
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.target_branch, identity.target_sha),
+            )
+        if isinstance(result, LandPostMergeVerifySuccess):
+            return result, None
+        if isinstance(result, LandPostMergeVerifyFailure):
+            return self._implicit_post_merge_verify_success(identity), result
+        return self._implicit_post_merge_verify_success(identity), None
+
+    def _implicit_post_merge_verify_success(self, identity: LandingResolvedIdentity) -> LandPostMergeVerifySuccess:
+        target_sha = self._current_target_sha(identity) or identity.target_sha
+        if target_sha is None:
+            target_sha = "unknown-post-merge-target"
+        return LandPostMergeVerifySuccess(
+            checkpoint_id=None,
+            target_head=target_sha,
+            tree_fingerprint=None,
+            gate_identity=identity.target_branch,
+            evidence_refs=_evidence_refs(identity.owner_task_id, identity.target_branch, target_sha),
+        )
+
+    def _current_target_sha(self, identity: LandingResolvedIdentity) -> str | None:
+        git = self.git
+        if git is None:
+            return None
+        return _rev_parse_if_exists(cast(Git, git), identity.target_branch)
+
+    def _persist_pending_finalization(
+        self,
+        *,
+        identity: LandingResolvedIdentity,
+        authorization: MergeLandingAuthorization | None,
+        provenance: Literal["manual_land", "manual_land_escalated"],
+        post_merge_target_sha: str,
+        deferred_ids: tuple[str, ...],
+        followup_ids: tuple[str, ...],
+    ) -> LandPostMergeVerifyFailure | None:
+        if authorization is None:
+            return LandPostMergeVerifyFailure(
+                status="state_persistence_failed",
+                fact="landing pending-finalization authorization identity is unavailable",
+                target_head=post_merge_target_sha,
+                gate_identity=identity.target_branch,
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.merge_unit_id, post_merge_target_sha),
+            )
+        payload = {
+            "kind": "landing_pending_finalization",
+            "authorization": authorization.__dict__,
+            "provenance": provenance,
+            "post_merge_target_sha": post_merge_target_sha,
+            "deferred_task_ids": tuple(deferred_ids),
+            "followup_task_ids": tuple(followup_ids),
+        }
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        digest = sha256(body.encode()).hexdigest()
+        try:
+            self.store.add_artifact(
+                identity.owner_task_id,
+                kind="landing_pending_finalization",
+                label="landing_pending_finalization",
+                path=f".gza/artifacts/{identity.owner_task_id}/landing-pending-finalization-{digest}.json",
+                content_type="application/json",
+                byte_size=len(body.encode()),
+                sha256=digest,
+                producer="gza.landing",
+                status="pending",
+                head_sha=authorization.source_sha,
+                metadata=payload,
+            )
+        except Exception as exc:
+            return LandPostMergeVerifyFailure(
+                status="state_persistence_failed",
+                fact=_exception_fact("landing pending-finalization proof persistence failed", exc),
+                target_head=post_merge_target_sha,
+                gate_identity=identity.target_branch,
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.merge_unit_id, post_merge_target_sha),
+            )
+        return None
+
+    def _load_pending_finalization(self, identity: LandingResolvedIdentity) -> LandingPendingFinalization | None:
+        try:
+            artifacts = self.store.list_artifacts(identity.owner_task_id, kind="landing_pending_finalization")
+        except Exception:
+            return None
+        for artifact in artifacts:
+            metadata = getattr(artifact, "metadata", None)
+            if not isinstance(metadata, dict):
+                continue
+            pending = self._pending_finalization_from_metadata(identity, str(artifact.id), metadata)
+            if pending is not None:
+                return pending
+        return None
+
+    def _pending_finalization_from_metadata(
+        self,
+        identity: LandingResolvedIdentity,
+        artifact_id: str,
+        metadata: Mapping[str, Any],
+    ) -> LandingPendingFinalization | None:
+        if metadata.get("kind") != "landing_pending_finalization":
+            return None
+        authorization_payload = metadata.get("authorization")
+        if not isinstance(authorization_payload, dict):
+            return None
+        try:
+            authorization = MergeLandingAuthorization(
+                owner_task_id=str(authorization_payload["owner_task_id"]),
+                merge_unit_id=cast(str | None, authorization_payload.get("merge_unit_id")),
+                source_ref=str(authorization_payload["source_ref"]),
+                target_branch=str(authorization_payload["target_branch"]),
+                source_sha=str(authorization_payload["source_sha"]),
+                target_sha=str(authorization_payload["target_sha"]),
+                representative_task_id=cast(str | None, authorization_payload.get("representative_task_id")),
+                member_task_ids=tuple(str(item) for item in authorization_payload.get("member_task_ids", ())),
+                policy_version=cast(str | None, authorization_payload.get("policy_version")),
+                schema_version=cast(str | None, authorization_payload.get("schema_version")),
+                authoritative_scope_identity=cast(str | None, authorization_payload.get("authoritative_scope_identity")),
+                allowed_overrides=tuple(str(item) for item in authorization_payload.get("allowed_overrides", ())),
+                judgment_artifact_id=cast(str | None, authorization_payload.get("judgment_artifact_id")),
+                judgment_key=cast(str | None, authorization_payload.get("judgment_key")),
+                live_judgment_identity=cast(str | None, authorization_payload.get("live_judgment_identity")),
+                review_id=cast(str | None, authorization_payload.get("review_id")),
+                reviewed_head=cast(str | None, authorization_payload.get("reviewed_head")),
+                review_mode=cast(str | None, authorization_payload.get("review_mode")),
+                review_verdict=cast(str | None, authorization_payload.get("review_verdict")),
+                blocker_identities=tuple(str(item) for item in authorization_payload.get("blocker_identities", ())),
+                blocker_fingerprints=tuple(str(item) for item in authorization_payload.get("blocker_fingerprints", ())),
+                deferred_blocker_task_identities=tuple(
+                    str(item) for item in authorization_payload.get("deferred_blocker_task_identities", ())
+                ),
+                followup_identities=tuple(str(item) for item in authorization_payload.get("followup_identities", ())),
+                followup_fingerprints=tuple(str(item) for item in authorization_payload.get("followup_fingerprints", ())),
+                verify_epoch=cast(str | None, authorization_payload.get("verify_epoch")),
+                verify_verdict=cast(str | None, authorization_payload.get("verify_verdict")),
+                verify_gate_identity=cast(str | None, authorization_payload.get("verify_gate_identity")),
+                verify_tree_fingerprint=cast(str | None, authorization_payload.get("verify_tree_fingerprint")),
+                parked_reason=cast(str | None, authorization_payload.get("parked_reason")),
+                adjudication_fingerprints=tuple(str(item) for item in authorization_payload.get("adjudication_fingerprints", ())),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        provenance = metadata.get("provenance")
+        post_merge_target_sha = metadata.get("post_merge_target_sha")
+        if provenance not in {"manual_land", "manual_land_escalated"} or not isinstance(post_merge_target_sha, str):
+            return None
+        if authorization.owner_task_id != identity.owner_task_id:
+            return None
+        if authorization.merge_unit_id != identity.merge_unit_id:
+            return None
+        if authorization.source_ref != identity.source_ref:
+            return None
+        if authorization.source_sha != identity.source_sha:
+            return None
+        if authorization.target_branch != identity.target_branch:
+            return None
+        if post_merge_target_sha != identity.target_sha:
+            return None
+        current_target_sha = self._current_target_sha(identity)
+        if current_target_sha != post_merge_target_sha:
+            return None
+        deferred_ids = tuple(str(item) for item in metadata.get("deferred_task_ids", ()) if str(item).strip())
+        followup_ids = tuple(str(item) for item in metadata.get("followup_task_ids", ()) if str(item).strip())
+        return LandingPendingFinalization(
+            artifact_id=artifact_id,
+            authorization=authorization,
+            provenance=cast(Literal["manual_land", "manual_land_escalated"], provenance),
+            post_merge_target_sha=post_merge_target_sha,
+            deferred_task_ids=deferred_ids,
+            followup_task_ids=followup_ids,
+        )
+
+    def _post_merge_final_preflight_failure(
+        self,
+        identity: LandingResolvedIdentity,
+        *,
+        verified: LandPostMergeVerifySuccess,
+        pending: LandingPendingFinalization | None = None,
+    ) -> LandPostMergeVerifyFailure | None:
+        git = self.git
+        if git is None:
+            return LandPostMergeVerifyFailure(
+                status="final_preflight_failed",
+                fact="git proof is unavailable for post-merge finalization preflight",
+                checkpoint_id=verified.checkpoint_id,
+                target_head=verified.target_head,
+                gate_identity=verified.gate_identity,
+                evidence_refs=verified.evidence_refs,
+            )
+        git = cast(Git, git)
+        current_target_sha = _rev_parse_if_exists(git, identity.target_branch)
+        if current_target_sha != verified.target_head:
+            return LandPostMergeVerifyFailure(
+                status="final_preflight_failed",
+                fact="target head changed after post-merge verification",
+                checkpoint_id=verified.checkpoint_id,
+                target_head=current_target_sha or verified.target_head,
+                gate_identity=verified.gate_identity,
+                evidence_refs=_evidence_refs(identity.owner_task_id, verified.target_head, current_target_sha, identity.target_branch),
+            )
+        if pending is not None and current_target_sha != pending.post_merge_target_sha:
+            return LandPostMergeVerifyFailure(
+                status="final_preflight_failed",
+                fact="pending-finalization target proof no longer matches current target",
+                checkpoint_id=verified.checkpoint_id,
+                target_head=current_target_sha or verified.target_head,
+                gate_identity=verified.gate_identity,
+                evidence_refs=_evidence_refs(identity.owner_task_id, pending.artifact_id, pending.post_merge_target_sha, current_target_sha),
+            )
+        current_source_sha = _rev_parse_if_exists(git, identity.source_ref) if identity.source_ref is not None else None
+        if current_source_sha != identity.source_sha:
+            return LandPostMergeVerifyFailure(
+                status="final_preflight_failed",
+                fact="source head changed after post-merge verification",
+                checkpoint_id=verified.checkpoint_id,
+                target_head=verified.target_head,
+                gate_identity=verified.gate_identity,
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.source_sha, current_source_sha, identity.source_ref),
+            )
+        try:
+            current_branch = git.current_branch()
+        except Exception as exc:
+            return LandPostMergeVerifyFailure(
+                status="final_preflight_failed",
+                fact=_exception_fact("current checkout branch proof is unavailable before merged-state finalization", exc),
+                checkpoint_id=verified.checkpoint_id,
+                target_head=verified.target_head,
+                gate_identity=verified.gate_identity,
+                evidence_refs=verified.evidence_refs,
+            )
+        if current_branch != identity.target_branch:
+            return LandPostMergeVerifyFailure(
+                status="final_preflight_failed",
+                fact=f"current checkout is {current_branch}, expected target {identity.target_branch}",
+                checkpoint_id=verified.checkpoint_id,
+                target_head=verified.target_head,
+                gate_identity=verified.gate_identity,
+                evidence_refs=_evidence_refs(identity.owner_task_id, current_branch, identity.target_branch),
+            )
+        try:
+            if git.has_changes(include_untracked=False):
+                return LandPostMergeVerifyFailure(
+                    status="final_preflight_failed",
+                    fact="tracked checkout changed after post-merge verification",
+                    checkpoint_id=verified.checkpoint_id,
+                    target_head=verified.target_head,
+                    gate_identity=verified.gate_identity,
+                    evidence_refs=verified.evidence_refs,
+                )
+        except Exception as exc:
+            return LandPostMergeVerifyFailure(
+                status="final_preflight_failed",
+                fact=_exception_fact("tracked checkout cleanliness proof is unavailable before merged-state finalization", exc),
+                checkpoint_id=verified.checkpoint_id,
+                target_head=verified.target_head,
+                gate_identity=verified.gate_identity,
+                evidence_refs=verified.evidence_refs,
+            )
+        try:
+            source_contained = git.is_merged(identity.source_ref or identity.source_sha or "", identity.target_branch)
+        except Exception as exc:
+            return LandPostMergeVerifyFailure(
+                status="final_preflight_failed",
+                fact=_exception_fact("source containment proof is unavailable before merged-state finalization", exc),
+                checkpoint_id=verified.checkpoint_id,
+                target_head=verified.target_head,
+                gate_identity=verified.gate_identity,
+                evidence_refs=verified.evidence_refs,
+            )
+        if not source_contained:
+            return LandPostMergeVerifyFailure(
+                status="final_preflight_failed",
+                fact="source is not contained in the verified target before merged-state finalization",
+                checkpoint_id=verified.checkpoint_id,
+                target_head=verified.target_head,
+                gate_identity=verified.gate_identity,
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.source_ref, identity.target_branch, verified.target_head),
+            )
+        return None
+
+    def _missing_post_merge_verifier_block(self, identity: LandingResolvedIdentity) -> LandBlocked:
+        return LandBlocked(
+            "verify-unavailable-or-red",
+            "canonical post-merge target verifier is unavailable",
+            _evidence_refs(identity.owner_task_id, identity.target_branch, identity.target_sha),
         )
 
     def _final_preflight_block(self, identity: LandingResolvedIdentity) -> LandBlocked | None:
@@ -1219,6 +1934,8 @@ class LandingCoordinator:
                 f"current checkout is {current_branch}, expected target {identity.target_branch}",
                 _evidence_refs(identity.owner_task_id, current_branch, identity.target_branch),
             )
+        if identity.already_merged:
+            return None
         try:
             preflight = check_manual_merge_preflight(
                 git,
@@ -1777,7 +2494,7 @@ class LandingCoordinator:
                     merge_truth.skipped_reason,
                 ),
             )
-        if already_merged and persist_reconciliation:
+        if already_merged and persist_reconciliation and unit.state != "unmerged":
             try:
                 persisted_truth = self.reconcile_merge_truth(
                     self.store,
@@ -1816,7 +2533,7 @@ class LandingCoordinator:
             owner_task=owner,
             representative_task=representative,
             merge_unit_id=unit.id,
-            merge_unit_state="merged" if already_merged else unit.state,
+            merge_unit_state=unit.state,
             source_branch=unit.source_branch,
             source_ref=source_ref,
             source_sha=source_sha,
@@ -1927,6 +2644,37 @@ class LandingCoordinator:
             )
         if target_contained is not True:
             return "rebase"
+        if identity.already_merged:
+            verify = facts.verify
+            if verify is None or not _landing_verify_evidence_is_current_green(verify):
+                return "verify"
+            spec = facts.spec_coherence
+            if spec is not None and spec.required:
+                spec_terminal_block = _terminal_spec_coherence_block(facts)
+                if spec_terminal_block is not None:
+                    return spec_terminal_block
+                if (
+                    spec.status != "completed"
+                    or spec.verdict != "APPROVED"
+                    or not spec.current
+                    or not spec.identity_matched
+                ):
+                    return "spec_coherence"
+            review = facts.review
+            if review is None:
+                return "post_rebase_review"
+            review_terminal_block = _terminal_code_review_block(facts)
+            if review_terminal_block is not None:
+                return review_terminal_block
+            if review.required and not _landing_review_evidence_is_current(review):
+                return "post_rebase_review"
+            if not review.required and not review.identity_matched:
+                return "merge"
+            if review.verdict == "CHANGES_REQUESTED":
+                return _dry_run_review_boundary(policy, facts)
+            if review.followup_findings:
+                return "defer_blockers"
+            return "merge"
         try:
             preflight = check_manual_merge_preflight(
                 git,
@@ -2718,6 +3466,14 @@ LandingLiveTreeResolver = Callable[[], str | None]
 LandingMergeExecutor = Callable[
     [LandingResolvedIdentity, LandingPolicyDecision, Literal["manual_land", "manual_land_escalated"]],
     ManualMergeExecutionResult,
+]
+LandingMergeFinalizer = Callable[
+    [LandingResolvedIdentity, LandingPolicyDecision, Literal["manual_land", "manual_land_escalated"]],
+    ManualMergeExecutionResult,
+]
+LandingPostMergeVerifier = Callable[
+    [LandingResolvedIdentity],
+    LandPostMergeVerifyFailure | LandPostMergeVerifySuccess | None,
 ]
 
 

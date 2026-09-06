@@ -5,12 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from gza.cli._common import get_store, resolve_id
 from gza.config import Config
 from gza.git import Git
-from gza.merge_services import ManualMergeExecutionResult, ResolvedMergeSubject
+from gza.merge_services import ManualMergeExecutionResult, ResolvedMergeSubject, mark_merge_subject_merged
 from gza.review_verdict import ReviewFinding, get_review_content
 
 if TYPE_CHECKING:
@@ -40,6 +40,8 @@ def cmd_land(args: argparse.Namespace) -> int:
         LandingCollaborators,
         LandingCoordinator,
         LandingJudgment,
+        LandPostMergeVerifyFailure,
+        LandPostMergeVerifySuccess,
         LandRequest,
         LandTerminalResult,
     )
@@ -64,17 +66,24 @@ def cmd_land(args: argparse.Namespace) -> int:
         terminal_collaborators = LandingCollaborators(
             reconcile_terminal_state=reconcile_terminal_merge_truth(git),
         )
-        terminal_result = land_terminal_state(
-            store,
-            LandRequest(task_id=task_id, policy=policy, dry_run=bool(args.dry_run)),
-            git=git,
-            collaborators=terminal_collaborators,
-        )
-        if isinstance(terminal_result, LandTerminalResult):
-            print(_format_terminal_result(terminal_result))
-            return 0
-        if getattr(terminal_result, "reason_code", None) == "required-review-unavailable":
+        unit = store.resolve_merge_unit_subject(task_id)
+        pending_finalization = False
+        if unit is not None and unit.state == "unmerged" and unit.owner_task_id:
+            pending_finalization = bool(store.list_artifacts(unit.owner_task_id, kind="landing_pending_finalization"))
+        if pending_finalization:
             coordinator_collaborators = terminal_collaborators
+        else:
+            terminal_result = land_terminal_state(
+                store,
+                LandRequest(task_id=task_id, policy=policy, dry_run=bool(args.dry_run)),
+                git=git,
+                collaborators=terminal_collaborators,
+            )
+            if isinstance(terminal_result, LandTerminalResult):
+                print(_format_terminal_result(terminal_result))
+                return 0
+            if getattr(terminal_result, "reason_code", None) == "required-review-unavailable":
+                coordinator_collaborators = terminal_collaborators
 
     latest_identity: dict[str, Any] = {}
     latest_facts: dict[str, Any] = {}
@@ -177,6 +186,7 @@ def cmd_land(args: argparse.Namespace) -> int:
             merge_preflight_ref=identity.target_branch,
             merge_source=provenance,
             quiet_mechanics=True,
+            finalize_merge_state=False,
             landing_authorization=authorization,
             load_landing_authorization=lambda: _current_landing_authorization(coordinator, identity, decision, policy=policy),
             resolved_subject=ResolvedMergeSubject(
@@ -202,6 +212,87 @@ def cmd_land(args: argparse.Namespace) -> int:
             reused_deferred_blockers=list(merge_result.reused_deferred_blockers),
         )
 
+    def finalize_land_merge(identity: Any, _decision: Any, provenance: str) -> ManualMergeExecutionResult:
+        try:
+            mark_merge_subject_merged(
+                store,
+                merge_subject=identity.owner_task,
+                merge_unit_id=identity.merge_unit_id,
+                merge_source=provenance,
+            )
+        except Exception as exc:
+            return ManualMergeExecutionResult(
+                rc=1,
+                status="post_merge_state_persistence_failed",
+                block_reason=f"landing merge state persistence failed: {_exception_identity(exc)}",
+            )
+        return ManualMergeExecutionResult(rc=0, status="merged")
+
+    def verify_post_merge_target(identity: Any) -> LandPostMergeVerifyFailure | LandPostMergeVerifySuccess:
+        from gza.main_integration_verify import check_main_integration_verify
+
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="manual_land",
+            force=False,
+            resolved_head_sha=git.rev_parse_if_exists("HEAD"),
+        )
+        state = check.state
+        evidence_refs = tuple(
+            ref
+            for ref in (
+                getattr(state.task, "id", None),
+                state.head_sha,
+                state.tree_fingerprint,
+                identity.target_branch,
+            )
+            if isinstance(ref, str) and ref.strip()
+        )
+        if not check.is_current:
+            return LandPostMergeVerifyFailure(
+                status="stale",
+                fact="post-merge target verification checkpoint is stale",
+                checkpoint_id=getattr(state.task, "id", None),
+                target_head=state.head_sha,
+                gate_identity=identity.target_branch,
+                evidence_refs=evidence_refs,
+            )
+        if check.merges_halted or check.needs_attention:
+            status: Literal["failed", "unavailable"] = (
+                "unavailable" if state.verify_status == "unavailable" else "failed"
+            )
+            return LandPostMergeVerifyFailure(
+                status=status,
+                fact=state.alert_message or f"post-merge target verification is {state.verify_status or 'unavailable'}",
+                checkpoint_id=getattr(state.task, "id", None),
+                target_head=state.head_sha,
+                gate_identity=identity.target_branch,
+                evidence_refs=evidence_refs,
+            )
+        if not isinstance(state.head_sha, str) or not state.head_sha.strip():
+            return LandPostMergeVerifyFailure(
+                status="malformed",
+                fact="post-merge target verification checkpoint did not record a target head",
+                checkpoint_id=getattr(state.task, "id", None),
+                target_head=identity.target_sha,
+                gate_identity=identity.target_branch,
+                evidence_refs=evidence_refs
+                or tuple(
+                    ref
+                    for ref in (getattr(state.task, "id", None), identity.target_sha, identity.target_branch)
+                    if isinstance(ref, str) and ref.strip()
+                ),
+            )
+        return LandPostMergeVerifySuccess(
+            checkpoint_id=getattr(state.task, "id", None),
+            target_head=state.head_sha,
+            tree_fingerprint=state.tree_fingerprint,
+            gate_identity=identity.target_branch,
+            evidence_refs=evidence_refs,
+        )
+
     coordinator = LandingCoordinator(
         store=store,
         git=git,
@@ -211,6 +302,8 @@ def cmd_land(args: argparse.Namespace) -> int:
         inspect_policy_facts=inspect_policy_facts,
         landing_judge=durable_judge,
         execute_merge=execute_land_merge,
+        finalize_merge=finalize_land_merge,
+        post_merge_verifier=verify_post_merge_target,
         collaborators=coordinator_collaborators,
     )
     result = coordinator.run(LandRequest(task_id=task_id, policy=policy, dry_run=bool(args.dry_run)))
@@ -219,6 +312,9 @@ def cmd_land(args: argparse.Namespace) -> int:
 
     if result.blocked is not None:
         print(result.blocked.terminal_sentence(task_id))
+        return 1
+    if result.post_merge_verify_failure is not None:
+        print(result.post_merge_verify_failure.terminal_sentence(task_id))
         return 1
     terminal_output = _format_terminal_result(result)
     if terminal_output is not None:

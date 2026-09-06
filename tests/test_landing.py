@@ -36,6 +36,7 @@ from gza.landing import (
     LandingVerifyAcquisitionResult,
     LandingVerifyEvidence,
     LandPostMergeVerifyFailure,
+    LandPostMergeVerifySuccess,
     LandRequest,
     LandResult,
     LandStep,
@@ -233,6 +234,8 @@ def _blocker(
         blocker_class=blocker_class,  # type: ignore[arg-type]
         source=source,
         fingerprint=fingerprint or f"blocker:{finding_id}:normalized",
+        deferred_task_prompt_sha256=f"sha256:prompt-{finding_id}",
+        deferred_task_review_scope_sha256=f"sha256:scope-{finding_id}",
     )
 
 
@@ -1925,7 +1928,7 @@ def test_policy_refusals_have_non_empty_durable_evidence(facts: LandingPolicyFac
 
 
 @pytest.mark.parametrize("status", ("failed", "unavailable", "stale", "malformed", "missing"))
-def test_post_merge_verify_failure_renders_truthful_merged_non_success(status: str) -> None:
+def test_post_merge_verify_failure_renders_pending_finalization_non_success(status: str) -> None:
     failure = LandPostMergeVerifyFailure(
         status=status,  # type: ignore[arg-type]
         fact=f"post-merge checkpoint is {status}",
@@ -1938,21 +1941,24 @@ def test_post_merge_verify_failure_renders_truthful_merged_non_success(status: s
         owner_task_id="gza-100",
         target_branch="main",
         source_ref="feature/example",
-        merged=True,
-        merge_provenance="manual_land",
         post_merge_verify_failure=failure,
     )
 
-    assert result.merged is True
+    assert result.merged is False
+    assert result.already_merged is False
+    assert result.merge_provenance is None
     assert result.blocked is None
     sentence = failure.terminal_sentence("gza-100")
-    assert sentence == f"Merged gza-100, but integration verification failed: post-merge checkpoint is {status}."
+    assert sentence == (
+        "Git merged gza-100, but integration verification failed before recording merged state: "
+        f"post-merge checkpoint is {status}."
+    )
     assert "Cannot land" not in sentence
     assert failure.evidence_refs
 
 
 @pytest.mark.parametrize("status", ("failed", "unavailable", "stale", "malformed", "missing"))
-def test_already_merged_post_merge_verify_failure_needs_no_new_provenance(
+def test_post_merge_verify_failure_rejects_authoritative_terminal_state(
     status: str,
 ) -> None:
     failure = LandPostMergeVerifyFailure(
@@ -1962,21 +1968,25 @@ def test_already_merged_post_merge_verify_failure_needs_no_new_provenance(
         target_head="target-after",
         gate_identity="main-verify",
     )
-    result = LandResult(
-        request=LandRequest(task_id="gza-100"),
-        owner_task_id="gza-100",
-        target_branch="main",
-        source_ref="feature/example",
-        already_merged=True,
-        post_merge_verify_failure=failure,
-    )
-
-    assert result.already_merged is True
-    assert result.merged is False
-    assert result.merge_provenance is None
-    assert failure.terminal_sentence("gza-100") == (
-        f"Merged gza-100, but integration verification failed: post-merge checkpoint is {status}."
-    )
+    with pytest.raises(ValueError):
+        LandResult(
+            request=LandRequest(task_id="gza-100"),
+            owner_task_id="gza-100",
+            target_branch="main",
+            source_ref="feature/example",
+            merged=True,
+            merge_provenance="manual_land",
+            post_merge_verify_failure=failure,
+        )
+    with pytest.raises(ValueError):
+        LandResult(
+            request=LandRequest(task_id="gza-100"),
+            owner_task_id="gza-100",
+            target_branch="main",
+            source_ref="feature/example",
+            already_merged=True,
+            post_merge_verify_failure=failure,
+        )
 
 
 def test_landblocked_rejects_empty_evidence_refs() -> None:
@@ -2161,14 +2171,14 @@ def test_land_result_rejects_contradictory_terminal_state_combinations() -> None
             already_merged=True,
             merge_provenance="manual_land",
         )
-    with pytest.raises(ValueError):
-        LandResult(
-            request=LandRequest(task_id="gza-100"),
-            owner_task_id="gza-100",
-            target_branch="main",
-            source_ref="feature/example",
-            post_merge_verify_failure=failure,
-        )
+    pending_finalization = LandResult(
+        request=LandRequest(task_id="gza-100"),
+        owner_task_id="gza-100",
+        target_branch="main",
+        source_ref="feature/example",
+        post_merge_verify_failure=failure,
+    )
+    assert pending_finalization.merged is False
     with pytest.raises(ValueError):
         LandResult(
             request=LandRequest(task_id="gza-100"),
@@ -2262,6 +2272,9 @@ class _FakeGit:
     def current_branch(self) -> str:
         return self._current_branch
 
+    def default_branch(self) -> str:
+        return "main"
+
     def has_changes(self, include_untracked: bool = False) -> bool:
         assert include_untracked is False
         return self.dirty
@@ -2304,6 +2317,20 @@ class _LandingSourceGit(_FakeGit):
         return ref in self.heads
 
 
+def _simulate_no_ff_landing_git_merge(
+    git: _LandingSourceGit,
+    *,
+    source_ref: str = "feature/landing",
+    target_branch: str = "main",
+    merge_sha: str = "merge-a",
+) -> None:
+    git.heads[target_branch] = merge_sha
+    git.merged_refs.add((source_ref, target_branch))
+    source_sha = git.heads.get(source_ref)
+    if source_sha is not None:
+        git.ancestors.add((source_sha, merge_sha))
+
+
 def _coordinator_store(tmp_path) -> SqliteTaskStore:
     return SqliteTaskStore(tmp_path / "test.db")
 
@@ -2333,6 +2360,23 @@ def _completed_impl(store: SqliteTaskStore, prompt: str, branch: str) -> Task:
     refreshed = store.get(task.id or "")
     assert refreshed is not None
     return refreshed
+
+
+def _finalize_landing_merge_state(
+    store: SqliteTaskStore,
+    identity: Any,
+    _decision: Any,
+    provenance: str,
+) -> Any:
+    from gza.merge_services import ManualMergeExecutionResult, mark_merge_subject_merged
+
+    mark_merge_subject_merged(
+        store,
+        merge_subject=identity.owner_task,
+        merge_unit_id=identity.merge_unit_id,
+        merge_source=provenance,
+    )
+    return ManualMergeExecutionResult(rc=0, status="merged")
 
 
 def _completed_impl_with_stored_unit(
@@ -2582,8 +2626,9 @@ def test_landing_coordinator_cleanliness_probe_failure_does_not_mask_higher_prio
     assert git.mutation_calls == []
 
 
-def test_landing_coordinator_reconciles_already_landed_through_merge_truth(tmp_path) -> None:
+def test_landing_coordinator_checkpoint_gates_unmerged_already_landed_merge_truth(tmp_path) -> None:
     store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
     impl = _completed_impl(store, "already landed", "feature/already")
     unit = store.get_or_create_merge_unit_for_task(impl)
     assert unit is not None and impl.id is not None
@@ -2593,14 +2638,50 @@ def test_landing_coordinator_reconciles_already_landed_through_merge_truth(tmp_p
         merged_refs={("feature/already", "main")},
         ancestors={("target-a", "source-a")},
     )
+    merge_calls: list[str] = []
+    finalizations: list[str] = []
 
-    result = LandingCoordinator(store=store, git=git).run(LandRequest(task_id=impl.id))
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            review=_review(verdict="APPROVED", reviewed_head=identity.source_sha),
+            open_blockers=(),
+        )
+
+    def merge(*_args: Any, **_kwargs: Any) -> Any:
+        merge_calls.append("git_merge")
+        raise AssertionError("already-merged git truth must not merge again")
+
+    def post_merge_verify(_identity: Any) -> None:
+        assert store.get_merge_unit(unit.id).state == "unmerged"  # type: ignore[union-attr]
+        return None
+
+    def finalize(identity: Any, decision: Any, provenance: str) -> Any:
+        finalizations.append(provenance)
+        return _finalize_landing_merge_state(store, identity, decision, provenance)
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        execute_merge=merge,
+        finalize_merge=finalize,
+        post_merge_verifier=post_merge_verify,
+    ).run(LandRequest(task_id=impl.id))
     refreshed_unit = store.get_merge_unit(unit.id)
 
-    assert result.already_merged is True
-    assert result.blocked is None
+    assert result.already_merged is False
+    assert result.merged is False
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "merge-proof-unavailable"
+    assert merge_calls == []
+    assert finalizations == []
     assert refreshed_unit is not None
-    assert refreshed_unit.state == "merged"
+    assert refreshed_unit.state == "unmerged"
+    assert refreshed_unit.merge_source is None
 
 
 @pytest.mark.parametrize("state", ("empty", "redundant"))
@@ -5169,11 +5250,16 @@ def test_landing_coordinator_guarded_defers_blockers_after_final_preflight_and_m
             "parked:review-max-cycles-reached",
         )
         blocker = store.add("deferred B1", task_type="implement", depends_on=impl.id, create_pr=True, urgent=True)
+        _simulate_no_ff_landing_git_merge(git)
         return ManualMergeExecutionResult(
             rc=0,
             status="merged",
             created_deferred_blockers=[blocker],
         )
+
+    def post_merge_verify(_identity: Any) -> None:
+        order.append("post_merge_verify")
+        return None
 
     result = LandingCoordinator(
         store=store,
@@ -5182,6 +5268,10 @@ def test_landing_coordinator_guarded_defers_blockers_after_final_preflight_and_m
         inspect_policy_facts=inspect,
         landing_judge=judge,
         execute_merge=merge,
+        finalize_merge=lambda identity, decision, provenance: _finalize_landing_merge_state(
+            store, identity, decision, provenance
+        ),
+        post_merge_verifier=post_merge_verify,
     ).run(LandRequest(task_id=impl.id))
 
     assert result.blocked is None
@@ -5194,7 +5284,620 @@ def test_landing_coordinator_guarded_defers_blockers_after_final_preflight_and_m
     assert deferred is not None
     assert deferred.urgent is True
     assert deferred.create_pr is True
-    assert [step.phase for step in result.steps[-3:]] == ["judge", "defer_blockers", "merge"]
+    assert [step.phase for step in result.steps[-4:]] == ["judge", "defer_blockers", "merge", "post_merge_verify"]
+
+
+def test_landing_coordinator_requires_post_merge_verifier_before_merge(tmp_path) -> None:
+    from gza.merge_services import ManualMergeExecutionResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "missing post merge verifier", "feature/landing")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    merge_calls: list[str] = []
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            review=_review(verdict="APPROVED", reviewed_head=identity.source_sha),
+            open_blockers=(),
+        )
+
+    def merge(*_args: Any, **_kwargs: Any) -> ManualMergeExecutionResult:
+        merge_calls.append("merge")
+        return ManualMergeExecutionResult(rc=0, status="merged")
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        execute_merge=merge,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "verify-unavailable-or-red"
+    assert result.blocked.fact == "canonical post-merge target verifier is unavailable"
+    assert result.merged is False
+    assert result.merge_provenance is None
+    assert merge_calls == []
+    assert result.steps[-1].phase == "post_merge_verify"
+    assert result.steps[-1].status == "blocked"
+
+
+def test_landing_coordinator_runs_post_merge_verify_after_normal_merge(tmp_path) -> None:
+    from gza.merge_services import ManualMergeExecutionResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "normal landing", "feature/landing")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    calls: list[str] = []
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            review=_review(verdict="APPROVED", reviewed_head=identity.source_sha),
+            open_blockers=(),
+        )
+
+    def merge(*_args: Any, **_kwargs: Any) -> ManualMergeExecutionResult:
+        calls.append("merge")
+        _simulate_no_ff_landing_git_merge(git)
+        return ManualMergeExecutionResult(rc=0, status="merged")
+
+    def post_merge_verify(identity: Any) -> None:
+        calls.append(f"verify:{identity.target_branch}")
+        return None
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        execute_merge=merge,
+        finalize_merge=lambda identity, decision, provenance: _finalize_landing_merge_state(
+            store, identity, decision, provenance
+        ),
+        post_merge_verifier=post_merge_verify,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is None
+    assert result.post_merge_verify_failure is None
+    assert result.merged is True
+    assert calls == ["merge", "verify:main"]
+    assert result.steps[-1].phase == "post_merge_verify"
+    assert result.steps[-1].status == "completed"
+
+
+def test_landing_coordinator_verifies_before_persisting_merged_state(tmp_path) -> None:
+    from gza.merge_services import ManualMergeExecutionResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "ordered landing", "feature/landing")
+    assert impl.id is not None
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    order: list[str] = []
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            review=_review(verdict="APPROVED", reviewed_head=identity.source_sha),
+            open_blockers=(),
+        )
+
+    def merge(_identity: Any, _decision: Any, _provenance: str) -> ManualMergeExecutionResult:
+        order.append("git_merge")
+        assert store.get_merge_unit(unit.id).state == "unmerged"  # type: ignore[union-attr]
+        _simulate_no_ff_landing_git_merge(git)
+        return ManualMergeExecutionResult(rc=0, status="merged")
+
+    def post_merge_verify(_identity: Any) -> None:
+        order.append("post_merge_verify")
+        assert store.get_merge_unit(unit.id).state == "unmerged"  # type: ignore[union-attr]
+        assert store.get_merge_unit(unit.id).merge_source is None  # type: ignore[union-attr]
+        return None
+
+    def finalize(identity: Any, decision: Any, provenance: str) -> ManualMergeExecutionResult:
+        order.append(f"finalize:{provenance}")
+        assert order == ["git_merge", "post_merge_verify", "finalize:manual_land"]
+        return _finalize_landing_merge_state(store, identity, decision, provenance)
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        execute_merge=merge,
+        finalize_merge=finalize,
+        post_merge_verifier=post_merge_verify,
+    ).run(LandRequest(task_id=impl.id))
+
+    refreshed = store.get_merge_unit(unit.id)
+    assert result.blocked is None
+    assert result.post_merge_verify_failure is None
+    assert result.merged is True
+    assert order == ["git_merge", "post_merge_verify", "finalize:manual_land"]
+    assert refreshed is not None
+    assert refreshed.state == "merged"
+    assert refreshed.merge_source == "manual_land"
+
+
+@pytest.mark.parametrize("status", ("failed", "stale", "unavailable", "malformed", "missing"))
+def test_landing_coordinator_post_merge_verify_failure_leaves_unit_unfinalized(
+    tmp_path,
+    status: str,
+) -> None:
+    from gza.merge_services import ManualMergeExecutionResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "post merge verify red", "feature/landing")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            review=_review(verdict="APPROVED", reviewed_head=identity.source_sha),
+            open_blockers=(),
+        )
+
+    def merge(*_args: Any, **_kwargs: Any) -> ManualMergeExecutionResult:
+        return ManualMergeExecutionResult(rc=0, status="merged")
+
+    def post_merge_verify(_identity: Any) -> LandPostMergeVerifyFailure:
+        return LandPostMergeVerifyFailure(
+            status=status,  # type: ignore[arg-type]
+            fact=f"post-merge checkpoint is {status}",
+            checkpoint_id="checkpoint-1",
+            target_head="target-after",
+            gate_identity="main-verify",
+        )
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        execute_merge=merge,
+        post_merge_verifier=post_merge_verify,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is None
+    assert result.merged is False
+    assert result.merge_provenance is None
+    assert result.post_merge_verify_failure is not None
+    assert result.post_merge_verify_failure.status == status
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    assert unit.state == "unmerged"
+    assert unit.merge_source is None
+    assert result.steps[-1].phase == "post_merge_verify"
+    assert result.steps[-1].status == "blocked"
+
+
+def test_landing_coordinator_reports_raised_post_merge_verify_after_authoritative_merge(tmp_path) -> None:
+    from gza.merge_services import ManualMergeExecutionResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "raised post merge verify", "feature/landing")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            review=_review(verdict="APPROVED", reviewed_head=identity.source_sha),
+            open_blockers=(),
+        )
+
+    def merge(*_args: Any, **_kwargs: Any) -> ManualMergeExecutionResult:
+        return ManualMergeExecutionResult(rc=0, status="merged")
+
+    def post_merge_verify(_identity: Any) -> None:
+        raise RuntimeError("checkpoint backend offline")
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        execute_merge=merge,
+        post_merge_verifier=post_merge_verify,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is None
+    assert result.merged is False
+    assert result.merge_provenance is None
+    assert result.post_merge_verify_failure is not None
+    assert result.post_merge_verify_failure.status == "unavailable"
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    assert unit.state == "unmerged"
+    assert unit.merge_source is None
+    assert "checkpoint backend offline" in result.post_merge_verify_failure.fact
+    assert result.steps[-1].phase == "post_merge_verify"
+    assert result.steps[-1].status == "blocked"
+
+
+def test_landing_coordinator_reruns_partial_git_merge_checkpoint_and_finalizes_once(tmp_path) -> None:
+    from gza.merge_services import ManualMergeExecutionResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "partial landing rerun", "feature/landing")
+    assert impl.id is not None
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    merge_calls: list[str] = []
+    verify_results = [
+        LandPostMergeVerifyFailure(
+            status="failed",
+            fact="post-merge checkpoint is red",
+            checkpoint_id="checkpoint-1",
+            target_head="merge-a",
+            gate_identity="main",
+        ),
+        LandPostMergeVerifyFailure(
+            status="failed",
+            fact="post-merge checkpoint is still red",
+            checkpoint_id="checkpoint-2",
+            target_head="merge-a",
+            gate_identity="main",
+        ),
+        None,
+    ]
+    finalizations: list[str] = []
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            review=_review(verdict="APPROVED", reviewed_head=identity.source_sha),
+            open_blockers=(),
+        )
+
+    def merge(_identity: Any, _decision: Any, _provenance: str) -> ManualMergeExecutionResult:
+        merge_calls.append("git_merge")
+        _simulate_no_ff_landing_git_merge(git, merge_sha="merge-a")
+        return ManualMergeExecutionResult(rc=0, status="merged")
+
+    def post_merge_verify(_identity: Any) -> LandPostMergeVerifyFailure | None:
+        return verify_results.pop(0)
+
+    def finalize(identity: Any, decision: Any, provenance: str) -> ManualMergeExecutionResult:
+        finalizations.append(provenance)
+        return _finalize_landing_merge_state(store, identity, decision, provenance)
+
+    coordinator = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        execute_merge=merge,
+        finalize_merge=finalize,
+        post_merge_verifier=post_merge_verify,
+    )
+
+    first = coordinator.run(LandRequest(task_id=impl.id))
+    second = coordinator.run(LandRequest(task_id=impl.id))
+    third = coordinator.run(LandRequest(task_id=impl.id))
+
+    refreshed = store.get_merge_unit(unit.id)
+    assert first.post_merge_verify_failure is not None
+    assert second.post_merge_verify_failure is not None
+    assert first.merged is False
+    assert second.merged is False
+    assert third.post_merge_verify_failure is None
+    assert third.merged is True
+    assert merge_calls == ["git_merge"]
+    assert finalizations == ["manual_land"]
+    assert refreshed is not None
+    assert refreshed.state == "merged"
+    assert refreshed.merge_source == "manual_land"
+
+
+def test_landing_coordinator_guarded_rerun_replays_pending_no_ff_merge_without_duplicate_side_effects(
+    tmp_path,
+) -> None:
+    from gza.merge_services import ManualMergeExecutionResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "guarded partial landing rerun", "feature/landing")
+    assert impl.id is not None
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    merge_calls: list[str] = []
+    rebase_calls: list[str] = []
+    judgment_calls: list[str] = []
+    materialized: list[str] = []
+    finalizations: list[str] = []
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            parked_reason="review-max-cycles-reached",
+            review=_review(
+                verdict="CHANGES_REQUESTED",
+                reviewed_head=identity.source_sha,
+                review_id="gza-review",
+            ),
+            open_blockers=(
+                _blocker("B1", deferrable=True, blocker_class="out_of_scope", source="review:gza-review"),
+            ),
+        )
+
+    def judge() -> LandingJudgment:
+        judgment_calls.append("judge")
+        return LandingJudgment("LAND", artifact_id="judge-artifact", key="judge-key")
+
+    def merge(_identity: Any, _decision: Any, _provenance: str) -> ManualMergeExecutionResult:
+        merge_calls.append("git_merge")
+        _simulate_no_ff_landing_git_merge(git, merge_sha="merge-a")
+        blocker = store.add("deferred B1", task_type="implement", depends_on=impl.id, create_pr=True, urgent=True)
+        assert blocker.id is not None
+        materialized.append(blocker.id)
+        return ManualMergeExecutionResult(rc=0, status="merged", created_deferred_blockers=[blocker])
+
+    verify_results = [
+        LandPostMergeVerifyFailure(
+            status="failed",
+            fact="post-merge checkpoint is red",
+            checkpoint_id="checkpoint-red",
+            target_head="merge-a",
+            gate_identity="main",
+        ),
+        None,
+    ]
+
+    def post_merge_verify(_identity: Any) -> LandPostMergeVerifyFailure | None:
+        return verify_results.pop(0)
+
+    def finalize(identity: Any, decision: Any, provenance: str) -> ManualMergeExecutionResult:
+        finalizations.append(provenance)
+        return _finalize_landing_merge_state(store, identity, decision, provenance)
+
+    first = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        landing_judge=judge,
+        execute_merge=merge,
+        finalize_merge=finalize,
+        post_merge_verifier=post_merge_verify,
+        create_rebase_task=lambda *_args, **_kwargs: rebase_calls.append("rebase") or impl,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert first.post_merge_verify_failure is not None
+    assert git.heads["feature/landing"] == "head-a"
+    assert git.heads["main"] == "merge-a"
+
+    second = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=lambda _identity: (_ for _ in ()).throw(AssertionError("policy facts must not reload")),
+        landing_judge=lambda: (_ for _ in ()).throw(AssertionError("judgment must not rerun")),
+        execute_merge=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("git merge must not rerun")),
+        finalize_merge=finalize,
+        post_merge_verifier=post_merge_verify,
+        create_rebase_task=lambda *_args, **_kwargs: rebase_calls.append("rebase") or impl,
+    ).run(LandRequest(task_id=impl.id))
+
+    refreshed = store.get_merge_unit(unit.id)
+    assert second.merged is True
+    assert second.merge_provenance == "manual_land_escalated"
+    assert second.judgment_artifact_id == "judge-artifact"
+    assert second.judgment_key == "judge-key"
+    assert second.deferred_task_ids == tuple(materialized)
+    assert merge_calls == ["git_merge"]
+    assert rebase_calls == []
+    assert judgment_calls == ["judge"]
+    assert finalizations == ["manual_land_escalated"]
+    assert refreshed is not None
+    assert refreshed.state == "merged"
+    assert refreshed.merge_source == "manual_land_escalated"
+
+
+@pytest.mark.parametrize("mutation", ("target", "source", "checkout"))
+def test_landing_coordinator_post_checkpoint_mutation_blocks_merged_state(
+    tmp_path,
+    mutation: str,
+) -> None:
+    from gza.merge_services import ManualMergeExecutionResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, f"post checkpoint mutation {mutation}", "feature/landing")
+    assert impl.id is not None
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    finalizations: list[str] = []
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            review=_review(verdict="APPROVED", reviewed_head=identity.source_sha),
+            open_blockers=(),
+        )
+
+    def merge(*_args: Any, **_kwargs: Any) -> ManualMergeExecutionResult:
+        _simulate_no_ff_landing_git_merge(git, merge_sha="merge-a")
+        return ManualMergeExecutionResult(rc=0, status="merged")
+
+    def post_merge_verify(_identity: Any) -> LandPostMergeVerifySuccess:
+        success = LandPostMergeVerifySuccess(
+            checkpoint_id="checkpoint-green",
+            target_head="merge-a",
+            tree_fingerprint=TREE_A,
+            gate_identity="main",
+        )
+        if mutation == "target":
+            git.heads["main"] = "merge-b"
+        elif mutation == "source":
+            git.heads["feature/landing"] = "head-b"
+        else:
+            git.dirty = True
+        return success
+
+    def finalize(*_args: Any, **_kwargs: Any) -> ManualMergeExecutionResult:
+        finalizations.append("finalize")
+        raise AssertionError("merged state must not be finalized after post-checkpoint mutation")
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        execute_merge=merge,
+        finalize_merge=finalize,
+        post_merge_verifier=post_merge_verify,
+    ).run(LandRequest(task_id=impl.id))
+
+    refreshed = store.get_merge_unit(unit.id)
+    assert result.blocked is None
+    assert result.post_merge_verify_failure is not None
+    assert result.post_merge_verify_failure.status == "final_preflight_failed"
+    assert result.merged is False
+    assert result.merge_provenance is None
+    assert finalizations == []
+    assert refreshed is not None
+    assert refreshed.state == "unmerged"
+    assert refreshed.merge_source is None
+
+
+def test_landing_coordinator_finalizer_non_success_is_post_merge_failure_and_replays(
+    tmp_path,
+) -> None:
+    from gza.merge_services import ManualMergeExecutionResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "finalizer return failure", "feature/landing")
+    assert impl.id is not None
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    merge_calls: list[str] = []
+    finalization_results = ["fail", "pass"]
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            review=_review(verdict="APPROVED", reviewed_head=identity.source_sha),
+            open_blockers=(),
+        )
+
+    def merge(*_args: Any, **_kwargs: Any) -> ManualMergeExecutionResult:
+        merge_calls.append("git_merge")
+        _simulate_no_ff_landing_git_merge(git, merge_sha="merge-a")
+        return ManualMergeExecutionResult(rc=0, status="merged")
+
+    def finalize(identity: Any, decision: Any, provenance: str) -> ManualMergeExecutionResult:
+        if finalization_results.pop(0) == "fail":
+            return ManualMergeExecutionResult(
+                rc=1,
+                status="post_merge_state_persistence_failed",
+                block_reason="state write failed",
+            )
+        return _finalize_landing_merge_state(store, identity, decision, provenance)
+
+    first = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        execute_merge=merge,
+        finalize_merge=finalize,
+        post_merge_verifier=lambda _identity: None,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert first.blocked is None
+    assert first.post_merge_verify_failure is not None
+    assert first.post_merge_verify_failure.status == "state_persistence_failed"
+    assert first.post_merge_verify_failure.fact == "state write failed"
+    assert first.merge_provenance is None
+    assert store.get_merge_unit(unit.id).state == "unmerged"  # type: ignore[union-attr]
+
+    second = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=lambda _identity: (_ for _ in ()).throw(AssertionError("policy facts must not reload")),
+        execute_merge=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("git merge must not rerun")),
+        finalize_merge=finalize,
+        post_merge_verifier=lambda _identity: None,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert second.merged is True
+    assert second.merge_provenance == "manual_land"
+    assert merge_calls == ["git_merge"]
+    assert store.get_merge_unit(unit.id).state == "merged"  # type: ignore[union-attr]
 
 
 @pytest.mark.parametrize("changed_ref", ("source", "target"))
@@ -5335,8 +6038,22 @@ def test_cmd_land_guarded_uses_durable_judge_and_typed_authorization_to_reach_me
             "parked:review-blocker-adjudication-needed",
         )
         assert kwargs["load_landing_authorization"]() == authorization
+        _simulate_no_ff_landing_git_merge(git, merge_sha="target-after")
         deferred = store.add("Deferred B1", task_type="implement", depends_on=impl.id, urgent=True, create_pr=True)
         return _MergeSingleTaskResult(rc=0, status="merged", created_deferred_blockers=(deferred,))
+
+    main_verify_calls: list[str] = []
+
+    def main_verify(*_args: Any, **_kwargs: Any) -> Any:
+        main_verify_calls.append("called")
+        state = SimpleNamespace(
+            task=SimpleNamespace(id="gza-main-verify"),
+            head_sha="target-after",
+            tree_fingerprint=TREE_A,
+            verify_status="passed",
+            alert_message=None,
+        )
+        return SimpleNamespace(state=state, is_current=True, merges_halted=False, needs_attention=False)
 
     monkeypatch.setattr(land_cli.Config, "load", lambda _project_dir: config)
     monkeypatch.setattr(land_cli, "get_store", lambda _config, open_mode="readwrite": store)
@@ -5344,14 +6061,141 @@ def test_cmd_land_guarded_uses_durable_judge_and_typed_authorization_to_reach_me
     monkeypatch.setattr(land_cli, "Git", lambda _project_dir: git)
     monkeypatch.setattr("gza.landing_judge.obtain_landing_judgment", obtain)
     monkeypatch.setattr("gza.cli.git_ops._merge_single_task", merge_single)
+    monkeypatch.setattr("gza.main_integration_verify.check_main_integration_verify", main_verify)
 
     rc = land_cli.cmd_land(argparse.Namespace(project_dir=tmp_path, task_id=impl.id, policy="guarded", dry_run=False))
 
     assert rc == 0
+    assert main_verify_calls == ["called"]
     assert judge_calls == [(merge_authorizations[0].judgment_key, ("B1",))]
     assert merge_authorizations[0].review_id == review.id
     assert merge_authorizations[0].blocker_fingerprints
     assert "Landed" in capsys.readouterr().out
+
+
+def test_cmd_land_reports_red_post_merge_target_verify_as_non_success(
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    from gza.cli import land as land_cli
+    from gza.cli.git_ops import _MergeSingleTaskResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "CLI normal landing", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    _completed_full_review(store, impl, head="head-a", verdict="APPROVED")
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    def merge_single(*_args: Any, **_kwargs: Any) -> _MergeSingleTaskResult:
+        return _MergeSingleTaskResult(rc=0, status="merged")
+
+    def main_verify(*_args: Any, **_kwargs: Any) -> Any:
+        state = SimpleNamespace(
+            task=SimpleNamespace(id="gza-main-verify"),
+            head_sha="target-after",
+            tree_fingerprint=TREE_A,
+            verify_status="failed",
+            alert_message="main verify RED - merges halted",
+        )
+        return SimpleNamespace(state=state, is_current=True, merges_halted=True, needs_attention=True)
+
+    monkeypatch.setattr(land_cli.Config, "load", lambda _project_dir: config)
+    monkeypatch.setattr(land_cli, "get_store", lambda _config, open_mode="readwrite": store)
+    monkeypatch.setattr(land_cli, "resolve_id", lambda _config, task_id: task_id)
+    monkeypatch.setattr(land_cli, "Git", lambda _project_dir: git)
+    monkeypatch.setattr("gza.cli.git_ops._merge_single_task", merge_single)
+    monkeypatch.setattr("gza.main_integration_verify.check_main_integration_verify", main_verify)
+
+    rc = land_cli.cmd_land(argparse.Namespace(project_dir=tmp_path, task_id=impl.id, policy="guarded", dry_run=False))
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "Git merged" in output
+    assert "before recording merged state" in output
+    assert "integration verification failed" in output
+    assert "main verify RED" in output
+
+
+def test_cmd_land_reports_state_persistence_failure_without_cannot_land_and_reruns(
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    from gza.cli import land as land_cli
+    from gza.cli.git_ops import _MergeSingleTaskResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "CLI persistence failure landing", "feature/landing")
+    assert impl.id is not None
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    _completed_full_review(store, impl, head="head-a", verdict="APPROVED")
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    merge_calls: list[str] = []
+    mark_calls: list[str] = []
+
+    def merge_single(*_args: Any, **_kwargs: Any) -> _MergeSingleTaskResult:
+        merge_calls.append("git_merge")
+        _simulate_no_ff_landing_git_merge(git, merge_sha="merge-a")
+        return _MergeSingleTaskResult(rc=0, status="merged")
+
+    def main_verify(*_args: Any, **_kwargs: Any) -> Any:
+        state = SimpleNamespace(
+            task=SimpleNamespace(id="gza-main-verify"),
+            head_sha="merge-a",
+            tree_fingerprint=TREE_A,
+            verify_status="passed",
+            alert_message=None,
+        )
+        return SimpleNamespace(state=state, is_current=True, merges_halted=False, needs_attention=False)
+
+    def mark(store_arg: Any, *, merge_subject: Any, merge_unit_id: str | None, merge_source: str) -> None:
+        del store_arg, merge_subject, merge_unit_id
+        mark_calls.append(merge_source)
+        if len(mark_calls) == 1:
+            raise RuntimeError("db locked")
+        _finalize_landing_merge_state(store, SimpleNamespace(owner_task=impl, merge_unit_id=unit.id), None, merge_source)
+
+    monkeypatch.setattr(land_cli.Config, "load", lambda _project_dir: config)
+    monkeypatch.setattr(land_cli, "get_store", lambda _config, open_mode="readwrite": store)
+    monkeypatch.setattr(land_cli, "resolve_id", lambda _config, task_id: task_id)
+    monkeypatch.setattr(land_cli, "Git", lambda _project_dir: git)
+    monkeypatch.setattr(land_cli, "mark_merge_subject_merged", mark)
+    monkeypatch.setattr("gza.cli.git_ops._merge_single_task", merge_single)
+    monkeypatch.setattr("gza.main_integration_verify.check_main_integration_verify", main_verify)
+
+    first_rc = land_cli.cmd_land(argparse.Namespace(project_dir=tmp_path, task_id=impl.id, policy="guarded", dry_run=False))
+    first_output = capsys.readouterr().out
+
+    assert first_rc == 1
+    assert "Cannot land" not in first_output
+    assert "Git merged" in first_output
+    assert "merged-state finalization failed" in first_output
+    assert "db locked" in first_output
+    assert merge_calls == ["git_merge"]
+    assert mark_calls == ["manual_land"]
+
+    second_rc = land_cli.cmd_land(argparse.Namespace(project_dir=tmp_path, task_id=impl.id, policy="guarded", dry_run=False))
+    second_output = capsys.readouterr().out
+
+    assert second_rc == 0
+    assert "Landed" in second_output
+    assert "manual_land provenance" in second_output
+    assert merge_calls == ["git_merge"]
+    assert mark_calls == ["manual_land", "manual_land"]
 
 
 def _persist_test_landing_judgment(
