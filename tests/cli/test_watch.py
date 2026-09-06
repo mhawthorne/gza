@@ -34578,6 +34578,9 @@ def test_main_verify_remediation_prompt_includes_evidence_without_changing_metad
     assert f"Remediation attempts spent: 0/{MAIN_VERIFY_REMEDIATION_ATTEMPT_LIMIT}" in prompt
     assert "Verify artifact: .gza/artifacts/gza-1/verify.txt" in prompt
     assert "Failing test IDs: tests/test_alpha.py::test_one, tests/test_beta.py::test_two" in prompt
+    assert "make only the minimal targeted change that addresses the specific verify failure" in prompt
+    assert "do not refactor, rename, restructure, or expand scope beyond the direct root cause" in prompt
+    assert "stop and flag it for human review instead of proceeding" in prompt
     assert "Verify excerpt:" in prompt
     assert "\n    WORKER_DIED subprocess boundary failure\n" in prompt
     assert "\n    FAILED tests/test_alpha.py::test_one - AssertionError: boom" in prompt

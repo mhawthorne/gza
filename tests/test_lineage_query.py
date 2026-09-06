@@ -35,6 +35,7 @@ from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_REASON,
     MAIN_INTEGRATION_VERIFY_REASON,
     MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    MAIN_INTEGRATION_VERIFY_TAG,
     load_main_integration_verify_state,
 )
 from gza.main_verify_format import main_verify_state_halts_merges
@@ -43,6 +44,7 @@ from gza.operator_state import blocked_by_empty_prereq_label
 from gza.recovery_engine import list_failed_tasks_for_recovery
 from gza.recovery_read_context import RecoveryReadContext
 from gza.review_verify_state import persist_verify_gate_artifact
+from gza.review_scope import build_spec_coherence_review_scope
 from tests.cli.conftest import make_store, setup_config
 
 
@@ -132,6 +134,61 @@ def _persist_current_green_verify(
         verify_timeout_grace_seconds=5.0,
         producer="test",
     )
+
+
+def _completed_main_verify_remediation(store: SqliteTaskStore, *, branch: str) -> DbTask:
+    remediation = store.add(
+        "Fix local main integration verify phase `unit`\n\n"
+        "Remediation kind: fix\n"
+        "Failure signature: phase:unit\n"
+        "Tree fingerprint: fp-unit-a\n",
+        task_type="implement",
+        tags=("system", MAIN_INTEGRATION_VERIFY_TAG),
+        trigger_source=MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    assert remediation.id is not None
+    _set_completed(
+        remediation,
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+        branch=branch,
+        has_commits=True,
+    )
+    remediation.merge_status = "unmerged"
+    store.update(remediation)
+    return remediation
+
+
+def _main_verify_remediation_git(branch: str, *, diff_name_status: str = "") -> MagicMock:
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
+    git.branch_exists.return_value = True
+    git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(branch)
+    git.rev_parse_if_exists.side_effect = lambda ref: (
+        "same-head" if ref == branch else "base-head" if ref == "main" else None
+    )
+    git.get_diff_name_status.return_value = diff_name_status
+    return git
+
+
+def _query_single_owner_action(
+    store: SqliteTaskStore,
+    config: Config,
+    git: MagicMock,
+    owner_id: str,
+) -> dict[str, Any]:
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+    row = next(r for r in rows if r.owner_task.id == owner_id)
+    assert row.next_action is not None
+    return row.next_action
 
 
 class _ExplodingLineageGit:
@@ -7661,6 +7718,225 @@ def test_query_lineage_owner_rows_keeps_auto_refreshable_stale_review_out_of_att
     assert row.next_action is not None
     assert row.next_action["type"] == "create_review"
     assert row.next_action.get("needs_attention_reason") is None
+
+
+def test_query_lineage_owner_rows_merges_verified_main_verify_remediation_without_review(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    assert config.require_review_before_merge is True
+    assert config.advance_create_reviews is True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    remediation = store.add(
+        "Fix local main integration verify phase `unit`\n\n"
+        "Remediation kind: fix\n"
+        "Failure signature: phase:unit\n"
+        "Tree fingerprint: fp-unit-a\n",
+        task_type="implement",
+        tags=("system", MAIN_INTEGRATION_VERIFY_TAG),
+        trigger_source=MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    assert remediation.id is not None
+    _set_completed(
+        remediation,
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+        branch="feature/main-verify-remediation",
+        has_commits=True,
+    )
+    remediation.merge_status = "unmerged"
+    store.update(remediation)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.can_merge.return_value = True
+    git.count_commits_behind.return_value = 0
+    git.branch_exists.return_value = True
+    git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(remediation.branch)
+    git.rev_parse_if_exists.side_effect = lambda ref: (
+        "same-head" if ref == remediation.branch else "base-head" if ref == "main" else None
+    )
+    _persist_current_green_verify(
+        store,
+        config,
+        owner_task=remediation,
+        source_task=remediation,
+        head_sha="same-head",
+    )
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    row = next(r for r in rows if r.owner_task.id == remediation.id)
+    assert row.next_action is not None
+    assert row.next_action["type"] == "merge"
+    assert row.next_action["description"] == "Merge main-verify remediation after green verify"
+    assert store.get_reviews_for_task(remediation.id) == []
+
+
+def test_query_lineage_owner_rows_merges_main_verify_remediation_with_changes_requested_review(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    remediation = _completed_main_verify_remediation(store, branch="feature/main-verify-with-cr-review")
+    review = store.add("Review round 1", task_type="review", depends_on=remediation.id, based_on=remediation.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    review.review_verify_head_sha = "same-head"
+    store.update(review)
+
+    git = _main_verify_remediation_git(remediation.branch or "")
+    _persist_current_green_verify(store, config, owner_task=remediation, source_task=remediation, head_sha="same-head")
+
+    action = _query_single_owner_action(store, config, git, remediation.id)
+
+    assert action["type"] == "merge"
+    assert action["description"] == "Merge main-verify remediation after green verify"
+    assert action.get("review_task") is None
+
+
+def test_query_lineage_owner_rows_merges_main_verify_remediation_with_needs_discussion_review(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    remediation = _completed_main_verify_remediation(store, branch="feature/main-verify-with-needs-discussion-review")
+    review = store.add("Review round 1", task_type="review", depends_on=remediation.id, based_on=remediation.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review.output_content = "## Verdict\n\nVerdict: NEEDS_DISCUSSION\n"
+    review.review_verify_head_sha = "same-head"
+    store.update(review)
+
+    git = _main_verify_remediation_git(remediation.branch or "")
+    _persist_current_green_verify(store, config, owner_task=remediation, source_task=remediation, head_sha="same-head")
+
+    action = _query_single_owner_action(store, config, git, remediation.id)
+
+    assert action["type"] == "merge"
+    assert action["description"] == "Merge main-verify remediation after green verify"
+    assert action.get("needs_attention_reason") is None
+
+
+def test_query_lineage_owner_rows_main_verify_remediation_preserves_spec_coherence_before_merge(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.spec_coherence.enabled = True
+    config.spec_coherence.paths = ("specs/behavior/**",)
+
+    remediation = _completed_main_verify_remediation(store, branch="feature/main-verify-with-spec-coherence")
+    ordinary_review = store.add(
+        "Pending normal review",
+        task_type="review",
+        depends_on=remediation.id,
+        based_on=remediation.id,
+    )
+    assert ordinary_review.id is not None
+    ordinary_review.status = "pending"
+    ordinary_review.review_verify_head_sha = "same-head"
+    store.update(ordinary_review)
+
+    git = _main_verify_remediation_git(
+        remediation.branch or "",
+        diff_name_status="M\tspecs/behavior/lifecycle-engine.md\n",
+    )
+    _persist_current_green_verify(store, config, owner_task=remediation, source_task=remediation, head_sha="same-head")
+
+    action = _query_single_owner_action(store, config, git, remediation.id)
+
+    assert action["type"] == "create_review"
+    assert action["review_mode"] == "spec_coherence"
+    assert action["description"] == "Create behavior-spec coherence review"
+
+    ordinary_review.status = "in_progress"
+    store.update(ordinary_review)
+    spec_review = store.add(
+        "Spec coherence review",
+        task_type="review",
+        depends_on=remediation.id,
+        based_on=remediation.id,
+    )
+    assert spec_review.id is not None
+    spec_review.status = "completed"
+    spec_review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    spec_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    spec_review.review_scope = build_spec_coherence_review_scope(
+        implementation_task_id=remediation.id,
+        reviewed_head_sha="same-head",
+        changed_paths=("specs/behavior/lifecycle-engine.md",),
+    )
+    spec_review.review_verify_head_sha = "same-head"
+    store.update(spec_review)
+
+    action = _query_single_owner_action(store, config, git, remediation.id)
+
+    assert action["type"] == "merge"
+    assert action["description"] == "Merge main-verify remediation after green verify"
+
+
+def test_query_lineage_owner_rows_main_verify_remediation_bypasses_fresh_feedback_improve(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    remediation = _completed_main_verify_remediation(store, branch="feature/main-verify-with-fresh-feedback")
+    review = store.add("Review round 1", task_type="review", depends_on=remediation.id, based_on=remediation.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    review.review_verify_head_sha = "same-head"
+    store.update(review)
+    improve = store.add("Pending feedback improve", task_type="improve", depends_on=review.id, based_on=remediation.id)
+    assert improve.id is not None
+    improve.status = "in_progress"
+    improve.created_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    store.update(improve)
+    store.add_comment(remediation.id, "Fresh feedback after the review.")
+
+    git = _main_verify_remediation_git(remediation.branch or "")
+    _persist_current_green_verify(store, config, owner_task=remediation, source_task=remediation, head_sha="same-head")
+
+    action = _query_single_owner_action(store, config, git, remediation.id)
+
+    assert action["type"] == "merge"
+    assert action["description"] == "Merge main-verify remediation after green verify"
+    assert "improve" not in action["type"]
 
 
 def test_query_lineage_owner_rows_surfaces_cleared_review_probe_failure_attention(

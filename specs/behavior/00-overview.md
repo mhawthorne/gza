@@ -91,6 +91,7 @@ stateDiagram-v2
 
     Verifying --> Reviewing: verify passed,\nreview required
     Verifying --> Mergeable: verify passed,\nreview not required
+    Verifying --> Mergeable: system-main-verify remediation,\nverify passed + spec-coherence satisfied
     Verifying --> VerifyFixing: verify red / unavailable,\nauto-fix lane available
     Verifying --> HumanParked: verify red / unavailable,\nno safe automated route
 
@@ -164,15 +165,24 @@ These hold across the whole machine; the detailed rules in
      fail-closed exact-head fallback when Git tree identity is unavailable.
    When `require_review_before_merge=false` disables the review gate for that
    implementation-owned lineage, the verify gate remains mandatory and that no-review
-   merge path is an explicit exception to the ordinary two-gate rule. The other explicit
-   exception is exact-state, operator-triggered guarded landing: `gza land --policy
-   guarded` MAY merge a current `CHANGES_REQUESTED` code-review gate only after the
-   guarded landing contract in [lifecycle-engine.md](lifecycle-engine.md#8a--operator-triggered-land)
-   obtains a current green verify gate, any mandatory spec-coherence gate, and a durable
-   `LAND` judgment for that exact source/target/review/verify/blocker identity. This
-   exception is operator-scoped only; `advance` and `watch` remain strict and MUST NOT use
-   guarded landing authority. The default `on_max_cycles=merge_and_defer` MAY bypass
-   review approval only for ordinary
+   merge path is an explicit exception to the ordinary two-gate rule. A second unattended
+   exception is the narrow `system-main-verify` remediation lane: a completed remediation
+   `implement` task created by the main integration verify repair path MUST bypass
+   ordinary code-review-derived routing, including historical verdicts, fresh feedback
+   improves, stale-review refresh, resolution-review prerequisites, and active ordinary
+   reviews. It MAY merge only after current lifecycle-owned green verify evidence for the
+   remediation source epoch, any mandatory behavior-spec coherence review gate, the
+   red-freeze exemption authorization owned by the watch supervisor, and all ordinary
+   non-review merge safety gates such as dependency, scope, source-ref, target, execution
+   status, and conflict proof. The operator-triggered exception is exact-state guarded
+   landing: `gza land --policy guarded` MAY merge a current `CHANGES_REQUESTED`
+   code-review gate only after the guarded landing contract in
+   [lifecycle-engine.md](lifecycle-engine.md#8a--operator-triggered-land) obtains a
+   current green verify gate, any mandatory spec-coherence gate, and a durable `LAND`
+   judgment for that exact source/target/review/verify/blocker identity. This exception
+   is operator-scoped only; `advance` and `watch` remain strict and MUST NOT use guarded
+   landing authority. The default `on_max_cycles=merge_and_defer` MAY bypass review
+   approval only for ordinary
    current-head capped `CHANGES_REQUESTED` reviews after the capped-review contract in
    [lifecycle-engine.md](lifecycle-engine.md#6--review-state) proves fresh green
    lifecycle-owned verify evidence for the current branch content/tree epoch and a
@@ -218,10 +228,13 @@ target branch, and either finishes idempotently when authoritative merge state i
 Running `gza land` is the operator's explicit authorization for that selected unit only.
 It does not change the normal two-gate merge invariant for `advance` or `watch`: unattended
 automation remains strict, never creates landing judgments, and never bypasses parked
-lifecycle gates merely because guarded landing exists. The only unattended blocker
-deferral allowed by this contract is the narrow `on_max_cycles=merge_and_defer`
-exception governed by the capped-review proof rules in
-[lifecycle-engine.md](lifecycle-engine.md#6--review-state).
+lifecycle gates merely because guarded landing exists. The only unattended code-review
+bypasses are the narrow `system-main-verify` remediation exception and the
+`on_max_cycles=merge_and_defer` exception governed by the capped-review proof rules in
+[lifecycle-engine.md](lifecycle-engine.md#6--review-state). Only the capped-review path
+defers blockers; the remediation exception requires current green verify and any
+mandatory spec-coherence gate before ordinary non-review merge safety gates may permit
+merge.
 
 Successful guarded escalation is auditable as distinct merge provenance. A strict or
 non-escalated landing records `manual_land`; a guarded landing that defers blockers or

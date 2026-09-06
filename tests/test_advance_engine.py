@@ -23835,6 +23835,7 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         "review_unknown_verdict",
         "implement_needs_manual_review",
         "review_merge_source_requires_manual_resolution",
+        "main_verify_remediation_merge_source_requires_manual_resolution",
         "no_review_merge_source_requires_manual_resolution",
     }
 

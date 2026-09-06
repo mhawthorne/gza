@@ -256,6 +256,11 @@ The repair path MUST distinguish flaky from deterministic verify failures:
 - Reused or newly created remediation tasks for this gate MUST carry the distinctive tag
   `system-main-verify` in addition to the inherited `system` and scope tags so operators
   can filter main-verify state rows and remediation work together.
+- Reused or newly created remediation tasks for this gate MUST self-enforce the review
+  scope discipline in their prompt instead of relying on a spawned review task. The
+  prompt MUST require the minimal targeted change for the specific verify failure, forbid
+  unrelated refactoring, renaming, restructuring, or scope expansion, and tell the worker
+  to stop for human review when the fix must reach beyond the failure's direct cause.
 - Reused or newly created remediation tasks for this gate MUST include bounded rerun
   evidence in the prompt: the failure signature, the observed tree fingerprint context,
   the spent-attempt metadata line `Remediation attempts spent: N/2`,
@@ -307,6 +312,10 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   fingerprint unavailability MUST NOT override a durable id mismatch. Only when no
   durable active task id exists may the exemption fall back to a remediation prompt that
   likewise records fingerprint unavailability.
+- A completed `system-main-verify` remediation implement task MUST NOT auto-spawn a
+  normal code-review task. Once the remediation task's own current verify evidence is
+  green, lifecycle MUST route it directly to merge, subject to the red-freeze exemption
+  above and the ordinary non-review merge safety gates.
 - After that exempt remediation merge, watch MUST immediately rerun local-target verify
   against the post-merge local target tree before allowing any later merge in the same
   cycle. Only a green rerun clears the freeze. If the rerun is still red, automation

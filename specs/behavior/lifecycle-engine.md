@@ -409,6 +409,16 @@ closed and be treated as changed.
   MUST win with `merge-source-needs-manual-resolution`. Missing or stale verify
   evidence MUST run the normal pre-merge verify path; red or unavailable
   evidence MUST remain on the existing verify-fix or attention path.
+- A completed `system-main-verify` remediation `implement` task created by the main
+  integration verify repair path bypasses ordinary code-review-derived routing. Existing
+  ordinary review artifacts for that row, including completed `CHANGES_REQUESTED`,
+  `NEEDS_DISCUSSION`, malformed/unknown verdicts, pending or in-progress normal reviews,
+  stale-review refresh state, fresh-feedback improve state, adjudication state, and
+  resolution-review prerequisites, MUST NOT create, run, wait on, or require an ordinary
+  code review or improve before merge. This exception does not bypass the lifecycle
+  verify gate, mandatory behavior-spec coherence review, red-main freeze authorization,
+  source-ref proof, dependency readiness, scope checks, execution-status checks, merge
+  source availability, or conflict/rebase safety gates.
 - `max_review_cycles` MUST count completed review/improve cycles for the merge unit,
   not just cycles since the last commit, and MUST apply to ordinary and
   `spec_coherence` review modes through the same boundary-scoped count. Existing
@@ -828,7 +838,10 @@ failure *and* actionable merge/review work remains eligible for the latter.
   evidence for the current source verify epoch. If the verify gate is
   missing or stale, automation MUST rerun it; if it is red or unavailable, automation
   MUST block merge and follow the shared verify-gate handling instead of merging on
-  review alone.
+  review alone. The narrow `system-main-verify` remediation exception replaces only the
+  ordinary code-review gate for the remediation row and only after current green verify,
+  any mandatory spec-coherence review, red-freeze authorization, and all non-review merge
+  safety gates pass.
 - An implementation unit with no review and `require_review_before_merge` on →
   `create_review` when `advance_create_reviews` is on, otherwise `needs_discussion` with
   reason `review-needs-manual-creation` (never merge unreviewed). With
@@ -836,10 +849,11 @@ failure *and* actionable merge/review work remains eligible for the latter.
   `merge`; otherwise lifecycle MUST route through the shared `verify_gate` / same-epoch
   `verify_fix` handling before merge. This review-disabled branch is one ordinary
   automated lifecycle exception to the implementation two-gate merge rule from
-  [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules); the other is
-  the narrow capped-review `on_max_cycles=merge_and_defer` path defined below. The
-  separate exact-state guarded-landing exception named there is operator-triggered only
-  and belongs to §8a; `advance` and `watch` MUST NOT use it.
+  [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules). The other
+  unattended exceptions are the narrow `system-main-verify` remediation path and the
+  narrow capped-review `on_max_cycles=merge_and_defer` path defined below. The separate
+  exact-state guarded-landing exception named there is operator-triggered only and
+  belongs to §8a; `advance` and `watch` MUST NOT use it.
 - A selected `create_review` action has epoch identity, and automation MUST NOT treat an
   older review row or mismatched active duplicate as the selected action. Ordinary
   branch-head and closing-review refreshes match the implementation and selected reviewed
@@ -870,13 +884,18 @@ failure *and* actionable merge/review work remains eligible for the latter.
   MUST NOT invoke conflict assessment or create a rebase child.
 - Manual `gza merge` retains a narrower human-override path than automation. Automated
   lifecycle actions (`advance`/`watch`) MUST still merge only review-cleared work under
-  the rules above, except for the narrow `on_max_cycles=merge_and_defer` capped-review
-  path defined in §6: an eligible ordinary plain-full or resolution review may produce an
-  annotated `merge` action only when the review content is unchanged, the live source ref
-  still equals the reviewed head, the deterministic persisted `BLOCKER` payload is
-  validated, and current lifecycle-owned verify evidence is fresh and passing for that
-  current source verify epoch. The executor MUST create or reuse every deferred-blocker task before
-  promotion, already-merged mutation, or merge-unit finalization records success.
+  the rules above, except for the narrow `system-main-verify` remediation path and the
+  narrow `on_max_cycles=merge_and_defer` capped-review path defined in §6. The
+  remediation path may emit the ordinary `merge` action after current green verify, any
+  mandatory spec-coherence review, red-freeze authorization, and ordinary non-review
+  merge safety gates pass; ordinary code-review verdicts and follow-on review/improve
+  rules MUST NOT preempt it. For `merge_and_defer`, an eligible ordinary plain-full or
+  resolution review may produce an annotated `merge` action only when the review content
+  is unchanged, the live source ref still equals the reviewed head, the deterministic
+  persisted `BLOCKER` payload is validated, and current lifecycle-owned verify evidence
+  is fresh and passing for that current source verify epoch. The executor MUST create or
+  reuse every deferred-blocker task before promotion, already-merged mutation, or
+  merge-unit finalization records success.
   Missing or stale verify evidence MUST run the normal pre-merge verify path before
   eligibility is reconsidered; spec-coherence reviews, red or unavailable verify gates,
   no-op/adjudication lanes, and other parked gates remain non-deferable. Automation MUST

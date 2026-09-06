@@ -578,6 +578,12 @@ Each watch cycle MUST execute these phases in order:
    task so its prompt and purpose match the current classification before queue-bumping
    it. Reused or newly created remediation tasks in this lane MUST also carry the distinctive tag
    `system-main-verify` in addition to `system` and inherited watch scope tags.
+   The remediation prompt MUST carry the lane's review criteria directly: make the
+   minimal targeted change for the specific verify failure, avoid unrelated refactoring,
+   renaming, restructuring, or scope expansion, and stop for human review if the fix must
+   touch more than the failure's direct cause. Completed tasks from this lane MUST NOT
+   auto-spawn a normal review task; after their own current verify evidence is green,
+   lifecycle routes them directly to merge subject to the narrow red-main exemption.
    The bounded rerun evidence's observed verify environment identity, or an explicit
    `unknown/unavailable` marker when that identity could not be captured, MUST travel
    into the remediation metadata and prompt so the remediation worker can see where the

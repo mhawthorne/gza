@@ -31,6 +31,10 @@ from gza.flaky_investigations import (
 from gza.git import GitError, ResolvedMergeSourceRef
 from gza.lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from gza.lineage import resolve_impl_task, walk_ancestors, walk_based_on_descendants
+from gza.main_integration_verify import (
+    MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    MAIN_INTEGRATION_VERIFY_TAG,
+)
 from gza.merge_finalization_proof import (
     MergeFinalizationFamily,
     matching_merge_finalization_proofs,
@@ -5784,6 +5788,27 @@ def _is_implementation_owned_lineage(ctx: AdvanceContext) -> bool:
     return (getattr(ctx, "review_root_task", None) or ctx.task).task_type == "implement"
 
 
+def _is_main_verify_remediation_task(task: DbTask) -> bool:
+    return (
+        task.task_type == "implement"
+        and task.trigger_source == MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE
+        and MAIN_INTEGRATION_VERIFY_TAG in (task.tags or ())
+    )
+
+
+def _main_verify_remediation_skips_review(ctx: AdvanceContext) -> bool:
+    """Return whether a main-verify remediation can merge on verify evidence alone."""
+    if not _is_implementation_owned_lineage(ctx):
+        return False
+    review_root = getattr(ctx, "review_root_task", None) or ctx.task
+    return _is_main_verify_remediation_task(review_root)
+
+
+def _ordinary_code_review_routes_enabled(ctx: AdvanceContext) -> bool:
+    """Return whether ordinary code-review routing may decide this lineage."""
+    return not _main_verify_remediation_skips_review(ctx)
+
+
 def execution_status_allows_merge(ctx: AdvanceContext) -> bool:
     """Return whether the current planning task has merge-eligible execution status."""
     return ctx.task.status in MERGEABLE_EXECUTION_STATUSES
@@ -6321,6 +6346,8 @@ def _verify_gate_blocks_closing_review(ctx: AdvanceContext) -> bool:
 
 def _verify_gate_in_closing_review_scope(ctx: AdvanceContext) -> bool:
     if not _is_implementation_owned_lineage(ctx):
+        return False
+    if _main_verify_remediation_skips_review(ctx):
         return False
     if not ctx.requires_review:
         return False
@@ -7293,7 +7320,11 @@ def _verify_gate_in_merge_scope(ctx: AdvanceContext) -> bool:
     return (
         _is_implementation_owned_lineage(ctx)
         and execution_status_allows_merge(ctx)
-        and (has_valid_review_for_merge(ctx) or review_max_cycles_merge_candidate(ctx))
+        and (
+            has_valid_review_for_merge(ctx)
+            or review_max_cycles_merge_candidate(ctx)
+            or _main_verify_remediation_skips_review(ctx)
+        )
     )
 
 
@@ -7407,6 +7438,8 @@ def _closing_review_requires_automation(ctx: AdvanceContext) -> bool:
         return False
     if not _is_implementation_owned_lineage(ctx):
         return False
+    if _main_verify_remediation_skips_review(ctx):
+        return False
     if not ctx.requires_review:
         return False
     return True
@@ -7418,6 +7451,8 @@ def _stale_review_refresh_required(ctx: AdvanceContext) -> bool:
         return False
     if not _is_implementation_owned_lineage(ctx):
         return False
+    if _main_verify_remediation_skips_review(ctx):
+        return False
     if not ctx.requires_review:
         return False
     return True
@@ -7426,6 +7461,8 @@ def _stale_review_refresh_required(ctx: AdvanceContext) -> bool:
 def _active_review_requires_automation(ctx: AdvanceContext) -> bool:
     """Whether an active review should still block merge automation."""
     if ctx.review_cleared or ctx.active_review is None:
+        return False
+    if _main_verify_remediation_skips_review(ctx):
         return False
     if ctx.review_invalidated_by_progress and _is_implementation_owned_lineage(ctx) and not ctx.requires_review:
         return False
@@ -7437,6 +7474,8 @@ def _review_freshness_probe_failed(ctx: AdvanceContext) -> bool:
     if ctx.current_review_head_is_live:
         return False
     if not _is_implementation_owned_lineage(ctx):
+        return False
+    if _main_verify_remediation_skips_review(ctx):
         return False
     if not ctx.requires_review:
         return False
@@ -9309,6 +9348,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
             _spec_coherence_gate_required(ctx)
             and not _spec_coherence_gate_currently_approved(ctx)
             and ctx.spec_coherence_active_review is None
+            and _ordinary_code_review_routes_enabled(ctx)
             and ctx.active_review is not None
             and ctx.active_review.status == "pending"
         ),
@@ -9326,6 +9366,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
             _spec_coherence_gate_required(ctx)
             and not _spec_coherence_gate_currently_approved(ctx)
             and ctx.spec_coherence_active_review is None
+            and _ordinary_code_review_routes_enabled(ctx)
             and ctx.active_review is not None
             and ctx.active_review.status == "in_progress"
         ),
@@ -9384,7 +9425,10 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="resolution_review_metadata_invalid",
         matches=lambda ctx: (
-            ctx.resolution_review_metadata_invalid and _is_implementation_owned_lineage(ctx) and ctx.requires_review
+            ctx.resolution_review_metadata_invalid
+            and _ordinary_code_review_routes_enabled(ctx)
+            and _is_implementation_owned_lineage(ctx)
+            and ctx.requires_review
         ),
         action=_resolution_review_metadata_invalid_action,
     ),
@@ -9531,6 +9575,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="fresh_comments_wait_improve",
         matches=lambda ctx: (
             ctx.task_type == "implement"
+            and _ordinary_code_review_routes_enabled(ctx)
             and ctx.latest_completed_review is not None
             and ctx.has_fresh_unresolved_comments_since_latest_review
             and (ctx.review_cleared or ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"})
@@ -9549,6 +9594,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="fresh_comments_run_pending_improve",
         matches=lambda ctx: (
             ctx.task_type == "implement"
+            and _ordinary_code_review_routes_enabled(ctx)
             and ctx.latest_completed_review is not None
             and ctx.has_fresh_unresolved_comments_since_latest_review
             and (ctx.review_cleared or ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"})
@@ -9567,6 +9613,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="fresh_comments_noop_improve_limit",
         matches=lambda ctx: (
             ctx.task_type == "implement"
+            and _ordinary_code_review_routes_enabled(ctx)
             and ctx.noop_improve_trigger == "comments"
             and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
         ),
@@ -9576,6 +9623,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="fresh_comments_create_improve",
         matches=lambda ctx: (
             ctx.task_type == "implement"
+            and _ordinary_code_review_routes_enabled(ctx)
             and ctx.latest_completed_review is not None
             and ctx.has_fresh_unresolved_comments_since_latest_review
             and (ctx.review_cleared or ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"})
@@ -9601,9 +9649,21 @@ ADVANCE_RULES: list[AdvanceRule] = [
         action=lambda ctx: _verify_gate_action(ctx, phase="pre_merge"),
     ),
     AdvanceRule(
+        name="main_verify_remediation_merge_source_requires_manual_resolution",
+        matches=lambda ctx: _merge_source_unavailable_requires_manual_resolution(ctx)
+        and _main_verify_remediation_skips_review(ctx),
+        action=_merge_source_unavailable_manual_resolution_action,
+    ),
+    AdvanceRule(
+        name="main_verify_remediation_verified_merge",
+        matches=lambda ctx: _can_emit_live_merge_action(ctx) and _main_verify_remediation_skips_review(ctx),
+        action=lambda ctx: {"type": "merge", "description": "Merge main-verify remediation after green verify"},
+    ),
+    AdvanceRule(
         name="review_approved_with_followups",
         matches=lambda ctx: (
             _can_emit_live_merge_action(ctx)
+            and _ordinary_code_review_routes_enabled(ctx)
             and has_valid_review_for_merge(ctx)
             and (not ctx.review_cleared)
             and ctx.latest_completed_review is not None
@@ -9621,6 +9681,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="review_approved",
         matches=lambda ctx: (
             _can_emit_live_merge_action(ctx)
+            and _ordinary_code_review_routes_enabled(ctx)
             and has_valid_review_for_merge(ctx)
             and (not ctx.review_cleared)
             and ctx.latest_completed_review is not None
@@ -9635,7 +9696,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="review_wait_improve",
         matches=lambda ctx: (
-            (not ctx.review_cleared)
+            _ordinary_code_review_routes_enabled(ctx)
+            and (not ctx.review_cleared)
             and ctx.review_verdict == "CHANGES_REQUESTED"
             and ctx.active_improve_running is not None
         ),
@@ -9648,7 +9710,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="review_run_pending_improve",
         matches=lambda ctx: (
-            (not ctx.review_cleared)
+            _ordinary_code_review_routes_enabled(ctx)
+            and (not ctx.review_cleared)
             and ctx.review_verdict == "CHANGES_REQUESTED"
             and ctx.active_improve_pending is not None
         ),
@@ -9661,7 +9724,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="review_clear_off_topic_verify_blocker",
         matches=lambda ctx: (
-            (not ctx.review_cleared)
+            _ordinary_code_review_routes_enabled(ctx)
+            and (not ctx.review_cleared)
             and ctx.review_verdict == "CHANGES_REQUESTED"
             and ctx.active_improve_running is None
             and ctx.active_improve_pending is None
@@ -9672,7 +9736,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="review_blocker_adjudication_needed",
         matches=lambda ctx: (
-            (not ctx.review_cleared)
+            _ordinary_code_review_routes_enabled(ctx)
+            and (not ctx.review_cleared)
             and ctx.review_verdict == "CHANGES_REQUESTED"
             and ctx.review_blocker_adjudication_needed
         ),
@@ -9681,7 +9746,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="review_wait_blocker_adjudication",
         matches=lambda ctx: (
-            (not ctx.review_cleared)
+            _ordinary_code_review_routes_enabled(ctx)
+            and (not ctx.review_cleared)
             and ctx.review_verdict == "CHANGES_REQUESTED"
             and ctx.active_review_blocker_adjudication is not None
             and ctx.active_review_blocker_adjudication.status == "in_progress"
@@ -9695,7 +9761,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="review_run_pending_blocker_adjudication",
         matches=lambda ctx: (
-            (not ctx.review_cleared)
+            _ordinary_code_review_routes_enabled(ctx)
+            and (not ctx.review_cleared)
             and ctx.review_verdict == "CHANGES_REQUESTED"
             and ctx.active_review_blocker_adjudication is not None
             and ctx.active_review_blocker_adjudication.status == "pending"
@@ -9709,7 +9776,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="review_create_blocker_adjudication",
         matches=lambda ctx: (
-            (not ctx.review_cleared)
+            _ordinary_code_review_routes_enabled(ctx)
+            and (not ctx.review_cleared)
             and ctx.review_verdict == "CHANGES_REQUESTED"
             and ctx.active_improve_running is None
             and ctx.active_improve_pending is None
@@ -9730,7 +9798,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="review_recover_verify_only_noop_review",
         matches=lambda ctx: (
-            (not ctx.review_cleared)
+            _ordinary_code_review_routes_enabled(ctx)
+            and (not ctx.review_cleared)
             and ctx.review_verdict == "CHANGES_REQUESTED"
             and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
             and ctx.active_improve_running is None
@@ -9757,7 +9826,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="review_noop_improve_limit",
         matches=lambda ctx: (
-            (not ctx.review_cleared)
+            _ordinary_code_review_routes_enabled(ctx)
+            and (not ctx.review_cleared)
             and ctx.review_verdict == "CHANGES_REQUESTED"
             and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
             and ctx.active_improve_running is None
@@ -9768,7 +9838,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="review_verify_blocked_no_code_issues",
         matches=lambda ctx: (
-            (not ctx.review_cleared)
+            _ordinary_code_review_routes_enabled(ctx)
+            and (not ctx.review_cleared)
             and ctx.review_verdict == "CHANGES_REQUESTED"
             and len(ctx.recent_verify_timeout_only_reviews) >= VERIFY_BLOCKED_REVIEW_THRESHOLD
             and ctx.active_improve_running is None
@@ -9779,7 +9850,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="review_duplicate_blocker_no_progress",
         matches=lambda ctx: (
-            (not ctx.review_cleared)
+            _ordinary_code_review_routes_enabled(ctx)
+            and (not ctx.review_cleared)
             and ctx.review_verdict == "CHANGES_REQUESTED"
             and ctx.duplicate_blocker_streak is not None
             and not ctx.review_blockers_revalidated
@@ -9789,7 +9861,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="review_max_cycles",
         matches=lambda ctx: (
-            (not ctx.review_cleared)
+            _ordinary_code_review_routes_enabled(ctx)
+            and (not ctx.review_cleared)
             and (
                 (
                     ctx.review_verdict == "CHANGES_REQUESTED"
@@ -9803,7 +9876,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_create_improve",
-        matches=lambda ctx: (not ctx.review_cleared) and ctx.review_verdict == "CHANGES_REQUESTED",
+        matches=lambda ctx: (
+            _ordinary_code_review_routes_enabled(ctx)
+            and (not ctx.review_cleared)
+            and ctx.review_verdict == "CHANGES_REQUESTED"
+        ),
         action=lambda ctx: {
             "type": "improve",
             "description": f"Create improve task (review CHANGES_REQUESTED){_noop_improve_followup_suffix(ctx)}",
@@ -9814,7 +9891,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_unknown_verdict",
-        matches=lambda ctx: (not ctx.review_cleared) and ctx.latest_completed_review is not None,
+        matches=lambda ctx: (
+            _ordinary_code_review_routes_enabled(ctx)
+            and (not ctx.review_cleared)
+            and ctx.latest_completed_review is not None
+        ),
         action=lambda ctx: with_needs_attention(
             {
                 "type": "needs_discussion",
@@ -9829,6 +9910,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="review_cleared_but_sibling_review_unresolved",
         matches=lambda ctx: (
             _can_emit_live_merge_action(ctx)
+            and _ordinary_code_review_routes_enabled(ctx)
             and has_valid_review_for_merge(ctx)
             and ctx.review_cleared
             and ctx.latest_completed_review is not None
@@ -9840,6 +9922,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="reviews_all_cleared",
         matches=lambda ctx: (
             _can_emit_live_merge_action(ctx)
+            and _ordinary_code_review_routes_enabled(ctx)
             and has_valid_review_for_merge(ctx)
             and ctx.review_cleared
             and ctx.latest_completed_review is not None
@@ -9850,7 +9933,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="no_review_merge_source_requires_manual_resolution",
         matches=lambda ctx: (
             _merge_source_unavailable_requires_manual_resolution(ctx)
-            and (not _is_implementation_owned_lineage(ctx) or not ctx.requires_review)
+            and (
+                _main_verify_remediation_skips_review(ctx)
+                or not _is_implementation_owned_lineage(ctx)
+                or not ctx.requires_review
+            )
         ),
         action=_merge_source_unavailable_manual_resolution_action,
     ),
@@ -9871,14 +9958,20 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="implement_create_review",
         matches=lambda ctx: (
-            ctx.requires_review and ctx.create_reviews and _resolve_plain_review_target_task(ctx) is not None
+            _ordinary_code_review_routes_enabled(ctx)
+            and ctx.requires_review
+            and ctx.create_reviews
+            and _resolve_plain_review_target_task(ctx) is not None
         ),
         action=lambda ctx: {"type": "create_review", "description": "Create review (required before merge)"},
     ),
     AdvanceRule(
         name="implement_needs_manual_review",
         matches=lambda ctx: (
-            ctx.requires_review and not ctx.create_reviews and _resolve_plain_review_target_task(ctx) is not None
+            _ordinary_code_review_routes_enabled(ctx)
+            and ctx.requires_review
+            and not ctx.create_reviews
+            and _resolve_plain_review_target_task(ctx) is not None
         ),
         action=lambda ctx: with_needs_attention(
             {
