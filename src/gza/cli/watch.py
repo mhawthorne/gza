@@ -42,6 +42,7 @@ from ..concurrency import (
     LaunchPermit,
     MaxConcurrentTasksError,
     _collect_live_running_state_details as _shared_collect_live_running_state_details,
+    _collect_live_running_state_details_from_registry as _shared_collect_live_running_state_details_from_registry,
     get_concurrency_snapshot as _shared_get_concurrency_snapshot,
     launch_permit,
     release_task_launch_permit,
@@ -191,6 +192,7 @@ from ..unstick import (
 )
 from ..watch_leases import (
     WatchLeaseConflict,
+    WatchLeaseHeld,
     WatchLeaseReleaseError,
     WatchLeaseSet,
     WatchLeaseTarget,
@@ -6635,7 +6637,33 @@ def _reconcile_watch_runtime_state(
         reconcile_in_progress_tasks(config, store=store, runtime_context=runtime_context)
         prune_terminal_dead_workers(config, store=store)
         reconcile_dead_pending_recovery_tasks(config, store=store, runtime_context=runtime_context)
-    live_state = _shared_collect_live_running_state_details(config, store)
+    return _project_runtime_reconcile_result_from_live_state(
+        _shared_collect_live_running_state_details(config, store),
+        store=store,
+        runtime_key=runtime_key,
+    )
+
+
+def _observe_watch_runtime_state_read_only(
+    *,
+    store: SqliteTaskStore,
+    runtime_key: str,
+    worker_registry: WorkerRegistry,
+) -> "ProjectRuntimeReconcileResult":
+    live_state = _shared_collect_live_running_state_details_from_registry(worker_registry, store)
+    return _project_runtime_reconcile_result_from_live_state(
+        live_state,
+        store=store,
+        runtime_key=runtime_key,
+    )
+
+
+def _project_runtime_reconcile_result_from_live_state(
+    live_state: Any,
+    *,
+    store: SqliteTaskStore,
+    runtime_key: str,
+) -> "ProjectRuntimeReconcileResult":
     live_pids, running_task_ids, anonymous_worker_count, starting_worker_count = (
         _watch_visible_running_state_from_live_state(live_state, store=store)
     )
@@ -9054,6 +9082,7 @@ def acquire_watch_supervisor_selection_leases(
     selection: WatchSupervisorSelection,
     owner_token: str | None = None,
     existing_lease_set: WatchLeaseSet | None = None,
+    retain_existing_disabled_keys: frozenset[str] = frozenset(),
 ) -> WatchSupervisorLeaseAcquisition:
     """Acquire leases for every currently healthy selected project in selector order."""
 
@@ -9068,6 +9097,11 @@ def acquire_watch_supervisor_selection_leases(
     activation_candidates, disabled_projects = _watch_supervisor_activation_candidates(
         anchor_store=anchor_store,
         selection=selection,
+    )
+    disabled_existing_key_set = (
+        {disabled.selector_key for disabled in disabled_projects} & retain_existing_disabled_keys
+        if existing_lease_set is not None
+        else set()
     )
 
     lease_set: WatchLeaseSet | None = None
@@ -9087,7 +9121,7 @@ def acquire_watch_supervisor_selection_leases(
         else:
             remaining_candidates = list(activation_candidates)
             disabled_list = list(disabled_projects)
-            retained_existing_key_set: set[str] = set()
+            retained_existing_key_set: set[str] = set(disabled_existing_key_set)
             while True:
                 targets = [
                     WatchLeaseTarget(candidate.project.key, candidate.lease_store) for candidate in remaining_candidates
@@ -9119,8 +9153,6 @@ def acquire_watch_supervisor_selection_leases(
                     if conflicted is None:
                         raise
                     disabled_list.append(_disabled_watch_project_from_lease_conflict(conflicted, exc))
-                    if any(held.target.key == conflicted.project.key for held in existing_lease_set.held):
-                        retained_existing_key_set.add(conflicted.project.key)
                     remaining_candidates = [
                         candidate for candidate in remaining_candidates if candidate is not conflicted
                     ]
@@ -9140,13 +9172,83 @@ def acquire_watch_supervisor_selection_leases(
             (),
             owner_token=owner_token,
             existing_lease_set=existing_lease_set,
+            retain_existing_target_keys=frozenset(disabled_existing_key_set),
         )
+        retained_existing_key_tuple = retained_existing_key_order(disabled_existing_key_set)
     return WatchSupervisorLeaseAcquisition(
         lease_set=lease_set,
         disabled=disabled_projects,
         activation_candidates=activation_candidates,
         retained_existing_keys=retained_existing_key_tuple,
     )
+
+
+def _validate_watch_supervisor_refresh_prior_state(
+    *,
+    selection: WatchSupervisorSelection,
+    existing_lease_set: WatchLeaseSet,
+    existing_runtimes: Sequence["WatchProjectRuntime"],
+) -> None:
+    if not existing_runtimes:
+        raise ValueError("existing_runtimes are required when refreshing an existing watch lease set")
+
+    selection_keys = {project.key for project in selection.projects}
+    runtime_by_key: dict[str, WatchProjectRuntime] = {}
+    duplicate_runtime_keys: set[str] = set()
+    extra_runtime_keys: set[str] = set()
+    for runtime in existing_runtimes:
+        if runtime.key in runtime_by_key:
+            duplicate_runtime_keys.add(runtime.key)
+        runtime_by_key[runtime.key] = runtime
+        if runtime.key not in selection_keys:
+            extra_runtime_keys.add(runtime.key)
+        if runtime.runtime_identity.selector_key != runtime.key:
+            raise ValueError(
+                "existing_runtimes must match their runtime identities when refreshing "
+                f"an existing watch lease set: {runtime.key!r} != {runtime.runtime_identity.selector_key!r}"
+            )
+    if duplicate_runtime_keys:
+        keys = ", ".join(sorted(repr(key) for key in duplicate_runtime_keys))
+        raise ValueError(f"existing_runtimes contain duplicate watch selector keys: {keys}")
+    if extra_runtime_keys:
+        keys = ", ".join(sorted(repr(key) for key in extra_runtime_keys))
+        raise ValueError(f"existing_runtimes contain keys outside the current watch selection: {keys}")
+
+    held_by_key: dict[str, WatchLeaseHeld] = {}
+    duplicate_lease_keys: set[str] = set()
+    for held in existing_lease_set.held:
+        if held.target.key in held_by_key:
+            duplicate_lease_keys.add(held.target.key)
+        held_by_key[held.target.key] = held
+        if held.target.key not in selection_keys:
+            raise ValueError(
+                "existing watch lease set contains a lease outside the current watch selection: "
+                f"{held.target.key!r}"
+            )
+    if duplicate_lease_keys:
+        keys = ", ".join(sorted(repr(key) for key in duplicate_lease_keys))
+        raise ValueError(f"existing watch lease set contains duplicate selector keys: {keys}")
+
+    missing_runtime_keys = sorted(key for key in held_by_key if key not in runtime_by_key)
+    if missing_runtime_keys:
+        keys = ", ".join(repr(key) for key in missing_runtime_keys)
+        raise ValueError(
+            "existing_runtimes must cover every held watch lease when refreshing an existing watch lease set: "
+            f"missing {keys}"
+        )
+
+    for key, held in held_by_key.items():
+        runtime = runtime_by_key[key]
+        runtime_identity = runtime.runtime_identity
+        lease_identity = watch_lease_target_identity(held.target)
+        if (
+            runtime_identity.db_path.resolve() != lease_identity.db_path
+            or runtime_identity.project_id != lease_identity.project_id
+        ):
+            raise ValueError(
+                "existing_runtimes must identity-match the held watch leases when refreshing "
+                f"an existing watch lease set: {key!r}"
+            )
 
 
 def construct_watch_project_runtimes(
@@ -9159,6 +9261,7 @@ def construct_watch_project_runtimes(
     existing_lease_set: WatchLeaseSet | None = None,
     runtime_state: Any = None,
     aggregate_log_path: Path | None = None,
+    existing_runtimes: Sequence["WatchProjectRuntime"] = (),
 ) -> WatchSupervisorRuntimeConstruction:
     """Construct ordered project-local watch runtimes from a resolved supervisor selection.
 
@@ -9168,18 +9271,39 @@ def construct_watch_project_runtimes(
     disabled startup states for the future fleet supervisor.
     """
 
+    if existing_lease_set is not None:
+        if owner_token is not None and owner_token != existing_lease_set.owner_token:
+            raise ValueError("owner_token must match existing_lease_set.owner_token")
+        _validate_watch_supervisor_refresh_prior_state(
+            selection=selection,
+            existing_lease_set=existing_lease_set,
+            existing_runtimes=existing_runtimes,
+        )
+
     lease_acquisition = acquire_watch_supervisor_selection_leases(
         anchor_store=anchor_store,
         selection=selection,
         owner_token=owner_token,
         existing_lease_set=existing_lease_set,
+        retain_existing_disabled_keys=frozenset(runtime.key for runtime in existing_runtimes),
     )
     lease_set = lease_acquisition.lease_set
     disabled_projects = list(lease_acquisition.disabled)
     runtimes: list[WatchProjectRuntime] = []
+    existing_runtime_by_key = {runtime.key: runtime for runtime in existing_runtimes}
+
+    def preserve_disabled_runtime(disabled: ExecutionProjectDisabled) -> None:
+        previous = existing_runtime_by_key.get(disabled.selector_key)
+        if previous is None:
+            return
+        if any(runtime.key == disabled.selector_key for runtime in runtimes):
+            return
+        runtimes.append(WatchProjectRuntime.read_only_disabled(previous=previous, disabled=disabled))
 
     retained_lease_keys: list[str] = []
-    retained_conflict_lease_keys = list(lease_acquisition.retained_existing_keys)
+    retained_existing_lease_keys = list(lease_acquisition.retained_existing_keys)
+    for disabled in disabled_projects:
+        preserve_disabled_runtime(disabled)
     try:
         for candidate in lease_acquisition.activation_candidates:
             project = candidate.project
@@ -9195,7 +9319,9 @@ def construct_watch_project_runtimes(
                 sqlite3.Error,
                 UnicodeError,
             ) as exc:
-                disabled_projects.append(_disabled_watch_project_from_activation_error(project, resolved, exc))
+                disabled = _disabled_watch_project_from_activation_error(project, resolved, exc)
+                disabled_projects.append(disabled)
+                preserve_disabled_runtime(disabled)
                 continue
             retained_lease_keys.append(project.key)
             log_path = _watch_log_path(execution_runtime.config, dry_run=dry_run)
@@ -9225,18 +9351,18 @@ def construct_watch_project_runtimes(
             try:
                 worker_registry = WorkerRegistry(execution_runtime.config.workers_path)
             except OSError as exc:
-                disabled_projects.append(
-                    ExecutionProjectDisabled(
-                        selector_key=project.key,
-                        reason="runtime_filesystem_unavailable",
-                        message=f"Execution project worker registry could not be initialized for watch: {exc}",
-                        project_id=resolved.project_id,
-                        root_path=resolved.root_path,
-                        config_path=resolved.config_path,
-                        db_path=resolved.db_path,
-                    )
+                disabled = ExecutionProjectDisabled(
+                    selector_key=project.key,
+                    reason="runtime_filesystem_unavailable",
+                    message=f"Execution project worker registry could not be initialized for watch: {exc}",
+                    project_id=resolved.project_id,
+                    root_path=resolved.root_path,
+                    config_path=resolved.config_path,
+                    db_path=resolved.db_path,
                 )
+                disabled_projects.append(disabled)
                 retained_lease_keys.remove(project.key)
+                preserve_disabled_runtime(disabled)
                 continue
             git = Git(execution_runtime.config.project_dir, env=execution_runtime.runtime_context.env)
             runtime = WatchProjectRuntime.from_execution_runtime(
@@ -9263,11 +9389,12 @@ def construct_watch_project_runtimes(
         raise
 
     if lease_set is not None:
-        retained_lease_key_set = {*retained_lease_keys, *retained_conflict_lease_keys}
-        released_disabled_held = [held for held in lease_set.held if held.target.key not in retained_lease_key_set]
+        held_by_key: dict[str, WatchLeaseHeld] = {held.target.key: held for held in lease_set.held}
+        retained_lease_key_set = {*retained_lease_keys, *retained_existing_lease_keys}
+        released_disabled_keys = [held.target.key for held in lease_set.held if held.target.key not in retained_lease_key_set]
         try:
             release_watch_held_leases(
-                released_disabled_held,
+                [held_by_key[key] for key in released_disabled_keys],
                 owner_token=lease_set.owner_token,
             )
         except WatchLeaseReleaseError as release_error:
@@ -9282,9 +9409,16 @@ def construct_watch_project_runtimes(
         lease_set = WatchLeaseSet(
             owner_pid=lease_set.owner_pid,
             owner_token=lease_set.owner_token,
-            held=tuple(held for held in lease_set.held if held.target.key in retained_lease_key_set),
+            held=tuple(
+                held_by_key[key]
+                for key in (project.key for project in selection.projects)
+                if key in retained_lease_key_set
+                if key in held_by_key
+            ),
         )
 
+    runtime_order = {project.key: index for index, project in enumerate(selection.projects)}
+    runtimes.sort(key=lambda runtime: runtime_order.get(runtime.key, len(runtime_order)))
     return WatchSupervisorRuntimeConstruction(
         runtimes=tuple(runtimes),
         disabled=tuple(disabled_projects),
@@ -9649,6 +9783,9 @@ class WatchSupervisorRuntimeState:
     last_reconcile_by_runtime_key: dict[str, ProjectRuntimeReconcileResult] = field(default_factory=dict)
     local_limit_by_runtime_key: dict[str, int] = field(default_factory=dict)
     initialized_project_log_paths: set[Path] = field(default_factory=set)
+    launch_reservations: dict[str, Any] = field(default_factory=dict)
+    settled_launch_reservation_ids: set[str] = field(default_factory=set)
+    unresolved_exception_launch_reservation_ids: set[str] = field(default_factory=set)
 
     def transfer_to(self, runtime: "WatchProjectRuntime") -> None:
         previous = self.runtimes_by_key.get(runtime.key)
@@ -9697,6 +9834,37 @@ class WatchSupervisorRuntimeState:
                 states.append(previous)
                 seen.add(disabled_project.selector_key)
         return tuple(states)
+
+    def restore_launch_budget(self, launch_budget: "SupervisorLaunchBudget") -> None:
+        if (
+            not self.launch_reservations
+            and not self.settled_launch_reservation_ids
+            and not self.unresolved_exception_launch_reservation_ids
+        ):
+            return
+        launch_budget.restore_persistent_state(
+            reservations=self.launch_reservations,
+            settled_reservation_ids=self.settled_launch_reservation_ids,
+            unresolved_exception_reservation_ids=self.unresolved_exception_launch_reservation_ids,
+        )
+
+    def remember_launch_budget(self, launch_budget: "SupervisorLaunchBudget") -> None:
+        state = launch_budget.persistent_state()
+        self.launch_reservations = dict(state[0])
+        self.settled_launch_reservation_ids = set(state[1])
+        self.unresolved_exception_launch_reservation_ids = set(state[2])
+
+    def apply_launch_reservations_to_occupancy(
+        self,
+        occupancy: AggregateWatchOccupancy,
+    ) -> AggregateWatchOccupancy:
+        reservations = tuple(self.launch_reservations.values())
+        return replace(
+            occupancy,
+            slots=max(0, occupancy.slots - len(reservations)),
+            provisional_reservations=len(reservations),
+            reservation_ids=tuple(reservation.reservation_id for reservation in reservations),
+        )
 
 
 def _watch_runtime_state_matches(previous: "WatchProjectRuntime", current: "WatchProjectRuntime") -> bool:
@@ -9768,6 +9936,39 @@ class SupervisorLaunchBudget:
         with self._lock:
             return tuple(self._last_reconcile_by_runtime_key.values())
 
+    def persistent_state(
+        self,
+    ) -> tuple[
+        Mapping[str, SupervisorLaunchReservation],
+        AbstractSet[str],
+        AbstractSet[str],
+    ]:
+        with self._lock:
+            return (
+                dict(self._reservations),
+                set(self._settled_reservation_ids),
+                set(self._unresolved_exception_reservation_ids),
+            )
+
+    def restore_persistent_state(
+        self,
+        *,
+        reservations: Mapping[str, SupervisorLaunchReservation],
+        settled_reservation_ids: AbstractSet[str],
+        unresolved_exception_reservation_ids: AbstractSet[str],
+    ) -> AggregateWatchOccupancy:
+        with self._lock:
+            self._reservations = dict(reservations)
+            self._settled_reservation_ids = set(settled_reservation_ids)
+            self._unresolved_exception_reservation_ids = set(unresolved_exception_reservation_ids)
+            return self.refresh_occupancy()
+
+    def update_runtimes(self, runtimes: Sequence["WatchProjectRuntime"]) -> AggregateWatchOccupancy:
+        """Replace refreshed runtime handles while preserving unsettled launch reservations."""
+        with self._lock:
+            self.runtimes = tuple(runtimes)
+            return self.refresh_occupancy()
+
     def refresh_occupancy(self) -> AggregateWatchOccupancy:
         with self._lock:
             snapshots: list[ProjectRuntimeReconcileResult] = []
@@ -9826,9 +10027,12 @@ class SupervisorLaunchBudget:
     def reserve(self, candidate: ProjectDispatchCandidate) -> SupervisorLaunchReservation | None:
         with self._lock:
             assert self._occupancy is not None
-            if self._available_slots_locked() <= 0:
+            runtime = self.runtime_by_key.get(candidate.runtime_key)
+            if runtime is None or not runtime.enabled or candidate.task.id is None:
                 return None
-            if candidate.runtime_key not in self.runtime_by_key or candidate.task.id is None:
+            if candidate.runtime_identity != runtime.runtime_identity:
+                return None
+            if self._available_slots_locked() <= 0:
                 return None
             reservation = SupervisorLaunchReservation(
                 reservation_id=uuid.uuid4().hex,
@@ -9901,6 +10105,22 @@ class SupervisorLaunchBudget:
     ) -> ProjectDispatchResult:
         """Reserve one global slot, run the runtime-local dispatch, then settle the claim."""
         with self._lock:
+            current_runtime = self.runtime_by_key.get(candidate.runtime_key)
+            if (
+                current_runtime is None
+                or current_runtime is not runtime
+                or not current_runtime.enabled
+                or candidate.runtime_identity != current_runtime.runtime_identity
+            ):
+                return ProjectDispatchResult(
+                    runtime_key=runtime.key,
+                    candidate=candidate,
+                    status="not_dispatchable",
+                    slot_consuming=False,
+                    work_done=False,
+                    detail="candidate does not match the current enabled runtime",
+                    task=candidate.task,
+                )
             reservation = self.reserve(candidate)
             if reservation is None:
                 return ProjectDispatchResult(
@@ -9913,7 +10133,7 @@ class SupervisorLaunchBudget:
                     task=candidate.task,
                 )
             try:
-                result = runtime.dispatch_pending_candidate(
+                result = current_runtime.dispatch_pending_candidate(
                     candidate,
                     max_iterations=max_iterations,
                     dry_run=dry_run,
@@ -10392,6 +10612,13 @@ def _watch_supervisor_runtime_enabled_for_cycle(
     *,
     dry_run: bool,
 ) -> tuple[bool, ExecutionProjectDisabled | None]:
+    if not runtime.enabled:
+        disabled = runtime.disabled or _watch_cycle_disabled_project(
+            runtime,
+            reason="runtime_filesystem_unavailable",
+            message="Project runtime is disabled; preserving read-only occupancy only.",
+        )
+        return False, disabled
     if runtime.failure_halt_active:
         return False, _watch_cycle_disabled_project(
             runtime,
@@ -10611,6 +10838,11 @@ def run_watch_supervisor_fleet_cycle(
 ) -> tuple[WatchSupervisorFleetCycleResult, WatchLeaseSet | None]:
     """Run one multi-project supervisor pass with fleet-wide phase barriers."""
     runtime_state = runtime_state or WatchSupervisorRuntimeState()
+    existing_runtimes = tuple(
+        runtime
+        for project in selection.projects
+        if (runtime := runtime_state.runtimes_by_key.get(project.key)) is not None
+    )
     construction = construct_watch_project_runtimes(
         anchor_store=anchor_store,
         selection=selection,
@@ -10620,10 +10852,20 @@ def run_watch_supervisor_fleet_cycle(
         existing_lease_set=existing_lease_set,
         runtime_state=runtime_state,
         aggregate_log_path=aggregate_log_path,
+        existing_runtimes=existing_runtimes,
     )
     try:
         runtimes = construction.runtimes
         disabled: list[ExecutionProjectDisabled] = list(construction.disabled)
+
+        def append_disabled(disabled_project: ExecutionProjectDisabled) -> None:
+            if any(
+                existing.selector_key == disabled_project.selector_key and existing.reason == disabled_project.reason
+                for existing in disabled
+            ):
+                return
+            disabled.append(disabled_project)
+
         if not runtimes:
             disabled_reconcile_states = runtime_state.disabled_reconcile_states(
                 disabled,
@@ -10634,6 +10876,7 @@ def run_watch_supervisor_fleet_cycle(
                 supervisor_batch=batch,
                 limit_by_runtime_key=runtime_state.local_limit_by_runtime_key,
             )
+            occupancy = runtime_state.apply_launch_reservations_to_occupancy(occupancy)
             result = WatchSupervisorFleetCycleResult(
                 work_done=False,
                 running=occupancy.running,
@@ -10658,6 +10901,19 @@ def run_watch_supervisor_fleet_cycle(
         for runtime in runtimes:
             runtime_state.remember_runtime(runtime)
             runtime.log.begin_cycle()
+            if not runtime.enabled:
+                if runtime.disabled is not None:
+                    append_disabled(runtime.disabled)
+                read_only_state, read_only_disabled = _watch_supervisor_try_project_phase(
+                    runtime,
+                    phase="reconcile",
+                    operation=functools.partial(runtime.reconcile_runtime_state, dry_run=True),
+                )
+                if read_only_disabled is not None:
+                    append_disabled(read_only_disabled)
+                elif read_only_state is not None:
+                    runtime_state.remember_reconcile(read_only_state, local_limit=runtime.config.max_concurrent)
+                continue
             if not runtime.previous_snapshot:
                 _baseline_result, disabled_project = _watch_supervisor_try_project_phase(
                     runtime,
@@ -10665,7 +10921,7 @@ def run_watch_supervisor_fleet_cycle(
                     operation=runtime.initialize_baseline,
                 )
                 if disabled_project is not None:
-                    disabled.append(disabled_project)
+                    append_disabled(disabled_project)
                     baseline_disabled_keys.add(runtime.key)
                     continue
             runtime.begin_dispatch_pass()
@@ -10684,18 +10940,18 @@ def run_watch_supervisor_fleet_cycle(
                 ),
             )
             if disabled_project is not None:
-                disabled.append(disabled_project)
+                append_disabled(disabled_project)
             enabled = health_result[0] if health_result is not None else False
             health_disabled = health_result[1] if health_result is not None else None
             if health_disabled is not None:
-                disabled.append(health_disabled)
+                append_disabled(health_disabled)
                 read_only_state, read_only_disabled = _watch_supervisor_try_project_phase(
                     runtime,
                     phase="reconcile",
                     operation=functools.partial(runtime.reconcile_runtime_state, dry_run=True),
                 )
                 if read_only_disabled is not None:
-                    disabled.append(read_only_disabled)
+                    append_disabled(read_only_disabled)
                 elif read_only_state is not None:
                     runtime_state.remember_reconcile(read_only_state, local_limit=runtime.config.max_concurrent)
             if enabled:
@@ -10711,7 +10967,7 @@ def run_watch_supervisor_fleet_cycle(
                     operation=runtime.repair_merge_unit_state,
                 )
                 if disabled_project is not None:
-                    disabled.append(disabled_project)
+                    append_disabled(disabled_project)
                     continue
             reconcile_state, disabled_project = _watch_supervisor_try_project_phase(
                 runtime,
@@ -10719,7 +10975,7 @@ def run_watch_supervisor_fleet_cycle(
                 operation=functools.partial(runtime.reconcile_runtime_state, dry_run=dry_run),
             )
             if disabled_project is not None:
-                disabled.append(disabled_project)
+                append_disabled(disabled_project)
                 continue
             assert reconcile_state is not None
             reconciled_states.append(reconcile_state)
@@ -10739,12 +10995,12 @@ def run_watch_supervisor_fleet_cycle(
                 ),
             )
             if disabled_project is not None:
-                disabled.append(disabled_project)
+                append_disabled(disabled_project)
                 continue
             assert observed is not None
             if observed[1]:
                 runtime.failure_halt_active = True
-                disabled.append(
+                append_disabled(
                     _watch_cycle_disabled_project(
                         runtime,
                         reason="failure-halt",
@@ -10770,7 +11026,7 @@ def run_watch_supervisor_fleet_cycle(
                 ),
             )
             if disabled_project is not None:
-                disabled.append(disabled_project)
+                append_disabled(disabled_project)
                 continue
             assert analysis is not None
             analyses[runtime.key] = analysis
@@ -10803,7 +11059,7 @@ def run_watch_supervisor_fleet_cycle(
                 ),
             )
             if disabled_project is not None:
-                disabled.append(disabled_project)
+                append_disabled(disabled_project)
                 analyses.pop(runtime.key, None)
                 continue
             assert direct_result is not None
@@ -10822,7 +11078,7 @@ def run_watch_supervisor_fleet_cycle(
                     ),
                 )
                 if disabled_project is not None:
-                    disabled.append(disabled_project)
+                    append_disabled(disabled_project)
                     analyses.pop(runtime.key, None)
                     continue
                 assert analysis is not None
@@ -10872,8 +11128,9 @@ def run_watch_supervisor_fleet_cycle(
                     *disabled_reconcile_states,
                 ),
                 read_only_limit_by_runtime_key=runtime_state.local_limit_by_runtime_key,
-                operational_disabled_callback=disabled.append,
+                operational_disabled_callback=append_disabled,
             )
+            runtime_state.restore_launch_budget(launch_budget)
             dispatch_results = dispatch_watch_supervisor_lanes_incrementally(
                 enabled_runtimes,
                 recovery_slots_config=recovery_slots,
@@ -10884,7 +11141,7 @@ def run_watch_supervisor_fleet_cycle(
                 launch_budget=launch_budget,
                 max_iterations=max_iterations,
                 analyses=analyses,
-                operational_disabled_callback=disabled.append,
+                operational_disabled_callback=append_disabled,
             )
             for state in launch_budget.reconciled_states:
                 local_limit = runtime_state.local_limit_by_runtime_key.get(
@@ -10895,8 +11152,9 @@ def run_watch_supervisor_fleet_cycle(
                     local_limit = launch_budget.runtime_by_key[state.runtime_key].config.max_concurrent
                 runtime_state.remember_reconcile(state, local_limit=local_limit)
             occupancy = launch_budget.occupancy
+            runtime_state.remember_launch_budget(launch_budget)
         else:
-            occupancy = pre_dispatch_occupancy
+            occupancy = runtime_state.apply_launch_reservations_to_occupancy(pre_dispatch_occupancy)
 
         pending = 0
         runnable_candidate_count = 0
@@ -10904,15 +11162,16 @@ def run_watch_supervisor_fleet_cycle(
         enabled_runtimes = [runtime for runtime in enabled_runtimes if runtime.key not in active_dispatch_disabled_keys]
         analyses = {key: analysis for key, analysis in analyses.items() if key not in active_dispatch_disabled_keys}
         for runtime in enabled_runtimes:
+            runtime_for_pending = runtime
 
-            def count_pending_runnable(runtime: WatchProjectRuntime = runtime) -> int:
+            def count_pending_runnable() -> int:
                 return len(
                     _pending_runnable_tasks(
-                        runtime.store,
-                        config=runtime.config,
-                        tags=runtime.tags,
-                        any_tag=runtime.any_tag,
-                        excluded_owner_ids=runtime.active_failure_owner_ids(),
+                        runtime_for_pending.store,
+                        config=runtime_for_pending.config,
+                        tags=runtime_for_pending.tags,
+                        any_tag=runtime_for_pending.any_tag,
+                        excluded_owner_ids=runtime_for_pending.active_failure_owner_ids(),
                     )
                 )
 
@@ -10922,29 +11181,29 @@ def run_watch_supervisor_fleet_cycle(
                 operation=count_pending_runnable,
             )
             if disabled_project is not None:
-                disabled.append(disabled_project)
+                append_disabled(disabled_project)
                 analyses.pop(runtime.key, None)
                 continue
             assert pending_count is not None
             pending += pending_count
             attempts = resolve_watch_supervisor_runtime_recovery_attempts(runtime, max_recovery_attempts)
+            runtime_for_dispatch_head = runtime
 
             def runtime_has_dispatch_head(
-                runtime: WatchProjectRuntime = runtime,
                 attempts: int = attempts,
             ) -> bool:
                 mode = normalize_dispatch_selection_mode(recovery_mode)
                 return (
-                    runtime.recovery_dispatch_head(
+                    runtime_for_dispatch_head.recovery_dispatch_head(
                         max_recovery_attempts=attempts,
                         recovery_mode=mode,
-                        analysis=analyses.get(runtime.key),
+                        analysis=analyses.get(runtime_for_dispatch_head.key),
                     )
                     is not None
-                    or runtime.pending_dispatch_head(
+                    or runtime_for_dispatch_head.pending_dispatch_head(
                         max_recovery_attempts=attempts,
                         selection_mode=_watch_supervisor_pending_selection_mode(mode),
-                        analysis=analyses.get(runtime.key),
+                        analysis=analyses.get(runtime_for_dispatch_head.key),
                     )
                     is not None
                 )
@@ -10955,7 +11214,7 @@ def run_watch_supervisor_fleet_cycle(
                 operation=runtime_has_dispatch_head,
             )
             if disabled_project is not None:
-                disabled.append(disabled_project)
+                append_disabled(disabled_project)
                 analyses.pop(runtime.key, None)
                 continue
             if has_head:
@@ -10978,13 +11237,13 @@ def run_watch_supervisor_fleet_cycle(
                 ),
             )
             if disabled_project is not None:
-                disabled.append(disabled_project)
+                append_disabled(disabled_project)
                 continue
             assert observed is not None
             confirmed_start_count += observed[0]
             if observed[1]:
                 runtime.failure_halt_active = True
-                disabled.append(
+                append_disabled(
                     _watch_cycle_disabled_project(
                         runtime,
                         reason="failure-halt",
@@ -11441,6 +11700,9 @@ class WatchProjectRuntime:
     system_hold_active: bool = False
     git_health_hold_active: bool = False
     failure_halt_active: bool = False
+    enabled: bool = True
+    disabled: ExecutionProjectDisabled | None = None
+    disabled_observation: ProjectRuntimeReconcileResult | None = None
     _confirmed_started_task_ids: set[str] = field(default_factory=set)
     _attempted_dispatch_task_ids: set[str] = field(default_factory=set)
 
@@ -11556,6 +11818,35 @@ class WatchProjectRuntime:
             runtime_identity=identity,
         )
 
+    @classmethod
+    def read_only_disabled(
+        cls,
+        *,
+        previous: "WatchProjectRuntime",
+        disabled: ExecutionProjectDisabled,
+    ) -> "WatchProjectRuntime":
+        if previous.key != disabled.selector_key:
+            raise ValueError(
+                f"disabled selector {disabled.selector_key!r} cannot preserve runtime {previous.key!r}"
+            )
+        observation = (
+            previous.disabled_observation
+            if not previous.enabled and previous.disabled_observation is not None
+            else previous.observe_runtime_state_read_only()
+        )
+        disabled_identity = replace(previous.runtime_identity, generation=uuid.uuid4().hex)
+        previous.enabled = False
+        previous.disabled = disabled
+        previous.disabled_observation = replace(observation, runtime_identity=disabled_identity)
+        previous.runtime_identity = disabled_identity
+        return replace(
+            previous,
+            enabled=False,
+            disabled=disabled,
+            disabled_observation=previous.disabled_observation,
+            runtime_identity=disabled_identity,
+        )
+
     def initialize_baseline(self) -> None:
         self.previous_snapshot = _task_snapshot(self.store)
 
@@ -11643,6 +11934,9 @@ class WatchProjectRuntime:
         )
 
     def reconcile_runtime_state(self, *, dry_run: bool) -> ProjectRuntimeReconcileResult:
+        if not self.enabled:
+            reconciled = self.disabled_observation or self.observe_runtime_state_read_only()
+            return replace(reconciled, runtime_identity=self.runtime_identity)
         reconciled = _reconcile_watch_runtime_state(
             config=self.config,
             store=self.store,
@@ -11656,6 +11950,14 @@ class WatchProjectRuntime:
         self.store.repair_inconsistent_unmerged_merge_units()
         self.store.repair_stale_unmerged_merge_unit_owners()
 
+    def observe_runtime_state_read_only(self) -> ProjectRuntimeReconcileResult:
+        reconciled = _observe_watch_runtime_state_read_only(
+            store=self.store,
+            runtime_key=self.key,
+            worker_registry=self.worker_registry,
+        )
+        return replace(reconciled, runtime_identity=self.runtime_identity)
+
     def analyze_cycle(
         self,
         *,
@@ -11668,6 +11970,9 @@ class WatchProjectRuntime:
         known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
         excluded_owner_ids: frozenset[str] = frozenset(),
     ) -> ProjectCycleAnalysis:
+        if not self.enabled:
+            reason = self.disabled.reason if self.disabled is not None else "disabled"
+            raise RuntimeError(f"watch runtime {self.key!r} is disabled ({reason})")
         plan = _build_reported_watch_cycle_plan(
             log=self.log,
             threshold_seconds=self.config.watch.long_phase_threshold_seconds,
@@ -11698,6 +12003,12 @@ class WatchProjectRuntime:
         return self.analyze_cycle(**kwargs)
 
     def run_cycle(self, **kwargs: Any) -> _CycleResult:
+        if not self.enabled:
+            return _CycleResult(
+                work_done=False,
+                running=0,
+                pending=0,
+            )
         return _run_cycle(
             config=self.config,
             store=self.store,
@@ -11987,6 +12298,14 @@ class WatchProjectRuntime:
         **kwargs: Any,
     ) -> ProjectDirectResult:
         """Run only project-local direct lifecycle work for a future fleet barrier."""
+        if not self.enabled:
+            reason = self.disabled.reason if self.disabled is not None else "disabled"
+            return ProjectDirectResult(
+                runtime_key=self.key,
+                work_done=False,
+                blocked=True,
+                detail=f"watch runtime is disabled ({reason})",
+            )
         precomputed_plan = kwargs.pop("precomputed_plan", None)
         plan_supplied_by_analysis = analysis is not None
         if analysis is not None:
@@ -12018,6 +12337,8 @@ class WatchProjectRuntime:
         include_pending: bool = True,
     ) -> DispatchPreview:
         """Build this runtime's project-local dispatch preview using its own config/store/Git."""
+        if not self.enabled:
+            return DispatchPreview(entries=())
         if analysis is not None:
             self._validate_analysis(analysis)
         plan_analysis = analysis.analysis if analysis is not None else None
@@ -12050,6 +12371,8 @@ class WatchProjectRuntime:
         suppression_context: _WatchDispatchSuppressionContext | None = None,
     ) -> tuple[ProjectDispatchCandidate, ...]:
         """Expose locally ordered runnable recovery/pending candidates for fleet arbitration."""
+        if not self.enabled:
+            return ()
         preview = self.build_dispatch_preview(
             recovery_mode=recovery_mode,
             max_recovery_attempts=max_recovery_attempts,
@@ -13052,6 +13375,17 @@ class WatchProjectRuntime:
         step1_handled_child_task_ids: frozenset[str] = frozenset(),
     ) -> ProjectDispatchResult:
         """Dispatch one pending candidate through this runtime's local launch machinery."""
+        if not self.enabled:
+            reason = self.disabled.reason if self.disabled is not None else "disabled"
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="not_dispatchable",
+                slot_consuming=False,
+                work_done=False,
+                detail=f"watch runtime is disabled ({reason})",
+                task=candidate.task,
+            )
         if (
             not self._candidate_belongs_to_runtime(candidate)
             or candidate.lane != "pending"

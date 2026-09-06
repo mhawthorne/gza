@@ -118,8 +118,10 @@ def _pid_alive(pid: int | None) -> bool:
     return True
 
 
-def _collect_live_running_state_details(config: Config, store: SqliteTaskStore) -> _LiveRunningState:
-    registry = WorkerRegistry(config.workers_path)
+def _collect_live_running_state_details_from_registry(
+    registry: WorkerRegistry,
+    store: SqliteTaskStore,
+) -> _LiveRunningState:
     live_pids: set[int] = set()
     live_task_ids: set[str] = set()
     live_active_task_pids: set[int] = set()
@@ -192,6 +194,11 @@ def _collect_live_running_state_details(config: Config, store: SqliteTaskStore) 
         running_task_pid_by_task_id=live_task_pid_by_task_id,
         starting_task_ids=tuple(sorted(live_starting_task_ids, key=lambda task_id: task_id_numeric_key(task_id))),
     )
+
+
+def _collect_live_running_state_details(config: Config, store: SqliteTaskStore) -> _LiveRunningState:
+    registry = WorkerRegistry(config.workers_path)
+    return _collect_live_running_state_details_from_registry(registry, store)
 
 
 def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple[set[int], tuple[str, ...], int, int]:

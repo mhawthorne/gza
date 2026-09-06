@@ -160,7 +160,7 @@ def _full_verify_ruff_command(repo_root: Path) -> list[str]:
 
 
 @pytest.mark.timeout(30, method="signal")
-def test_full_verify_defaults_to_fixed_ci_parity_xdist_worker_count_on_high_core_machine(tmp_path: Path) -> None:
+def test_full_verify_defaults_to_fixed_two_xdist_workers_on_high_core_hosts(tmp_path: Path) -> None:
     fixture_root = _setup_verify_script_fixture(tmp_path)
     tool_log = fixture_root / "venv-tools.log"
 
@@ -199,7 +199,7 @@ def test_full_verify_defaults_to_fixed_ci_parity_xdist_worker_count_on_high_core
 
 
 @pytest.mark.timeout(30, method="signal")
-def test_full_verify_clamps_xdist_worker_count_to_a_single_core_machine(tmp_path: Path) -> None:
+def test_full_verify_defaults_to_fixed_two_xdist_workers_on_single_core_hosts(tmp_path: Path) -> None:
     fixture_root = _setup_verify_script_fixture(tmp_path)
     tool_log = fixture_root / "venv-tools.log"
 
@@ -227,12 +227,12 @@ def test_full_verify_clamps_xdist_worker_count_to_a_single_core_machine(tmp_path
     )
 
     assert result.returncode == 0, result.stderr
-    assert "cores=1 xdist_workers=1" in result.stdout
+    assert "cores=1 xdist_workers=2" in result.stdout
     tool_invocations = tool_log.read_text(encoding="utf-8")
-    assert "test-unit --summary -- tests/ -n 1 --dist load --durations=25 -o faulthandler_timeout=60" in tool_invocations
+    assert "test-unit --summary -- tests/ -n 2 --dist load --durations=25 -o faulthandler_timeout=60" in tool_invocations
     assert (
         f"{venv_bin / 'python'} -m gza.test_functional_rerun --summary -- tests_functional/ "
-        "-n 1 --dist loadscope --durations=25 -o faulthandler_timeout=60"
+        "-n 2 --dist loadscope --durations=25 -o faulthandler_timeout=60"
         in tool_invocations
     )
 

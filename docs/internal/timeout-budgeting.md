@@ -81,9 +81,10 @@ diagnostics, not longer budgets:
 
 ## Pytest parallel-only rerun bridges
 
-The unit and functional verify lanes keep their wall-clock behavior unchanged
-on the all-green path, but they now have bounded bridges for contention-style
-parallel failures:
+The unit and functional verify lanes default to a bounded xdist worker count
+of two. Operators can still set `PYTEST_XDIST_WORKERS` explicitly when they
+need a different local triage shape. The lanes also have bounded bridges for
+contention-style parallel failures:
 
 - the parallel xdist pass runs first with the relevant lane cap plus one
   failure (`--maxfail=GZA_UNIT_RERUN_CAP+1` for the unit lane, or
