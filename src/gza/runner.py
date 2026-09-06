@@ -3119,6 +3119,8 @@ def _docker_verify_snapshot_holder_is_live(holder: object) -> bool:
         return True
     if sys.platform.startswith("linux"):
         return False
+    if "pid_start_ticks" not in holder and holder.get("token") == "legacy":
+        return False
     if "pid_start_ticks" in holder and not isinstance(holder.get("pid_start_ticks"), int):
         return False
     try:
