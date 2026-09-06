@@ -1034,6 +1034,16 @@ def _review_output_with_findings(
     return "\n".join(sections)
 
 
+def _assert_no_landing_or_deferred_blocker_side_effects(store: SqliteTaskStore) -> None:
+    assert store.list_project_artifacts(kind="landing_judgment") == []
+    assert store.list_project_artifacts(kind="landing_merge_authorization") == []
+    assert [
+        task.id
+        for task in store.get_all()
+        if "deferred-review-blocker" in task.tags or task.task_type == "internal"
+    ] == []
+
+
 def _persist_test_merge_finalization_proof(
     store: SqliteTaskStore,
     *,
@@ -5938,6 +5948,70 @@ def test_omitted_on_max_cycles_uses_merge_and_defer_lifecycle_behavior(
     assert action["persisted_review_output"] == review.output_content
     assert action["max_cycles_audit"]["verify_gate_state"] == "passed"
     assert "needs_attention_reason" not in action
+
+
+def test_ordinary_advance_park_policy_does_not_invoke_guarded_landing_or_defer_blockers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "park"
+    config.max_review_cycles = 0
+    config.verify_command = "./bin/tests"
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/ordinary-advance-parked-review-blocker",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "current-sha"
+    review.output_content = _review_output_with_findings("CHANGES_REQUESTED", blockers=("B1",))
+    store.update(review)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 5, 10, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="current-sha",
+            reviewed_base_sha="base-sha",
+            working_directory=str(tmp_path),
+            failure=None,
+        ),
+        verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+        verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+        producer="test",
+    )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: parse_review_report(review.output_content or ""),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "current-sha"}),
+        impl,
+        "main",
+    )
+
+    assert classify_advance_action(action) == "needs_attention"
+    assert action["needs_attention_reason"] == "review-max-cycles-reached"
+    assert action["type"] == "max_cycles_reached"
+    assert "max_cycles_merge_and_defer" not in action
+    assert "deferred_blocker_ids" not in action
+    _assert_no_landing_or_deferred_blocker_side_effects(store)
 
 
 def test_opt_in_on_max_cycles_with_green_verify_emits_annotated_merge_action(

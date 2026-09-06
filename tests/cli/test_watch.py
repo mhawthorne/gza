@@ -61680,6 +61680,97 @@ def test_watch_cycle_treats_capped_merge_and_defer_as_direct_merge_action(
     assert "iterate" not in " ".join(executed_worker_actions)
 
 
+def test_watch_cycle_review_blocker_attention_does_not_invoke_landing_or_defer_blockers(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Parked review blockers remain operator gated", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = "feature/watch-review-blocker-attention"
+    owner.has_commits = True
+    owner.merge_status = "unmerged"
+    store.update(owner)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=False)
+    attention_action = {
+        "type": "max_cycles_reached",
+        "description": "Manual attention required after review max cycles",
+        "needs_attention_reason": "review-max-cycles-reached",
+        "subject_task_id": owner.id,
+    }
+
+    def _row(task: Task) -> LineageOwnerRow:
+        return LineageOwnerRow(
+            owner_task=task,
+            members=(task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action=None,
+            next_action_reason="",
+            unresolved_tasks=(task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=task,
+            recovery_action_task=None,
+            recovery_leaf_task=None,
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch(
+            "gza.cli.watch._query_owner_rows_with_context",
+            return_value=([_row(owner)], RecoveryReadContext()),
+        ),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.determine_next_action", return_value=attention_action),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            side_effect=AssertionError("watch must not execute parked needs-attention actions"),
+        ),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            side_effect=AssertionError("watch must not bypass attention by merging"),
+        ),
+        patch(
+            "gza.landing.run_production_landing",
+            side_effect=AssertionError("ordinary watch must not invoke guarded landing"),
+        ),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    stdout = capsys.readouterr().out
+    log_text = log_path.read_text()
+    refreshed_owner = store.get(owner.id)
+    assert refreshed_owner is not None
+    assert refreshed_owner.status == "completed"
+    assert refreshed_owner.merge_status == "unmerged"
+    assert "reason=review-max-cycles-reached" in stdout
+    assert "reason=review-max-cycles-reached" in log_text
+    assert store.list_project_artifacts(kind="landing_judgment") == []
+    assert store.list_project_artifacts(kind="landing_merge_authorization") == []
+    assert [
+        task.id
+        for task in store.get_all()
+        if "deferred-review-blocker" in task.tags or task.task_type == "internal"
+    ] == []
+
+
 def test_watch_cycle_reuses_lifecycle_slot_when_non_consuming_result_leaves_capacity(
     tmp_path: Path,
 ) -> None:
