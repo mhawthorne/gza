@@ -551,16 +551,19 @@ epoch.
   recovery rerun persists any
   non-green result, including another timeout, lifecycle MUST record the rerun as consumed
   and the next decision MUST park rather than rerun indefinitely.
-- Latest same-source-epoch verify evidence wins inside a verify epoch: branch identity is
-  mandatory and fail-closed, so both persisted and current `reviewed_branch` values MUST
-  be concrete non-blank strings that match exactly. Within that exact branch, a newer
-  persisted green result supersedes older red evidence when both sides have equal
-  non-empty Git tree object IDs in `reviewed_tree_sha`; if tree proof is unavailable on
-  either side, exact non-empty `reviewed_head_sha` equality is the fallback freshness
-  proof. Equal heads also preserve the existing current-evidence authority when optional
-  tree metadata is absent or contradictory. Missing tree proof MUST NOT be treated as
-  tree equality, and the committed Git tree OID in `reviewed_tree_sha` MUST NOT be
-  conflated with phase/worktree `tree_fingerprint` checkpoints. The normalized verify
+- The source verify epoch is branch-scoped content identity for runner-owned verify
+  freshness. Latest same-source-epoch verify evidence wins inside a verify epoch: branch
+  identity is mandatory and fail-closed, so both persisted and current `reviewed_branch`
+  values MUST be concrete non-blank strings that match exactly. Within that exact
+  branch, a newer persisted green result supersedes older red evidence when both sides
+  have equal non-empty Git tree object IDs in `reviewed_tree_sha`; if tree proof is
+  unavailable on either side, exact non-empty `reviewed_head_sha` equality is the fallback
+  freshness proof. Equal heads also preserve the existing current-evidence authority when
+  optional tree metadata is absent or contradictory. Missing tree proof MUST NOT be treated as
+  tree equality. The committed Git tree OID in `reviewed_tree_sha` is the only tree
+  identity that participates in source verify freshness and MUST NOT be conflated with
+  phase/worktree `tree_fingerprint` checkpoints, landing local-target fingerprints, or
+  main integration verify target fingerprints. The normalized verify
   command and timeout settings are run provenance, not verify freshness identity;
   changing only `verify_command`, `autonomous_verify_timeout_seconds`, or
   `review_verify_timeout_grace_seconds` MUST NOT be the supported way to clear or stale a
@@ -696,8 +699,8 @@ When a current review exists for the implementation lineage:
   ordinary current-head candidates first prove local merge source and readable
   deterministic blocker content, then traverse the pre-merge verify gate above,
   and emit the existing `merge` action annotated with max-cycle deferral metadata
-  only when fresh green verify evidence and validated persisted `BLOCKER` metadata
-  are available. Under rollback `on_max_cycles=park`, this emits
+  only when fresh green current source/tree verify evidence and validated persisted
+  `BLOCKER` metadata are available. Under rollback `on_max_cycles=park`, this emits
   `max_cycles_reached`. Missing merge source or unavailable/invalid review content
   surfaces its own attention reason instead of falling through to the generic cap
   park; if both are present, missing merge source wins. Plan-review cap exhaustion

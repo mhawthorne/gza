@@ -166,8 +166,10 @@ These hold across the whole machine; the detailed rules in
    - the **code-review gate**: a current, valid review whose verdict permits merge
      (`APPROVED` or `APPROVED_WITH_FOLLOWUPS`);
    - the **verify gate**: current runner-owned verify evidence for the current
-     implementation branch content/tree epoch, with
-     fail-closed exact-head fallback when Git tree identity is unavailable.
+     implementation branch source/tree epoch: the branches MUST match, and either both
+     non-empty commit heads match or both non-empty Git tree object IDs match. Missing
+     tree values cannot establish tree equivalence; equal exact heads remain authoritative
+     even when optional tree metadata is absent or contradictory.
    When `require_review_before_merge=false` disables the review gate for that
    implementation-owned lineage, the verify gate remains mandatory and that no-review
    merge path is an explicit exception to the ordinary two-gate rule. A second unattended
@@ -190,7 +192,7 @@ These hold across the whole machine; the detailed rules in
    approval only for ordinary
    current-head capped `CHANGES_REQUESTED` reviews after the capped-review contract in
    [lifecycle-engine.md](lifecycle-engine.md#6--review-state) proves fresh green
-   lifecycle-owned verify evidence for the current branch content/tree epoch and a
+   lifecycle-owned verify evidence for the current branch source/tree epoch and a
    deterministic persisted blocker payload, then emits an annotated `merge` action. The
    merge executor MUST create or reuse every required deferred-blocker task before promotion,
    already-merged mutation, or merge-unit finalization records merge success. Missing or
@@ -281,7 +283,7 @@ time, so each row names what would let us remove it.
 | `needs_discussion` — verify fix failed | One completed same-epoch `verify_fix` already ran, and the current verify gate is still red for that same source verify epoch. | Inspect the failing verify evidence and the completed `verify_fix`, then take over manually. | Better targeted remediation quality and better verify diagnostics. |
 | `needs_discussion` — verify unavailable | The lifecycle-owned verify gate could not be run safely for the current source verify epoch, or remained unavailable after one same-epoch `verify_fix`. | Fix the environment or configuration problem, then re-advance. | More reliable verify setup and environment diagnostics. |
 | `needs_discussion` — main verify schema-runtime skew | The local-target verify gate could not produce code evidence because the running gza runtime and task database schema are incompatible. This is non-red merge-blocking unavailable evidence for actions that require current target verify. | Restart or update the runtime, or rerun from the canonical default-branch checkout after the migration code has landed. | Clearer schema rollout and migration-authority diagnostics. |
-| `max_cycles_reached` — review churn | Review→improve cycles for the merge unit since the current deliberate scope/base boundary hit the bound (`max_review_cycles`) and no stale-review refresh path is available. Ordinary improve, fix, and reviewed-head advancement do not reset the bound; a completed changed-diff rebase may. Under default `on_max_cycles=merge_and_defer`, eligible ordinary current-head code/resolution reviews follow the audited merge-and-defer path after fresh green source verify epoch proof and deterministic persisted blocker payload proof; the executor must durably create or reuse the blocker tasks before promotion, already-merged mutation, or merge-unit finalization. Under rollback `on_max_cycles=park`, this remains a manual-attention stop. Missing or stale verify evidence goes through the normal pre-merge verify path first, while red or unavailable verify evidence remains non-deferred. | Take over: review and fix inline, or redirect the work. | Better improve quality; raise/redesign the bound. |
+| `max_cycles_reached` — review churn | Review→improve cycles for the merge unit since the current deliberate scope/base boundary hit the bound (`max_review_cycles`) and no stale-review refresh path is available. Ordinary improve, fix, and reviewed-head advancement do not reset the bound; a completed changed-diff rebase may. Under default `on_max_cycles=merge_and_defer`, eligible ordinary current-head code/resolution reviews follow the audited merge-and-defer path after fresh green current source/tree verify epoch proof and deterministic persisted blocker payload proof; the executor must durably create or reuse the blocker tasks before promotion, already-merged mutation, or merge-unit finalization. Under rollback `on_max_cycles=park`, this remains a manual-attention stop. Missing or stale verify evidence goes through the normal pre-merge verify path first, while red or unavailable verify evidence remains non-deferred. | Take over: review and fix inline, or redirect the work. | Better improve quality; raise/redesign the bound. |
 | `needs_discussion` — blocker adjudication needed | A disputed non-verify CODE blocker reached independent adjudication, but the adjudicator returned `NEEDS_HUMAN`, failed, or produced an unsafe/unparseable result. | Review the blocker, the dispute evidence, and the adjudication output; then fix, override, or restate the blocker explicitly. | Reliable adjudication worker plus durable blocker-resolution state. |
 | `needs_discussion` — duplicate blocker | The same primary blocker repeats across cycles (default bound) with no progress. | Resolve the underlying issue the agent keeps missing. | Detect and break the repeat earlier. |
 | `needs_discussion` — no-op improves | Improve completed without changing code, repeatedly (`max_noop_improve_cycles`). Disputed non-verify CODE blockers route to adjudication first; remaining no-op cases still park. Legacy compatibility handling for verify-only blocked reviews does not make repeated no-op improves a normal merge path. | Decide whether the feedback is actionable; fix or drop. | Detect un-actionable feedback up front. |
