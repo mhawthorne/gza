@@ -80,6 +80,7 @@ def cmd_land(args: argparse.Namespace) -> int:
         print(
             f"Landed {task_id}: owner {result.owner_task_id} -> {result.target_branch} "
             f"with {_landing_usage_summary(result)}; "
+            f"follow-up task IDs {_format_task_ids(result.followup_task_ids)}; "
             f"deferred task IDs {_format_task_ids(result.deferred_task_ids)}; "
             f"final provenance {result.merge_provenance} ({result.merge_provenance} provenance)."
         )

@@ -1062,6 +1062,7 @@ def test_land_cli_success_output_reports_policy_usage_deferred_ids_and_provenanc
         merge_provenance="manual_land_escalated",
         judgment_artifact_id="42",
         judgment_key="judge-key",
+        followup_task_ids=("test-project-10", "test-project-11"),
         deferred_task_ids=("test-project-20", "test-project-21"),
     )
     args = argparse.Namespace(project_dir=tmp_path, task_id="test-project-1", policy="guarded", dry_run=False)
@@ -1082,6 +1083,7 @@ def test_land_cli_success_output_reports_policy_usage_deferred_ids_and_provenanc
     assert request.dry_run is False
     assert "Landed test-project-1: owner test-project-1 -> main" in output
     assert "rebase used, review used, judgment used" in output
+    assert "follow-up task IDs test-project-10, test-project-11" in output
     assert "deferred task IDs test-project-20, test-project-21" in output
     assert "final provenance manual_land_escalated" in output
 
@@ -1125,6 +1127,7 @@ def test_land_cli_success_output_reports_unused_optional_phases_and_no_deferred_
     request = land.call_args.kwargs["request"]
     assert request.policy == "strict"
     assert "rebase not used, review not used, judgment not used" in output
+    assert "follow-up task IDs none" in output
     assert "deferred task IDs none" in output
     assert "final provenance manual_land" in output
 
