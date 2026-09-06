@@ -10,6 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from gza.providers import DockerConfig
+from gza.providers.base import build_docker_cmd
 from gza.runner import disposable_verify_db_snapshot_env
 from gza.runtime_context import RuntimeExecutionContext
 
@@ -95,7 +97,24 @@ def test_docker_verify_snapshot_is_writable_by_different_uid_process_and_cleaned
     with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config) as snapshot:
         snapshot_path = snapshot.host_path
         snapshot_dir = snapshot_path.parent
-        supplemental_groups = snapshot.docker_group_ids
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+        docker_cmd = build_docker_cmd(
+            docker_config,
+            verify_cwd,
+            timeout_minutes=10,
+            host_env=snapshot.env,
+        )
+        supplemental_groups = tuple(
+            int(docker_cmd[index + 1])
+            for index, value in enumerate(docker_cmd)
+            if value == "--group-add"
+        )
         assert setgid_parent_gid in supplemental_groups
         assert host_gid not in supplemental_groups
         assert snapshot.env["GZA_DOCKER_GROUP_ADD"] == ",".join(str(gid) for gid in supplemental_groups)

@@ -902,8 +902,8 @@ class TestBuildDockerCmd:
         assert "--rm" in cmd
         assert cmd[-1] == "test-image"
 
-    def test_docker_run_adds_host_gid_for_private_bind_mount_writes(self, tmp_path):
-        """Container processes should receive the host group for private bind-mounted files."""
+    def test_docker_run_omits_supplemental_groups_by_default(self, tmp_path):
+        """Ordinary container processes should not receive broad supplemental groups."""
         docker_config = DockerConfig(
             image_name="test-image",
             npm_package="@test/cli",
@@ -914,8 +914,7 @@ class TestBuildDockerCmd:
 
         cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10)
 
-        group_idx = cmd.index("--group-add")
-        assert cmd[group_idx + 1] == str(os.getgid())
+        assert "--group-add" not in cmd
 
     def test_docker_run_adds_verify_snapshot_groups_from_env(self, tmp_path):
         """Container processes should receive declared snapshot GIDs for writable verify DBs."""
@@ -933,14 +932,12 @@ class TestBuildDockerCmd:
             docker_config,
             tmp_path,
             timeout_minutes=10,
-            docker_env=[f"GZA_DOCKER_GROUP_ADD={docker_env_gid},invalid"],
-            host_env={"GZA_DOCKER_GROUP_ADD": f"{extra_gid}"},
+            docker_env=[f"GZA_DOCKER_GROUP_ADD={docker_env_gid},{extra_gid},invalid"],
+            host_env={"GZA_DOCKER_GROUP_ADD": f"{extra_gid},{extra_gid}"},
         )
 
         group_ids = [cmd[index + 1] for index, value in enumerate(cmd) if value == "--group-add"]
-        assert str(os.getgid()) in group_ids
-        assert str(extra_gid) in group_ids
-        assert str(docker_env_gid) in group_ids
+        assert group_ids == sorted({str(extra_gid), str(docker_env_gid)}, key=int)
         assert "invalid" not in group_ids
 
     def test_git_identity_is_read_from_work_dir_with_runtime_env(self, tmp_path):
