@@ -28915,6 +28915,76 @@ def test_verify_gate_preflight_provenance_rejects_changed_head_without_tree_proo
     )
 
 
+def test_pre_review_completed_preflight_same_tree_different_head_uses_source_epoch_message(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-preflight-same-tree-message",
+        when=datetime(2026, 8, 18, 10, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 8, 18, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="commit-b",
+            reviewed_tree_sha="tree-same",
+            reviewed_base_sha="target-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed after content-preserving rebase",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 8, 18, 10, 10, tzinfo=UTC),
+        changed_diff=False,
+    )
+    _add_matching_verify_gate_preflight_provenance(
+        store,
+        rebase,
+        impl,
+        reviewed_head_sha="commit-a",
+        reviewed_tree_sha="tree-same",
+        target_tip_sha="target-head",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "commit-b", "main": "target-head"},
+        resolved_tree_shas={impl.branch: "tree-same"},
+        ancestor_pairs={("main", impl.branch): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-gate-preflight-rebase"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action["verify_epoch"].reviewed_head_sha == "commit-b"
+    assert action["verify_epoch"].reviewed_tree_sha == "tree-same"
+    assert "source epoch/content" in action["description"]
+    assert "did not advance the verify epoch head" not in action["description"]
+    assert "verify_fix_task" not in action
+
+
 def test_pre_review_failed_verify_new_epoch_gets_one_preflight_then_parks(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)

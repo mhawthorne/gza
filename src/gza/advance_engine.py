@@ -6962,8 +6962,9 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext, *, phase: str = "pre_revi
                                 "type": "needs_discussion",
                                 "description": (
                                     f"SKIP: completed preflight rebase {_task_id(matched_rebase)} did not advance "
-                                    f"the verify epoch head {current_epoch.reviewed_head_sha}; repair the branch or rebase "
-                                    "state before lifecycle can retry verify-fix routing"
+                                    f"the verify source epoch/content for branch {current_epoch.reviewed_branch} "
+                                    f"at head {current_epoch.reviewed_head_sha}; repair the branch or rebase state "
+                                    "before lifecycle can retry verify-fix routing"
                                 ),
                                 "rebase_task": matched_rebase,
                                 "verify_epoch": current_epoch,
