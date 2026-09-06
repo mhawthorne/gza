@@ -8251,6 +8251,16 @@ class TestDisposableVerifyDbSnapshotEnv:
 
         assert not runner._docker_verify_snapshot_holder_is_live({"pid": os.getpid(), "token": "legacy"})
 
+    def test_docker_snapshot_holder_liveness_accepts_non_linux_pid_without_start_tick(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(runner, "_read_linux_proc_stat", lambda _pid: None)
+
+        with patch("gza.runner.sys") as mock_sys:
+            mock_sys.platform = "darwin"
+            assert runner._docker_verify_snapshot_holder_is_live({"pid": os.getpid(), "token": "non-linux"})
+
     def test_docker_snapshot_holder_requires_strong_process_identity_on_linux(
         self,
         monkeypatch: pytest.MonkeyPatch,
