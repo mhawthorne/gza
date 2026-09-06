@@ -1031,6 +1031,7 @@ class TaskQueryService:
             "verify_captured_at": verify_read_model.result.captured_at if verify_read_model is not None else None,
             "verify_branch": verify_read_model.result.reviewed_branch if verify_read_model is not None else None,
             "verify_head_sha": verify_read_model.result.reviewed_head_sha if verify_read_model is not None else None,
+            "verify_tree_sha": verify_read_model.result.reviewed_tree_sha if verify_read_model is not None else None,
             "verify_base_sha": verify_read_model.result.reviewed_base_sha if verify_read_model is not None else None,
             "verify_working_directory": (
                 verify_read_model.result.working_directory if verify_read_model is not None else None
@@ -1150,6 +1151,7 @@ class TaskQueryService:
             "verify_captured_at": verify_read_model.result.captured_at if verify_read_model is not None else None,
             "verify_branch": verify_read_model.result.reviewed_branch if verify_read_model is not None else None,
             "verify_head_sha": verify_read_model.result.reviewed_head_sha if verify_read_model is not None else None,
+            "verify_tree_sha": verify_read_model.result.reviewed_tree_sha if verify_read_model is not None else None,
             "verify_base_sha": verify_read_model.result.reviewed_base_sha if verify_read_model is not None else None,
             "verify_working_directory": (
                 verify_read_model.result.working_directory if verify_read_model is not None else None

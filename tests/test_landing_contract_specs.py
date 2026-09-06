@@ -131,7 +131,7 @@ def test_landing_writable_mode_requires_available_prerequisite_actions() -> None
 
     assert "MUST perform or exact-reuse deterministic prerequisites" in land_section
     assert "If the source does not contain the target tip, `land` MUST run or exact-reuse exactly one task-backed rebase" in prerequisites
-    assert "If evidence is absent or stale, writable `land` MUST run or exact-reuse the shared direct verify acquisition path" in prerequisites
+    assert "If evidence is absent or stale, writable `land` MUST run or canonically reuse the shared direct verify acquisition path" in prerequisites
     assert "writable `land` MUST create/run the exact task through the shared launch route" in prerequisites
     assert "If an exact pending spec-coherence task exists, `land` MUST run or exact-reuse that task" in prerequisites
     assert "Missing or stale required code/resolution review evidence" in prerequisites

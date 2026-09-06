@@ -74,12 +74,15 @@ def _failed_branch_implement(store, prompt="Historical failed owner", branch="fe
     return task
 
 
-def _fake_git(tmp_path, head_sha="head-current"):
+def _fake_git(tmp_path, head_sha="head-current", tree_sha: str | None = None):
     return SimpleNamespace(
         repo_dir=tmp_path,
         default_branch=MagicMock(return_value="main"),
         branch_exists=MagicMock(return_value=True),
         rev_parse_if_exists=MagicMock(return_value=head_sha),
+        resolve_refs=MagicMock(
+            return_value={"feature/verified-change": tree_sha} if tree_sha is not None else {}
+        ),
         can_merge=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         get_diff_name_status=MagicMock(return_value=""),
@@ -95,6 +98,7 @@ def _persist_verify(
     status,
     exit_status,
     head_sha="head-current",
+    tree_sha=None,
     path=None,
     captured_at=None,
     reviewed_branch=None,
@@ -111,6 +115,7 @@ def _persist_verify(
             captured_at=captured_at or datetime.now(UTC),
             reviewed_branch=task.branch if reviewed_branch is None else reviewed_branch,
             reviewed_head_sha=head_sha,
+            reviewed_tree_sha=tree_sha,
             reviewed_base_sha="base-sha",
             working_directory=str(config.project_dir),
             failure=None if status == "passed" else "verify failed",
@@ -221,14 +226,17 @@ def _verify_resolution_summary(resolved, decision):
     if result is not None:
         evidence_source = result.output_artifact_task_id or result.source_task_id
     epoch = decision.current_epoch
+    epoch_summary = {
+        "branch": epoch.reviewed_branch if epoch is not None else None,
+        "head": epoch.reviewed_head_sha if epoch is not None else None,
+        "command": epoch.verify_command if epoch is not None else None,
+    }
+    if epoch is not None and epoch.reviewed_tree_sha is not None:
+        epoch_summary["tree"] = epoch.reviewed_tree_sha
     return {
         "owner_id": resolved.merge_subject.id,
         "representative_id": resolved.execution_task.id,
-        "epoch": {
-            "branch": epoch.reviewed_branch if epoch is not None else None,
-            "head": epoch.reviewed_head_sha if epoch is not None else None,
-            "command": epoch.verify_command if epoch is not None else None,
-        },
+        "epoch": epoch_summary,
         "verdict": result.status if result is not None else None,
         "exit_status": result.exit_status if result is not None else None,
         "evidence_source": evidence_source,
@@ -371,6 +379,38 @@ def test_verify_current_green_is_noop_without_force(tmp_path, capsys):
     execute_action.assert_not_called()
     assert store.list_artifacts(task.id, kind=VERIFY_GATE_ARTIFACT_KIND) == before
     output = capsys.readouterr().out
+    assert "already passed for the current epoch" in output
+
+
+def test_verify_current_green_same_tree_rewrite_prints_tree_and_does_not_rerun(tmp_path, capsys):
+    config = _setup_verify_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_unmerged_task(store)
+    _persist_verify(
+        store,
+        config,
+        task,
+        status="passed",
+        exit_status="0",
+        head_sha="head-before-rewrite",
+        tree_sha="tree-same",
+        path="green-output.md",
+    )
+    git = _fake_git(tmp_path, head_sha="head-after-rewrite", tree_sha="tree-same")
+    before = store.list_artifacts(task.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+
+    with (
+        patch("gza.cli.verify.Git", return_value=git),
+        patch("gza.cli.verify.execute_advance_action") as execute_action,
+    ):
+        rc = cmd_verify(_args(tmp_path, task.id))
+
+    assert rc == 0
+    execute_action.assert_not_called()
+    assert store.list_artifacts(task.id, kind=VERIFY_GATE_ARTIFACT_KIND) == before
+    output = capsys.readouterr().out
+    assert "head=head-after-rewrite" in output
+    assert "tree=tree-same" in output
     assert "already passed for the current epoch" in output
 
 

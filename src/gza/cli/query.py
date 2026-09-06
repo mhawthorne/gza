@@ -210,6 +210,7 @@ _TASK_EXPLICIT_PROJECTION_FIELDS: tuple[str, ...] = (
     "verify_captured_at",
     "verify_branch",
     "verify_head_sha",
+    "verify_tree_sha",
     "verify_base_sha",
     "verify_working_directory",
     "verify_failure",
@@ -232,6 +233,7 @@ _INCOMPLETE_PROJECTION_FIELDS = (
     "verify_captured_at",
     "verify_branch",
     "verify_head_sha",
+    "verify_tree_sha",
     "verify_base_sha",
     "verify_working_directory",
     "verify_failure",
@@ -4986,6 +4988,11 @@ def _render_show_verify_section(
         console.print(
             f"[{c['label']}]Verify Head:[/{c['label']}] "
             f"[{c['value']}]{verify_result.reviewed_head_sha}[/{c['value']}]"
+        )
+    if verify_result is not None and verify_result.reviewed_tree_sha:
+        console.print(
+            f"[{c['label']}]Verify Tree:[/{c['label']}] "
+            f"[{c['value']}]{verify_result.reviewed_tree_sha}[/{c['value']}]"
         )
     if verify_result is not None and verify_result.reviewed_base_sha:
         console.print(

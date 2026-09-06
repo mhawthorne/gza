@@ -939,6 +939,7 @@ def test_task_projection_verify_fields_use_canonical_owner_artifact(tmp_path: Pa
             captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
             reviewed_branch=impl.branch,
             reviewed_head_sha="head-1",
+            reviewed_tree_sha="tree-1",
             reviewed_base_sha="base-1",
             working_directory="/tmp/verify-owner",
             failure=None,
@@ -955,12 +956,17 @@ def test_task_projection_verify_fields_use_canonical_owner_artifact(tmp_path: Pa
             limit=None,
             task_types=("implement",),
             projection=ProjectionSpec(
-                fields=("id", "verify_status", "verify_source", "verify_current"),
+                fields=("id", "verify_status", "verify_source", "verify_current", "verify_tree_sha"),
             ),
             presentation=PresentationSpec(mode="json"),
         ),
         config=config,
-        git=SimpleNamespace(rev_parse_if_exists=lambda ref: "head-1" if ref == impl.branch else None),
+        git=SimpleNamespace(
+            rev_parse_if_exists=lambda ref: "head-2" if ref == impl.branch else None,
+            resolve_refs=lambda refs, peel="commit": {
+                ref: "tree-1" if peel == "tree" and ref == impl.branch else None for ref in refs
+            },
+        ),
     )
 
     assert len(result.rows) == 1
@@ -969,6 +975,7 @@ def test_task_projection_verify_fields_use_canonical_owner_artifact(tmp_path: Pa
     assert row.values["verify_status"] == "passed"
     assert row.values["verify_source"] == "owner_artifact"
     assert row.values["verify_current"] is True
+    assert row.values["verify_tree_sha"] == "tree-1"
 
 
 def test_task_projection_verify_fields_use_owner_artifact_for_based_on_only_review(tmp_path: Path) -> None:

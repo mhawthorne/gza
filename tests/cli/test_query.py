@@ -6819,6 +6819,7 @@ class TestShowCommand:
                 captured_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
                 reviewed_branch=impl.branch,
                 reviewed_head_sha="deadbeef",
+                reviewed_tree_sha="tree-deadbeef",
                 reviewed_base_sha="cafebabe",
                 working_directory="/tmp/canonical-verify-worktree",
                 failure=None,
@@ -6838,6 +6839,8 @@ class TestShowCommand:
         assert "Verify Exit:" in result.stdout
         assert "Verify Branch:" in result.stdout
         assert "Verify Head:" in result.stdout
+        assert "Verify Tree:" in result.stdout
+        assert "tree-deadbeef" in result.stdout
         assert "Verify Base:" in result.stdout
         assert "Verify Cwd:" in result.stdout
         assert "Verify Artifact:" in result.stdout

@@ -465,12 +465,13 @@ epoch.
   terminal), lifecycle MUST fail closed with `needs_discussion`
   (`merge-source-needs-manual-resolution`) before any pre-review `verify_gate`,
   `create_review`, or `run_review` automation.
-- Missing or stale verify evidence for the current owner epoch MUST select `verify_gate`
-  first. Lifecycle MUST rerun verify before it creates a review for that head.
+- Missing or stale verify evidence for the current owner source epoch MUST select
+  `verify_gate` first. Lifecycle MUST rerun verify before it creates a review for that
+  source epoch.
 - Current non-budget red verify evidence before review MUST route into the `verify_fix`
   lane, not the review/improve lane, only after the preflight rebase guard below allows
   it. Lifecycle MUST create, reuse, run, or wait on one same-branch `verify_fix` task
-  keyed by the exact current verify epoch and implementation owner.
+  keyed by the current source verify epoch and implementation owner.
 - If the current verify evidence has `failure_origin == "timeout"` and persisted phase
   diagnostics show no failed phase, lifecycle MUST park with
   `verify-budget-exceeded` instead of creating a `verify_fix`. The gate remains
@@ -741,8 +742,8 @@ When a current review exists for the implementation lineage:
   no-op park applies only after ruling out rule B adjudication-eligible disputed
   non-verify CODE blockers. A no-op improve does not create new merge authority by
   itself: if lifecycle still lacks a current merge-permitting review plus current passing
-  verify evidence for the same head, the no-op improve limit MUST park rather than
-  auto-clear. If lifecycle cannot resolve the current branch head while checking
+  verify evidence for the same source epoch, the no-op improve limit MUST park rather
+  than auto-clear. If lifecycle cannot resolve the current branch head while checking
   freshness, it MUST still fail closed but surface that probe failure in the parked
   result instead of silently degrading to a generic no-op loop. When parallel sibling
   reviews exist on one implementation, lifecycle MUST attribute this park to the review
@@ -1104,7 +1105,7 @@ proven from current state:
   command MUST stop.
 - Current lifecycle verify evidence is green for the final live source verify epoch. If
   evidence is absent or stale, writable `land` MUST
-  run or exact-reuse the shared direct verify acquisition path when acquisition is
+  run or canonically reuse the shared direct verify acquisition path when acquisition is
   enabled and identity proof is available. It MUST refuse only for an enumerated
   inability: verify acquisition disabled, source/epoch or active-work identity conflict,
   launch/capacity failure, terminal worker failure, unavailable proof, exact

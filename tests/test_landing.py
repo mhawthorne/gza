@@ -2228,6 +2228,7 @@ class _FakeGit:
         self,
         heads: dict[str, str],
         *,
+        trees: dict[str, str] | None = None,
         current_branch: str = "main",
         dirty: bool = False,
         merged_refs: set[tuple[str, str]] | None = None,
@@ -2237,6 +2238,7 @@ class _FakeGit:
         diff: str = "diff --git a/example b/example\n+landing change\n",
     ) -> None:
         self.heads = heads
+        self.trees = trees or {}
         self._current_branch = current_branch
         self.dirty = dirty
         self.merged_refs = merged_refs or set()
@@ -2249,6 +2251,10 @@ class _FakeGit:
 
     def rev_parse_if_exists(self, ref: str) -> str | None:
         return self.heads.get(ref)
+
+    def resolve_refs(self, refs: tuple[str, ...] | list[str], peel: str = "commit") -> dict[str, str | None]:
+        source = self.trees if peel == "tree" else self.heads
+        return {ref: source.get(ref) for ref in refs}
 
     def current_branch(self) -> str:
         return self._current_branch
@@ -5601,6 +5607,7 @@ def _verify_result(
     *,
     status: str = "passed",
     head: str = "head-a",
+    tree: str | None = None,
     tree_fingerprint: str | None = TREE_A,
 ) -> SimpleNamespace:
     output = "verify output\n"
@@ -5613,6 +5620,7 @@ def _verify_result(
         captured_at=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
         reviewed_branch="feature/landing",
         reviewed_head_sha=head,
+        reviewed_tree_sha=tree,
         reviewed_base_sha="base-a",
         working_directory="/tmp/worktree",
         failure=None if status == "passed" else "failed",
@@ -5620,15 +5628,27 @@ def _verify_result(
     )
 
 
-def _decision(state: str, *, head: str = "head-a") -> VerifyGateDecision:
+def _decision(
+    state: str,
+    *,
+    head: str = "head-a",
+    tree: str | None = None,
+    result_head: str | None = None,
+    result_tree: str | None = None,
+) -> VerifyGateDecision:
     epoch = make_verify_epoch(
         reviewed_branch="feature/landing",
         reviewed_head_sha=head,
+        reviewed_tree_sha=tree,
         verify_command="./bin/tests",
         verify_timeout_seconds=120,
         verify_timeout_grace_seconds=5.0,
     )
-    result = None if state in {"missing", "stale"} else _verify_result(status=state, head=head)
+    result = None if state in {"missing", "stale"} else _verify_result(
+        status=state,
+        head=result_head or head,
+        tree=result_tree if result_tree is not None else tree,
+    )
     return VerifyGateDecision(
         owner_task_id="gza-1",
         current_epoch=epoch,
@@ -5668,6 +5688,66 @@ def test_inspect_current_landing_verify_blocks_omitted_or_blank_live_tree(tmp_pa
     assert evidence.tree_fingerprint == TREE_A
 
 
+def test_inspect_current_landing_verify_accepts_same_tree_artifact_after_commit_rewrite(tmp_path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = _verify_config(tmp_path)
+    impl = store.add("Implement landing verify same tree", task_type="implement")
+    impl.status = "completed"
+    impl.branch = "feature/landing"
+    store.update(impl)
+    _persist_lifecycle_verify_for_landing(
+        store,
+        config,
+        impl,
+        reviewed_head="head-a",
+        reviewed_tree="tree-same",
+    )
+
+    evidence = inspect_current_landing_verify_evidence(
+        store,
+        impl,
+        config=config,
+        git=_FakeGit({"feature/landing": "head-b"}, trees={"feature/landing": "tree-same"}),
+        source_head="head-b",
+        tree_fingerprint=TREE_A,
+    )
+
+    assert evidence.status == "passed"
+    assert evidence.current is True
+    assert evidence.identity_matched is True
+    assert '"head":"head-b"' in (evidence.epoch or "")
+    assert '"tree":"tree-same"' in (evidence.epoch or "")
+
+
+def test_inspect_current_landing_verify_rejects_legacy_missing_tree_after_commit_rewrite(tmp_path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = _verify_config(tmp_path)
+    impl = store.add("Implement landing verify legacy stale", task_type="implement")
+    impl.status = "completed"
+    impl.branch = "feature/landing"
+    store.update(impl)
+    _persist_lifecycle_verify_for_landing(
+        store,
+        config,
+        impl,
+        reviewed_head="head-a",
+        reviewed_tree=None,
+    )
+
+    evidence = inspect_current_landing_verify_evidence(
+        store,
+        impl,
+        config=config,
+        git=_FakeGit({"feature/landing": "head-b"}, trees={"feature/landing": "tree-same"}),
+        source_head="head-b",
+        tree_fingerprint=TREE_A,
+    )
+
+    assert evidence.status == "stale"
+    assert evidence.current is False
+    assert evidence.identity_matched is False
+
+
 def test_inspect_current_landing_verify_requires_canonical_owner_artifact_not_rebase_verify(tmp_path) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
     config = _verify_config(tmp_path)
@@ -5702,6 +5782,8 @@ def _persist_lifecycle_verify_for_landing(
     config: Config,
     impl,
     *,
+    reviewed_head: str = "head-a",
+    reviewed_tree: str | None = None,
     aggregate_tree: str | None = TREE_A,
     project_trees: tuple[str | None, ...] = (),
     consumed_verify_fix_task=None,
@@ -5712,7 +5794,8 @@ def _persist_lifecycle_verify_for_landing(
         exit_status="0",
         captured_at=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
         reviewed_branch="feature/landing",
-        reviewed_head_sha="head-a",
+        reviewed_head_sha=reviewed_head,
+        reviewed_tree_sha=reviewed_tree,
         reviewed_base_sha="base-a",
         working_directory="/tmp/worktree",
         failure=None,

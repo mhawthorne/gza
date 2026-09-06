@@ -39,6 +39,7 @@ def _format_epoch(decision: VerifyGateDecision) -> str:
     return (
         f"epoch: branch={epoch.reviewed_branch or '<unknown>'} "
         f"head={epoch.reviewed_head_sha or '<unknown>'} "
+        f"tree={epoch.reviewed_tree_sha or '<unknown>'} "
         f"command={epoch.verify_command or '<none>'}"
     )
 

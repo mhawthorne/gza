@@ -56,7 +56,12 @@ from gza.review_verdict import (
     parse_review_report,
     summarize_review_blockers,
 )
-from gza.review_verify_state import VerifyGateDecision, resolve_verify_gate_decision
+from gza.review_verify_state import (
+    VerifyGateDecision,
+    make_verify_epoch,
+    resolve_verify_gate_decision,
+    verify_epoch_matches,
+)
 from gza.runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND, _compute_tree_fingerprint
 from gza.sync_ops import BranchSyncResult, reconcile_task_branch_merge_truth
 from gza.watch_progress import review_matches_create_review_action
@@ -3015,6 +3020,16 @@ def _landing_verify_evidence_from_decision(
     identity_matched = current
     if expected_source_head is not None:
         identity_matched = identity_matched and epoch is not None and epoch.reviewed_head_sha == expected_source_head
+    if identity_matched and result is not None and epoch is not None:
+        result_epoch = make_verify_epoch(
+            reviewed_branch=result.reviewed_branch,
+            reviewed_head_sha=result.reviewed_head_sha,
+            reviewed_tree_sha=result.reviewed_tree_sha,
+            verify_command=result.command,
+            verify_timeout_seconds=epoch.verify_timeout_seconds,
+            verify_timeout_grace_seconds=epoch.verify_timeout_grace_seconds,
+        )
+        identity_matched = verify_epoch_matches(expected=epoch, candidate=result_epoch)
     if expected_gate_identity is not None:
         identity_matched = identity_matched and gate_identity == expected_gate_identity
     identity_matched = identity_matched and expected_tree is not None and tree_fingerprint == expected_tree
