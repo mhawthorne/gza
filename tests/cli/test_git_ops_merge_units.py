@@ -1436,7 +1436,7 @@ def test_merge_removed_rebase_flags_refuse_before_terminal_planning_can_persist_
 @pytest.mark.parametrize(
     ("executor_status", "executor_message"),
     [
-        ("success", "Verify gate passed for the current tip before merge."),
+        ("success", "Verify gate passed for the current source epoch before merge."),
         ("skip", "SKIP: verify gate remained failed; merge is blocked."),
         ("skip", "SKIP: could not run or persist the verify gate for owner testproject-1; merge is blocked."),
     ],
@@ -1540,7 +1540,7 @@ def test_manual_merge_after_verify_fix_rearm_refreshes_pre_merge_gate(
     assert "review is blocked" not in result.stdout
     if executor_status == "success":
         assert result.returncode == 0
-        assert "Verify gate passed for the current tip before merge." in result.stdout
+        assert "Verify gate passed for the current source epoch before merge." in result.stdout
         assert fake_git.merged == [(f"feature/manual-rearm-{verify_fix_shape}", False)]
     else:
         assert result.returncode == 1

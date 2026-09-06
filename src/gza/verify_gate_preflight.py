@@ -21,6 +21,7 @@ class VerifyGatePreflightProvenance:
     target_branch: str
     target_tip_sha: str
     failed_captured_at: str | None = None
+    reviewed_tree_sha: str | None = None
 
 
 def append_verify_gate_preflight_provenance(
@@ -34,6 +35,7 @@ def append_verify_gate_preflight_provenance(
             f"Implementation owner task: {provenance.owner_task_id}",
             f"Reviewed branch: {provenance.reviewed_branch}",
             f"Reviewed head SHA: {provenance.reviewed_head_sha}",
+            f"Reviewed tree SHA: {provenance.reviewed_tree_sha or ''}",
             f"Verify command: {provenance.verify_command}",
             f"Verify timeout seconds: {_format_optional(provenance.verify_timeout_seconds)}",
             f"Verify timeout grace seconds: {_format_optional(provenance.verify_timeout_grace_seconds)}",
@@ -73,6 +75,7 @@ def parse_verify_gate_preflight_provenance(
     owner_task_id = fields.get("implementation owner task")
     reviewed_branch = fields.get("reviewed branch")
     reviewed_head_sha = fields.get("reviewed head sha")
+    reviewed_tree_sha = fields.get("reviewed tree sha")
     verify_command = fields.get("verify command")
     target_branch = fields.get("target branch")
     target_tip_sha = fields.get("target tip sha")
@@ -95,6 +98,7 @@ def parse_verify_gate_preflight_provenance(
         owner_task_id=owner_task_id,
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
+        reviewed_tree_sha=reviewed_tree_sha or None,
         verify_command=verify_command,
         verify_timeout_seconds=_parse_optional_int(fields.get("verify timeout seconds")),
         verify_timeout_grace_seconds=_parse_optional_float(fields.get("verify timeout grace seconds")),

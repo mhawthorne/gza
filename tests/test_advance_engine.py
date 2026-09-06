@@ -48,6 +48,7 @@ from gza.advance_engine import (
     resolve_post_merge_rebase_state,
     resolve_review_cycle_accounting,
     resolve_subject_task,
+    _verify_gate_preflight_provenance_matches_current,
 )
 from gza.artifacts import store_command_output_artifact
 from gza.config import Config
@@ -789,6 +790,7 @@ def _add_matching_verify_gate_preflight_provenance(
     impl: DbTask,
     *,
     reviewed_head_sha: str = "verify-head",
+    reviewed_tree_sha: str | None = None,
     target_tip_sha: str = "target-head",
     target_branch: str = "main",
 ) -> DbTask:
@@ -800,6 +802,7 @@ def _add_matching_verify_gate_preflight_provenance(
             owner_task_id=impl.id,
             reviewed_branch=impl.branch,
             reviewed_head_sha=reviewed_head_sha,
+            reviewed_tree_sha=reviewed_tree_sha,
             verify_command="./bin/tests",
             verify_timeout_seconds=120,
             verify_timeout_grace_seconds=5.0,
@@ -6018,6 +6021,107 @@ def test_opt_in_on_max_cycles_with_green_verify_emits_annotated_merge_action(
     assert action["max_cycles_audit"]["verify_gate_state"] == "passed"
     assert action["max_cycles_audit"]["verify_epoch"].reviewed_head_sha == "current-sha"
     assert "needs_attention_reason" not in action
+
+
+def test_passed_verify_gate_same_tree_different_head_allows_post_verify_merge(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/same-tree-green-verify",
+        when=datetime(2026, 8, 18, 10, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 18, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="commit-a",
+            reviewed_tree_sha="tree-same",
+            reviewed_base_sha="base-sha",
+            working_directory=str(tmp_path),
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "commit-b", "main": "base-sha"},
+        resolved_tree_shas={impl.branch: "tree-same"},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.verify_gate_decision is not None
+    assert ctx.verify_gate_decision.state == "passed"
+    assert action["type"] == "merge"
+
+
+def test_passed_verify_gate_different_tree_different_head_schedules_verify_gate(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/different-tree-green-verify",
+        when=datetime(2026, 8, 18, 10, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 18, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="commit-a",
+            reviewed_tree_sha="tree-a",
+            reviewed_base_sha="base-sha",
+            working_directory=str(tmp_path),
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "commit-b", "main": "base-sha"},
+        resolved_tree_shas={impl.branch: "tree-b"},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
+    assert action["verify_gate_state"] == "stale"
 
 
 def test_merge_and_defer_audit_preserves_completed_review_cycles_above_cap(
@@ -28748,6 +28852,67 @@ def test_pre_review_failed_verify_rebase_head_advance_requests_fresh_verify_then
     assert third_action["verify_gate_phase"] == "pre_review"
     assert third_action["verify_epoch"].reviewed_head_sha == "verify-head-b"
     assert third_action["based_on_task"].id == impl.id
+
+
+def test_verify_gate_preflight_provenance_matches_same_tree_different_head() -> None:
+    owner = SimpleNamespace(id="gza-1", branch="feature/preflight-same-tree")
+    current_epoch = VerifyEpoch(
+        reviewed_branch="feature/preflight-same-tree",
+        reviewed_head_sha="commit-b",
+        reviewed_tree_sha="tree-same",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    provenance = VerifyGatePreflightProvenance(
+        owner_task_id="gza-1",
+        reviewed_branch="feature/preflight-same-tree",
+        reviewed_head_sha="commit-a",
+        reviewed_tree_sha="tree-same",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        target_branch="main",
+        target_tip_sha="target-head",
+    )
+
+    assert _verify_gate_preflight_provenance_matches_current(
+        provenance,
+        owner_task=owner,
+        current_epoch=current_epoch,
+        target_branch="main",
+        target_tip_sha="target-head",
+    )
+
+
+def test_verify_gate_preflight_provenance_rejects_changed_head_without_tree_proof() -> None:
+    owner = SimpleNamespace(id="gza-1", branch="feature/preflight-missing-tree")
+    current_epoch = VerifyEpoch(
+        reviewed_branch="feature/preflight-missing-tree",
+        reviewed_head_sha="commit-b",
+        reviewed_tree_sha="tree-b",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    provenance = VerifyGatePreflightProvenance(
+        owner_task_id="gza-1",
+        reviewed_branch="feature/preflight-missing-tree",
+        reviewed_head_sha="commit-a",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        target_branch="main",
+        target_tip_sha="target-head",
+    )
+
+    assert not _verify_gate_preflight_provenance_matches_current(
+        provenance,
+        owner_task=owner,
+        current_epoch=current_epoch,
+        target_branch="main",
+        target_tip_sha="target-head",
+    )
 
 
 def test_pre_review_failed_verify_new_epoch_gets_one_preflight_then_parks(tmp_path: Path) -> None:

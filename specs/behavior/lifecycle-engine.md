@@ -1535,7 +1535,7 @@ command may target parked owners with reason class `backstop`
   and reason so the next shared recovery evaluation measures retry budget from that epoch
   instead of lifetime history.
 - For `verify-fix-failed`, it MUST record one durable manual-rearm epoch for the owner so
-  the next shared lifecycle evaluation reruns the verify gate at the current head before
+  the next shared lifecycle evaluation reruns the verify gate at the current source epoch before
   considering the completed same-epoch `verify_fix` terminal again.
 - Plain `uv run gza unstick` MUST remain clear-only and MUST NOT start workers itself.
 - `uv run gza unstick --run` MAY immediately dispatch only the owners it just cleared, but

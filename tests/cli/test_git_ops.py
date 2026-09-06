@@ -1804,7 +1804,7 @@ def test_merge_single_task_runs_shared_verify_gate_before_merge(tmp_path: Path) 
             return_value=AdvanceActionExecutionResult(
                 action_type="verify_gate",
                 status="success",
-                success_message="Verify gate passed for the current tip before merge.",
+                success_message="Verify gate passed for the current source epoch before merge.",
                 work_done=True,
             ),
         ) as execute_action,

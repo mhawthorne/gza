@@ -6751,13 +6751,28 @@ def _verify_gate_preflight_provenance_matches_current(
         return False
     if provenance.owner_task_id != owner_task.id:
         return False
-    if provenance.reviewed_branch != (current_epoch.reviewed_branch or owner_task.branch):
-        return False
-    if provenance.reviewed_head_sha != current_epoch.reviewed_head_sha:
+    provenance_epoch = make_verify_epoch(
+        reviewed_branch=provenance.reviewed_branch,
+        reviewed_head_sha=provenance.reviewed_head_sha,
+        reviewed_tree_sha=provenance.reviewed_tree_sha,
+        verify_command=provenance.verify_command,
+        verify_timeout_seconds=provenance.verify_timeout_seconds,
+        verify_timeout_grace_seconds=provenance.verify_timeout_grace_seconds,
+    )
+    expected_epoch = make_verify_epoch(
+        reviewed_branch=current_epoch.reviewed_branch or owner_task.branch,
+        reviewed_head_sha=current_epoch.reviewed_head_sha,
+        reviewed_tree_sha=getattr(current_epoch, "reviewed_tree_sha", None),
+        verify_command=getattr(current_epoch, "verify_command", None),
+        verify_timeout_seconds=getattr(current_epoch, "verify_timeout_seconds", None),
+        verify_timeout_grace_seconds=getattr(current_epoch, "verify_timeout_grace_seconds", None),
+    )
+    if not verify_epoch_matches(expected=expected_epoch, candidate=provenance_epoch):
         return False
     # verify_command/timeout/grace are recorded provenance only, not consumption
-    # identity: the canonical verify epoch is defined solely by reviewed branch
-    # and head, so config drift after a same-head preflight must not reopen it.
+    # identity: the canonical verify epoch is defined by reviewed branch plus
+    # exact head or exact tree proof, so config drift after a same-source
+    # preflight must not reopen it.
     return provenance.target_branch == target_branch and provenance.target_tip_sha == target_tip_sha
 
 
@@ -6778,6 +6793,7 @@ def _verify_gate_preflight_payload(
         owner_task_id=owner_task.id,
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=current_epoch.reviewed_head_sha,
+        reviewed_tree_sha=current_epoch.reviewed_tree_sha,
         verify_command=current_epoch.verify_command,
         verify_timeout_seconds=current_epoch.verify_timeout_seconds,
         verify_timeout_grace_seconds=current_epoch.verify_timeout_grace_seconds,
@@ -6791,6 +6807,7 @@ def _verify_gate_preflight_payload(
         "owner_task_id": provenance.owner_task_id,
         "reviewed_branch": provenance.reviewed_branch,
         "reviewed_head_sha": provenance.reviewed_head_sha,
+        "reviewed_tree_sha": provenance.reviewed_tree_sha,
         "verify_command": provenance.verify_command,
         "verify_timeout_seconds": provenance.verify_timeout_seconds,
         "verify_timeout_grace_seconds": provenance.verify_timeout_grace_seconds,

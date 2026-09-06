@@ -303,7 +303,7 @@ def test_verify_red_epoch_that_becomes_green_records_pass_and_exits_zero(tmp_pat
         return AdvanceActionExecutionResult(
             action_type="verify_gate",
             status="success",
-            success_message="Verify gate passed for the current tip before merge.",
+            success_message="Verify gate passed for the current source epoch before merge.",
             work_done=True,
         )
 
@@ -515,7 +515,7 @@ def test_verify_merge_unit_newer_contributor_red_rerun_can_clear_block(tmp_path,
             return AdvanceActionExecutionResult(
                 action_type="verify_gate",
                 status="success",
-                success_message="Verify gate passed for the current tip before merge.",
+                success_message="Verify gate passed for the current source epoch before merge.",
                 work_done=True,
             )
         return advance_executor.execute_advance_action(task=task, action=action, context=context)
@@ -530,7 +530,7 @@ def test_verify_merge_unit_newer_contributor_red_rerun_can_clear_block(tmp_path,
     assert normal_rc == 0
     assert action_types == ["reconcile_verify_gate_evidence", "verify_gate"]
     assert "Recredited current merge-unit verify gate evidence (failed)" in normal_output
-    assert "Verify gate passed for the current tip before merge." in normal_output
+    assert "Verify gate passed for the current source epoch before merge." in normal_output
     assert "Verify gate: passed" in normal_output
     assert "artifact: owner-rerun-green.md" in normal_output
     refreshed_owner = store.get(owner.id)
@@ -1281,7 +1281,7 @@ def test_verify_force_new_failed_artifact_cannot_reuse_later_pre_existing_green(
         return AdvanceActionExecutionResult(
             action_type="verify_gate",
             status="success",
-            success_message="Verify gate passed for the current tip before merge.",
+            success_message="Verify gate passed for the current source epoch before merge.",
             work_done=True,
             handled_task_id=owner.id,
         )
@@ -1294,7 +1294,7 @@ def test_verify_force_new_failed_artifact_cannot_reuse_later_pre_existing_green(
 
     output = capsys.readouterr().out
     assert rc == 1
-    assert "Verify gate passed for the current tip before merge." in output
+    assert "Verify gate passed for the current source epoch before merge." in output
     assert "Pre-existing verify gate evidence: passed" in output
     assert "artifact: old-green-output.md" in output
     assert "Forced verify rerun did not produce new current green evidence." in output
@@ -1321,7 +1321,7 @@ def test_verify_force_new_green_evidence_exits_zero(tmp_path, capsys):
         return AdvanceActionExecutionResult(
             action_type="verify_gate",
             status="success",
-            success_message="Verify gate passed for the current tip before merge.",
+            success_message="Verify gate passed for the current source epoch before merge.",
             work_done=True,
         )
 
@@ -1367,7 +1367,7 @@ def test_verify_force_uses_representative_owner_for_fresh_green_evidence(tmp_pat
         return AdvanceActionExecutionResult(
             action_type="verify_gate",
             status="success",
-            success_message="Verify gate passed for the current tip before merge.",
+            success_message="Verify gate passed for the current source epoch before merge.",
             work_done=True,
             handled_task_id=verify_owner.id,
         )

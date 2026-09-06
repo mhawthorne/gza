@@ -14337,7 +14337,7 @@ class TestIterateCommand:
             return AdvanceActionExecutionResult(
                 action_type="verify_gate",
                 status="success",
-                success_message="Verify gate passed for the current tip before review.",
+                success_message="Verify gate passed for the current source epoch before review.",
             )
 
         with (
@@ -16296,7 +16296,7 @@ class TestIterateCommand:
         assert len(verify_calls) == 1
         assert mock_git.worktree_add_existing.call_count == 1
         assert "Next action: verify_gate" in output
-        assert "Verify gate passed for the current tip before review." in output
+        assert "Verify gate passed for the current source epoch before review." in output
         assert "Iteration 1/1: create_review" in output
         assert "Iterate complete: APPROVED" in output
 
@@ -17127,7 +17127,7 @@ class TestIterateCommand:
         assert result == 3
         assert len(verify_calls) == 1
         assert "Next action: verify_gate" in inner_output
-        assert "Verify gate passed for the current tip before review." in inner_output
+        assert "Verify gate passed for the current source epoch before review." in inner_output
 
     def test_iterate_force_recovered_lineage_wait_improve_keeps_blocked_exit(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -17647,7 +17647,7 @@ class TestIterateCommand:
         assert len(verify_calls) == 1
         assert head_decision.state == "passed"
         assert "Next action: verify_gate" in inner_output
-        assert "Verify gate passed for the current tip before review." in inner_output
+        assert "Verify gate passed for the current source epoch before review." in inner_output
 
     def test_iterate_background_force_prepared_recovered_lineage_no_review_goes_merge_ready(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -20797,7 +20797,7 @@ class TestIterateCommand:
             return AdvanceActionExecutionResult(
                 action_type="verify_gate",
                 status="success",
-                success_message="Verify gate already passed for the current tip before merge.",
+                success_message="Verify gate already passed for the current source epoch before merge.",
             )
 
         with (
@@ -25279,7 +25279,7 @@ class TestIterateCommand:
             return AdvanceActionExecutionResult(
                 action_type="verify_gate",
                 status="success",
-                success_message="Verify gate passed for the current tip before review.",
+                success_message="Verify gate passed for the current source epoch before review.",
             )
 
         args = argparse.Namespace(

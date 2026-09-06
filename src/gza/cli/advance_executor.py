@@ -289,10 +289,12 @@ def _persist_verify_gate_preflight_rebase_provenance(
     timeout_value = payload.get("verify_timeout_seconds")
     grace_value = payload.get("verify_timeout_grace_seconds")
     failed_captured_at_value = payload.get("failed_captured_at")
+    reviewed_tree_sha_value = payload.get("reviewed_tree_sha")
     provenance = VerifyGatePreflightProvenance(
         owner_task_id=str(payload.get("owner_task_id") or ""),
         reviewed_branch=str(payload.get("reviewed_branch") or ""),
         reviewed_head_sha=str(payload.get("reviewed_head_sha") or ""),
+        reviewed_tree_sha=reviewed_tree_sha_value if isinstance(reviewed_tree_sha_value, str) else None,
         verify_command=str(payload.get("verify_command") or ""),
         verify_timeout_seconds=timeout_value if isinstance(timeout_value, int) else None,
         verify_timeout_grace_seconds=(
@@ -1346,7 +1348,7 @@ def _execute_verify_gate(
         return AdvanceActionExecutionResult(
             action_type=action_type,
             status="success",
-            success_message=f"Verify gate already passed for the current tip before {phase_label}.",
+            success_message=f"Verify gate already passed for the current source epoch before {phase_label}.",
             handled_task_id=owner_task.id,
         )
     if decision.state in {"failed", "unavailable"} and not explicit_refresh:
@@ -1519,7 +1521,7 @@ def _execute_verify_gate(
             return AdvanceActionExecutionResult(
                 action_type=action_type,
                 status="success",
-                success_message=f"Verify gate passed for the current tip before {phase_label}.",
+                success_message=f"Verify gate passed for the current source epoch before {phase_label}.",
                 work_done=True,
                 handled_task_id=owner_task.id,
                 created_task=refreshed_owner_task or owner_task,

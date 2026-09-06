@@ -5335,6 +5335,100 @@ def test_verify_gate_cached_pass_with_mismatched_subject_head_runs_verify(tmp_pa
     assert store.list_artifacts(followup.id, kind=VERIFY_GATE_ARTIFACT_KIND)
 
 
+def test_verify_gate_cached_pass_same_tree_different_subject_head_skips_verify(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    followup = store.add("Follow-up implementation", task_type="implement")
+    assert followup.id is not None
+    _mark_completed(followup, branch="feature/cached-pass-same-tree")
+    store.update(followup)
+
+    heads = {
+        followup.branch: "subject-head",
+        "main": "base-1",
+        "origin/main": "base-1",
+    }
+    added_refs: list[str] = []
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda ref: heads.get(ref),
+        resolve_refs=lambda refs, peel="commit": {
+            ref: "tree-same" if peel == "tree" and ref == followup.branch else None for ref in refs
+        },
+        worktree_add_existing=lambda _path, ref, detach=True: added_refs.append(ref),
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+    cached_pass = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 8, 17, 10, 10, tzinfo=UTC),
+        reviewed_branch=followup.branch,
+        reviewed_head_sha="cached-head",
+        reviewed_tree_sha="tree-same",
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+    )
+    same_tree_decision = SimpleNamespace(
+        state="passed",
+        current_epoch=VerifyEpoch(
+            reviewed_branch=followup.branch,
+            reviewed_head_sha="subject-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        ),
+        lookup=SimpleNamespace(result=cached_pass),
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
+    )
+
+    with (
+        patch("gza.cli.advance_executor.resolve_verify_gate_decision", return_value=same_tree_decision),
+        patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")),
+    ):
+        result = execute_advance_action(
+            task=followup,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before review",
+                "verify_gate_phase": "pre_review",
+                "verify_owner_task": followup,
+            },
+            context=context,
+        )
+
+    assert result.status == "success"
+    assert result.work_done is False
+    assert result.success_message == "Verify gate already passed for the current source epoch before review."
+    assert added_refs == []
+
+
 def _write_verify_gate_cross_project_configs(root: Path, worktree: Path) -> Config:
     root_config_text = (
         "project_name: root\n"
@@ -8556,6 +8650,7 @@ def test_needs_rebase_verify_gate_preflight_persists_matching_provenance(
                 "owner_task_id": impl.id,
                 "reviewed_branch": impl.branch,
                 "reviewed_head_sha": "verify-head",
+                "reviewed_tree_sha": "verify-tree",
                 "verify_command": "./bin/tests",
                 "verify_timeout_seconds": 120,
                 "verify_timeout_grace_seconds": 5.0,
@@ -8575,6 +8670,7 @@ def test_needs_rebase_verify_gate_preflight_persists_matching_provenance(
     assert provenance is not None
     assert provenance.owner_task_id == impl.id
     assert provenance.reviewed_head_sha == "verify-head"
+    assert provenance.reviewed_tree_sha == "verify-tree"
     assert provenance.target_branch == "main"
     assert provenance.target_tip_sha == "target-head"
 
