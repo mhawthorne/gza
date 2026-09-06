@@ -3140,14 +3140,10 @@ def _verify_snapshot_subprocess_path(
     cwd: Path,
     snapshot_path: Path,
 ) -> Path:
-    if not bool(getattr(config, "use_docker", False)):
-        return snapshot_path
-    try:
-        relative_snapshot_path = snapshot_path.relative_to(cwd)
-    except ValueError:
-        return snapshot_path
-    docker_workdir = Path(str(getattr(config, "docker_workdir", "/workspace") or "/workspace"))
-    return docker_workdir / relative_snapshot_path
+    # The canonical verify launcher below is a host-side Popen boundary even
+    # when the configured provider uses Docker. Container-visible paths belong
+    # only to an actual container launch adapter.
+    return snapshot_path
 
 
 def _prepare_docker_verify_snapshot_permissions(
@@ -3163,6 +3159,12 @@ def _prepare_docker_verify_snapshot_permissions(
         lease = _acquire_docker_verify_snapshot_traversal_lease(path, state_path=state_path)
         if lease is not None:
             traversal_leases.append(lease)
+    snapshot_gid = tmp_dir.stat().st_gid
+    for path in (tmp_dir, snapshot_path):
+        try:
+            os.chown(path, -1, snapshot_gid)
+        except PermissionError:
+            pass
     tmp_dir.chmod(0o730)
     snapshot_path.chmod(0o660)
     required_gids: set[int] = set()
@@ -3177,6 +3179,7 @@ def disposable_verify_db_snapshot_env(
     *,
     cwd: Path,
     config: Config | object | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> Iterator[VerifyDbSnapshotEnvironment]:
     """Yield a runtime env routed to a private writable SQLite backup for verify."""
     source_db_path = runtime_context.db_path
@@ -3208,12 +3211,16 @@ def disposable_verify_db_snapshot_env(
             cwd=cwd,
             snapshot_path=snapshot_path,
         )
-        env = dict(runtime_context.env)
-        env["GZA_DB_PATH"] = str(subprocess_path)
+        snapshot_env = dict(runtime_context.env)
+        if "HOME" not in snapshot_env and "HOME" in os.environ:
+            snapshot_env["HOME"] = os.environ["HOME"]
+        if env is not None:
+            snapshot_env.update(env)
+        snapshot_env["GZA_DB_PATH"] = str(subprocess_path)
         if docker_group_ids:
-            env["GZA_DOCKER_GROUP_ADD"] = ",".join(str(gid) for gid in docker_group_ids)
+            snapshot_env["GZA_DOCKER_GROUP_ADD"] = ",".join(str(gid) for gid in docker_group_ids)
         yield VerifyDbSnapshotEnvironment(
-            env=env,
+            env=snapshot_env,
             host_path=snapshot_path,
             subprocess_path=subprocess_path,
             docker_group_ids=docker_group_ids,
@@ -6347,6 +6354,8 @@ def _monitored_review_verify_process_pipe_drain(
                 stderr=stderr,
                 heartbeat=heartbeat,
             )
+    if wait_for_process_group and selector.get_map():
+        return False
     return exited or not _review_verify_process_group_alive(process)
 
 
@@ -6971,6 +6980,8 @@ def _run_review_verify_command(
     *,
     cwd: Path,
     env: Mapping[str, str] | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
+    config: Config | object | None = None,
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
     reviewed_tree_sha: str | None = None,
@@ -6982,20 +6993,23 @@ def _run_review_verify_command(
     on_heartbeat: LongPhaseHeartbeat | None = None,
 ) -> ReviewVerifyResult:
     """Compatibility wrapper for legacy review-specific verify execution."""
-    return _run_verify_command(
-        verify_command,
-        cwd=cwd,
-        env=env,
-        reviewed_branch=reviewed_branch,
-        reviewed_head_sha=reviewed_head_sha,
-        reviewed_tree_sha=reviewed_tree_sha,
-        reviewed_base_sha=reviewed_base_sha,
-        timeout_seconds=timeout_seconds,
-        timeout_grace_seconds=timeout_grace_seconds,
-        heartbeat_threshold_seconds=heartbeat_threshold_seconds,
-        heartbeat_interval_seconds=heartbeat_interval_seconds,
-        on_heartbeat=on_heartbeat,
-    )
+    if runtime_context is None:
+        raise ValueError("runtime_context is required for isolated verify DB routing")
+    with disposable_verify_db_snapshot_env(runtime_context, cwd=cwd, config=config, env=env) as snapshot:
+        return _run_verify_command(
+            verify_command,
+            cwd=cwd,
+            env=snapshot.env,
+            reviewed_branch=reviewed_branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_tree_sha=reviewed_tree_sha,
+            reviewed_base_sha=reviewed_base_sha,
+            timeout_seconds=timeout_seconds,
+            timeout_grace_seconds=timeout_grace_seconds,
+            heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            on_heartbeat=on_heartbeat,
+        )
 
 
 def _status_has_tracked_source_changes(
@@ -7441,19 +7455,19 @@ def _run_verify_commands_for_projects(
         if budget_margin_failure is not None:
             result = budget_margin_failure
         else:
+            project_runtime_context = (
+                runtime_context
+                if runtime_context is not None
+                and project.config.project_id == config.project_id
+                and project.scope_root == owning_scope_root
+                else project.runtime_context
+            )
             result = _run_review_verify_command(
                 project.verify_command,
                 cwd=project_cwd,
-                env=normalize_subprocess_env(
-                    (
-                        runtime_context.env
-                        if runtime_context is not None
-                        and project.config.project_id == config.project_id
-                        and project.scope_root == owning_scope_root
-                        else project.runtime_context.env
-                    ),
-                    project_cwd,
-                ),
+                env=normalize_subprocess_env(project_runtime_context.env, project_cwd),
+                runtime_context=project_runtime_context,
+                config=project.config,
                 reviewed_branch=reviewed_branch,
                 reviewed_head_sha=reviewed_head_sha,
                 reviewed_tree_sha=reviewed_tree_sha,
@@ -7629,6 +7643,8 @@ def _run_lifecycle_verify(
         verify_command,
         cwd=cwd,
         env=normalize_subprocess_env(runtime_context.env, cwd),
+        runtime_context=runtime_context,
+        config=config,
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
         reviewed_tree_sha=reviewed_tree_sha,

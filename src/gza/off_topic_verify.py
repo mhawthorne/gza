@@ -14,8 +14,10 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
+    from gza.config import Config
     from gza.git import Git
     from gza.runner import ReviewVerifyResult
+    from gza.runtime_context import RuntimeExecutionContext
 
 
 VerifyFailureUnavailableReason = Literal[
@@ -647,6 +649,8 @@ def run_local_target_baseline_plan(
     worktree_root: Path,
     timeout_seconds: int,
     timeout_grace_seconds: float,
+    runtime_context: RuntimeExecutionContext | None = None,
+    config: Config | object | None = None,
     run_verify_command: Callable[..., ReviewVerifyResult] | None = None,
 ) -> LocalTargetBaselineRun:
     """Execute a previously planned local-target rerun inside a detached target worktree."""
@@ -667,17 +671,34 @@ def run_local_target_baseline_plan(
         )
         if not target_cwd.exists() or not target_cwd.is_dir():
             raise FileNotFoundError(f"local-target baseline cwd does not exist: {target_cwd}")
-        results = tuple(
-            verify_runner(
-                plan.command,
-                cwd=target_cwd,
-                reviewed_branch=plan.target_branch,
-                reviewed_head_sha=plan.target_head_sha,
-                timeout_seconds=timeout_seconds,
-                timeout_grace_seconds=timeout_grace_seconds,
+        if run_verify_command is None and runtime_context is None:
+            raise ValueError("runtime_context is required for local-target baseline verify isolation")
+        if run_verify_command is None:
+            results = tuple(
+                verify_runner(
+                    plan.command,
+                    cwd=target_cwd,
+                    runtime_context=runtime_context,
+                    config=config,
+                    reviewed_branch=plan.target_branch,
+                    reviewed_head_sha=plan.target_head_sha,
+                    timeout_seconds=timeout_seconds,
+                    timeout_grace_seconds=timeout_grace_seconds,
+                )
+                for _ in range(plan.run_count)
             )
-            for _ in range(plan.run_count)
-        )
+        else:
+            results = tuple(
+                verify_runner(
+                    plan.command,
+                    cwd=target_cwd,
+                    reviewed_branch=plan.target_branch,
+                    reviewed_head_sha=plan.target_head_sha,
+                    timeout_seconds=timeout_seconds,
+                    timeout_grace_seconds=timeout_grace_seconds,
+                )
+                for _ in range(plan.run_count)
+            )
         return LocalTargetBaselineRun(
             plan=plan,
             worktree_path=str(worktree_git.repo_dir),

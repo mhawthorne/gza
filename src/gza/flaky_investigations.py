@@ -18,8 +18,10 @@ from .off_topic_verify import build_local_target_pytest_command, parse_review_ve
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from .config import Config
     from .off_topic_verify import FailingNode, PytestPassFailCounts, PytestXdistMetadata
     from .runner import ReviewVerifyResult
+    from .runtime_context import RuntimeExecutionContext
 
 FLAKY_VERIFY_INVESTIGATION_ARTIFACT_KIND = "flaky_verify_investigation"
 FLAKY_VERIFY_ATTEMPT_ARTIFACT_KIND = "flaky_verify_attempt"
@@ -287,22 +289,37 @@ def run_flaky_reproduction_plan(
     timeout_seconds: int,
     timeout_grace_seconds: float,
     hypotheses: tuple[str, ...] = (),
+    runtime_context: RuntimeExecutionContext | None = None,
+    config: Config | object | None = None,
     run_verify_command: Callable[..., ReviewVerifyResult] | None = None,
 ) -> FlakyReproductionRun:
     """Execute the bounded harness and persist attempt/inconclusive artifacts."""
     from .runner import _run_review_verify_command
 
     verify_runner = run_verify_command or _run_review_verify_command
+    if run_verify_command is None and runtime_context is None:
+        raise ValueError("runtime_context is required for flaky reproduction verify isolation")
     attempts: list[FlakyAttemptRecord] = []
     for attempt_number in range(1, plan.runs + 1):
         command = _command_for_attempt(plan, attempt_number)
-        result = verify_runner(
-            command,
-            cwd=plan.working_directory,
-            reviewed_head_sha=plan.reviewed_head_sha,
-            timeout_seconds=timeout_seconds,
-            timeout_grace_seconds=timeout_grace_seconds,
-        )
+        if run_verify_command is None:
+            result = verify_runner(
+                command,
+                cwd=plan.working_directory,
+                runtime_context=runtime_context,
+                config=config,
+                reviewed_head_sha=plan.reviewed_head_sha,
+                timeout_seconds=timeout_seconds,
+                timeout_grace_seconds=timeout_grace_seconds,
+            )
+        else:
+            result = verify_runner(
+                command,
+                cwd=plan.working_directory,
+                reviewed_head_sha=plan.reviewed_head_sha,
+                timeout_seconds=timeout_seconds,
+                timeout_grace_seconds=timeout_grace_seconds,
+            )
         matched_signature = _result_matches_flaky_signature(
             result,
             nodeid=plan.nodeid,

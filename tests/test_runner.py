@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import queue
 import selectors
+import shlex
 import signal
 import sqlite3
 import stat
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import threading
 from contextlib import nullcontext
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -1835,6 +1837,7 @@ class TestReviewContextFromChain:
         result = _run_review_verify_command(
             "printf 'lint failed\\n' && exit 7",
             cwd=tmp_path,
+            runtime_context=_make_verify_runtime_context(tmp_path),
         )
 
         rendered = _format_review_verify_result(result)
@@ -1862,7 +1865,11 @@ class TestReviewContextFromChain:
             "gza.runner._run_review_verify_command_with_timeout_diagnostics",
             return_value=helper_result,
         ):
-            result = _run_review_verify_command("./bin/tests", cwd=tmp_path)
+            result = _run_review_verify_command(
+                "./bin/tests",
+                cwd=tmp_path,
+                runtime_context=_make_verify_runtime_context(tmp_path),
+            )
 
         assert result.status == "unavailable"
         assert result.exit_status == SCHEMA_RUNTIME_SKEW_EXIT_STATUS
@@ -1881,7 +1888,11 @@ class TestReviewContextFromChain:
             "gza.runner._run_review_verify_command_with_timeout_diagnostics",
             return_value=helper_result,
         ):
-            result = _run_review_verify_command("./bin/tests", cwd=tmp_path)
+            result = _run_review_verify_command(
+                "./bin/tests",
+                cwd=tmp_path,
+                runtime_context=_make_verify_runtime_context(tmp_path),
+            )
 
         assert result.status == "unavailable"
         assert result.exit_status == SCHEMA_RUNTIME_SKEW_EXIT_STATUS
@@ -1902,7 +1913,11 @@ class TestReviewContextFromChain:
             "gza.runner._run_review_verify_command_with_timeout_diagnostics",
             return_value=helper_result,
         ):
-            result = _run_review_verify_command("./bin/tests", cwd=tmp_path)
+            result = _run_review_verify_command(
+                "./bin/tests",
+                cwd=tmp_path,
+                runtime_context=_make_verify_runtime_context(tmp_path),
+            )
 
         assert result.status == "failed"
         assert result.exit_status == "1"
@@ -1967,6 +1982,7 @@ class TestReviewContextFromChain:
             result = _run_review_verify_command(
                 "uv run pytest tests/ -q",
                 cwd=tmp_path,
+                runtime_context=_make_verify_runtime_context(tmp_path),
                 timeout_seconds=120,
                 timeout_grace_seconds=5,
             )
@@ -3048,6 +3064,7 @@ class TestReviewContextFromChain:
             result = _run_review_verify_command(
                 "uv run pytest tests/ -q",
                 cwd=tmp_path,
+                runtime_context=_make_verify_runtime_context(tmp_path),
                 timeout_seconds=240,
                 timeout_grace_seconds=7,
             )
@@ -3090,6 +3107,7 @@ class TestReviewContextFromChain:
             result = _run_review_verify_command(
                 "printf 'all good\\n'",
                 cwd=tmp_path,
+                runtime_context=_make_verify_runtime_context(tmp_path),
                 timeout_seconds=10,
             )
 
@@ -3121,6 +3139,7 @@ class TestReviewContextFromChain:
             result = _run_review_verify_command(
                 "printf 'all good\\n'",
                 cwd=tmp_path,
+                runtime_context=_make_verify_runtime_context(tmp_path),
                 timeout_seconds=10,
             )
 
@@ -3793,6 +3812,10 @@ class TestReviewContextFromChain:
         assert verify_calls[0].kwargs["reviewed_branch"] == "feature/cross-project"
         assert verify_calls[0].kwargs["reviewed_head_sha"] == "deadbeef"
         assert verify_calls[0].kwargs["reviewed_base_sha"] == "cafebabe"
+        assert verify_calls[0].kwargs["runtime_context"].cwd == worktree_path / "services" / "foo"
+        assert verify_calls[1].kwargs["runtime_context"].cwd == worktree_path / "libs" / "bar"
+        assert verify_calls[0].kwargs["config"].project_name == "foo"
+        assert verify_calls[1].kwargs["config"].project_name == "bar"
 
     def test_cross_project_verify_preflight_blocks_unsafe_child_full_suite_when_root_command_differs(
         self, tmp_path: Path
@@ -6923,7 +6946,10 @@ class TestDisposableVerifyDbSnapshotEnv:
         for suffix in ("-wal", "-shm", "-journal"):
             assert not Path(f"{snapshot_path}{suffix}").exists()
 
-    def test_translates_snapshot_path_for_docker_without_mutating_runtime_env(self, tmp_path: Path) -> None:
+    def test_docker_snapshot_uses_host_subprocess_path_and_restores_preexisting_modes(
+        self,
+        tmp_path: Path,
+    ) -> None:
         db_path = tmp_path / "repo" / "services" / "foo" / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True)
         conn = sqlite3.connect(str(db_path))
@@ -6932,6 +6958,9 @@ class TestDisposableVerifyDbSnapshotEnv:
         conn.close()
         verify_cwd = tmp_path / "worktree" / "services" / "foo"
         verify_cwd.mkdir(parents=True)
+        verify_gza = verify_cwd / ".gza"
+        verify_tmp = verify_gza / "tmp"
+        verify_tmp.mkdir(parents=True)
         runtime_env = {"GZA_DB_PATH": str(db_path), "PATH": "/runtime/bin"}
         runtime_context = RuntimeExecutionContext(
             cwd=tmp_path / "repo" / "services" / "foo",
@@ -6941,41 +6970,30 @@ class TestDisposableVerifyDbSnapshotEnv:
         )
         config = SimpleNamespace(use_docker=True, docker_workdir="/workspace/services/foo")
         verify_cwd.chmod(0o700)
-        (verify_cwd / ".gza" / "tmp").mkdir(parents=True)
-        (verify_cwd / ".gza").chmod(0o750)
-        (verify_cwd / ".gza" / "tmp").chmod(0o770)
-        original_modes = {
-            path: stat.S_IMODE(path.stat().st_mode)
-            for path in (verify_cwd, verify_cwd / ".gza", verify_cwd / ".gza" / "tmp")
-        }
-        original_gids = {
-            path: path.stat().st_gid
-            for path in (verify_cwd, verify_cwd / ".gza", verify_cwd / ".gza" / "tmp")
+        verify_gza.chmod(0o701)
+        verify_tmp.chmod(0o705)
+        preexisting_stat = {
+            path: (stat.S_IMODE(path.stat().st_mode), path.stat().st_uid, path.stat().st_gid)
+            for path in (verify_cwd, verify_gza, verify_tmp)
         }
 
         with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config) as snapshot:
             assert snapshot.host_path.exists()
-            assert snapshot.subprocess_path == Path("/workspace/services/foo") / snapshot.host_path.relative_to(verify_cwd)
+            assert snapshot.subprocess_path == snapshot.host_path
             assert snapshot.env["GZA_DB_PATH"] == str(snapshot.subprocess_path)
             assert snapshot.env["PATH"] == "/runtime/bin"
             assert stat.S_IMODE(verify_cwd.stat().st_mode) == 0o710
-            assert stat.S_IMODE((verify_cwd / ".gza").stat().st_mode) == 0o750
-            assert stat.S_IMODE((verify_cwd / ".gza" / "tmp").stat().st_mode) == 0o770
+            assert stat.S_IMODE(verify_gza.stat().st_mode) == 0o711
+            assert stat.S_IMODE(verify_tmp.stat().st_mode) == 0o715
             assert stat.S_IMODE(snapshot.host_path.parent.stat().st_mode) == 0o730
             assert stat.S_IMODE(snapshot.host_path.stat().st_mode) == 0o660
-            assert set(snapshot.docker_group_ids) == {
-                verify_cwd.stat().st_gid,
-                (verify_cwd / ".gza").stat().st_gid,
-                (verify_cwd / ".gza" / "tmp").stat().st_gid,
-                snapshot.host_path.parent.stat().st_gid,
-                snapshot.host_path.stat().st_gid,
-            }
+            snapshot_path = snapshot.host_path
 
         assert runtime_env["GZA_DB_PATH"] == str(db_path)
-        for path, original_mode in original_modes.items():
-            assert stat.S_IMODE(path.stat().st_mode) == original_mode
-        for path, original_gid in original_gids.items():
-            assert path.stat().st_gid == original_gid
+        assert not snapshot_path.exists()
+        for path, expected in preexisting_stat.items():
+            current = path.stat()
+            assert (stat.S_IMODE(current.st_mode), current.st_uid, current.st_gid) == expected
 
     def test_overlapping_docker_snapshot_keeps_traversal_after_first_context_exits(
         self,
@@ -7258,7 +7276,7 @@ class TestDisposableVerifyDbSnapshotEnv:
         assert not first.host_path.exists()
         self._assert_metadata(tracked_paths, original_modes, original_gids)
 
-    def test_docker_snapshot_permissions_restore_metadata_after_body_exception(self, tmp_path: Path) -> None:
+    def test_docker_snapshot_restores_preexisting_modes_after_exception(self, tmp_path: Path) -> None:
         db_path = tmp_path / "repo" / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True)
         conn = sqlite3.connect(str(db_path))
@@ -7266,13 +7284,18 @@ class TestDisposableVerifyDbSnapshotEnv:
         conn.commit()
         conn.close()
         verify_cwd = tmp_path / "worktree"
-        (verify_cwd / ".gza" / "tmp").mkdir(parents=True)
-        verify_cwd.chmod(0o700)
-        (verify_cwd / ".gza").chmod(0o750)
-        (verify_cwd / ".gza" / "tmp").chmod(0o700)
-        tracked_paths = (verify_cwd, verify_cwd / ".gza", verify_cwd / ".gza" / "tmp")
-        original_modes = {path: stat.S_IMODE(path.stat().st_mode) for path in tracked_paths}
-        original_gids = {path: path.stat().st_gid for path in tracked_paths}
+        verify_tmp = verify_cwd / ".gza" / "tmp"
+        verify_tmp.mkdir(parents=True)
+        for path, mode in (
+            (verify_cwd, 0o700),
+            (verify_cwd / ".gza", 0o701),
+            (verify_tmp, 0o705),
+        ):
+            path.chmod(mode)
+        preexisting_stat = {
+            path: (stat.S_IMODE(path.stat().st_mode), path.stat().st_uid, path.stat().st_gid)
+            for path in (verify_cwd, verify_cwd / ".gza", verify_tmp)
+        }
         runtime_context = RuntimeExecutionContext(
             cwd=tmp_path / "repo",
             env={"GZA_DB_PATH": str(db_path)},
@@ -7281,17 +7304,19 @@ class TestDisposableVerifyDbSnapshotEnv:
         )
         config = SimpleNamespace(use_docker=True, docker_workdir="/workspace")
 
-        with pytest.raises(RuntimeError, match="verify body failed"):
+        with pytest.raises(RuntimeError, match="verify failed"):
             with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config) as snapshot:
                 snapshot_path = snapshot.host_path
-                assert stat.S_IMODE(verify_cwd.stat().st_mode) == 0o710
-                raise RuntimeError("verify body failed")
+                for suffix in ("-wal", "-shm", "-journal"):
+                    Path(f"{snapshot_path}{suffix}").write_text("sidecar", encoding="utf-8")
+                raise RuntimeError("verify failed")
 
         assert not snapshot_path.exists()
-        for path, original_mode in original_modes.items():
-            assert stat.S_IMODE(path.stat().st_mode) == original_mode
-        for path, original_gid in original_gids.items():
-            assert path.stat().st_gid == original_gid
+        for suffix in ("-wal", "-shm", "-journal"):
+            assert not Path(f"{snapshot_path}{suffix}").exists()
+        for path, expected in preexisting_stat.items():
+            current = path.stat()
+            assert (stat.S_IMODE(current.st_mode), current.st_uid, current.st_gid) == expected
 
     def test_docker_snapshot_permissions_restore_metadata_after_partial_setup_failure(
         self,
@@ -7324,6 +7349,257 @@ class TestDisposableVerifyDbSnapshotEnv:
         for path, original_gid in original_gids.items():
             assert path.stat().st_gid == original_gid
         assert not any((verify_cwd / ".gza" / "tmp").glob("verify-db-*"))
+
+
+def _write_verify_marker_db(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE verify_markers (id INTEGER PRIMARY KEY, label TEXT)")
+        conn.execute("INSERT INTO verify_markers (label) VALUES ('live')")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _verify_marker_labels(db_path: Path) -> list[str]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return [row[0] for row in conn.execute("SELECT label FROM verify_markers ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def _make_verify_runtime_context(tmp_path: Path) -> RuntimeExecutionContext:
+    live_db = tmp_path / "project" / ".gza" / "gza.db"
+    _write_verify_marker_db(live_db)
+    return RuntimeExecutionContext(
+        cwd=tmp_path / "project",
+        env={"GZA_DB_PATH": str(live_db), "PATH": os.environ.get("PATH", "")},
+        project_id="project",
+        db_path=live_db,
+    )
+
+
+class TestReviewVerifyCommandDbIsolation:
+    """Tests for per-attempt verify DB isolation at subprocess launch."""
+
+    def test_run_review_verify_command_requires_runtime_context(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="runtime_context is required"):
+            _run_review_verify_command("printf ok", cwd=tmp_path)
+
+    def test_run_review_verify_command_routes_runtime_db_to_disposable_snapshot(self, tmp_path: Path) -> None:
+        live_db = tmp_path / "project" / ".gza" / "gza.db"
+        _write_verify_marker_db(live_db)
+        verify_cwd = tmp_path / "worktree"
+        verify_cwd.mkdir()
+        runtime_env = {"GZA_DB_PATH": str(live_db), "PATH": "/runtime/bin"}
+        runtime_context = RuntimeExecutionContext(
+            cwd=tmp_path / "project",
+            env=runtime_env,
+            project_id="project",
+            db_path=live_db,
+        )
+        seen_snapshot_paths: list[Path] = []
+
+        def fake_run(_command: str, **kwargs: object) -> object:
+            child_env = cast(Mapping[str, str], kwargs["env"])
+            snapshot_path = Path(child_env["GZA_DB_PATH"])
+            assert snapshot_path != live_db
+            conn = sqlite3.connect(str(snapshot_path))
+            try:
+                conn.execute("INSERT INTO verify_markers (label) VALUES ('snapshot-only')")
+                conn.commit()
+            finally:
+                conn.close()
+            seen_snapshot_paths.append(snapshot_path)
+            return runner._ReviewVerifyCommandRun(returncode=0, stdout=b"ok", stderr=b"")
+
+        with patch("gza.runner._run_review_verify_command_with_timeout_diagnostics", side_effect=fake_run):
+            result = _run_review_verify_command(
+                "uv run gza verify",
+                cwd=verify_cwd,
+                env=runtime_env,
+                runtime_context=runtime_context,
+            )
+
+        assert result.status == "passed"
+        assert _verify_marker_labels(live_db) == ["live"]
+        assert seen_snapshot_paths
+        assert all(not path.exists() for path in seen_snapshot_paths)
+        assert runtime_env["GZA_DB_PATH"] == str(live_db)
+
+    def test_run_review_verify_command_preserves_explicit_env_while_routing_snapshot(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        live_db = tmp_path / "project" / ".gza" / "gza.db"
+        _write_verify_marker_db(live_db)
+        verify_cwd = tmp_path / "worktree"
+        verify_cwd.mkdir()
+        runtime_context = RuntimeExecutionContext(
+            cwd=tmp_path / "project",
+            env={"GZA_DB_PATH": str(live_db), "PATH": "/runtime/bin", "RUNTIME_ONLY": "kept"},
+            project_id="project",
+            db_path=live_db,
+        )
+        explicit_env = {
+            "GZA_DB_PATH": str(live_db),
+            "PATH": "/explicit/bin",
+            "HOME": str(tmp_path / "explicit-home"),
+            "EXPLICIT_ONLY": "kept",
+        }
+
+        def fake_run(_command: str, **kwargs: object) -> object:
+            child_env = cast(Mapping[str, str], kwargs["env"])
+            assert Path(child_env["GZA_DB_PATH"]) != live_db
+            assert child_env["PATH"] == "/explicit/bin"
+            assert child_env["HOME"] == str(tmp_path / "explicit-home")
+            assert child_env["EXPLICIT_ONLY"] == "kept"
+            assert child_env["RUNTIME_ONLY"] == "kept"
+            return runner._ReviewVerifyCommandRun(returncode=0, stdout=b"ok", stderr=b"")
+
+        with patch("gza.runner._run_review_verify_command_with_timeout_diagnostics", side_effect=fake_run):
+            result = _run_review_verify_command(
+                "uv run gza verify",
+                cwd=verify_cwd,
+                env=explicit_env,
+                runtime_context=runtime_context,
+            )
+
+        assert result.status == "passed"
+        assert explicit_env["GZA_DB_PATH"] == str(live_db)
+
+    def test_run_review_verify_command_with_docker_config_passes_host_path_to_host_child(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        live_db = tmp_path / "project" / ".gza" / "gza.db"
+        _write_verify_marker_db(live_db)
+        verify_cwd = tmp_path / "worktree"
+        verify_cwd.mkdir()
+        runtime_context = RuntimeExecutionContext(
+            cwd=tmp_path / "project",
+            env={"GZA_DB_PATH": str(live_db), "PATH": os.environ.get("PATH", "")},
+            project_id="project",
+            db_path=live_db,
+        )
+        child_code = """
+import os
+import sqlite3
+from pathlib import Path
+path = os.environ["GZA_DB_PATH"]
+assert Path(path).exists(), path
+conn = sqlite3.connect(path)
+try:
+    labels = [row[0] for row in conn.execute("SELECT label FROM verify_markers ORDER BY id")]
+    print("SNAPSHOT_PATH=" + path)
+    print("SNAPSHOT_LABELS=" + ",".join(labels))
+    conn.execute("INSERT INTO verify_markers (label) VALUES ('snapshot-only')")
+    conn.commit()
+finally:
+    conn.close()
+for suffix in ("-wal", "-shm", "-journal"):
+    Path(path + suffix).write_text("sidecar", encoding="utf-8")
+""".strip()
+
+        result = _run_review_verify_command(
+            f"{sys.executable} -c {shlex.quote(child_code)}",
+            cwd=verify_cwd,
+            runtime_context=runtime_context,
+            config=SimpleNamespace(use_docker=True, docker_workdir="/workspace"),
+        )
+
+        assert result.status == "passed"
+        assert "SNAPSHOT_LABELS=live" in result.output
+        snapshot_lines = [line for line in result.output.splitlines() if line.startswith("SNAPSHOT_PATH=")]
+        assert len(snapshot_lines) == 1
+        snapshot_path = Path(snapshot_lines[0].partition("=")[2])
+        assert snapshot_path != live_db
+        assert not snapshot_path.exists()
+        for suffix in ("-wal", "-shm", "-journal"):
+            assert not Path(f"{snapshot_path}{suffix}").exists()
+        assert _verify_marker_labels(live_db) == ["live"]
+
+    def test_run_review_verify_command_cleans_snapshot_after_timeout(self, tmp_path: Path) -> None:
+        live_db = tmp_path / "project" / ".gza" / "gza.db"
+        _write_verify_marker_db(live_db)
+        verify_cwd = tmp_path / "worktree"
+        verify_cwd.mkdir()
+        runtime_context = RuntimeExecutionContext(
+            cwd=tmp_path / "project",
+            env={"GZA_DB_PATH": str(live_db)},
+            project_id="project",
+            db_path=live_db,
+        )
+        seen_snapshot_paths: list[Path] = []
+
+        def fake_run(_command: str, **kwargs: object) -> object:
+            child_env = cast(Mapping[str, str], kwargs["env"])
+            snapshot_path = Path(child_env["GZA_DB_PATH"])
+            conn = sqlite3.connect(str(snapshot_path))
+            try:
+                conn.execute("INSERT INTO verify_markers (label) VALUES ('timeout-only')")
+                conn.commit()
+            finally:
+                conn.close()
+            seen_snapshot_paths.append(snapshot_path)
+            return runner._ReviewVerifyCommandRun(
+                returncode=1,
+                stdout=b"still running",
+                stderr=b"",
+                timed_out=True,
+                forced_kill=True,
+            )
+
+        with patch("gza.runner._run_review_verify_command_with_timeout_diagnostics", side_effect=fake_run):
+            result = _run_review_verify_command(
+                "slow verify",
+                cwd=verify_cwd,
+                runtime_context=runtime_context,
+                timeout_seconds=1,
+                timeout_grace_seconds=0.1,
+            )
+
+        assert result.status == "failed"
+        assert result.exit_status == "timed out"
+        assert _verify_marker_labels(live_db) == ["live"]
+        assert seen_snapshot_paths
+        assert all(not path.exists() for path in seen_snapshot_paths)
+
+    def test_run_review_verify_command_cleans_snapshot_after_exception(self, tmp_path: Path) -> None:
+        live_db = tmp_path / "project" / ".gza" / "gza.db"
+        _write_verify_marker_db(live_db)
+        verify_cwd = tmp_path / "worktree"
+        verify_cwd.mkdir()
+        runtime_context = RuntimeExecutionContext(
+            cwd=tmp_path / "project",
+            env={"GZA_DB_PATH": str(live_db)},
+            project_id="project",
+            db_path=live_db,
+        )
+        seen_snapshot_paths: list[Path] = []
+
+        def fake_run(_command: str, **kwargs: object) -> object:
+            child_env = cast(Mapping[str, str], kwargs["env"])
+            snapshot_path = Path(child_env["GZA_DB_PATH"])
+            seen_snapshot_paths.append(snapshot_path)
+            for suffix in ("-wal", "-shm", "-journal"):
+                Path(f"{snapshot_path}{suffix}").write_text("sidecar", encoding="utf-8")
+            raise RuntimeError("verify launcher broke")
+
+        with (
+            patch("gza.runner._run_review_verify_command_with_timeout_diagnostics", side_effect=fake_run),
+            pytest.raises(RuntimeError, match="verify launcher broke"),
+        ):
+            _run_review_verify_command("broken verify", cwd=verify_cwd, runtime_context=runtime_context)
+
+        assert _verify_marker_labels(live_db) == ["live"]
+        assert seen_snapshot_paths
+        for snapshot_path in seen_snapshot_paths:
+            assert not snapshot_path.exists()
+            for suffix in ("-wal", "-shm", "-journal"):
+                assert not Path(f"{snapshot_path}{suffix}").exists()
 
 
 class TestStageWorktreeAgentResources:

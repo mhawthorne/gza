@@ -6,6 +6,7 @@ import fcntl
 import os
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -14,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from gza.runner import _run_review_verify_command
+from gza.runtime_context import RuntimeExecutionContext
 
 pytestmark = [
     pytest.mark.functional,
@@ -105,6 +107,23 @@ def _wait_for_lock_release(lock_file: Path, *, timeout_seconds: float = 1.0) -> 
     return lock_file.exists() and not _child_lock_held(lock_file)
 
 
+def _runtime_context_for_verify(tmp_path: Path) -> RuntimeExecutionContext:
+    db_path = tmp_path / "project" / ".gza" / "gza.db"
+    db_path.parent.mkdir(parents=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE runtime_marker (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+    return RuntimeExecutionContext(
+        cwd=tmp_path / "project",
+        env={"GZA_DB_PATH": str(db_path), "PATH": os.environ.get("PATH", "")},
+        project_id="project",
+        db_path=db_path,
+    )
+
+
 @pytest.mark.timeout(5)
 def test_run_review_verify_command_captures_sigterm_dump_before_forced_kill(tmp_path: Path) -> None:
     script = tmp_path / "verify_sigterm_dump.py"
@@ -125,6 +144,7 @@ def test_run_review_verify_command_captures_sigterm_dump_before_forced_kill(tmp_
     result = _run_review_verify_command(
         f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}",
         cwd=tmp_path,
+        runtime_context=_runtime_context_for_verify(tmp_path),
         timeout_seconds=0.1,
         timeout_grace_seconds=0.1,
     )
@@ -157,6 +177,7 @@ def test_run_review_verify_command_reports_graceful_exit_without_forced_kill(tmp
     result = _run_review_verify_command(
         f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}",
         cwd=tmp_path,
+        runtime_context=_runtime_context_for_verify(tmp_path),
         timeout_seconds=0.1,
         timeout_grace_seconds=0.2,
     )
@@ -194,6 +215,7 @@ def test_run_review_verify_command_drains_large_sigterm_output_during_grace(tmp_
     result = _run_review_verify_command(
         f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}",
         cwd=tmp_path,
+        runtime_context=_runtime_context_for_verify(tmp_path),
         timeout_seconds=0.1,
         timeout_grace_seconds=1.0,
     )
@@ -256,6 +278,7 @@ def test_run_review_verify_command_forces_kill_when_inherited_pipe_descendant_su
     result = _run_review_verify_command(
         verify_command,
         cwd=tmp_path,
+        runtime_context=_runtime_context_for_verify(tmp_path),
         timeout_seconds=0.2,
         timeout_grace_seconds=0.1,
     )

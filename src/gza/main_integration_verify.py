@@ -29,6 +29,7 @@ from .runner import (
     _run_review_verify_command,
     resolve_lifecycle_verify_timeout_settings,
 )
+from .runtime_context import RuntimeExecutionContext
 from .schema_compat import (
     SCHEMA_RUNTIME_SKEW_EXIT_STATUS,
     SCHEMA_RUNTIME_SKEW_FAILURE_ORIGIN,
@@ -69,6 +70,34 @@ _CANONICAL_LAUNCH_ISSUE_FAILURE_RE = re.compile(
     r"(?:(?:`(?P<tool>[^`]+)`)(?: for phase `(?P<phase>[^`]+)`)?|verify tooling) "
     r"\((?P<detail>.*)\)$"
 )
+
+
+def _verify_runtime_context(config: Config, env: Mapping[str, str] | None, *, cwd: Path) -> RuntimeExecutionContext:
+    try:
+        runtime_context = RuntimeExecutionContext.from_config(config)
+    except (AttributeError, TypeError, ValueError):
+        runtime_env = dict(env or {})
+        raw_db_path = runtime_env.get("GZA_DB_PATH")
+        db_path = Path(raw_db_path).resolve() if raw_db_path else (cwd / ".gza" / "gza.db").resolve()
+        runtime_env.setdefault("GZA_DB_PATH", str(db_path))
+        return RuntimeExecutionContext(
+            cwd=cwd,
+            env=runtime_env,
+            project_id=str(getattr(config, "project_id", "")),
+            db_path=db_path,
+        )
+    if env is None:
+        return runtime_context
+    runtime_env = dict(env)
+    runtime_env.setdefault("GZA_DB_PATH", str(runtime_context.db_path))
+    return RuntimeExecutionContext(
+        cwd=runtime_context.cwd,
+        env=runtime_env,
+        project_id=runtime_context.project_id,
+        db_path=runtime_context.db_path,
+    )
+
+
 @dataclass(frozen=True)
 class MainIntegrationVerifyState:
     """Persisted verification state for the canonical local target branch."""
@@ -1405,6 +1434,7 @@ def run_main_integration_verify(
         budget_resolution_failure = exc
     verify_command = gate.verify_command or ""
     gate_enabled = gate.gate_enabled
+    runtime_context = _verify_runtime_context(config, env, cwd=git.repo_dir)
 
     if not gate_enabled:
         result = _make_review_verify_result(
@@ -1436,6 +1466,8 @@ def run_main_integration_verify(
                 verify_command,
                 cwd=git.repo_dir,
                 env=env,
+                runtime_context=runtime_context,
+                config=config,
                 reviewed_branch=git.current_branch(),
                 reviewed_head_sha=head_sha,
                 timeout_seconds=gate.verify_timeout_seconds,
@@ -1449,6 +1481,8 @@ def run_main_integration_verify(
                 verify_command,
                 cwd=git.repo_dir,
                 env=env,
+                runtime_context=runtime_context,
+                config=config,
                 reviewed_branch=git.current_branch(),
                 reviewed_head_sha=head_sha,
                 timeout_seconds=gate.verify_timeout_seconds,
@@ -1990,6 +2024,7 @@ def run_candidate_integration_verify(
     gate_enabled = gate.gate_enabled
     current_branch = git.current_branch()
     working_directory = str(git.repo_dir)
+    runtime_context = _verify_runtime_context(config, env, cwd=git.repo_dir)
 
     if not gate_enabled:
         result = _make_review_verify_result(
@@ -2010,6 +2045,8 @@ def run_candidate_integration_verify(
                 verify_command,
                 cwd=git.repo_dir,
                 env=env,
+                runtime_context=runtime_context,
+                config=config,
                 reviewed_branch=current_branch,
                 reviewed_head_sha=head_sha,
                 timeout_seconds=gate.verify_timeout_seconds,
@@ -2023,6 +2060,8 @@ def run_candidate_integration_verify(
                 verify_command,
                 cwd=git.repo_dir,
                 env=env,
+                runtime_context=runtime_context,
+                config=config,
                 reviewed_branch=current_branch,
                 reviewed_head_sha=head_sha,
                 timeout_seconds=gate.verify_timeout_seconds,

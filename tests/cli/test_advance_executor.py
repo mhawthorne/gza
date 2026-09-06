@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -1263,8 +1264,16 @@ def test_recover_verify_only_noop_review_uses_runtime_env_for_direct_verify(
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
-    config.verify_command = "uv run pytest tests/unit -q"
     selected_db = tmp_path / ".gza" / "selected.db"
+    selected_db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(selected_db))
+    try:
+        conn.execute("CREATE TABLE verify_markers (id INTEGER PRIMARY KEY, label TEXT)")
+        conn.execute("INSERT INTO verify_markers (label) VALUES ('live')")
+        conn.commit()
+    finally:
+        conn.close()
+    config.verify_command = "verify child writes db"
     runtime_context = RuntimeExecutionContext(
         cwd=tmp_path,
         env={
@@ -1313,6 +1322,7 @@ def test_recover_verify_only_noop_review_uses_runtime_env_for_direct_verify(
         runtime_context=runtime_context,
     )
     observed_git_envs: list[dict[str, str] | None] = []
+    observed_snapshot_paths: list[Path] = []
 
     def fake_git(path: Path, **kwargs: Any) -> SimpleNamespace:
         observed_git_envs.append(kwargs.get("env"))
@@ -1322,22 +1332,31 @@ def test_recover_verify_only_noop_review_uses_runtime_env_for_direct_verify(
             rev_parse_if_exists=lambda ref: "same-head",
         )
 
+    def fake_child(_command: str, **kwargs: Any) -> Any:
+        child_env = kwargs["env"]
+        snapshot_path = Path(child_env["GZA_DB_PATH"])
+        conn = sqlite3.connect(str(snapshot_path))
+        try:
+            labels = [row[0] for row in conn.execute("SELECT label FROM verify_markers ORDER BY id")]
+            conn.execute("INSERT INTO verify_markers (label) VALUES ('snapshot-only')")
+            conn.commit()
+        finally:
+            conn.close()
+        for suffix in ("-wal", "-shm", "-journal"):
+            Path(f"{snapshot_path}{suffix}").write_text("sidecar", encoding="utf-8")
+        observed_snapshot_paths.append(snapshot_path)
+        return SimpleNamespace(
+            returncode=0,
+            timed_out=False,
+            forced_kill=False,
+            stdout=f"SNAPSHOT_PATH={snapshot_path}\nSNAPSHOT_LABELS={','.join(labels)}\n".encode(),
+            stderr=b"",
+        )
+
     with (
         patch("gza.cli.advance_executor.Git", side_effect=fake_git),
         patch("gza.cli.advance_executor._resolve_review_verify_base_sha", return_value="base-sha"),
-        patch(
-            "gza.cli.advance_executor._run_review_verify_command",
-            return_value=_make_review_verify_result(
-                "uv run pytest tests/unit -q",
-                status="passed",
-                exit_status="0",
-                captured_at=datetime(2026, 6, 27, 12, 0, tzinfo=UTC),
-                reviewed_branch=impl.branch,
-                reviewed_head_sha="same-head",
-                reviewed_base_sha="base-sha",
-                working_directory=str(tmp_path),
-            ),
-        ) as run_verify,
+        patch("gza.runner._run_review_verify_command_with_timeout_diagnostics", side_effect=fake_child),
     ):
         result = execute_advance_action(
             task=impl,
@@ -1352,13 +1371,32 @@ def test_recover_verify_only_noop_review_uses_runtime_env_for_direct_verify(
 
     assert result.status == "success"
     assert observed_git_envs == [runtime_context.env]
-    verify_env = run_verify.call_args.kwargs["env"]
-    provider_cwd = Path(run_verify.call_args.kwargs["cwd"])
-    assert verify_env["PATH"] == "/selected/bin"
-    assert verify_env["PWD"] == str(provider_cwd.resolve())
-    assert verify_env["GZA_DB_PATH"] == str(selected_db)
-    assert verify_env["PROJECT_ONLY_TOKEN"] == "selected-token"
-    assert "GIT_DIR" not in verify_env
+    refreshed_improve = store.get(improve.id)
+    assert refreshed_improve is not None
+    assert refreshed_improve.review_verify_status == "passed"
+    assert refreshed_improve.review_verify_artifact_file is not None
+    verify_output = (tmp_path / refreshed_improve.review_verify_artifact_file).read_text(encoding="utf-8")
+    assert "SNAPSHOT_LABELS=live" in verify_output
+    snapshot_lines = [
+        line
+        for line in verify_output.splitlines()
+        if line.startswith("SNAPSHOT_PATH=")
+    ]
+    assert len(snapshot_lines) == 1
+    snapshot_path = Path(snapshot_lines[0].partition("=")[2])
+    assert snapshot_path != selected_db
+    assert observed_snapshot_paths == [snapshot_path]
+    assert not snapshot_path.exists()
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not Path(f"{snapshot_path}{suffix}").exists()
+    conn = sqlite3.connect(str(selected_db))
+    try:
+        labels = [row[0] for row in conn.execute("SELECT label FROM verify_markers ORDER BY id")]
+    finally:
+        conn.close()
+    assert labels == ["live"]
+    artifacts = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+    assert len(artifacts) == 1
     assert os.environ["PWD"] == str(supervisor_cwd)
     assert os.environ["GZA_DB_PATH"] == str(tmp_path / "ambient.db")
     assert os.environ["PROJECT_ONLY_TOKEN"] == "ambient-token"

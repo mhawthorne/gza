@@ -1,5 +1,8 @@
+import os
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -19,6 +22,7 @@ from gza.off_topic_verify import (
     select_local_target_baseline_plan,
 )
 from gza.runner import ReviewVerifyResult
+from gza.runtime_context import RuntimeExecutionContext
 
 
 def test_parse_pytest_verify_failure_extracts_multiple_failing_nodes() -> None:
@@ -933,6 +937,89 @@ def test_run_local_target_baseline_plan_uses_immutable_target_sha(tmp_path: Path
         ("reset_hard", "abc123def456"),
         ("clean_force", ""),
     ]
+
+
+def test_run_local_target_baseline_plan_isolates_each_attempt_db(tmp_path: Path) -> None:
+    _RecordingGit.reset()
+    repo_git = _RecordingGit(tmp_path / "repo")
+    live_db = tmp_path / "project" / ".gza" / "gza.db"
+    live_db.parent.mkdir(parents=True)
+    conn = sqlite3.connect(str(live_db))
+    try:
+        conn.execute("CREATE TABLE verify_markers (id INTEGER PRIMARY KEY, label TEXT)")
+        conn.execute("INSERT INTO verify_markers (label) VALUES ('live')")
+        conn.commit()
+    finally:
+        conn.close()
+    plan = LocalTargetBaselinePlan(
+        mode="stress",
+        command="verify child writes db",
+        nodeids=("tests/test_example.py::test_parse",),
+        target_branch="main",
+        target_head_sha="abc123def456",
+        target_tree_fingerprint="f" * 64,
+        run_count=2,
+        relative_cwd=".",
+    )
+    runtime_context = RuntimeExecutionContext(
+        cwd=tmp_path / "project",
+        env={"GZA_DB_PATH": str(live_db), "PATH": os.environ.get("PATH", "")},
+        project_id="project",
+        db_path=live_db,
+    )
+
+    def fake_child(_command: str, **kwargs: object) -> object:
+        child_env = kwargs["env"]
+        assert isinstance(child_env, dict)
+        snapshot_path = Path(child_env["GZA_DB_PATH"])
+        conn = sqlite3.connect(str(snapshot_path))
+        try:
+            labels = [row[0] for row in conn.execute("SELECT label FROM verify_markers ORDER BY id")]
+            conn.execute("INSERT INTO verify_markers (label) VALUES ('attempt-only')")
+            conn.commit()
+        finally:
+            conn.close()
+        for suffix in ("-wal", "-shm", "-journal"):
+            Path(f"{snapshot_path}{suffix}").write_text("sidecar", encoding="utf-8")
+        return type(
+            "ChildResult",
+            (),
+            {
+                "returncode": 0,
+                "timed_out": False,
+                "forced_kill": False,
+                "stdout": f"SNAPSHOT_PATH={snapshot_path}\nSNAPSHOT_LABELS={','.join(labels)}\n".encode(),
+                "stderr": b"",
+            },
+        )()
+
+    with patch("gza.runner._run_review_verify_command_with_timeout_diagnostics", side_effect=fake_child):
+        run = run_local_target_baseline_plan(
+            plan,
+            repo_git=repo_git,
+            worktree_root=tmp_path / "worktrees",
+            timeout_seconds=30,
+            timeout_grace_seconds=5.0,
+            runtime_context=runtime_context,
+        )
+
+    snapshot_paths = []
+    for result in run.results:
+        assert result.status == "passed"
+        assert "SNAPSHOT_LABELS=live" in result.output
+        snapshot_line = next(line for line in result.output.splitlines() if line.startswith("SNAPSHOT_PATH="))
+        snapshot_path = Path(snapshot_line.partition("=")[2])
+        snapshot_paths.append(snapshot_path)
+        assert not snapshot_path.exists()
+        for suffix in ("-wal", "-shm", "-journal"):
+            assert not Path(f"{snapshot_path}{suffix}").exists()
+    assert len(set(snapshot_paths)) == 2
+    conn = sqlite3.connect(str(live_db))
+    try:
+        labels = [row[0] for row in conn.execute("SELECT label FROM verify_markers ORDER BY id")]
+    finally:
+        conn.close()
+    assert labels == ["live"]
 
 
 @pytest.mark.parametrize(

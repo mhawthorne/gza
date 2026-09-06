@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import json
 import platform
+import sqlite3
 import sys
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from gza import runner
 from gza.artifacts import store_command_output_artifact
 from gza.cli.watch import (
     _candidate_rework_identity,
@@ -76,6 +79,25 @@ def _linux_container_identity() -> MainIntegrationVerifyEnvironmentIdentity:
         python_implementation="CPython",
         python_version="3.12",
     )
+
+
+def _ensure_verify_marker_table(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS verify_markers (id INTEGER PRIMARY KEY, label TEXT)")
+        conn.execute("INSERT INTO verify_markers (label) VALUES ('live')")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _verify_marker_labels(db_path: Path) -> list[str]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return [row[0] for row in conn.execute("SELECT label FROM verify_markers ORDER BY id")]
+    finally:
+        conn.close()
 
 
 def _current_host_identity() -> MainIntegrationVerifyEnvironmentIdentity:
@@ -2170,15 +2192,17 @@ def test_check_candidate_integration_verify_pass_returns_structured_evidence_wit
             reason="candidate-pass",
         )
 
-    run_verify.assert_called_once_with(
-        "./bin/tests",
-        cwd=tmp_path,
-        env=None,
-        reviewed_branch="candidate-main",
-        reviewed_head_sha="def456",
-        timeout_seconds=120,
-        timeout_grace_seconds=5.0,
-    )
+    run_verify.assert_called_once()
+    verify_call = run_verify.call_args
+    assert verify_call.args == ("./bin/tests",)
+    assert verify_call.kwargs["cwd"] == tmp_path
+    assert verify_call.kwargs["env"] is None
+    assert verify_call.kwargs["runtime_context"].db_path == tmp_path / ".gza" / "gza.db"
+    assert verify_call.kwargs["config"] is config
+    assert verify_call.kwargs["reviewed_branch"] == "candidate-main"
+    assert verify_call.kwargs["reviewed_head_sha"] == "def456"
+    assert verify_call.kwargs["timeout_seconds"] == 120
+    assert verify_call.kwargs["timeout_grace_seconds"] == 5.0
     compute_fingerprint.assert_not_called()
     assert check.classification == "pass"
     assert check.verify_runs == 1
@@ -2369,6 +2393,76 @@ def test_check_candidate_integration_verify_uses_owning_runtime_env_for_initial_
         str(alpha_config.db_path.resolve()),
         str(beta_config.db_path.resolve()),
     ]
+
+
+def test_check_candidate_integration_verify_red_rerun_gets_fresh_disposable_db_snapshot(tmp_path) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + "verify_command: ./bin/runtime-verify\n"
+        + "autonomous_verify_timeout_seconds: 120\n",
+        encoding="utf-8",
+    )
+    config = Config.load(tmp_path)
+    config.use_docker = False
+    make_store(tmp_path)
+    _ensure_verify_marker_table(config.db_path)
+    git = MagicMock()
+    git.repo_dir = tmp_path / "candidate-checkout"
+    git.repo_dir.mkdir()
+    git.current_branch.return_value = "candidate-main"
+    git.rev_parse_if_exists.return_value = "a" * 40
+    runtime_env = {"PATH": "/runtime/bin", "GZA_DB_PATH": str(config.db_path)}
+    seen_snapshot_paths: list[Path] = []
+    attempt = 0
+
+    def fake_run(_command: str, **kwargs: object) -> object:
+        nonlocal attempt
+        attempt += 1
+        child_env = kwargs["env"]
+        assert isinstance(child_env, dict)
+        snapshot_path = Path(child_env["GZA_DB_PATH"])
+        assert snapshot_path != config.db_path
+        seen_snapshot_paths.append(snapshot_path)
+        assert _verify_marker_labels(snapshot_path) == ["live"]
+        conn = sqlite3.connect(str(snapshot_path))
+        try:
+            conn.execute("INSERT INTO verify_markers (label) VALUES (?)", (f"attempt-{attempt}",))
+            conn.commit()
+        finally:
+            conn.close()
+        if attempt == 1:
+            return runner._ReviewVerifyCommandRun(
+                returncode=1,
+                stdout=b"gza-verify phase=failed name=unit duration_seconds=1.0",
+                stderr=b"",
+            )
+        return runner._ReviewVerifyCommandRun(
+            returncode=0,
+            stdout=b"gza-verify phase=passed name=unit duration_seconds=1.0 tree_fingerprint=fp-candidate",
+            stderr=b"",
+        )
+
+    with (
+        patch("gza.runner._run_review_verify_command_with_timeout_diagnostics", side_effect=fake_run),
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-candidate"),
+    ):
+        check = check_candidate_integration_verify(
+            config,
+            git,
+            reason="candidate-rerun-isolation",
+            red_reruns=1,
+            env=runtime_env,
+        )
+
+    assert check.verify_runs == 2
+    assert check.classification == "flake"
+    assert len(seen_snapshot_paths) == 2
+    assert seen_snapshot_paths[0] != seen_snapshot_paths[1]
+    assert all(not path.exists() for path in seen_snapshot_paths)
+    assert _verify_marker_labels(config.db_path) == ["live"]
+    assert runtime_env["GZA_DB_PATH"] == str(config.db_path)
 
 
 def test_check_candidate_integration_verify_returns_container_runner_class(tmp_path) -> None:

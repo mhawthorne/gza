@@ -79,7 +79,7 @@ from ..runner import (
     _worktree_execution_dir,
     resolve_lifecycle_verify_timeout_settings,
 )
-from ..runtime_context import RuntimeExecutionContext, normalize_subprocess_env
+from ..runtime_context import RuntimeExecutionContext
 from ..verify_fix_outcome import (
     effective_verify_fix_completion_outcome,
     inspect_legacy_review_scope_completion_outcome,
@@ -2216,7 +2216,8 @@ def _execute_recover_verify_only_noop_review(
                 result = _run_review_verify_command(
                     verify_command,
                     cwd=provider_cwd,
-                    env=normalize_subprocess_env(runtime_context.env, provider_cwd),
+                    runtime_context=runtime_context,
+                    config=context.config,
                     reviewed_branch=task.branch,
                     reviewed_head_sha=reviewed_head_sha,
                     reviewed_tree_sha=reviewed_tree_sha,

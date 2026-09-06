@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +16,7 @@ from gza.flaky_investigations import (
     FLAKY_VERIFY_ATTEMPT_ARTIFACT_KIND,
     FLAKY_VERIFY_INCONCLUSIVE_ARTIFACT_KIND,
     FLAKY_VERIFY_INVESTIGATION_ARTIFACT_KIND,
+    FlakyReproductionPlan,
     build_flaky_investigation_prompt,
     build_flaky_reproduction_plan,
     create_or_reuse_flaky_investigations,
@@ -23,6 +26,7 @@ from gza.flaky_investigations import (
 )
 from gza.off_topic_verify import FailingNode, PytestPassFailCounts, PytestXdistMetadata
 from gza.runner import _make_review_verify_result
+from gza.runtime_context import RuntimeExecutionContext
 
 
 def _task_scoped_config(tmp_path: Path, task_types: tuple[str, ...]) -> Config:
@@ -490,6 +494,107 @@ def test_run_flaky_reproduction_plan_persists_attempts_and_inconclusive_record(t
     assert inconclusive_artifacts[0].metadata["attempt_count"] == 2
     assert inconclusive_artifacts[0].metadata["hypotheses"] == ["race is timing-sensitive"]
     assert len(inconclusive_artifacts[0].metadata["attempt_artifact_ids"]) == 2
+
+
+def test_run_flaky_reproduction_plan_isolates_each_attempt_db_and_persists_artifacts(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "host.db")
+    task = store.add("Investigate flaky verify", task_type="internal")
+    assert task.id is not None
+    live_db = tmp_path / "project" / ".gza" / "gza.db"
+    live_db.parent.mkdir(parents=True)
+    conn = sqlite3.connect(str(live_db))
+    try:
+        conn.execute("CREATE TABLE verify_markers (id INTEGER PRIMARY KEY, label TEXT)")
+        conn.execute("INSERT INTO verify_markers (label) VALUES ('live')")
+        conn.commit()
+    finally:
+        conn.close()
+    plan = FlakyReproductionPlan(
+        task_id=task.id,
+        dedup_key="tests/test_example.py::test_parse::never-matches",
+        nodeid="tests/test_example.py::test_parse",
+        assertion_signature="never-matches",
+        command="verify child writes db",
+        working_directory=tmp_path,
+        runs=2,
+        reviewed_head_sha="deadbeef",
+        tree_fingerprint="f" * 64,
+    )
+    runtime_context = RuntimeExecutionContext(
+        cwd=tmp_path / "project",
+        env={
+            "GZA_DB_PATH": str(live_db),
+            "PATH": os.environ.get("PATH", ""),
+            "OBSERVED_SNAPSHOT_LOG": str(tmp_path / "observed-snapshots.txt"),
+        },
+        project_id="project",
+        db_path=live_db,
+    )
+
+    def fake_child(_command: str, **kwargs: object) -> object:
+        child_env = kwargs["env"]
+        assert isinstance(child_env, dict)
+        snapshot_path = Path(child_env["GZA_DB_PATH"])
+        observed_path = Path(child_env["OBSERVED_SNAPSHOT_LOG"])
+        conn = sqlite3.connect(str(snapshot_path))
+        try:
+            labels = [row[0] for row in conn.execute("SELECT label FROM verify_markers ORDER BY id")]
+            with observed_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{snapshot_path}|{','.join(labels)}\n")
+            conn.execute("INSERT INTO verify_markers (label) VALUES ('attempt-only')")
+            conn.commit()
+        finally:
+            conn.close()
+        for suffix in ("-wal", "-shm", "-journal"):
+            Path(f"{snapshot_path}{suffix}").write_text("sidecar", encoding="utf-8")
+        return type(
+            "ChildResult",
+            (),
+            {
+                "returncode": 0,
+                "timed_out": False,
+                "forced_kill": False,
+                "stdout": f"SNAPSHOT_PATH={snapshot_path}\nSNAPSHOT_LABELS={','.join(labels)}\n".encode(),
+                "stderr": b"",
+            },
+        )()
+
+    with patch("gza.runner._run_review_verify_command_with_timeout_diagnostics", side_effect=fake_child):
+        run = run_flaky_reproduction_plan(
+            store,
+            project_dir=tmp_path,
+            task_id=task.id,
+            plan=plan,
+            timeout_seconds=30,
+            timeout_grace_seconds=5.0,
+            runtime_context=runtime_context,
+        )
+
+    assert run.reproduced is False
+    assert len(run.attempts) == 2
+    snapshot_paths = []
+    observed_lines = (tmp_path / "observed-snapshots.txt").read_text(encoding="utf-8").splitlines()
+    assert len(observed_lines) == 2
+    for line in observed_lines:
+        raw_path, labels = line.split("|", 1)
+        assert labels == "live"
+        snapshot_path = Path(raw_path)
+        snapshot_paths.append(snapshot_path)
+        assert not snapshot_path.exists()
+        for suffix in ("-wal", "-shm", "-journal"):
+            assert not Path(f"{snapshot_path}{suffix}").exists()
+    attempt_artifacts = store.list_artifacts(task.id, kind=FLAKY_VERIFY_ATTEMPT_ARTIFACT_KIND)
+    assert len(attempt_artifacts) == 2
+    assert len(set(snapshot_paths)) == 2
+    assert len(store.list_artifacts(task.id, kind=FLAKY_VERIFY_INCONCLUSIVE_ARTIFACT_KIND)) == 1
+    conn = sqlite3.connect(str(live_db))
+    try:
+        labels = [row[0] for row in conn.execute("SELECT label FROM verify_markers ORDER BY id")]
+    finally:
+        conn.close()
+    assert labels == ["live"]
 
 
 def test_run_flaky_reproduction_plan_stops_on_matching_reproduction(tmp_path: Path) -> None:

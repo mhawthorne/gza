@@ -10,6 +10,7 @@ from ..flaky_investigations import (
     run_flaky_reproduction_plan,
 )
 from ..runner import _resolve_review_verify_timeout_grace_seconds, _resolve_review_verify_timeout_seconds
+from ..runtime_context import RuntimeExecutionContext
 from ._common import get_store, resolve_id
 
 
@@ -46,6 +47,8 @@ def cmd_flaky_reproduce(args) -> int:
         timeout_seconds=_resolve_review_verify_timeout_seconds(config),
         timeout_grace_seconds=_resolve_review_verify_timeout_grace_seconds(config),
         hypotheses=hypotheses,
+        runtime_context=RuntimeExecutionContext.from_config(config),
+        config=config,
     )
     print(f"Task: {task_id}")
     print(f"Harness cwd: {plan.working_directory}")

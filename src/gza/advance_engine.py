@@ -1982,12 +1982,16 @@ def _classify_off_topic_noop_improve_verify_clearance(
     if not selection.available or selection.plan is None:
         return False, None, None, (), ()
     try:
+        from gza.runtime_context import RuntimeExecutionContext
+
         baseline_run = run_local_target_baseline_plan(
             selection.plan,
             repo_git=git,
             worktree_root=_resolve_baseline_worktree_root(config),
             timeout_seconds=int(getattr(config, "autonomous_verify_timeout_seconds", 120)),
             timeout_grace_seconds=float(getattr(config, "review_verify_timeout_grace_seconds", 5.0)),
+            runtime_context=RuntimeExecutionContext.from_config(config),
+            config=config,
         )
     except Exception as exc:
         return False, None, f"off-topic local-target baseline failed for {target_branch}: {exc}", (), ()
