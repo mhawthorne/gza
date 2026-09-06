@@ -111,12 +111,14 @@ from gza.runner import (
     _persist_review_blocker_adjudication_for_completed_task,
     _post_complete_code_task,
     _prepare_docker_worktree_git_metadata,
+    _provider_runtime_env_with_db_snapshot,
     _read_darwin_process_tree_cpu_seconds,
     _resolve_code_task_branch_name,
     _resolve_review_verify_timeout_grace_seconds,
     _resolve_task_timeout_budget,
     _restore_wip_changes,
     _retry_pr_required_code_task_completion,
+    _route_docker_provider_db_snapshot,
     _run_inner,
     _run_lifecycle_verify,
     _run_non_code_task,
@@ -131,11 +133,10 @@ from gza.runner import (
     _snapshot_task_db_to_worktree,
     _stage_worktree_agent_resources,
     _staged_provider_db_snapshot,
-    _provider_runtime_env_with_db_snapshot,
-    _route_docker_provider_db_snapshot,
     _wait_for_review_verify_process_group_exit,
     backup_database,
     build_prompt,
+    disposable_verify_db_snapshot_env,
     generate_slug,
     get_task_output_paths,
     open_task_startup_log,
@@ -6479,6 +6480,159 @@ class TestSnapshotTaskDbToWorktree:
         _snapshot_task_db_to_worktree(tmp_path / ".gza" / "gza.db", worktree_dir)
 
         assert not (worktree_dir / ".gza" / "gza.db").exists()
+
+
+class TestDisposableVerifyDbSnapshotEnv:
+    """Tests for disposable verify DB snapshot environments."""
+
+    def test_clones_runtime_db_to_fresh_writable_snapshot_without_mutating_env(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / "project" / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO items (name) VALUES ('live')")
+        conn.commit()
+        conn.close()
+
+        verify_cwd = tmp_path / "worktree"
+        verify_cwd.mkdir()
+        monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
+        runtime_env = {
+            "PATH": "/runtime/bin",
+            "HOME": str(tmp_path / "home"),
+            "PWD": str(tmp_path / "project"),
+            "GZA_DB_PATH": str(db_path),
+            "PROJECT_TOKEN": "runtime-token",
+        }
+        runtime_context = RuntimeExecutionContext(
+            cwd=tmp_path / "project",
+            env=runtime_env,
+            project_id="project",
+            db_path=db_path,
+        )
+
+        with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd) as snapshot:
+            assert snapshot.env is not runtime_env
+            assert snapshot.env == {**runtime_env, "GZA_DB_PATH": str(snapshot.host_path)}
+            assert snapshot.subprocess_path == snapshot.host_path
+            assert snapshot.host_path.exists()
+            assert stat.S_IMODE(snapshot.host_path.parent.stat().st_mode) == 0o700
+            assert stat.S_IMODE(snapshot.host_path.stat().st_mode) == 0o600
+
+            snapshot_conn = sqlite3.connect(str(snapshot.host_path))
+            row = snapshot_conn.execute("SELECT name FROM items").fetchone()
+            assert row == ("live",)
+            snapshot_conn.execute("INSERT INTO items (name) VALUES ('snapshot-only')")
+            snapshot_conn.commit()
+            snapshot_conn.close()
+
+            live_conn = sqlite3.connect(str(db_path))
+            live_rows = live_conn.execute("SELECT name FROM items ORDER BY id").fetchall()
+            live_conn.close()
+            assert live_rows == [("live",)]
+            snapshot_path = snapshot.host_path
+
+        assert runtime_context.env is runtime_env
+        assert runtime_env["GZA_DB_PATH"] == str(db_path)
+        assert os.environ["GZA_DB_PATH"] == str(tmp_path / "ambient.db")
+        assert not snapshot_path.exists()
+
+    def test_creates_fresh_snapshot_for_each_entry(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "project" / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO items (name) VALUES ('first')")
+        conn.commit()
+        conn.close()
+        verify_cwd = tmp_path / "worktree"
+        verify_cwd.mkdir()
+        runtime_context = RuntimeExecutionContext(
+            cwd=tmp_path / "project",
+            env={"GZA_DB_PATH": str(db_path)},
+            project_id="project",
+            db_path=db_path,
+        )
+
+        with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd) as first:
+            first_path = first.host_path
+            conn = sqlite3.connect(str(first.host_path))
+            conn.execute("INSERT INTO items (name) VALUES ('first-snapshot')")
+            conn.commit()
+            conn.close()
+
+        with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd) as second:
+            assert second.host_path != first_path
+            conn = sqlite3.connect(str(second.host_path))
+            rows = conn.execute("SELECT name FROM items ORDER BY id").fetchall()
+            conn.close()
+
+        assert rows == [("first",)]
+        assert not first_path.exists()
+        assert not second.host_path.exists()
+
+    def test_cleans_database_and_companions_after_exception(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "project" / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+        verify_cwd = tmp_path / "worktree"
+        verify_cwd.mkdir()
+        runtime_context = RuntimeExecutionContext(
+            cwd=tmp_path / "project",
+            env={"GZA_DB_PATH": str(db_path)},
+            project_id="project",
+            db_path=db_path,
+        )
+
+        with pytest.raises(RuntimeError, match="verify failed"):
+            with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd) as snapshot:
+                snapshot_path = snapshot.host_path
+                for suffix in ("-wal", "-shm", "-journal"):
+                    Path(f"{snapshot_path}{suffix}").write_text("sidecar", encoding="utf-8")
+                raise RuntimeError("verify failed")
+
+        assert not snapshot_path.exists()
+        for suffix in ("-wal", "-shm", "-journal"):
+            assert not Path(f"{snapshot_path}{suffix}").exists()
+
+    def test_translates_snapshot_path_for_docker_without_mutating_runtime_env(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "repo" / "services" / "foo" / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+        verify_cwd = tmp_path / "worktree" / "services" / "foo"
+        verify_cwd.mkdir(parents=True)
+        runtime_env = {"GZA_DB_PATH": str(db_path), "PATH": "/runtime/bin"}
+        runtime_context = RuntimeExecutionContext(
+            cwd=tmp_path / "repo" / "services" / "foo",
+            env=runtime_env,
+            project_id="foo",
+            db_path=db_path,
+        )
+        config = SimpleNamespace(use_docker=True, docker_workdir="/workspace/services/foo")
+        verify_cwd.chmod(0o700)
+
+        with disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config) as snapshot:
+            assert snapshot.host_path.exists()
+            assert snapshot.subprocess_path == Path("/workspace/services/foo") / snapshot.host_path.relative_to(verify_cwd)
+            assert snapshot.env["GZA_DB_PATH"] == str(snapshot.subprocess_path)
+            assert snapshot.env["PATH"] == "/runtime/bin"
+            assert stat.S_IMODE(verify_cwd.stat().st_mode) == 0o710
+            assert stat.S_IMODE((verify_cwd / ".gza").stat().st_mode) & stat.S_IXGRP
+            assert stat.S_IMODE((verify_cwd / ".gza" / "tmp").stat().st_mode) & stat.S_IXGRP
+            assert stat.S_IMODE(snapshot.host_path.parent.stat().st_mode) == 0o730
+            assert stat.S_IMODE(snapshot.host_path.stat().st_mode) == 0o660
+
+        assert runtime_env["GZA_DB_PATH"] == str(db_path)
 
 
 class TestStageWorktreeAgentResources:

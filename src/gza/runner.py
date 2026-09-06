@@ -10,12 +10,14 @@ import selectors
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import tomllib
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -338,6 +340,16 @@ class StagedProviderDbSnapshot:
 
     host_path: Path
     provider_path: Path
+
+
+@dataclass(frozen=True)
+class VerifyDbSnapshotEnvironment:
+    """Disposable verify DB snapshot paths plus the subprocess environment."""
+
+    env: dict[str, str]
+    host_path: Path
+    subprocess_path: Path
+    docker_group_ids: tuple[int, ...] = ()
 
 
 def _git_error_failure() -> ResolvedRunFailure:
@@ -2914,6 +2926,112 @@ def _backup_sqlite_file(source_path: Path, destination_path: Path) -> None:
             destination.close()
     finally:
         source.close()
+
+
+_SQLITE_COMPANION_SUFFIXES = ("", "-wal", "-shm", "-journal")
+
+
+def _cleanup_sqlite_file_with_companions(db_path: Path) -> None:
+    """Remove a SQLite file and common sidecar files if they exist."""
+    for suffix in _SQLITE_COMPANION_SUFFIXES:
+        path = Path(f"{db_path}{suffix}")
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _verify_snapshot_subprocess_path(
+    *,
+    config: Config | object | None,
+    cwd: Path,
+    snapshot_path: Path,
+) -> Path:
+    if not bool(getattr(config, "use_docker", False)):
+        return snapshot_path
+    try:
+        relative_snapshot_path = snapshot_path.relative_to(cwd)
+    except ValueError:
+        return snapshot_path
+    docker_workdir = Path(str(getattr(config, "docker_workdir", "/workspace") or "/workspace"))
+    return docker_workdir / relative_snapshot_path
+
+
+def _prepare_docker_verify_snapshot_permissions(
+    *,
+    cwd: Path,
+    tmp_parent: Path,
+    tmp_dir: Path,
+    snapshot_path: Path,
+) -> tuple[int, ...]:
+    snapshot_gid = tmp_dir.stat().st_gid
+    safe_paths = (cwd, cwd / ".gza", tmp_parent, tmp_dir, snapshot_path)
+    for path in safe_paths:
+        try:
+            os.chown(path, -1, snapshot_gid)
+        except PermissionError:
+            pass
+    for path in (cwd, cwd / ".gza", tmp_parent):
+        path.chmod(stat.S_IMODE(path.stat().st_mode) | stat.S_IXGRP)
+    tmp_dir.chmod(0o730)
+    snapshot_path.chmod(0o660)
+    required_gids = {snapshot_gid}
+    for path in (cwd, cwd / ".gza", tmp_parent, tmp_dir, snapshot_path):
+        path_gid = path.stat().st_gid
+        if path_gid != snapshot_gid:
+            required_gids.add(path_gid)
+    return tuple(sorted(required_gids))
+
+
+@contextmanager
+def disposable_verify_db_snapshot_env(
+    runtime_context: RuntimeExecutionContext,
+    *,
+    cwd: Path,
+    config: Config | object | None = None,
+) -> Iterator[VerifyDbSnapshotEnvironment]:
+    """Yield a runtime env routed to a private writable SQLite backup for verify."""
+    source_db_path = runtime_context.db_path
+    if not source_db_path.exists():
+        raise FileNotFoundError(f"runtime DB does not exist: {source_db_path}")
+
+    tmp_parent = cwd / ".gza" / "tmp"
+    tmp_parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="verify-db-", dir=tmp_parent))
+    snapshot_path = tmp_dir / "gza.db"
+    try:
+        _backup_sqlite_file(source_db_path, snapshot_path)
+        docker_group_ids: tuple[int, ...] = ()
+        if bool(getattr(config, "use_docker", False)):
+            docker_group_ids = _prepare_docker_verify_snapshot_permissions(
+                cwd=cwd,
+                tmp_parent=tmp_parent,
+                tmp_dir=tmp_dir,
+                snapshot_path=snapshot_path,
+            )
+        else:
+            snapshot_path.chmod(0o600)
+        subprocess_path = _verify_snapshot_subprocess_path(
+            config=config,
+            cwd=cwd,
+            snapshot_path=snapshot_path,
+        )
+        env = dict(runtime_context.env)
+        env["GZA_DB_PATH"] = str(subprocess_path)
+        if docker_group_ids:
+            env["GZA_DOCKER_GROUP_ADD"] = ",".join(str(gid) for gid in docker_group_ids)
+        yield VerifyDbSnapshotEnvironment(
+            env=env,
+            host_path=snapshot_path,
+            subprocess_path=subprocess_path,
+            docker_group_ids=docker_group_ids,
+        )
+    finally:
+        _cleanup_sqlite_file_with_companions(snapshot_path)
+        try:
+            tmp_dir.rmdir()
+        except OSError:
+            pass
 
 
 BACKUP_COMPRESSED_SUFFIX = ".zst"

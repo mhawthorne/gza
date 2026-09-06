@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -725,6 +725,9 @@ def build_docker_cmd(
     env_source = os.environ if host_env is None else host_env
     stdio_flag = "-it" if interactive else "-i"
     venv_tmpfs_target = posixpath.join(docker_workdir or "/workspace", ".venv")
+    group_add_ids = {str(os.getgid())}
+    for group_add_id in _iter_docker_group_add_values(env_source, docker_env):
+        group_add_ids.add(group_add_id)
     cmd = [
         "timeout", f"{timeout_minutes}m",
         "docker", "run", "--rm", stdio_flag,
@@ -735,6 +738,8 @@ def build_docker_cmd(
         "--tmpfs", f"{venv_tmpfs_target}:rw,exec,mode=1777",
         "-w", docker_workdir,
     ]
+    for group_id in sorted(group_add_ids, key=int):
+        cmd.extend(["--group-add", group_id])
 
     # Mount config directory if specified (for OAuth credentials)
     for arg in _get_config_dir_volume_args(docker_config, host_env=host_env):
@@ -790,6 +795,25 @@ def build_docker_cmd(
 
     cmd.append(docker_config.image_name)
     return cmd
+
+
+def _iter_docker_group_add_values(
+    host_env: Mapping[str, str],
+    docker_env: list[str] | None,
+) -> Iterator[str]:
+    raw_values = [host_env.get("GZA_DOCKER_GROUP_ADD")]
+    raw_values.extend(
+        value.split("=", 1)[1]
+        for value in (docker_env or [])
+        if value.startswith("GZA_DOCKER_GROUP_ADD=")
+    )
+    for raw_value in raw_values:
+        if not raw_value:
+            continue
+        for token in raw_value.split(","):
+            token = token.strip()
+            if token and token.isdecimal():
+                yield token
 
 
 def is_docker_running(*, host_env: Mapping[str, str] | None = None, host_cwd: Path | None = None) -> bool:
