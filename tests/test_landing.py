@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -11,8 +12,7 @@ from typing import Any
 import pytest
 
 from gza.config import Config
-from gza.db import SqliteTaskStore, Task
-from gza.db import WatchProgressObservation
+from gza.db import SqliteTaskStore, Task, WatchProgressObservation
 from gza.landing import (
     LANDING_PHASES,
     LandBlocked,
@@ -45,8 +45,8 @@ from gza.landing import (
     inspect_current_landing_verify_evidence,
     run_landing_post_rebase_review_transition,
 )
-from gza.review_scope import build_spec_coherence_review_scope
-from gza.review_scope import build_resolution_review_scope
+from gza.rebase_service import RebaseServiceRequest, RebaseServiceResult
+from gza.review_scope import build_resolution_review_scope, build_spec_coherence_review_scope
 from gza.review_tasks import DuplicateReviewError
 from gza.review_verdict import ParsedReviewReport, ReviewFinding
 from gza.review_verify_state import (
@@ -63,7 +63,6 @@ from gza.runner import (
     ReviewVerifyResult,
     _persist_lifecycle_verify_execution,
 )
-from gza.rebase_service import RebaseServiceRequest, RebaseServiceResult
 from gza.sync_ops import BranchSyncResult
 
 TREE_A = "a" * 64
@@ -2235,6 +2234,7 @@ class _FakeGit:
         ancestors: set[tuple[str, str]] | None = None,
         can_merge_refs: set[tuple[str, str]] | None = None,
         name_status: str = "",
+        diff: str = "diff --git a/example b/example\n+landing change\n",
     ) -> None:
         self.heads = heads
         self._current_branch = current_branch
@@ -2243,6 +2243,7 @@ class _FakeGit:
         self.ancestors = ancestors or set()
         self.can_merge_refs = can_merge_refs
         self.name_status = name_status
+        self.diff = diff
         self.merge_calls: list[tuple[str, str | None]] = []
         self.mutation_calls: list[str] = []
 
@@ -2268,6 +2269,9 @@ class _FakeGit:
     def get_diff_name_status(self, revision_range: str, *, check: bool = True) -> str:
         assert check is True
         return self.name_status
+
+    def get_diff(self, revision_range: str) -> str:
+        return self.diff
 
     def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
         del use_cherry
@@ -3587,7 +3591,7 @@ def test_landing_coordinator_store_backed_blocker_identity_mismatch_fails_closed
     )
     coordinator = LandingCoordinator(store=store, git=git, config=config)
 
-    result = coordinator.run(LandRequest(task_id=impl.id, dry_run=True))
+    coordinator.run(LandRequest(task_id=impl.id, dry_run=True))
     identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
     assert not isinstance(identity, LandBlocked)
     fingerprint = LandingStateFingerprint.from_facts(coordinator._landing_policy_facts(identity))
@@ -3658,7 +3662,7 @@ def test_landing_coordinator_production_fingerprint_tracks_park_and_judgment_ide
     assert first.parked_reason is None
     assert second.parked_reason == "review-max-cycles-reached"
     assert second.policy_judgment_identity is not None
-    assert second.policy_judgment_identity.startswith("artifact:")
+    assert second.policy_judgment_identity.startswith("sha256:")
 
 
 def test_landing_coordinator_dry_run_uses_merge_unit_attached_code_review_evidence(tmp_path) -> None:
@@ -4563,6 +4567,7 @@ def test_landing_coordinator_runs_one_task_backed_rebase_when_source_is_behind(t
             task_id=identity.owner_task_id,
             source_head=identity.source_sha,
             target_head=identity.target_sha,
+            review=_review(reviewed_head=identity.source_sha),
             rebase_status="none",
             rebase_resolution_kind="none",
             rebase_target_contained=(identity.target_sha, identity.source_sha) in git.ancestors,
@@ -4796,6 +4801,7 @@ def test_landing_coordinator_invokes_canonical_verify_acquisition(monkeypatch, t
             task_id=identity.owner_task_id,
             source_head=identity.source_sha,
             target_head=identity.target_sha,
+            review=_review(reviewed_head=identity.source_sha),
             verify=_verify(status="missing", current=False, identity_matched=False)
             if facts_calls == 1
             else _verify(),
@@ -5029,6 +5035,124 @@ def test_landing_coordinator_strict_changes_requested_stops_without_review_or_im
     _assert_no_review_or_improve_rows_after_landing_review(store, {review.id or ""})
 
 
+def test_landing_coordinator_guarded_defers_blockers_after_final_preflight_and_merges(tmp_path) -> None:
+    from gza.merge_services import ManualMergeExecutionResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "guarded deferral", "feature/landing")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    order: list[str] = []
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            parked_reason="review-max-cycles-reached",
+            review=_review(verdict="CHANGES_REQUESTED", reviewed_head=identity.source_sha),
+            open_blockers=(_blocker("B1", deferrable=True, blocker_class="out_of_scope"),),
+        )
+
+    def judge() -> LandingJudgment:
+        order.append("judge")
+        return LandingJudgment("LAND", artifact_id="judge-artifact", key="judge-key")
+
+    def merge(identity: Any, decision: LandingPolicyDecision, provenance: str) -> ManualMergeExecutionResult:
+        order.append("merge")
+        assert order == ["judge", "merge"]
+        assert provenance == "manual_land_escalated"
+        assert decision.allowed_overrides == (
+            "defer-review-blockers",
+            "parked:review-max-cycles-reached",
+        )
+        blocker = store.add("deferred B1", task_type="implement", depends_on=impl.id, create_pr=True, urgent=True)
+        return ManualMergeExecutionResult(
+            rc=0,
+            status="merged",
+            created_deferred_blockers=[blocker],
+        )
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        landing_judge=judge,
+        execute_merge=merge,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is None
+    assert result.merged is True
+    assert result.merge_provenance == "manual_land_escalated"
+    assert result.judgment_artifact_id == "judge-artifact"
+    assert result.judgment_key == "judge-key"
+    assert result.deferred_task_ids
+    deferred = store.get(result.deferred_task_ids[0])
+    assert deferred is not None
+    assert deferred.urgent is True
+    assert deferred.create_pr is True
+    assert [step.phase for step in result.steps[-3:]] == ["judge", "defer_blockers", "merge"]
+
+
+@pytest.mark.parametrize("changed_ref", ("source", "target"))
+def test_landing_coordinator_final_head_change_blocks_before_deferred_materialization(
+    tmp_path,
+    changed_ref: str,
+) -> None:
+    from gza.merge_services import ManualMergeExecutionResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "head invalidation", "feature/landing")
+    assert impl.id is not None
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            parked_reason="review-max-cycles-reached",
+            review=_review(verdict="CHANGES_REQUESTED", reviewed_head=identity.source_sha),
+            open_blockers=(_blocker("B1", deferrable=True, blocker_class="out_of_scope"),),
+        )
+
+    def judge() -> LandingJudgment:
+        if changed_ref == "source":
+            git.heads["feature/landing"] = "head-b"
+        else:
+            git.heads["main"] = "target-b"
+        return LandingJudgment("LAND", artifact_id="judge-artifact", key="judge-key")
+
+    def merge(*_args: Any, **_kwargs: Any) -> ManualMergeExecutionResult:
+        raise AssertionError("deferred blockers and merge must not run after head invalidation")
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        inspect_policy_facts=inspect,
+        landing_judge=judge,
+        execute_merge=merge,
+    ).run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "identity-proof-unavailable"
+    assert f"{changed_ref} head changed" in result.blocked.fact
+    assert all(step.phase != "defer_blockers" for step in result.steps)
+    assert all(task.prompt != "deferred B1" for task in store.get_all())
+
+
 def test_land_cli_prints_concrete_dry_run_evidence(monkeypatch, capsys, tmp_path) -> None:
     from gza.cli import land as land_cli
 
@@ -5066,6 +5190,403 @@ def test_land_cli_prints_concrete_dry_run_evidence(monkeypatch, capsys, tmp_path
     assert status == 0
     assert "verify-1 passed for gate gate-a" in output
     assert "review gza-10158 is APPROVED" in output
+
+
+def test_cmd_land_guarded_uses_durable_judge_and_typed_authorization_to_reach_merge(
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    from gza.cli import land as land_cli
+    from gza.cli.git_ops import _MergeSingleTaskResult
+    from gza.landing_judge import LandingJudgeResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "CLI guarded landing", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", "Out-of-scope polish debt", "docs/internal/landing.md:12"),),
+    )
+    store.update(review)
+    _add_review_blocker_resolution(store, impl=impl, review=review)
+    _park_for_review_blocker_adjudication(store, impl)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    judge_calls: list[tuple[str, tuple[str, ...]]] = []
+    merge_authorizations: list[Any] = []
+
+    def obtain(**kwargs: Any) -> LandingJudgeResult:
+        judge_calls.append((kwargs["identity"].key, tuple(blocker.finding_id for blocker in kwargs["blockers"])))
+        artifact = _persist_test_landing_judgment(store, impl, review, kwargs["identity"], kwargs["prompt"])
+        return LandingJudgeResult(
+            judgment=LandingJudgment("LAND", artifact_id=str(artifact.id), key=kwargs["identity"].key),
+            reused_artifact=True,
+        )
+
+    def merge_single(*_args: Any, **kwargs: Any) -> _MergeSingleTaskResult:
+        authorization = kwargs["landing_authorization"]
+        merge_authorizations.append(authorization)
+        assert authorization.allowed_overrides == (
+            "defer-review-blockers",
+            "parked:review-blocker-adjudication-needed",
+        )
+        assert kwargs["load_landing_authorization"]() == authorization
+        deferred = store.add("Deferred B1", task_type="implement", depends_on=impl.id, urgent=True, create_pr=True)
+        return _MergeSingleTaskResult(rc=0, status="merged", created_deferred_blockers=(deferred,))
+
+    monkeypatch.setattr(land_cli.Config, "load", lambda _project_dir: config)
+    monkeypatch.setattr(land_cli, "get_store", lambda _config, open_mode="readwrite": store)
+    monkeypatch.setattr(land_cli, "resolve_id", lambda _config, task_id: task_id)
+    monkeypatch.setattr(land_cli, "Git", lambda _project_dir: git)
+    monkeypatch.setattr("gza.landing_judge.obtain_landing_judgment", obtain)
+    monkeypatch.setattr("gza.cli.git_ops._merge_single_task", merge_single)
+
+    rc = land_cli.cmd_land(argparse.Namespace(project_dir=tmp_path, task_id=impl.id, policy="guarded", dry_run=False))
+
+    assert rc == 0
+    assert judge_calls == [(merge_authorizations[0].judgment_key, ("B1",))]
+    assert merge_authorizations[0].review_id == review.id
+    assert merge_authorizations[0].blocker_fingerprints
+    assert "Landed" in capsys.readouterr().out
+
+
+def _persist_test_landing_judgment(
+    store: SqliteTaskStore,
+    impl: Task,
+    review: Task,
+    identity: Any,
+    prompt: str,
+) -> Any:
+    from gza.landing_judge import (
+        _extract_prompt_context_envelope,
+        create_or_reuse_landing_judge_task,
+        parse_landing_judge_output,
+        persist_landing_judgment_artifact,
+    )
+
+    blocker_ids = tuple(blocker.finding_id for blocker in identity.blocker_identities)
+    envelope = _extract_prompt_context_envelope(prompt)
+    decision_context = envelope["decision_context"]
+    assert isinstance(decision_context, dict)
+    review_output = decision_context["review_output"]
+    assert isinstance(review_output, str)
+    review.output_content = review_output
+    store.update(review)
+    payload = {
+        "schema_version": "landing_judge.v1",
+        "result": "LAND",
+        "ask_met": True,
+        "blocker_decisions": [
+            {
+                "finding_id": finding_id,
+                "decision": "DEFERABLE",
+                "citations": [f"blocker:{finding_id}", "review:current", "scope:authoritative"],
+                "reason": "safe adjacent follow-up",
+            }
+            for finding_id in blocker_ids
+        ],
+        "citations": [
+            "request:task",
+            "plan:context",
+            "scope:authoritative",
+            "review:current",
+            "diff:current",
+            "verify:green",
+            "adjudication:current",
+        ],
+        "blocking_fact": "none",
+    }
+    parsed = parse_landing_judge_output(
+        json.dumps(payload),
+        expected_blocker_ids=blocker_ids,
+        allowed_citation_ids=tuple(
+            sorted(
+                {
+                    "scope:authoritative",
+                    "request:task",
+                    "plan:context",
+                    "diff:current",
+                    "verify:green",
+                    "review:current",
+                    "adjudication:current",
+                    *(f"blocker:{finding_id}" for finding_id in blocker_ids),
+                }
+            )
+        ),
+    )
+    assert parsed is not None
+    judge_task, _created = create_or_reuse_landing_judge_task(
+        store,
+        config=None,
+        owner_task=impl,
+        review_task=review,
+        identity=identity,
+        prompt=prompt,
+        trigger_source="manual_land",
+    )
+    judge_task.status = "completed"
+    judge_task.completed_at = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    judge_task.output_content = json.dumps(payload)
+    store.update(judge_task)
+    return persist_landing_judgment_artifact(
+        store,
+        owner_task=impl,
+        config=_verify_config(store.db_path.parent),
+        identity=identity,
+        parsed=parsed,
+        judge_task_id=judge_task.id,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("review_output", "implementation_summary", "judge_status", "judge_output", "deleted_authorized_artifact"),
+)
+def test_cmd_land_guarded_final_reload_refuses_stale_or_missing_judgment_artifact(
+    monkeypatch,
+    capsys,
+    tmp_path,
+    mutation: str,
+) -> None:
+    from gza.cli import land as land_cli
+    from gza.cli.git_ops import _MergeSingleTaskResult
+    from gza.landing_judge import LandingJudgeResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "CLI guarded stale evidence", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", "Out-of-scope polish debt", "docs/internal/landing.md:12"),),
+    )
+    store.update(review)
+    _add_review_blocker_resolution(store, impl=impl, review=review)
+    _park_for_review_blocker_adjudication(store, impl)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    artifacts: list[Any] = []
+    judge_tasks: list[str] = []
+
+    def obtain(**kwargs: Any) -> LandingJudgeResult:
+        artifact = _persist_test_landing_judgment(store, impl, review, kwargs["identity"], kwargs["prompt"])
+        artifacts.append(artifact)
+        judge_task_id = artifact.metadata["judge_task_id"]
+        assert isinstance(judge_task_id, str)
+        judge_tasks.append(judge_task_id)
+        if mutation == "deleted_authorized_artifact":
+            newer = _persist_test_landing_judgment(store, impl, review, kwargs["identity"], kwargs["prompt"])
+            assert newer.id != artifact.id
+            artifacts.append(newer)
+        return LandingJudgeResult(
+            judgment=LandingJudgment("LAND", artifact_id=str(artifact.id), key=kwargs["identity"].key),
+            reused_artifact=True,
+        )
+
+    def mutate_current_evidence() -> None:
+        if mutation == "review_output":
+            review.output_content = _review_report_with_findings(
+                "CHANGES_REQUESTED",
+                blockers=(("B1", "Out-of-scope polish debt", "docs/internal/landing.md:12"),),
+            ) + "\nAdditional evidence detail.\n"
+            store.update(review)
+        elif mutation == "implementation_summary":
+            refreshed = store.get(impl.id or "")
+            assert refreshed is not None
+            refreshed.output_content = (refreshed.output_content or refreshed.prompt) + "\nCurrent summary changed.\n"
+            store.update(refreshed)
+        elif mutation == "judge_status":
+            judge = store.get(judge_tasks[0])
+            assert judge is not None
+            judge.status = "failed"
+            store.update(judge)
+        elif mutation == "judge_output":
+            judge = store.get(judge_tasks[0])
+            assert judge is not None
+            judge.output_content = json.dumps({"schema_version": "landing_judge.v1", "result": "LAND"})
+            store.update(judge)
+        elif mutation == "deleted_authorized_artifact":
+            with store._connect() as conn:
+                conn.execute(
+                    "DELETE FROM task_artifacts WHERE project_id = ? AND id = ?",
+                    (store._project_id, artifacts[0].id),
+                )
+
+    def merge_single(*_args: Any, **kwargs: Any) -> _MergeSingleTaskResult:
+        mutate_current_evidence()
+        assert kwargs["load_landing_authorization"]() is None
+        return _MergeSingleTaskResult(
+            rc=1,
+            status="landing_authorization_changed",
+            block_reason="landing authorization changed before merge side effects",
+        )
+
+    monkeypatch.setattr(land_cli.Config, "load", lambda _project_dir: config)
+    monkeypatch.setattr(land_cli, "get_store", lambda _config, open_mode="readwrite": store)
+    monkeypatch.setattr(land_cli, "resolve_id", lambda _config, task_id: task_id)
+    monkeypatch.setattr(land_cli, "Git", lambda _project_dir: git)
+    monkeypatch.setattr("gza.landing_judge.obtain_landing_judgment", obtain)
+    monkeypatch.setattr("gza.cli.git_ops._merge_single_task", merge_single)
+
+    rc = land_cli.cmd_land(argparse.Namespace(project_dir=tmp_path, task_id=impl.id, policy="guarded", dry_run=False))
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "Cannot land" in output
+    assert "landing authorization changed" in output
+    assert [task for task in store.get_all() if task.task_type == "implement" and task.depends_on == impl.id] == []
+
+
+def test_cmd_land_judge_receives_normalized_adjudication_content_and_actual_diff(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from gza.cli import land as land_cli
+    from gza.landing_judge import LandingJudgeResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "CLI guarded landing content", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", "Out-of-scope polish debt", "docs/internal/landing.md:12"),),
+    )
+    store.update(review)
+    _add_review_blocker_resolution(store, impl=impl, review=review, reason="adjacent")
+    _park_for_review_blocker_adjudication(store, impl)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+        diff="diff --git a/docs/internal/landing.md b/docs/internal/landing.md\n+current patch\n",
+    )
+    captured: dict[str, Any] = {}
+
+    def obtain(**kwargs: Any) -> LandingJudgeResult:
+        captured["identity"] = kwargs["identity"]
+        captured["prompt"] = kwargs["prompt"]
+        return LandingJudgeResult(judgment=LandingJudgment("BLOCK", blocking_fact="captured context"))
+
+    def merge_single(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("merge must not run when the judge refuses")
+
+    monkeypatch.setattr(land_cli.Config, "load", lambda _project_dir: config)
+    monkeypatch.setattr(land_cli, "get_store", lambda _config, open_mode="readwrite": store)
+    monkeypatch.setattr(land_cli, "resolve_id", lambda _config, task_id: task_id)
+    monkeypatch.setattr(land_cli, "Git", lambda _project_dir: git)
+    monkeypatch.setattr("gza.landing_judge.obtain_landing_judgment", obtain)
+    monkeypatch.setattr("gza.cli.git_ops._merge_single_task", merge_single)
+
+    rc = land_cli.cmd_land(argparse.Namespace(project_dir=tmp_path, task_id=impl.id, policy="guarded", dry_run=False))
+
+    assert rc == 1
+    assert "normalized_reason" in captured["prompt"]
+    assert "adjacent" in captured["prompt"]
+    assert "diff --git a/docs/internal/landing.md b/docs/internal/landing.md" in captured["prompt"]
+    assert captured["identity"].adjudication_content_identity.startswith("sha256:")
+
+
+@pytest.mark.parametrize("failure", ("diff", "judge"))
+def test_cmd_land_diff_and_judge_exceptions_are_typed_refusals_without_merge(
+    monkeypatch,
+    capsys,
+    tmp_path,
+    failure: str,
+) -> None:
+    from gza.cli import land as land_cli
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "CLI guarded landing failure", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", "Out-of-scope polish debt", "docs/internal/landing.md:12"),),
+    )
+    store.update(review)
+    _add_review_blocker_resolution(store, impl=impl, review=review)
+    _park_for_review_blocker_adjudication(store, impl)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    if failure == "diff":
+        def bad_diff(_revision_range: str) -> str:
+            raise RuntimeError("diff unavailable")
+
+        git.get_diff = bad_diff  # type: ignore[method-assign]
+
+    def obtain(**_kwargs: Any) -> Any:
+        if failure == "judge":
+            raise RuntimeError("judge unavailable")
+        raise AssertionError("judge service must not run when diff evidence is unavailable")
+
+    def merge_single(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("merge must not run after judge evidence failure")
+
+    monkeypatch.setattr(land_cli.Config, "load", lambda _project_dir: config)
+    monkeypatch.setattr(land_cli, "get_store", lambda _config, open_mode="readwrite": store)
+    monkeypatch.setattr(land_cli, "resolve_id", lambda _config, task_id: task_id)
+    monkeypatch.setattr(land_cli, "Git", lambda _project_dir: git)
+    monkeypatch.setattr("gza.landing_judge.obtain_landing_judgment", obtain)
+    monkeypatch.setattr("gza.cli.git_ops._merge_single_task", merge_single)
+
+    rc = land_cli.cmd_land(argparse.Namespace(project_dir=tmp_path, task_id=impl.id, policy="guarded", dry_run=False))
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "Cannot land" in output
+    assert "guarded landing judgment" in output
+    assert ("diff unavailable" in output) if failure == "diff" else ("judge unavailable" in output)
+
+
+def test_landing_adjudication_identity_changes_when_reason_changes_with_stable_artifact_id(tmp_path) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "adjudication reason identity", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    review = _completed_full_review(store, impl, head="head-a", verdict="CHANGES_REQUESTED")
+    review.output_content = _review_report_with_findings(
+        "CHANGES_REQUESTED",
+        blockers=(("B1", "Out-of-scope polish debt", "docs/internal/landing.md:12"),),
+    )
+    store.update(review)
+    artifact = _add_review_blocker_resolution(store, impl=impl, review=review, reason="out_of_scope")
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    first = coordinator._landing_policy_facts(identity)
+
+    _add_review_blocker_resolution(store, impl=impl, review=review, reason="adjacent", artifact_id=artifact.id)
+    second = coordinator._landing_policy_facts(identity)
+
+    assert first.adjudication_fingerprints != second.adjudication_fingerprints
+    assert first.open_blockers[0].blocker_class == "out_of_scope"
+    assert second.open_blockers[0].blocker_class == "adjacent"
 
 
 def _verify_config(tmp_path) -> Config:

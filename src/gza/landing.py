@@ -24,7 +24,13 @@ from gza.cli.advance_executor import (
 )
 from gza.db import SqliteTaskStore, Task as DbTask, _task_is_actionable_merge_unit_member
 from gza.dependency_preconditions import dependency_readiness
-from gza.merge_services import ResolvedMergeSubject, check_manual_merge_preflight, resolve_merge_subject_query_only
+from gza.merge_services import (
+    ManualMergeExecutionResult,
+    MergeLandingAuthorization,
+    ResolvedMergeSubject,
+    check_manual_merge_preflight,
+    resolve_merge_subject_query_only,
+)
 from gza.query import get_implementation_review_evidence, get_same_branch_rebase_descendants_for_root
 from gza.rebase_service import (
     COMPLETED_REBASE_EXECUTION_STATUSES,
@@ -124,6 +130,8 @@ LandingPolicyReasonCode = Literal[
     "nondeferrable-blocker",
     "policy-or-judge-refused",
 ]
+LANDING_GUARDED_POLICY_VERSION = "guarded.v1"
+LANDING_JUDGE_SCHEMA_VERSION = "landing_judge.v1"
 LandingVerifyAcquisitionStatus = Literal["current_green", "ran_verify", "blocked"]
 LandingPostRebaseReviewStatus = Literal[
     "not_required",
@@ -342,10 +350,11 @@ class LandingTransitionLimitPolicy:
 
 @dataclass
 class LandingCoordinator:
-    """Initial landing coordinator skeleton.
+    """Bounded coordinator for operator-triggered landing.
 
-    This slice resolves identity, reconciles already-landed state, emits
-    query-only dry-run plans, and stops before execution-required phases.
+    The coordinator re-resolves state after mutating prerequisites, evaluates
+    strict/guarded policy against current evidence, and delegates the final
+    merge/materialization boundary to a shared merge executor.
     """
 
     store: SqliteTaskStore
@@ -366,6 +375,7 @@ class LandingCoordinator:
     create_full_review: Callable[..., DbTask] = create_review_task
     create_resolution_review: Callable[..., DbTask] = create_resolution_review_task
     landing_judge: LandingJudge | None = None
+    execute_merge: LandingMergeExecutor | None = None
     post_rebase_review_budget_used: bool = False
 
     def plan(self, request: LandRequest) -> LandResult:
@@ -512,17 +522,27 @@ class LandingCoordinator:
                 continue
 
             if first_boundary == "post_rebase_review":
-                step, blocked = self._run_post_rebase_review_phase(identity, facts, policy=request.policy)
+                step, blocked, decision = self._run_post_rebase_review_phase(identity, facts, policy=request.policy)
                 steps.append(step)
                 if blocked is not None:
                     return self._blocked_result(request, identity, steps, blocked)
-                blocked = LandBlocked(
-                    "merge-failed",
-                    self._boundary_fact("merge"),
-                    _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+                return self._run_policy_and_merge_phases(
+                    request=request,
+                    identity=identity,
+                    facts=facts,
+                    steps=steps,
+                    judge_required=False,
+                    decision=decision,
                 )
-                steps.append(LandStep("merge", "blocked", blocked.fact, blocked=blocked))
-                return self._blocked_result(request, identity, steps, blocked)
+
+            if first_boundary in {"judge", "merge"}:
+                return self._run_policy_and_merge_phases(
+                    request=request,
+                    identity=identity,
+                    facts=facts,
+                    steps=steps,
+                    judge_required=first_boundary == "judge",
+                )
 
             blocked = LandBlocked(
                 self._boundary_reason_code(first_boundary),
@@ -531,6 +551,220 @@ class LandingCoordinator:
             )
             steps.append(LandStep(first_boundary, "blocked", blocked.fact, blocked=blocked))
             return self._blocked_result(request, identity, steps, blocked)
+
+    def _run_policy_and_merge_phases(
+        self,
+        *,
+        request: LandRequest,
+        identity: LandingResolvedIdentity,
+        facts: LandingPolicyFacts,
+        steps: list[LandStep],
+        judge_required: bool,
+        decision: LandingPolicyDecision | None = None,
+    ) -> LandResult:
+        decision = decision or evaluate_landing_policy(policy=request.policy, facts=facts, judge=self.landing_judge)
+        if decision.blocked is not None:
+            steps.append(
+                LandStep(
+                    _phase_for_block(decision.blocked),
+                    "blocked",
+                    decision.blocked.fact,
+                    blocked=decision.blocked,
+                )
+            )
+            return self._blocked_result(request, identity, steps, decision.blocked)
+
+        escalated = bool(decision.allowed_overrides)
+        if judge_required or escalated:
+            steps.append(
+                LandStep(
+                    "judge",
+                    "completed",
+                    "guarded landing judgment authorized policy overrides",
+                    evidence_refs=_evidence_refs(decision.judgment_artifact_id, decision.judgment_key),
+                )
+            )
+        else:
+            steps.append(LandStep("judge", "skipped", "landing judgment is not required"))
+
+        final_preflight_block = self._final_preflight_block(identity)
+        if final_preflight_block is not None:
+            steps.append(
+                LandStep(
+                    _phase_for_block(final_preflight_block),
+                    "blocked",
+                    final_preflight_block.fact,
+                    blocked=final_preflight_block,
+                )
+            )
+            return self._blocked_result(request, identity, steps, final_preflight_block)
+
+        if self.execute_merge is None:
+            blocked = LandBlocked(
+                "merge-failed",
+                self._boundary_fact("merge"),
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+            steps.append(LandStep("merge", "blocked", blocked.fact, blocked=blocked))
+            return self._blocked_result(request, identity, steps, blocked)
+
+        provenance: Literal["manual_land", "manual_land_escalated"] = (
+            "manual_land_escalated" if escalated else "manual_land"
+        )
+        try:
+            merge_result = self.execute_merge(identity, decision, provenance)
+        except Exception as exc:
+            blocked = LandBlocked(
+                "merge-failed",
+                _exception_fact("shared merge execution failed", exc),
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+            steps.append(LandStep("merge", "blocked", blocked.fact, blocked=blocked))
+            return self._blocked_result(request, identity, steps, blocked)
+
+        created_deferred = tuple(task for task in (merge_result.created_deferred_blockers or []) if task.id)
+        reused_deferred = tuple(task for task in (merge_result.reused_deferred_blockers or []) if task.id)
+        created_followups = tuple(task for task in (merge_result.created_followups or []) if task.id)
+        reused_followups = tuple(task for task in (merge_result.reused_followups or []) if task.id)
+        deferred_ids = tuple(task.id or "" for task in (*created_deferred, *reused_deferred))
+        followup_ids = tuple(task.id or "" for task in (*created_followups, *reused_followups))
+
+        if merge_result.rc != 0 or merge_result.status != "merged":
+            reason_code: LandBlockedReasonCode = (
+                "materialization-or-persistence-failed"
+                if merge_result.status
+                in {"deferred_blocker_materialization_failed", "merge_side_effect_materialization_failed"}
+                else "merge-failed"
+            )
+            blocked = LandBlocked(
+                reason_code,
+                merge_result.block_reason or f"shared merge execution stopped with status {merge_result.status}",
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha, *deferred_ids, *followup_ids),
+            )
+            steps.append(LandStep(_phase_for_block(blocked), "blocked", blocked.fact, blocked=blocked))
+            return self._blocked_result(request, identity, steps, blocked)
+
+        if escalated:
+            if "defer-review-blockers" in decision.allowed_overrides and not deferred_ids:
+                blocked = LandBlocked(
+                    "materialization-or-persistence-failed",
+                    "deferred blocker materialization produced no durable task",
+                    _evidence_refs(identity.owner_task_id, decision.judgment_artifact_id, decision.judgment_key),
+                )
+                steps.append(LandStep("defer_blockers", "blocked", blocked.fact, blocked=blocked))
+                return self._blocked_result(request, identity, steps, blocked)
+            steps.append(
+                LandStep(
+                    "defer_blockers",
+                    "completed" if deferred_ids else "skipped",
+                    "deferred blocker tasks were materialized or reused"
+                    if deferred_ids
+                    else "no review blocker deferral was required",
+                    evidence_refs=_evidence_refs(*deferred_ids, decision.judgment_artifact_id, decision.judgment_key),
+                )
+            )
+        elif followup_ids:
+            steps.append(
+                LandStep(
+                    "defer_blockers",
+                    "completed",
+                    "review follow-up tasks were materialized or reused",
+                    evidence_refs=_evidence_refs(*followup_ids),
+                )
+            )
+        else:
+            steps.append(
+                LandStep(
+                    "defer_blockers",
+                    "skipped",
+                    "no follow-up or deferred blocker materialization is required",
+                )
+            )
+
+        steps.append(
+            LandStep(
+                "merge",
+                "completed",
+                f"source merged with {provenance} provenance",
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+        )
+        return LandResult(
+            request=request,
+            owner_task_id=identity.owner_task_id,
+            target_branch=identity.target_branch,
+            source_ref=identity.source_ref,
+            steps=tuple(steps),
+            merged=True,
+            merge_provenance=provenance,
+            judgment_artifact_id=decision.judgment_artifact_id,
+            judgment_key=decision.judgment_key,
+            deferred_task_ids=deferred_ids,
+            followup_task_ids=followup_ids,
+        )
+
+    def _final_preflight_block(self, identity: LandingResolvedIdentity) -> LandBlocked | None:
+        if identity.source_ref is None or identity.source_sha is None or identity.target_sha is None:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                "exact local source or target ref proof is unavailable",
+                _evidence_refs(identity.owner_task_id, identity.source_ref, identity.target_branch),
+            )
+        current_source_sha = _rev_parse_if_exists(self.git, identity.source_ref)
+        current_target_sha = _rev_parse_if_exists(self.git, identity.target_branch)
+        if current_source_sha != identity.source_sha:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                "source head changed after landing authorization",
+                _evidence_refs(identity.owner_task_id, identity.source_sha, current_source_sha, identity.source_ref),
+            )
+        if current_target_sha != identity.target_sha:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                "target head changed after landing authorization",
+                _evidence_refs(identity.owner_task_id, identity.target_sha, current_target_sha, identity.target_branch),
+            )
+        try:
+            current_branch = self.git.current_branch()
+        except Exception as exc:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                _exception_fact("current checkout branch proof is unavailable", exc),
+                _evidence_refs(identity.owner_task_id, identity.source_ref, identity.target_branch),
+            )
+        if current_branch != identity.target_branch:
+            return LandBlocked(
+                "identity-proof-unavailable",
+                f"current checkout is {current_branch}, expected target {identity.target_branch}",
+                _evidence_refs(identity.owner_task_id, current_branch, identity.target_branch),
+            )
+        try:
+            preflight = check_manual_merge_preflight(
+                self.git,
+                merge_subject=identity.owner_task,
+                merge_source_ref=identity.source_ref,
+                current_branch=current_branch,
+                merge_preflight_target=identity.target_branch,
+            )
+        except Exception as exc:
+            return LandBlocked(
+                "rebase-or-conflict",
+                _exception_fact("final manual merge preflight proof is unavailable", exc),
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+        if preflight.ok:
+            return None
+        if preflight.status == "dirty_checkout":
+            return LandBlocked(
+                "dirty-checkout",
+                preflight.block_reason or "tracked checkout is not clean",
+                _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+            )
+        return LandBlocked(
+            "rebase-or-conflict",
+            preflight.block_reason or "final clean-merge proof is unavailable",
+            _evidence_refs(identity.owner_task_id, identity.source_sha, identity.target_sha),
+        )
 
     def _run_rebase_phase(
         self,
@@ -684,14 +918,14 @@ class LandingCoordinator:
         facts: LandingPolicyFacts,
         *,
         policy: LandingPolicyName,
-    ) -> tuple[LandStep, LandBlocked | None]:
+    ) -> tuple[LandStep, LandBlocked | None, LandingPolicyDecision | None]:
         if identity.source_sha is None or identity.target_sha is None:
             blocked = LandBlocked(
                 "identity-proof-unavailable",
                 "exact local source or target ref proof is unavailable",
                 _evidence_refs(identity.owner_task_id, identity.source_ref, identity.target_branch),
             )
-            return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked
+            return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None
         review_request = self._post_rebase_review_request(identity, facts)
         transition = run_landing_post_rebase_review_transition(
             self.store,
@@ -714,6 +948,7 @@ class LandingCoordinator:
                     blocked=review_result.blocked,
                 ),
                 review_result.blocked,
+                None,
             )
         if review_result.status in {"created", "pending", "in_progress"}:
             review = review_result.review_task
@@ -731,6 +966,7 @@ class LandingCoordinator:
                     evidence_refs=blocked.evidence_refs,
                 ),
                 blocked,
+                None,
             )
         if review_result.status == "not_required":
             if not transition.decision.allowed and transition.decision.blocked is not None:
@@ -742,6 +978,7 @@ class LandingCoordinator:
                         blocked=transition.decision.blocked,
                     ),
                     transition.decision.blocked,
+                    transition.decision,
                 )
             return (
                 LandStep(
@@ -751,6 +988,7 @@ class LandingCoordinator:
                     evidence_refs=_review_evidence(facts.review, facts),
                 ),
                 None,
+                transition.decision,
             )
         if not transition.decision.allowed and transition.decision.blocked is not None:
             return (
@@ -761,6 +999,7 @@ class LandingCoordinator:
                     blocked=transition.decision.blocked,
                 ),
                 transition.decision.blocked,
+                transition.decision,
             )
         review = review_result.review_task
         assert review is not None
@@ -773,6 +1012,7 @@ class LandingCoordinator:
                 evidence_refs=_evidence_refs(review.id, identity.source_sha, identity.target_sha),
             ),
             None,
+            transition.decision,
         )
 
     def _default_verify_action_context(self) -> AdvanceActionExecutionContext:
@@ -1169,6 +1409,7 @@ class LandingCoordinator:
                 identity=identity,
             ),
             policy_judgment_identity=_inspect_latest_landing_judgment_identity(self.store, identity),
+            authoritative_scope_identity=_inspect_authoritative_landing_scope_identity(self.store, review),
             adjudication_fingerprints=_inspect_landing_adjudication_fingerprints(self.store, review, identity=identity),
             actionable_lifecycle_work=gates.actionable_lifecycle_work,
             checkout_clean_block=identity.checkout_clean_block,
@@ -1700,6 +1941,7 @@ class LandingPolicyFacts:
     parked_reason: str | None = None
     review_blocker_adjudication_evidence_complete: bool = False
     policy_judgment_identity: str | None = None
+    authoritative_scope_identity: str | None = None
     adjudication_fingerprints: tuple[str, ...] = ()
     guarded_judgment_enabled: bool = True
     actionable_lifecycle_work: tuple[str, ...] = ()
@@ -1758,6 +2000,57 @@ class LandingPolicyDecision:
         object.__setattr__(self, "judgment_key", judgment_refs[1] if judgment_refs else None)
         if not self.allowed and self.followup_materialization_identities:
             raise ValueError("denied landing policy decisions cannot carry follow-up materialization inputs")
+
+
+def landing_merge_authorization_from_facts(
+    *,
+    identity: LandingResolvedIdentity,
+    facts: LandingPolicyFacts,
+    decision: LandingPolicyDecision,
+) -> MergeLandingAuthorization:
+    """Build the exact merge-side authorization snapshot for landing."""
+
+    if not decision.allowed:
+        raise ValueError("denied landing decisions cannot authorize a merge")
+    if identity.source_ref is None or identity.source_sha is None or identity.target_sha is None:
+        raise ValueError("landing authorization requires exact source and target heads")
+    review = facts.review
+    verify = facts.verify
+    return MergeLandingAuthorization(
+        owner_task_id=identity.owner_task_id,
+        merge_unit_id=identity.merge_unit_id,
+        source_ref=identity.source_ref,
+        target_branch=identity.target_branch,
+        source_sha=identity.source_sha,
+        target_sha=identity.target_sha,
+        representative_task_id=identity.representative_task.id,
+        member_task_ids=identity.member_task_ids,
+        policy_version=LANDING_GUARDED_POLICY_VERSION if decision.allowed_overrides else "strict.v1",
+        schema_version=LANDING_JUDGE_SCHEMA_VERSION if decision.allowed_overrides else "landing.strict.v1",
+        authoritative_scope_identity=facts.authoritative_scope_identity,
+        allowed_overrides=tuple(decision.allowed_overrides),
+        judgment_artifact_id=decision.judgment_artifact_id,
+        judgment_key=decision.judgment_key,
+        live_judgment_identity=facts.policy_judgment_identity,
+        review_id=review.review_id if review is not None else None,
+        reviewed_head=review.reviewed_head if review is not None else None,
+        review_mode=review.mode if review is not None else None,
+        review_verdict=review.verdict if review is not None else None,
+        blocker_identities=tuple(_landing_authorization_blocker_identity(blocker) for blocker in facts.open_blockers),
+        blocker_fingerprints=tuple(blocker.fingerprint for blocker in facts.open_blockers if blocker.fingerprint),
+        followup_identities=tuple(
+            item.fingerprint_key for item in decision.followup_materialization_identities
+        ),
+        followup_fingerprints=tuple(
+            item.fingerprint_key for item in decision.followup_materialization_identities
+        ),
+        verify_epoch=verify.epoch if verify is not None else None,
+        verify_verdict=verify.status if verify is not None else None,
+        verify_gate_identity=verify.gate_identity if verify is not None else None,
+        verify_tree_fingerprint=verify.tree_fingerprint if verify is not None else None,
+        parked_reason=facts.parked_reason,
+        adjudication_fingerprints=facts.adjudication_fingerprints,
+    )
 
 
 @dataclass(frozen=True)
@@ -1819,8 +2112,10 @@ class LandingStateFingerprint:
     verify: LandingVerifyFingerprint = LandingVerifyFingerprint()
     rebase: LandingRebaseFingerprint = LandingRebaseFingerprint()
     blocker_fingerprints: tuple[str, ...] = ()
+    blocker_identities: tuple[str, ...] = ()
     parked_reason: str | None = None
     policy_judgment_identity: str | None = None
+    authoritative_scope_identity: str | None = None
     adjudication_fingerprints: tuple[str, ...] = ()
     spec_coherence: LandingSpecCoherenceFingerprint = LandingSpecCoherenceFingerprint()
 
@@ -1883,8 +2178,10 @@ class LandingStateFingerprint:
                     )
                 )
             ),
+            blocker_identities=tuple(sorted(_landing_authorization_blocker_identity(blocker) for blocker in facts.open_blockers)),
             parked_reason=facts.parked_reason,
             policy_judgment_identity=resolved_judgment_identity,
+            authoritative_scope_identity=facts.authoritative_scope_identity,
             adjudication_fingerprints=tuple(sorted(resolved_adjudication_fingerprints)),
             spec_coherence=resolved_spec,
         )
@@ -1897,6 +2194,7 @@ class LandingJudgment:
     verdict: LandingJudgeVerdict
     artifact_id: str | None = None
     key: str | None = None
+    blocking_fact: str | None = None
 
     def __post_init__(self) -> None:
         judgment_refs = _normalize_evidence_refs((self.artifact_id, self.key))
@@ -1906,10 +2204,16 @@ class LandingJudgment:
             raise ValueError("non-LAND judgment cannot authorize artifact/key identity")
         object.__setattr__(self, "artifact_id", judgment_refs[0] if judgment_refs else None)
         object.__setattr__(self, "key", judgment_refs[1] if judgment_refs else None)
+        if self.blocking_fact is not None:
+            object.__setattr__(self, "blocking_fact", _normalize_terminal_fact(self.blocking_fact))
 
 
 LandingJudge = Callable[[], LandingJudgment | LandingJudgeVerdict]
 LandingLiveTreeResolver = Callable[[], str | None]
+LandingMergeExecutor = Callable[
+    [LandingResolvedIdentity, LandingPolicyDecision, Literal["manual_land", "manual_land_escalated"]],
+    ManualMergeExecutionResult,
+]
 
 
 @dataclass(frozen=True)
@@ -3742,6 +4046,46 @@ def _resolution_metadata_state(metadata: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _normalized_resolution_decision_payload(artifact: Any, metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the complete normalized decision-bearing resolution payload."""
+
+    normalized_metadata = json.loads(json.dumps(dict(metadata), sort_keys=True, default=str))
+    return {
+        "artifact_id": artifact.id,
+        "artifact_status": artifact.status,
+        "artifact_head": artifact.head_sha,
+        "artifact_sha256": getattr(artifact, "sha256", None),
+        "artifact_byte_size": getattr(artifact, "byte_size", None),
+        "normalized_state": _resolution_metadata_state(metadata),
+        "normalized_reason": _normalized_resolution_reason(metadata),
+        "metadata": normalized_metadata,
+    }
+
+
+def _normalized_resolution_reason(metadata: Mapping[str, Any]) -> str | None:
+    reason = metadata.get("reason")
+    if not isinstance(reason, str):
+        return None
+    normalized = reason.strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized or None
+
+
+def _resolution_decision_identity(artifact: Any, metadata: Mapping[str, Any]) -> str:
+    payload = _normalized_resolution_decision_payload(artifact, metadata)
+    return "sha256:" + sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _resolution_decision_context_record(
+    *,
+    blocker: ReviewFinding,
+    artifact: Any,
+    metadata: Mapping[str, Any],
+) -> str:
+    payload = _normalized_resolution_decision_payload(artifact, metadata)
+    payload["matched_finding_id"] = blocker.id.strip()
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def _landing_resolution_matches_current(
     artifact: Any,
     *,
@@ -3774,18 +4118,57 @@ def _landing_resolution_matches_current(
 
 
 def _resolution_identity_fingerprint(artifact: Any, metadata: Mapping[str, Any]) -> str:
-    payload = {
-        "artifact": artifact.id,
-        "status": artifact.status,
-        "head": artifact.head_sha,
-        "state": _resolution_metadata_state(metadata),
-        "impl_task_id": metadata.get("impl_task_id"),
-        "review_task_id": metadata.get("review_task_id"),
-        "finding_id": metadata.get("finding_id"),
-        "finding_fingerprint": metadata.get("finding_fingerprint"),
-        "target_head_sha": metadata.get("target_head_sha") or metadata.get("target_head"),
-    }
-    return "sha256:" + sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+    return _resolution_decision_identity(artifact, metadata)
+
+
+def _landing_current_adjudication_records(
+    store: SqliteTaskStore,
+    review: LandingReviewEvidence | None,
+    *,
+    identity: LandingResolvedIdentity | None = None,
+    allowed_states: frozenset[str] = frozenset({"valid", "invalid"}),
+) -> tuple[str, ...]:
+    if review is None or review.verdict != "CHANGES_REQUESTED" or not review.review_id:
+        return ()
+    blockers = tuple(
+        finding
+        for finding in getattr(review, "_parsed_blocker_findings", ())
+        if isinstance(finding, ReviewFinding)
+    )
+    if not blockers:
+        return ()
+    artifacts = store.list_artifacts(review.review_id, kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND)
+    records: list[str] = []
+    for blocker in blockers:
+        latest_match: Any | None = None
+        latest_metadata: Mapping[str, Any] | None = None
+        for artifact in artifacts:
+            metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
+            if metadata is None:
+                continue
+            state = _resolution_metadata_state(metadata)
+            if state not in allowed_states:
+                continue
+            if not _landing_resolution_matches_current(
+                artifact,
+                metadata=metadata,
+                review=review,
+                blocker=blocker,
+                identity=identity,
+            ):
+                continue
+            if latest_match is None or artifact.created_at > latest_match.created_at:
+                latest_match = artifact
+                latest_metadata = metadata
+        if latest_match is not None and latest_metadata is not None:
+            records.append(
+                _resolution_decision_context_record(
+                    blocker=blocker,
+                    artifact=latest_match,
+                    metadata=latest_metadata,
+                )
+            )
+    return tuple(sorted(records))
 
 
 def _landing_current_adjudication_fingerprints(
@@ -3878,8 +4261,7 @@ def _landing_resolution_deferrable_class(
             latest_metadata = metadata
     if latest_metadata is None:
         return None
-    reason = latest_metadata.get("reason")
-    normalized_reason = reason.strip().lower().replace("-", "_") if isinstance(reason, str) else ""
+    normalized_reason = _normalized_resolution_reason(latest_metadata) or ""
     if normalized_reason in {"out_of_scope", "beyond_scope"}:
         return "out_of_scope"
     if normalized_reason == "adjacent":
@@ -4036,8 +4418,48 @@ def _inspect_latest_landing_judgment_identity(store: SqliteTaskStore, identity: 
         metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
         key = metadata.get("key") if metadata else None
         if isinstance(key, str) and key.strip():
-            return f"artifact:{artifact.id}:key:{key.strip()}"
+            payload = {
+                "artifact_id": artifact.id,
+                "key": key.strip(),
+                "status": artifact.status,
+                "head": artifact.head_sha,
+                "sha256": getattr(artifact, "sha256", None),
+                "byte_size": getattr(artifact, "byte_size", None),
+            }
+            return "sha256:" + sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return None
+
+
+def _inspect_authoritative_landing_scope_identity(
+    store: SqliteTaskStore,
+    review: LandingReviewEvidence | None,
+) -> str | None:
+    if review is None or not review.review_id:
+        return None
+    try:
+        task = store.get(review.review_id)
+    except Exception:
+        return "review-scope-read-unavailable"
+    if task is None:
+        return "review-scope-missing"
+    scope = task.review_scope or f"{review.mode} review {review.review_id}"
+    payload = {
+        "review_id": review.review_id,
+        "review_mode": review.mode,
+        "review_scope": scope,
+    }
+    return "sha256:" + sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _landing_authorization_blocker_identity(blocker: LandingOpenBlocker) -> str:
+    payload = {
+        "finding_id": blocker.finding_id,
+        "fingerprint": blocker.fingerprint,
+        "source": blocker.source,
+        "class": blocker.blocker_class,
+        "deferrable": blocker.deferrable,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def _inspect_landing_adjudication_fingerprints(
@@ -4670,12 +5092,21 @@ def _judge_for_overrides(
                 _identity_evidence(facts),
             ),
         )
+    except Exception as exc:
+        return LandingPolicyDecision(
+            False,
+            blocked=LandBlocked(
+                "policy-or-judge-refused",
+                _exception_fact("guarded landing judgment is unavailable", exc),
+                _identity_evidence(facts),
+            ),
+        )
     if judgment.verdict != "LAND":
         return LandingPolicyDecision(
             False,
             blocked=LandBlocked(
                 "policy-or-judge-refused",
-                "guarded landing judgment refused landing",
+                judgment.blocking_fact or "guarded landing judgment refused landing",
                 _identity_evidence(facts),
             ),
             judgment_verdict=judgment.verdict,

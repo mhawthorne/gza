@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any, Literal
 
 from gza.query import get_reviews_for_root
@@ -13,7 +15,11 @@ from .db import MERGE_SOURCE_MANUAL, MERGE_SOURCE_MANUAL_FORCE, SqliteTaskStore,
 from .git import Git, GitError, ResolvedMergeSourceRef
 from .merge_state import resolve_task_merge_source
 from .review_scope import declares_spec_coherence_review_mode
-from .review_tasks import CappedReviewBlockerMaterializationError, FollowupMaterializationError
+from .review_tasks import (
+    CappedReviewBlockerMaterializationError,
+    FollowupMaterializationError,
+    extract_deferred_blocker_prompt_parts,
+)
 from .review_verdict import ReviewFinding, get_review_content, get_review_report, summarize_review_blockers
 
 
@@ -57,6 +63,50 @@ class ManualMergePreflightResult:
     block_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class MergeLandingAuthorization:
+    """Exact landing decision identity authorized before merge side effects."""
+
+    owner_task_id: str
+    merge_unit_id: str | None
+    source_ref: str
+    target_branch: str
+    source_sha: str
+    target_sha: str
+    representative_task_id: str | None = None
+    member_task_ids: tuple[str, ...] = ()
+    policy_version: str | None = None
+    schema_version: str | None = None
+    authoritative_scope_identity: str | None = None
+    allowed_overrides: tuple[str, ...] = ()
+    judgment_artifact_id: str | None = None
+    judgment_key: str | None = None
+    live_judgment_identity: str | None = None
+    review_id: str | None = None
+    reviewed_head: str | None = None
+    review_mode: str | None = None
+    review_verdict: str | None = None
+    blocker_identities: tuple[str, ...] = ()
+    blocker_fingerprints: tuple[str, ...] = ()
+    followup_identities: tuple[str, ...] = ()
+    followup_fingerprints: tuple[str, ...] = ()
+    verify_epoch: str | None = None
+    verify_verdict: str | None = None
+    verify_gate_identity: str | None = None
+    verify_tree_fingerprint: str | None = None
+    parked_reason: str | None = None
+    adjudication_fingerprints: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "member_task_ids", tuple(sorted(set(self.member_task_ids))))
+        object.__setattr__(self, "allowed_overrides", tuple(sorted(set(self.allowed_overrides))))
+        object.__setattr__(self, "blocker_identities", tuple(sorted(set(self.blocker_identities))))
+        object.__setattr__(self, "blocker_fingerprints", tuple(sorted(set(self.blocker_fingerprints))))
+        object.__setattr__(self, "followup_identities", tuple(sorted(set(self.followup_identities))))
+        object.__setattr__(self, "followup_fingerprints", tuple(sorted(set(self.followup_fingerprints))))
+        object.__setattr__(self, "adjudication_fingerprints", tuple(sorted(set(self.adjudication_fingerprints))))
+
+
 ManualMergeExecutionStatus = Literal[
     "merged",
     "already_merged",
@@ -78,6 +128,7 @@ ManualMergeExecutionStatus = Literal[
     "isolated_post_promotion_proof_persistence_failed",
     "isolated_post_promotion_rollback_failed",
     "isolated_promotion_rollback_failed_target_uncertain",
+    "landing_authorization_changed",
     "max_cycle_lifecycle_authority_changed",
     "merge_cleanup_failed",
     "merge_conflict",
@@ -123,6 +174,7 @@ class ManualMergeExecutionRequest:
     pre_materialized_deferred_blockers_printed: bool = False
     pending_squash_reconcile: Any = None
     process_monitor_factory: Any = None
+    landing_authorization: MergeLandingAuthorization | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +190,7 @@ class ManualMergeExecutionHooks:
     print_followups: Callable[[DbTask, tuple[list[DbTask], list[DbTask]]], None]
     emit: Callable[[str], None] = print
     before_irreversible_side_effect: Callable[[DbTask], ManualMergeExecutionResult | None] | None = None
+    load_landing_authorization: Callable[[], MergeLandingAuthorization | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -584,6 +637,9 @@ def execute_manual_merge(
     reused_deferred_blockers: list[DbTask] = []
     created_followups: list[DbTask] = []
     reused_followups: list[DbTask] = []
+    authorization_refusal = _validate_landing_authorization_before_side_effects(request, hooks)
+    if authorization_refusal is not None:
+        return authorization_refusal
     if hooks.before_irreversible_side_effect is not None:
         side_effect_result = hooks.before_irreversible_side_effect(request.merge_subject)
         if side_effect_result is not None:
@@ -602,11 +658,22 @@ def execute_manual_merge(
                     block_reason=block_reason,
                 )
             created_deferred_blockers, reused_deferred_blockers = deferred_blockers
+            deferred_refusal = _validate_landing_deferred_blocker_materialization(
+                request,
+                hooks,
+                created_deferred_blockers,
+                reused_deferred_blockers,
+            )
+            if deferred_refusal is not None:
+                return deferred_refusal
             if not request.pre_materialized_deferred_blockers_printed:
                 hooks.print_deferred_blockers(request.merge_subject, deferred_blockers)
             if not request.no_followups:
                 created_followups, reused_followups = hooks.materialize_followups(request.merge_subject)
                 hooks.print_followups(request.merge_subject, (created_followups, reused_followups))
+            audit_refusal = _persist_landing_merge_authorization_audit(request, hooks)
+            if audit_refusal is not None:
+                return audit_refusal
         except Exception as exc:
             if isinstance(exc, FollowupMaterializationError):
                 created_followups.extend(exc.created)
@@ -773,6 +840,215 @@ def execute_manual_merge(
             status="merge_failed",
             block_reason=f"merge failed: {exc}",
         )
+
+
+def _validate_landing_authorization_before_side_effects(
+    request: ManualMergeExecutionRequest,
+    hooks: ManualMergeExecutionHooks,
+) -> ManualMergeExecutionResult | None:
+    authorization = request.landing_authorization
+    if authorization is None:
+        return None
+    rev_parse_if_exists = getattr(request.git, "rev_parse_if_exists", None)
+    current_source_sha = rev_parse_if_exists(request.merge_source_ref) if callable(rev_parse_if_exists) else None
+    current_target_sha = rev_parse_if_exists(request.merge_preflight_target) if callable(rev_parse_if_exists) else None
+    if current_source_sha != authorization.source_sha:
+        return _landing_authorization_refusal(
+            hooks,
+            "landing source head changed after authorization",
+            authorization.source_sha,
+            current_source_sha,
+        )
+    if current_target_sha != authorization.target_sha:
+        return _landing_authorization_refusal(
+            hooks,
+            "landing target head changed after authorization",
+            authorization.target_sha,
+            current_target_sha,
+        )
+    if hooks.load_landing_authorization is None:
+        return _landing_authorization_refusal(
+            hooks,
+            "landing authorization current-evidence loader is unavailable",
+            "present",
+            None,
+        )
+    try:
+        current = hooks.load_landing_authorization()
+    except Exception as exc:
+        return _landing_authorization_refusal(
+            hooks,
+            f"landing authorization current evidence is unavailable: {exc}",
+            "available",
+            None,
+        )
+    if current != authorization:
+        return _landing_authorization_refusal(
+            hooks,
+            "landing authorization changed before merge side effects",
+            repr(authorization),
+            repr(current),
+        )
+    return None
+
+
+def _validate_landing_deferred_blocker_materialization(
+    request: ManualMergeExecutionRequest,
+    hooks: ManualMergeExecutionHooks,
+    created: list[DbTask],
+    reused: list[DbTask],
+) -> ManualMergeExecutionResult | None:
+    authorization = request.landing_authorization
+    if authorization is None or "defer-review-blockers" not in authorization.allowed_overrides:
+        return None
+    expected = _authorized_deferred_blocker_identities(authorization)
+    actual: dict[tuple[str, str, str], DbTask] = {}
+    mismatches: list[str] = []
+    for task in (*created, *reused):
+        identity = _materialized_deferred_blocker_identity(task)
+        if identity is None:
+            mismatches.append(f"{task.id or '<unknown>'}:identity")
+            continue
+        if identity in actual:
+            mismatches.append(f"{task.id or '<unknown>'}:duplicate")
+            continue
+        actual[identity] = task
+        if task.task_type != "implement":
+            mismatches.append(f"{task.id or '<unknown>'}:task_type")
+        if task.based_on != identity[1]:
+            mismatches.append(f"{task.id or '<unknown>'}:based_on")
+        if task.depends_on != identity[2]:
+            mismatches.append(f"{task.id or '<unknown>'}:depends_on")
+        if task.urgent is not True:
+            mismatches.append(f"{task.id or '<unknown>'}:urgent")
+        if task.create_pr is not True:
+            mismatches.append(f"{task.id or '<unknown>'}:create_pr")
+    if not expected or set(actual) != expected or mismatches:
+        missing = sorted(expected - set(actual))
+        unexpected = sorted(set(actual) - expected)
+        parts: list[str] = []
+        if not expected:
+            parts.append("no complete authorized blocker identity")
+        if missing:
+            parts.append(f"missing {len(missing)} authorized blocker task(s)")
+        if unexpected:
+            parts.append(f"unexpected {len(unexpected)} blocker task(s)")
+        if mismatches:
+            parts.append("task property mismatch: " + ", ".join(sorted(mismatches)))
+        block_reason = (
+            "guarded deferred blocker materialization did not match authorization"
+            + (": " + "; ".join(parts) if parts else "")
+            + "; source remains unmerged"
+        )
+        hooks.emit(f"Error: {block_reason}")
+        return ManualMergeExecutionResult(
+            rc=1,
+            status="deferred_blocker_materialization_failed",
+            block_reason=block_reason,
+            created_deferred_blockers=created,
+            reused_deferred_blockers=reused,
+            created_followups=[],
+            reused_followups=[],
+        )
+    return None
+
+
+def _authorized_deferred_blocker_identities(
+    authorization: MergeLandingAuthorization,
+) -> set[tuple[str, str, str]]:
+    expected: set[tuple[str, str, str]] = set()
+    if not authorization.review_id:
+        return expected
+    for raw in authorization.blocker_identities:
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return set()
+        if not isinstance(payload, dict):
+            return set()
+        finding_id = payload.get("finding_id")
+        source = payload.get("source")
+        if not isinstance(finding_id, str) or not finding_id.strip():
+            return set()
+        if source != f"review:{authorization.review_id}":
+            return set()
+        expected.add((finding_id.strip(), authorization.review_id, authorization.owner_task_id))
+    return expected
+
+
+def _materialized_deferred_blocker_identity(task: DbTask) -> tuple[str, str, str] | None:
+    parts = extract_deferred_blocker_prompt_parts(task.prompt)
+    if parts is None:
+        return None
+    finding_id, review_task_id, impl_task_id = parts
+    if not finding_id or not review_task_id or not impl_task_id:
+        return None
+    return finding_id, review_task_id, impl_task_id
+
+
+def _persist_landing_merge_authorization_audit(
+    request: ManualMergeExecutionRequest,
+    hooks: ManualMergeExecutionHooks,
+) -> ManualMergeExecutionResult | None:
+    authorization = request.landing_authorization
+    if authorization is None:
+        return None
+    task_id = request.merge_subject.id
+    if task_id is None:
+        return _landing_authorization_refusal(
+            hooks,
+            "landing authorization audit cannot identify merge subject",
+            "task ID",
+            None,
+        )
+    payload = {
+        "kind": "landing_merge_authorization",
+        "authorization": authorization.__dict__,
+        "merge_source": request.merge_source,
+        "merge_unit_id": request.merge_unit_id,
+    }
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = sha256(body.encode()).hexdigest()
+    try:
+        request.store.add_artifact(
+            task_id,
+            kind="landing_merge_authorization",
+            label="landing_merge_authorization",
+            path=f".gza/artifacts/{task_id}/landing-merge-authorization-{digest}.json",
+            content_type="application/json",
+            byte_size=len(body.encode()),
+            sha256=digest,
+            producer="gza.merge_services",
+            status="authorized",
+            head_sha=authorization.source_sha,
+            metadata=payload,
+        )
+    except Exception as exc:
+        return _landing_authorization_refusal(
+            hooks,
+            f"landing authorization audit persistence failed: {exc}",
+            "persisted",
+            None,
+        )
+    return None
+
+
+def _landing_authorization_refusal(
+    hooks: ManualMergeExecutionHooks,
+    reason: str,
+    expected: str | None,
+    actual: str | None,
+) -> ManualMergeExecutionResult:
+    block_reason = (
+        f"{reason}; expected {expected or 'unavailable'}, got {actual or 'unavailable'}; "
+        "source remains unmerged"
+    )
+    hooks.emit(f"Error: {block_reason}")
+    return ManualMergeExecutionResult(
+        rc=1,
+        status="landing_authorization_changed",
+        block_reason=block_reason,
+    )
 
 
 def mark_merge_subject_merged(

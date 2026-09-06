@@ -61,6 +61,7 @@ Fail-closed cases include:
 - `max_review_cycles=3` is the current review/improve loop bound.
 - When the bound is reached, `on_max_cycles=park` escalates with `review-max-cycles-reached` and requires human intervention instead of continuing to churn.
 - With `on_max_cycles=merge_and_defer`, an ordinary current-head capped review may merge only after local merge-source proof, readable deterministic review content, fresh green pre-merge verify evidence, and validated persisted `BLOCKER` metadata; unavailable or invalid content surfaces a dedicated attention reason before verify handling. The resulting action remains `type="merge"` and carries max-cycle deferral metadata for mandatory follow-up task creation.
+- `gza land --policy guarded` is the operator-triggered exception path: after deterministic prerequisites pass, it may defer only current plain-full or resolution review blockers that the landing policy and exact landing judgment authorize. It records `manual_land_escalated` provenance when it defers blockers or overrides an eligible churn park; non-escalated landings record `manual_land`.
 
 ## Operator Audit Policy
 
