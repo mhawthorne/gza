@@ -3117,9 +3117,9 @@ def _docker_verify_snapshot_holder_is_live(holder: object) -> bool:
         if holder_start_ticks != start_ticks:
             return False
         return True
-    if not isinstance(holder.get("pid_start_ticks"), int):
-        return False
     if sys.platform.startswith("linux"):
+        return False
+    if "pid_start_ticks" in holder and not isinstance(holder.get("pid_start_ticks"), int):
         return False
     try:
         os.kill(pid, 0)
