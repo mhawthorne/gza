@@ -1539,6 +1539,8 @@ def test_recover_verify_only_noop_review_uses_child_project_verify_budgets(
     )
     config = Config.load(tmp_path)
     store = make_store(tmp_path)
+    SqliteTaskStore.from_config(Config.load_execution(service_dir))
+    SqliteTaskStore.from_config(Config.load_execution(lib_dir))
 
     impl = store.add("Implement feature", task_type="implement")
     assert impl.id is not None
@@ -1663,7 +1665,7 @@ def test_recover_verify_only_noop_review_uses_child_project_verify_budgets(
     assert result.status == "success"
     calls_by_command = {verify_call.args[0]: verify_call.kwargs for verify_call in verify_command.call_args_list}
     assert set(calls_by_command) == {"./bin/foo-verify", "./bin/bar-verify"}
-    assert calls_by_command["./bin/foo-verify"]["timeout_seconds"] == 780
+    assert calls_by_command["./bin/foo-verify"]["timeout_seconds"] == 300
     assert calls_by_command["./bin/foo-verify"]["timeout_grace_seconds"] == 11.0
     assert calls_by_command["./bin/bar-verify"]["timeout_seconds"] == 222
     assert calls_by_command["./bin/bar-verify"]["timeout_grace_seconds"] == 22.0
@@ -4262,7 +4264,7 @@ def test_verify_only_noop_recovery_blocks_unsafe_cross_project_child_budget(
     latest = artifacts[0].metadata
     assert latest is not None
     assert latest["result"]["status"] == "unavailable"
-    assert latest["aggregate_details"]["scopes"][0]["exit_status"] == "insufficient verify budget margin"
+    assert latest["aggregate_details"]["scopes"][0]["exit_status"] == "owning runtime unavailable"
 
 
 def test_verify_gate_execution_persists_current_passing_owner_artifact(
@@ -5496,6 +5498,7 @@ def _write_verify_gate_cross_project_configs(root: Path, worktree: Path) -> Conf
     (worktree / "gza.yaml").write_text(root_config_text)
     (root / "libs" / "bar" / "gza.yaml").write_text(child_config_text)
     (worktree / "libs" / "bar" / "gza.yaml").write_text(child_config_text)
+    SqliteTaskStore.from_config(Config.load_execution(root / "libs" / "bar"))
     return Config.load(root)
 
 

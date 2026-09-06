@@ -202,6 +202,13 @@ MUST verify the branch diff stays within the work unit's declared project scope.
   path attribution so parent-owned paths can resolve cleanly. Most-specific attribution
   MUST prevent an ancestor project from being selected only because a descendant-owned
   path changed.
+- Cross-project verification MUST execute each affected project's branch-evaluated
+  `verify_command` from that project's evaluated worktree root, but durable task state
+  used by the verify subprocess MUST come from that project's canonical owning runtime.
+  Budget evidence and disposable verify DB snapshots MUST use the same owning runtime
+  mapping. If an affected sibling has no resolvable canonical owner or owner DB, its
+  verify result MUST be `unavailable`; automation MUST NOT treat the evaluated
+  worktree-local DB as authoritative fallback state.
 - If the diff cannot be inspected reliably, the engine MUST fail closed with
   `project-scope-unverified`. For a unit that is not explicitly or implicitly
   cross-project, the guidance MAY tell the operator to tag `cross-project` when wider

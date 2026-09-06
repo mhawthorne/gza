@@ -902,8 +902,9 @@ class TestBuildDockerCmd:
         assert "--rm" in cmd
         assert cmd[-1] == "test-image"
 
-    def test_docker_run_omits_supplemental_groups_by_default(self, tmp_path):
+    def test_docker_run_omits_supplemental_groups_by_default(self, tmp_path, monkeypatch):
         """Ordinary container processes should not receive broad supplemental groups."""
+        monkeypatch.setenv("GZA_DOCKER_GROUP_ADD", "12345")
         docker_config = DockerConfig(
             image_name="test-image",
             npm_package="@test/cli",

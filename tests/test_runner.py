@@ -14,8 +14,8 @@ import stat
 import subprocess
 import sys
 import threading
-from contextlib import nullcontext
 from collections.abc import Mapping
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -3044,6 +3044,7 @@ class TestReviewContextFromChain:
         )
         task = Task(id="gza-1", prompt="Review cross-project", status="pending", task_type="review")
         task.tags = ("cross-project",)
+        _write_verify_marker_db(project_dir / ".gza" / "gza.db")
         store = Mock(spec=SqliteTaskStore)
         store.list_recent_artifacts.side_effect = RuntimeError("database is locked")
         worktree_git = Mock()
@@ -3785,6 +3786,8 @@ class TestReviewContextFromChain:
         task = Task(id="gza-1", prompt="Review cross-project", status="pending", task_type="review")
         task.tags = ("cross-project",)
         store = SqliteTaskStore(tmp_path / "test.db")
+        _write_verify_marker_db(project_dir / ".gza" / "gza.db")
+        SqliteTaskStore.from_config(Config.load_execution(sibling_dir))
 
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
@@ -3845,10 +3848,616 @@ class TestReviewContextFromChain:
         assert verify_calls[0].kwargs["reviewed_branch"] == "feature/cross-project"
         assert verify_calls[0].kwargs["reviewed_head_sha"] == "deadbeef"
         assert verify_calls[0].kwargs["reviewed_base_sha"] == "cafebabe"
-        assert verify_calls[0].kwargs["runtime_context"].cwd == worktree_path / "services" / "foo"
-        assert verify_calls[1].kwargs["runtime_context"].cwd == worktree_path / "libs" / "bar"
+        assert verify_calls[0].kwargs["runtime_context"].cwd == project_dir
+        assert verify_calls[1].kwargs["runtime_context"].cwd == sibling_dir
         assert verify_calls[0].kwargs["config"].project_name == "foo"
         assert verify_calls[1].kwargs["config"].project_name == "bar"
+
+    def test_cross_project_verify_uses_canonical_owner_db_snapshots(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "services" / "foo"
+        sibling_dir = tmp_path / "libs" / "bar"
+        worktree_path = tmp_path / "worktree"
+        worktree_project_dir = worktree_path / "services" / "foo"
+        worktree_sibling_dir = worktree_path / "libs" / "bar"
+        for path in (project_dir, sibling_dir, worktree_project_dir, worktree_sibling_dir):
+            path.mkdir(parents=True)
+
+        observed_path = tmp_path / "observed.jsonl"
+
+        def verify_command(expected_label: str) -> str:
+            script = (
+                "import json, os, sqlite3\n"
+                "from pathlib import Path\n"
+                f"expected = {expected_label!r}\n"
+                f"observed = Path({str(observed_path)!r})\n"
+                "db_path = Path(os.environ['GZA_DB_PATH'])\n"
+                "conn = sqlite3.connect(str(db_path))\n"
+                "try:\n"
+                "    labels = [row[0] for row in conn.execute('SELECT label FROM verify_markers ORDER BY id')]\n"
+                "    conn.execute('INSERT INTO verify_markers (label) VALUES (?)', ('mutated-' + expected,))\n"
+                "    conn.commit()\n"
+                "finally:\n"
+                "    conn.close()\n"
+                "observed.parent.mkdir(parents=True, exist_ok=True)\n"
+                "with observed.open('a', encoding='utf-8') as handle:\n"
+                "    handle.write(json.dumps({'cwd': os.getcwd(), 'db_path': str(db_path), 'labels': labels}) + '\\n')\n"
+                "raise SystemExit(0 if labels == [expected] else 17)\n"
+            )
+            return f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+        foo_config_text = (
+            "project_name: foo\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            f"verify_command: {json.dumps(verify_command('canonical-foo'))}\n"
+            "autonomous_verify_timeout_seconds: 120\n"
+        )
+        bar_config_text = (
+            "project_name: bar\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            f"verify_command: {json.dumps(verify_command('canonical-bar'))}\n"
+            "autonomous_verify_timeout_seconds: 120\n"
+        )
+        for path, text in (
+            (project_dir / "gza.yaml", foo_config_text),
+            (sibling_dir / "gza.yaml", bar_config_text),
+            (worktree_project_dir / "gza.yaml", foo_config_text),
+            (worktree_sibling_dir / "gza.yaml", bar_config_text),
+        ):
+            path.write_text(text)
+
+        config = Config.load_execution(project_dir)
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        store = SqliteTaskStore.from_config(config)
+        sibling_store = SqliteTaskStore.from_config(Config.load_execution(sibling_dir))
+        _add_verify_marker(store.db_path, "canonical-foo")
+        _add_verify_marker(sibling_store.db_path, "canonical-bar")
+        worktree_foo_store = SqliteTaskStore.from_config(Config.load_execution(worktree_project_dir))
+        worktree_bar_store = SqliteTaskStore.from_config(Config.load_execution(worktree_sibling_dir))
+        _add_verify_marker(worktree_foo_store.db_path, "worktree-foo")
+        _add_verify_marker(worktree_bar_store.db_path, "worktree-bar")
+
+        task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = "M\tservices/foo/app.py\nM\tlibs/bar/lib.py\n"
+
+        outcome = _run_review_verify_commands_for_projects(
+            config=config,
+            store=store,
+            task=task,
+            worktree_git=worktree_git,
+            worktree_path=worktree_path,
+            runtime_context=RuntimeExecutionContext.from_config(config),
+            timeout_seconds=120,
+            timeout_grace_seconds=5.0,
+            reviewed_branch="feature/cross-project",
+            reviewed_head_sha="deadbeef",
+            reviewed_base_sha="cafebabe",
+        )
+
+        assert outcome is not None
+        assert outcome.aggregate_result.status == "passed", outcome.markdown
+        observed = [json.loads(line) for line in observed_path.read_text().splitlines()]
+        assert [entry["cwd"] for entry in observed] == [
+            str(worktree_project_dir),
+            str(worktree_sibling_dir),
+        ]
+        assert [entry["labels"] for entry in observed] == [["canonical-foo"], ["canonical-bar"]]
+        snapshot_paths = [Path(entry["db_path"]) for entry in observed]
+        assert len(set(snapshot_paths)) == 2
+        assert all(not snapshot_path.exists() for snapshot_path in snapshot_paths)
+        assert all(snapshot_path not in {store.db_path, sibling_store.db_path} for snapshot_path in snapshot_paths)
+        assert _verify_marker_labels(store.db_path) == ["canonical-foo"]
+        assert _verify_marker_labels(sibling_store.db_path) == ["canonical-bar"]
+        assert _verify_marker_labels(worktree_foo_store.db_path) == ["worktree-foo"]
+        assert _verify_marker_labels(worktree_bar_store.db_path) == ["worktree-bar"]
+
+    def test_cross_project_verify_uses_registry_backed_sibling_owner_for_budget_and_snapshot(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        project_dir = tmp_path / "services" / "foo"
+        sibling_dir = tmp_path / "libs" / "bar"
+        worktree_path = tmp_path / "worktree"
+        worktree_sibling_dir = worktree_path / "libs" / "bar"
+        sibling_local_db = sibling_dir / ".gza" / "gza.db"
+        for path in (project_dir, sibling_dir, worktree_sibling_dir):
+            path.mkdir(parents=True)
+        (project_dir / ".git").mkdir()
+        (sibling_dir / ".git").mkdir()
+        shared_db = tmp_path / "anchor-shared.db"
+        observed_path = tmp_path / "observed.jsonl"
+
+        script = (
+            "import json, os, sqlite3\n"
+            "from pathlib import Path\n"
+            f"observed = Path({str(observed_path)!r})\n"
+            "db_path = Path(os.environ['GZA_DB_PATH'])\n"
+            "conn = sqlite3.connect(str(db_path))\n"
+            "try:\n"
+            "    labels = [row[0] for row in conn.execute('SELECT label FROM verify_markers ORDER BY id')]\n"
+            "    conn.execute('INSERT INTO verify_markers (label) VALUES (?)', ('snapshot-only',))\n"
+            "    conn.commit()\n"
+            "finally:\n"
+            "    conn.close()\n"
+            "observed.parent.mkdir(parents=True, exist_ok=True)\n"
+            "with observed.open('a', encoding='utf-8') as handle:\n"
+            "    handle.write(json.dumps({'cwd': os.getcwd(), 'db_path': str(db_path), 'labels': labels}) + '\\n')\n"
+            "raise SystemExit(0 if labels == ['canonical-bar'] else 17)\n"
+        )
+        sibling_verify_command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+        root_config_text = (
+            "project_name: foo\n"
+            "project_id: foo\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/foo-verify\n"
+        )
+        sibling_config_text = (
+            "project_name: bar\n"
+            "project_id: bar\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            f"verify_command: {json.dumps(sibling_verify_command)}\n"
+            "autonomous_verify_timeout_seconds: 120\n"
+            "autonomous_verify_bootstrap_timeout_seconds: 600\n"
+            "autonomous_verify_min_margin_seconds: 60\n"
+        )
+        (project_dir / "gza.yaml").write_text(root_config_text)
+        (sibling_dir / "gza.yaml").write_text(sibling_config_text)
+        (worktree_sibling_dir / "gza.yaml").write_text(sibling_config_text)
+
+        monkeypatch.setenv("GZA_DB_PATH", str(shared_db))
+        config = Config.load(project_dir)
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        store = SqliteTaskStore.from_config(config)
+        child_config = Config.load(sibling_dir)
+        child_store = SqliteTaskStore.from_config(child_config)
+        task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
+        task.branch = "feature/cross-project"
+        store.update(task)
+        _add_verify_marker(shared_db, "canonical-bar")
+        source = child_store.add("Successful verify source", task_type="review", depends_on=task.id)
+        assert source.id is not None
+        output = "\n".join(
+            line
+            for phase in ("ruff", "ty", "mypy", "checks", "unit", "functional")
+            for line in (
+                f"gza-verify phase=start name={phase}",
+                f"gza-verify phase=passed name={phase} duration_seconds=80.0",
+            )
+        )
+        persist_verify_gate_artifact(
+            child_store,
+            child_config,
+            owner_task=task,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command=sibling_verify_command,
+                status="passed",
+                exit_status="0",
+                captured_at=datetime.now(UTC) - timedelta(minutes=10),
+                reviewed_branch=task.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(sibling_dir),
+                output=output,
+                duration_seconds=500.0,
+            ),
+            verify_timeout_seconds=child_config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=child_config.review_verify_timeout_grace_seconds,
+            producer="test",
+        )
+
+        monkeypatch.delenv("GZA_DB_PATH", raising=False)
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = "M\tlibs/bar/lib.py\n"
+        budget_store_paths: list[Path] = []
+
+        def fake_budget_settings(_config: object, budget_store: SqliteTaskStore, **_kwargs: object) -> tuple[int, float]:
+            budget_store_paths.append(budget_store.db_path.resolve())
+            return 120, 5.0
+
+        with patch("gza.runner.resolve_lifecycle_verify_timeout_settings", side_effect=fake_budget_settings):
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                store=store,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                runtime_context=RuntimeExecutionContext.from_config(config),
+                timeout_seconds=120,
+                timeout_grace_seconds=5.0,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+            )
+
+        assert outcome is not None
+        assert outcome.aggregate_result.status == "passed", outcome.markdown
+        assert budget_store_paths == [shared_db.resolve()]
+        observed = [json.loads(line) for line in observed_path.read_text().splitlines()]
+        assert [entry["cwd"] for entry in observed] == [str(worktree_sibling_dir)]
+        assert [entry["labels"] for entry in observed] == [["canonical-bar"]]
+        snapshot_path = Path(observed[0]["db_path"])
+        assert not snapshot_path.exists()
+        assert snapshot_path != shared_db
+        assert _verify_marker_labels(shared_db) == ["canonical-bar"]
+        assert not sibling_local_db.exists()
+
+    def test_cross_project_verify_registry_scope_conflict_fails_closed_without_local_owner_fallback(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        project_dir = tmp_path / "services" / "foo"
+        sibling_dir = tmp_path / "libs" / "bar"
+        registered_dir = tmp_path / "elsewhere" / "bar"
+        worktree_path = tmp_path / "worktree"
+        worktree_sibling_dir = worktree_path / "libs" / "bar"
+        sibling_local_db = sibling_dir / ".gza" / "gza.db"
+        shared_db = tmp_path / "anchor-shared.db"
+        for path in (project_dir, sibling_dir, registered_dir, worktree_sibling_dir):
+            path.mkdir(parents=True)
+
+        root_config_text = (
+            "project_name: foo\n"
+            "project_id: foo\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/foo-verify\n"
+        )
+        sibling_config_text = (
+            "project_name: bar\n"
+            "project_id: bar\n"
+            "project_prefix: bar\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/bar-verify\n"
+        )
+        (project_dir / "gza.yaml").write_text(root_config_text)
+        (sibling_dir / "gza.yaml").write_text(sibling_config_text)
+        (registered_dir / "gza.yaml").write_text(sibling_config_text)
+        (worktree_sibling_dir / "gza.yaml").write_text(sibling_config_text)
+
+        monkeypatch.setenv("GZA_DB_PATH", str(shared_db))
+        config = Config.load(project_dir)
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        store = SqliteTaskStore.from_config(config)
+        store.register_project_paths_for_identity(
+            project_id="bar",
+            project_name="bar",
+            project_prefix="bar",
+            root_path=registered_dir,
+            config_path=registered_dir / "gza.yaml",
+        )
+        _add_verify_marker(shared_db, "registered-bar")
+
+        monkeypatch.delenv("GZA_DB_PATH", raising=False)
+        sibling_store = SqliteTaskStore.from_config(Config.load_execution(sibling_dir))
+        _add_verify_marker(sibling_local_db, "local-bar")
+        task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = "M\tlibs/bar/lib.py\n"
+
+        with (
+            patch("gza.runner.resolve_lifecycle_verify_timeout_settings") as budget_lookup,
+            patch("gza.runner._run_review_verify_command") as run_verify,
+        ):
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                store=store,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                runtime_context=RuntimeExecutionContext.from_config(config),
+                timeout_seconds=120,
+                timeout_grace_seconds=5.0,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+            )
+
+        budget_lookup.assert_not_called()
+        run_verify.assert_not_called()
+        assert outcome is not None
+        assert outcome.aggregate_result.status == "unavailable"
+        result = outcome.project_results[0].result
+        assert result is not None
+        assert result.status == "unavailable"
+        assert result.exit_status == "owning runtime unavailable"
+        assert "project registry row for 'bar' points at root" in (result.failure or "")
+        assert str(registered_dir.resolve()) in (result.failure or "")
+        assert str(sibling_dir.resolve()) in (result.failure or "")
+        assert _verify_marker_labels(shared_db) == ["registered-bar"]
+        assert _verify_marker_labels(sibling_store.db_path) == ["local-bar"]
+
+    def test_cross_project_verify_malformed_registry_scope_conflict_fails_closed_without_local_owner_fallback(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        project_dir = tmp_path / "services" / "foo"
+        sibling_dir = tmp_path / "libs" / "bar"
+        worktree_path = tmp_path / "worktree"
+        worktree_sibling_dir = worktree_path / "libs" / "bar"
+        sibling_local_db = sibling_dir / ".gza" / "gza.db"
+        shared_db = tmp_path / "anchor-shared.db"
+        for path in (project_dir, sibling_dir, worktree_sibling_dir):
+            path.mkdir(parents=True)
+
+        root_config_text = (
+            "project_name: foo\n"
+            "project_id: foo\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/foo-verify\n"
+        )
+        sibling_config_text = (
+            "project_name: bar\n"
+            "project_id: bar\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/bar-verify\n"
+        )
+        (project_dir / "gza.yaml").write_text(root_config_text)
+        (sibling_dir / "gza.yaml").write_text(sibling_config_text)
+        (worktree_sibling_dir / "gza.yaml").write_text(sibling_config_text)
+
+        monkeypatch.setenv("GZA_DB_PATH", str(shared_db))
+        config = Config.load(project_dir)
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        store = SqliteTaskStore.from_config(config)
+        with store._write_transaction() as conn:  # noqa: SLF001 - corrupt registry fixture.
+            conn.execute(
+                """
+                INSERT INTO projects (
+                    id, root_path, config_path, project_name, project_prefix,
+                    db_layout_version, created_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("bar", "bad\x00root", "bad\x00config", "bar", "bar", 1, "2026-09-06 00:00:00", "2026-09-06 00:00:00"),
+            )
+        _add_verify_marker(shared_db, "registered-bar")
+
+        monkeypatch.delenv("GZA_DB_PATH", raising=False)
+        sibling_store = SqliteTaskStore.from_config(Config.load_execution(sibling_dir))
+        _add_verify_marker(sibling_local_db, "local-bar")
+        task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = "M\tlibs/bar/lib.py\n"
+
+        with (
+            patch("gza.runner.resolve_lifecycle_verify_timeout_settings") as budget_lookup,
+            patch("gza.runner._run_review_verify_command") as run_verify,
+        ):
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                store=store,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                runtime_context=RuntimeExecutionContext.from_config(config),
+                timeout_seconds=120,
+                timeout_grace_seconds=5.0,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+            )
+
+        budget_lookup.assert_not_called()
+        run_verify.assert_not_called()
+        assert outcome is not None
+        assert outcome.aggregate_result.status == "unavailable"
+        result = outcome.project_results[0].result
+        assert result is not None
+        assert result.status == "unavailable"
+        assert result.exit_status == "owning runtime unavailable"
+        assert "canonical project registry paths for 'bar' are unavailable" in (result.failure or "")
+        assert _verify_marker_labels(shared_db) == ["registered-bar"]
+        assert _verify_marker_labels(sibling_store.db_path) == ["local-bar"]
+
+    def test_cross_project_verify_store_none_marks_existing_sibling_missing_owner_db_unavailable(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "services" / "foo"
+        sibling_dir = tmp_path / "libs" / "bar"
+        worktree_path = tmp_path / "worktree"
+        worktree_sibling_dir = worktree_path / "libs" / "bar"
+        for path in (project_dir, sibling_dir, worktree_sibling_dir):
+            path.mkdir(parents=True)
+        (project_dir / "gza.yaml").write_text(
+            "project_name: foo\n"
+            "project_id: foo\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/foo-verify\n"
+        )
+        sibling_config_text = (
+            "project_name: bar\n"
+            "project_id: bar\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/bar-verify\n"
+        )
+        (sibling_dir / "gza.yaml").write_text(sibling_config_text)
+        (worktree_sibling_dir / "gza.yaml").write_text(sibling_config_text)
+        config = Config.load_execution(project_dir)
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        task = Task(id="gza-1", prompt="Review cross-project", status="pending", task_type="review")
+        task.tags = ("cross-project",)
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = "M\tlibs/bar/lib.py\n"
+
+        with patch("gza.runner._run_review_verify_command") as mock_verify:
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                store=None,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=120,
+                timeout_grace_seconds=5.0,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+            )
+
+        mock_verify.assert_not_called()
+        assert outcome is not None
+        assert outcome.aggregate_result.status == "unavailable"
+        result = outcome.project_results[0].result
+        assert result is not None
+        assert result.exit_status == "owning runtime unavailable"
+        assert "runtime DB does not exist" in (result.failure or "")
+
+    def test_cross_project_verify_marks_snapshot_time_owner_db_disappearance_unavailable(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "services" / "foo"
+        sibling_dir = tmp_path / "libs" / "bar"
+        worktree_path = tmp_path / "worktree"
+        worktree_sibling_dir = worktree_path / "libs" / "bar"
+        for path in (project_dir, sibling_dir, worktree_sibling_dir):
+            path.mkdir(parents=True)
+        (project_dir / "gza.yaml").write_text(
+            "project_name: foo\n"
+            "project_id: foo\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/foo-verify\n"
+        )
+        sibling_config_text = (
+            "project_name: bar\n"
+            "project_id: bar\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/bar-verify\n"
+        )
+        (sibling_dir / "gza.yaml").write_text(sibling_config_text)
+        (worktree_sibling_dir / "gza.yaml").write_text(sibling_config_text)
+        config = Config.load_execution(project_dir)
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        store = SqliteTaskStore.from_config(config)
+        child_store = SqliteTaskStore.from_config(Config.load_execution(sibling_dir))
+        task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = "M\tlibs/bar/lib.py\n"
+
+        def disappear_before_snapshot(source_path: Path, destination_path: Path) -> None:
+            del destination_path
+            source_path.unlink()
+            raise FileNotFoundError(f"runtime DB does not exist: {source_path}")
+
+        with patch("gza.runner._backup_sqlite_file", side_effect=disappear_before_snapshot):
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                store=store,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                runtime_context=RuntimeExecutionContext.from_config(config),
+                timeout_seconds=120,
+                timeout_grace_seconds=5.0,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+            )
+
+        assert outcome is not None
+        assert outcome.aggregate_result.status == "unavailable"
+        result = outcome.project_results[0].result
+        assert result is not None
+        assert result.exit_status == "owning runtime unavailable"
+        assert "runtime DB does not exist" in (result.failure or "")
+        assert not child_store.db_path.exists()
+
+    def test_cross_project_verify_marks_missing_sibling_owning_runtime_unavailable(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "services" / "foo"
+        worktree_path = tmp_path / "worktree"
+        worktree_project_dir = worktree_path / "services" / "foo"
+        worktree_sibling_dir = worktree_path / "libs" / "bar"
+        project_dir.mkdir(parents=True)
+        worktree_project_dir.mkdir(parents=True)
+        worktree_sibling_dir.mkdir(parents=True)
+        root_config_text = (
+            "project_name: foo\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/foo-verify\n"
+        )
+        branch_sibling_config_text = (
+            "project_name: bar\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/bar-verify\n"
+        )
+        (project_dir / "gza.yaml").write_text(root_config_text)
+        (worktree_project_dir / "gza.yaml").write_text(root_config_text)
+        (worktree_sibling_dir / "gza.yaml").write_text(branch_sibling_config_text)
+        config = Config.load_execution(project_dir)
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        store = SqliteTaskStore.from_config(config)
+        task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = "M\tlibs/bar/lib.py\n"
+
+        with patch("gza.runner._run_review_verify_command") as mock_verify:
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                store=store,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                runtime_context=RuntimeExecutionContext.from_config(config),
+                timeout_seconds=120,
+                timeout_grace_seconds=5.0,
+                reviewed_branch="feature/cross-project",
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+            )
+
+        mock_verify.assert_not_called()
+        assert outcome is not None
+        assert outcome.aggregate_result.status == "unavailable"
+        result = outcome.project_results[0].result
+        assert result is not None
+        assert result.exit_status == "owning runtime unavailable"
+        assert "could not resolve owning runtime for scope libs/bar" in (result.failure or "")
+        assert "canonical project config" in (result.failure or "")
 
     def test_cross_project_verify_preflight_blocks_unsafe_child_full_suite_when_root_command_differs(
         self, tmp_path: Path
@@ -3884,6 +4493,7 @@ class TestReviewContextFromChain:
             local_dependencies=(),
         )
         store = SqliteTaskStore.from_config(config)
+        SqliteTaskStore.from_config(Config.load_execution(child_dir))
         task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
@@ -3954,6 +4564,7 @@ class TestReviewContextFromChain:
             local_dependencies=(),
         )
         store = SqliteTaskStore.from_config(config)
+        child_store = SqliteTaskStore.from_config(Config.load_execution(child_dir))
         task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
@@ -4011,8 +4622,6 @@ class TestReviewContextFromChain:
             timeout_grace_seconds=5.0,
         )
 
-        child_config = Config.load(worktree_child_dir)
-        child_store = SqliteTaskStore.from_config(child_config)
         child_holder = child_store.list_project_artifacts(kind=VERIFY_GATE_ARTIFACT_KIND)[0]
         assert child_holder.metadata is not None
         assert child_holder.metadata["result"]["duration_seconds"] == duration_seconds
@@ -4118,6 +4727,8 @@ class TestReviewContextFromChain:
             local_dependencies=(),
         )
         store = SqliteTaskStore.from_config(config)
+        SqliteTaskStore.from_config(Config.load_execution(child_dir))
+        SqliteTaskStore.from_config(Config.load_execution(sibling_dir))
         task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
@@ -4230,6 +4841,7 @@ class TestReviewContextFromChain:
             local_dependencies=(),
         )
         store = SqliteTaskStore.from_config(config)
+        SqliteTaskStore.from_config(Config.load_execution(child_dir))
         task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
         source = store.add("Successful root verify source", task_type="review", depends_on=task.id)
         assert source.id is not None
@@ -4292,9 +4904,11 @@ class TestReviewContextFromChain:
         repo_root = tmp_path / "repo"
         worktree_path = tmp_path / "worktree"
         anchor_dir = repo_root / "services" / "anchor"
+        other_dir = repo_root / "libs" / "other"
         project_a = worktree_path / "services" / "anchor"
         project_b = worktree_path / "libs" / "other"
         anchor_dir.mkdir(parents=True)
+        other_dir.mkdir(parents=True)
         project_a.mkdir(parents=True)
         project_b.mkdir(parents=True)
         monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
@@ -4332,8 +4946,18 @@ class TestReviewContextFromChain:
             "db_path: .gza/other-runtime.db\n"
             "verify_command: ./bin/other-verify\n"
         )
+        (other_dir / "gza.yaml").write_text(
+            "project_name: other\n"
+            "project_id: other\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "theme: minimal\n"
+            "db_path: .gza/other-runtime.db\n"
+            "verify_command: ./bin/other-verify\n"
+        )
         (project_a / ".env").write_text("PATH=/project-a/bin\nTOKEN=project-a-token\n")
         (project_b / ".env").write_text("PATH=/project-b/bin\nTOKEN=project-b-token\n")
+        (other_dir / ".env").write_text("PATH=/canonical-b/bin\nTOKEN=canonical-b-token\n")
 
         config = Config.load(anchor_dir)
         anchor_task_color = color_state.TASK_COLORS.task_id
@@ -4357,6 +4981,8 @@ class TestReviewContextFromChain:
             project_id=config.project_id,
             db_path=anchor_dir / ".gza" / "selected-runtime.db",
         )
+        _write_verify_marker_db(selected_runtime.db_path)
+        _write_verify_marker_db(other_dir / ".gza" / "other-runtime.db")
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
         worktree_git.get_diff_name_status.return_value = "M\tservices/anchor/app.py\nM\tlibs/other/lib.py\n"
@@ -4399,12 +5025,13 @@ class TestReviewContextFromChain:
         assert isinstance(env_a, dict)
         assert isinstance(env_b, dict)
         assert env_a["PATH"] == "/selected-anchor/bin"
-        assert env_b["PATH"] == "/project-b/bin"
+        assert env_b["PATH"] == "/canonical-b/bin"
         assert env_a["TOKEN"] == "selected-anchor-token"
-        assert env_b["TOKEN"] == "project-b-token"
+        assert env_b["TOKEN"] == "canonical-b-token"
         assert env_a["GZA_DB_PATH"] == str(anchor_dir / ".gza" / "selected-runtime.db")
-        assert env_b["GZA_DB_PATH"] == str((project_b / ".gza" / "other-runtime.db").resolve())
+        assert env_b["GZA_DB_PATH"] == str((other_dir / ".gza" / "other-runtime.db").resolve())
         assert env_a["PWD"] == str(project_a.resolve())
+        assert env_b["PWD"] == str(project_b.resolve())
         assert "GIT_DIR" not in env_a
 
     def test_default_cross_project_runs_verify_for_current_and_parent_projects(self, tmp_path: Path):
@@ -4426,6 +5053,8 @@ class TestReviewContextFromChain:
         (worktree_project_dir / "gza.yaml").write_text(
             "project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n"
         )
+        SqliteTaskStore.from_config(Config.load_execution(repo_root))
+        SqliteTaskStore.from_config(Config.load_execution(project_dir))
 
         config = Config(
             project_dir=project_dir,
@@ -4495,6 +5124,7 @@ class TestReviewContextFromChain:
         (worktree_project_dir / "gza.yaml").write_text(
             "project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n"
         )
+        SqliteTaskStore.from_config(Config.load_execution(project_dir))
 
         config = Config(
             project_dir=project_dir,
@@ -4574,6 +5204,9 @@ class TestReviewContextFromChain:
         (worktree_unavailable_dir / "gza.yaml").write_text(
             "project_name: baz\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/baz-verify\n"
         )
+        SqliteTaskStore.from_config(Config.load_execution(project_dir))
+        SqliteTaskStore.from_config(Config.load_execution(sibling_dir))
+        SqliteTaskStore.from_config(Config.load_execution(unavailable_dir))
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
         config._project_boundary_cache = ProjectBoundary(
@@ -4658,6 +5291,7 @@ class TestReviewContextFromChain:
             "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
         )
         (worktree_skipped_dir / "gza.yaml").write_text("project_name: baz\nprovider: codex\nmodel: gpt-5.5\n")
+        SqliteTaskStore.from_config(Config.load_execution(project_dir))
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
         config._project_boundary_cache = ProjectBoundary(
@@ -4717,6 +5351,7 @@ class TestReviewContextFromChain:
         (worktree_project_dir / "gza.yaml").write_text(
             "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n"
         )
+        SqliteTaskStore.from_config(Config.load_execution(project_dir))
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
         config._project_boundary_cache = ProjectBoundary(
@@ -4788,6 +5423,7 @@ class TestReviewContextFromChain:
         (worktree_sibling_dir / "gza.yaml").write_text(
             "project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify-new\n"
         )
+        SqliteTaskStore.from_config(Config.load_execution(sibling_dir))
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
         config._project_boundary_cache = ProjectBoundary(
@@ -4878,9 +5514,10 @@ class TestReviewContextFromChain:
 
         assert outcome is not None
         assert "### dre/web" in outcome.markdown
-        mock_verify.assert_called_once()
-        assert mock_verify.call_args.args[0] == "./bin/web-verify"
-        assert mock_verify.call_args.kwargs["cwd"] == worktree_path / "dre" / "web"
+        mock_verify.assert_not_called()
+        assert outcome.aggregate_result.status == "unavailable"
+        assert outcome.project_results[0].result is not None
+        assert outcome.project_results[0].result.exit_status == "owning runtime unavailable"
 
     def test_run_review_verify_commands_for_cross_project_includes_rename_source_and_destination_projects(
         self, tmp_path: Path
@@ -4912,6 +5549,7 @@ class TestReviewContextFromChain:
         (renamed_dir / "gza.yaml").write_text(
             "project_name: renamed\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/renamed-verify\n"
         )
+        SqliteTaskStore.from_config(Config.load_execution(project_dir))
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
         config._project_boundary_cache = ProjectBoundary(
@@ -4977,11 +5615,15 @@ class TestReviewContextFromChain:
         assert "### libs/renamed" in outcome.markdown
         assert "apps/removed/gza.yaml" in outcome.markdown
         verify_calls = mock_verify.call_args_list
-        assert len(verify_calls) == 4
+        assert len(verify_calls) == 1
         assert verify_calls[0].kwargs["cwd"] == worktree_path / "services" / "foo"
-        assert verify_calls[1].kwargs["cwd"] == worktree_path / "libs" / "copied"
-        assert verify_calls[2].kwargs["cwd"] == worktree_path / "libs" / "old"
-        assert verify_calls[3].kwargs["cwd"] == worktree_path / "libs" / "renamed"
+        unavailable_results = [
+            project_result.result
+            for project_result in outcome.project_results
+            if project_result.result is not None and project_result.result.status == "unavailable"
+        ]
+        assert len(unavailable_results) == 3
+        assert {result.exit_status for result in unavailable_results} == {"owning runtime unavailable"}
 
     def test_review_context_includes_changed_files_diffstat_and_diff(self, tmp_path: Path):
         """Review context should include changed files, diffstat, and inline diff."""
@@ -7390,6 +8032,16 @@ def _write_verify_marker_db(db_path: Path) -> None:
     try:
         conn.execute("CREATE TABLE verify_markers (id INTEGER PRIMARY KEY, label TEXT)")
         conn.execute("INSERT INTO verify_markers (label) VALUES ('live')")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _add_verify_marker(db_path: Path, label: str) -> None:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS verify_markers (id INTEGER PRIMARY KEY, label TEXT)")
+        conn.execute("INSERT INTO verify_markers (label) VALUES (?)", (label,))
         conn.commit()
     finally:
         conn.close()
@@ -33482,6 +34134,7 @@ def test_publication_recovery_cross_project_diff_scope_comes_from_worktree_head(
     (tmp_path / "libs" / "bar" / "gza.yaml").write_text(
         "project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n"
     )
+    SqliteTaskStore.from_config(Config.load_execution(tmp_path / "libs" / "bar"))
     store, config, impl, verify_fix, verify_epoch = _timeout_verify_fix_fixture(tmp_path, cross_project=True)
     worktree_path = config.worktree_path / verify_fix.slug
     (worktree_path / "services" / "foo").mkdir(parents=True, exist_ok=True)

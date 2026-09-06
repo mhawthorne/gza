@@ -68,11 +68,16 @@ from .cross_project import (
 from .db import (
     DB_UNSET,
     TASK_COMMENT_KIND_FEEDBACK,
+    ExecutionProjectActivationError,
+    ExecutionProjectDisabled,
+    ExecutionProjectResolved,
+    ExecutionProjectSelector,
     SqliteTaskStore,
     Task,
     TaskArtifact,
     TaskStats,
     extract_failure_reason as _extract_failure_reason,
+    resolve_execution_projects,
     task_id_numeric_key,
 )
 from .dependency_preconditions import get_unmerged_dependency_precondition
@@ -2943,7 +2948,12 @@ def _extract_review_verdict(content: str | None) -> str | None:
 
 def _backup_sqlite_file(source_path: Path, destination_path: Path) -> None:
     """Copy a SQLite database file using SQLite's backup API."""
-    source = sqlite3.connect(str(source_path))
+    try:
+        source = sqlite3.connect(source_path.resolve().as_uri() + "?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        if not source_path.exists():
+            raise FileNotFoundError(f"runtime DB does not exist: {source_path}") from exc
+        raise
     try:
         destination = sqlite3.connect(str(destination_path))
         try:
@@ -3197,7 +3207,12 @@ def disposable_verify_db_snapshot_env(
     snapshot_path = tmp_dir / "gza.db"
     traversal_leases: list[_PathModeLeaseHandle] = []
     try:
-        _backup_sqlite_file(source_db_path, snapshot_path)
+        try:
+            _backup_sqlite_file(source_db_path, snapshot_path)
+        except sqlite3.Error as exc:
+            if not source_db_path.exists():
+                raise FileNotFoundError(f"runtime DB does not exist: {source_db_path}") from exc
+            raise
         docker_group_ids: tuple[int, ...] = ()
         if bool(getattr(config, "use_docker", False)):
             docker_group_ids = _prepare_docker_verify_snapshot_permissions(
@@ -3959,6 +3974,15 @@ class CrossProjectReviewVerifyResult:
 VerificationResult = ReviewVerifyResult
 ProjectVerificationResult = ProjectReviewVerifyResult
 CrossProjectVerificationResult = CrossProjectReviewVerifyResult
+
+
+@dataclass(frozen=True)
+class _CrossProjectOwningRuntime:
+    """Canonical runtime authority for an evaluated cross-project verify config."""
+
+    config: Config
+    runtime_context: RuntimeExecutionContext
+    store: SqliteTaskStore | None
 
 
 @dataclass(frozen=True)
@@ -5315,17 +5339,34 @@ def _persist_cross_project_successful_full_suite_observations(
     project_results: tuple[ProjectVerificationResult, ...],
     producer: str,
 ) -> None:
+    boundary = _project_boundary(config)
     for entry in project_results:
         if entry.project is None or entry.result is None:
             continue
         phase_summary = _successful_full_suite_phase_summary(entry.result)
         if phase_summary is None:
             continue
-        if entry.project.config.project_id == config.project_id:
+        owning_runtime, owning_runtime_error = _resolve_cross_project_owning_runtime(
+            root_config=config,
+            root_store=store,
+            root_runtime_context=None,
+            owning_repo_root=boundary.repo_root,
+            owning_scope_root=boundary.scope_root,
+            project=entry.project,
+        )
+        if owning_runtime is None:
+            logger.warning(
+                "Skipping cross-project full-suite observation for %s: %s",
+                entry.scope,
+                owning_runtime_error or "unknown owning runtime resolution failure",
+            )
+            continue
+        if entry.project.scope_root == boundary.scope_root:
             project_store = store
             owner_task = task
         else:
-            project_store = SqliteTaskStore.from_config(entry.project.config)
+            assert owning_runtime.store is not None
+            project_store = owning_runtime.store
             owner_task = project_store.add(
                 "Project full-suite verify runtime observation mirrored from cross-project lifecycle verify",
                 task_type="internal",
@@ -5342,7 +5383,7 @@ def _persist_cross_project_successful_full_suite_observations(
         )
         persist_verify_gate_artifact(
             project_store,
-            entry.project.config,
+            owning_runtime.config,
             owner_task=owner_task,
             source_task=owner_task,
             result=entry.result,
@@ -7276,6 +7317,173 @@ def _strip_review_verify_heading(markdown: str) -> list[str]:
     return lines
 
 
+def _cross_project_unavailable_result(
+    project: RepoProjectConfig,
+    *,
+    scope: str,
+    project_cwd: Path,
+    reviewed_branch: str | None,
+    reviewed_head_sha: str | None,
+    reviewed_tree_sha: str | None,
+    reviewed_base_sha: str | None,
+    failure: str,
+    exit_status: str = "owning runtime unavailable",
+) -> ReviewVerifyResult:
+    return _make_review_verify_result(
+        project.verify_command,
+        status="unavailable",
+        exit_status=exit_status,
+        captured_at=datetime.now(UTC),
+        reviewed_branch=reviewed_branch,
+        reviewed_head_sha=reviewed_head_sha,
+        reviewed_tree_sha=reviewed_tree_sha,
+        reviewed_base_sha=reviewed_base_sha,
+        working_directory=str(project_cwd),
+        failure=f"could not resolve owning runtime for scope {scope}: {failure}",
+    )
+
+
+def _resolve_cross_project_owning_runtime(
+    *,
+    root_config: Config,
+    root_store: SqliteTaskStore | None,
+    root_runtime_context: RuntimeExecutionContext | None,
+    owning_repo_root: Path,
+    owning_scope_root: Path,
+    project: RepoProjectConfig,
+) -> tuple[_CrossProjectOwningRuntime | None, str | None]:
+    """Resolve the canonical runtime that owns state for an evaluated project."""
+    is_root_project = project.scope_root == owning_scope_root
+    if is_root_project:
+        runtime_context = root_runtime_context or RuntimeExecutionContext.from_config(root_config)
+        if not runtime_context.db_path.exists():
+            return None, f"runtime DB does not exist: {runtime_context.db_path}"
+        return _CrossProjectOwningRuntime(
+            config=root_config,
+            runtime_context=runtime_context,
+            store=root_store,
+        ), None
+
+    owner_project_dir = owning_repo_root if project.scope_root == Path(".") else owning_repo_root / project.scope_root
+    owner_project_dir = owner_project_dir.resolve()
+    if root_store is not None:
+        try:
+            registry_entry = root_store.get_project_registry_entry(project.config.project_id)
+        except Exception as exc:  # pragma: no cover - defensive normalization for registry read failures.
+            return None, f"project registry could not be read for {project.config.project_id!r}: {exc}"
+        if registry_entry is not None:
+            if not registry_entry.root_path.strip() and not registry_entry.config_path.strip():
+                registry_entry = None
+                registry_entry_matches_scope = False
+            else:
+                try:
+                    registry_root_path = Path(registry_entry.root_path).expanduser().resolve()
+                    registry_config_path = Path(registry_entry.config_path).expanduser().resolve()
+                    expected_config_path = Config.config_path(owner_project_dir).resolve()
+                except (ConfigError, OSError, RuntimeError, ValueError) as exc:
+                    return None, f"canonical project registry paths for {project.config.project_id!r} are unavailable: {exc}"
+                registry_entry_matches_scope = (
+                    registry_root_path == owner_project_dir and registry_config_path == expected_config_path
+                )
+                if not registry_entry_matches_scope:
+                    root_project_dir = root_config.project_dir.resolve()
+                    root_config_path = Config.config_path(root_project_dir).resolve()
+                    registry_entry_is_root_runtime = (
+                        project.config.project_id == root_config.project_id
+                        and registry_root_path == root_project_dir
+                        and registry_config_path == root_config_path
+                    )
+                    if registry_entry_is_root_runtime:
+                        registry_entry = None
+                    else:
+                        return (
+                            None,
+                            "project registry row for "
+                            f"{project.config.project_id!r} points at root {registry_root_path} "
+                            f"and config {registry_config_path}, not affected repository scope "
+                            f"{owner_project_dir} with config {expected_config_path}",
+                        )
+        else:
+            registry_entry_matches_scope = False
+        if registry_entry is not None and registry_entry_matches_scope:
+            (resolved_owner,) = resolve_execution_projects(
+                root_store,
+                (
+                    ExecutionProjectSelector(
+                        project.config.project_id,
+                        "registry_id",
+                        project.config.project_id,
+                    ),
+                ),
+            )
+            if isinstance(resolved_owner, ExecutionProjectDisabled):
+                return None, resolved_owner.message
+            if not isinstance(resolved_owner, ExecutionProjectResolved):  # pragma: no cover - type narrowing guard.
+                return None, f"unexpected execution project resolution for {project.config.project_id!r}"
+            if resolved_owner.root_path != owner_project_dir:
+                return (
+                    None,
+                    "registry root "
+                    f"{resolved_owner.root_path} does not match affected repository scope {owner_project_dir}",
+                )
+            try:
+                expected_config_path = Config.config_path(owner_project_dir).resolve()
+            except (ConfigError, OSError, RuntimeError, ValueError) as exc:
+                return None, f"canonical project config path at {owner_project_dir} is unavailable: {exc}"
+            if resolved_owner.config_path != expected_config_path:
+                return (
+                    None,
+                    "registry config "
+                    f"{resolved_owner.config_path} does not match affected repository scope {expected_config_path}",
+                )
+            if resolved_owner.config.project_id != project.config.project_id:
+                return (
+                    None,
+                    "registry project_id "
+                    f"{resolved_owner.config.project_id!r} does not match evaluated project_id "
+                    f"{project.config.project_id!r}",
+                )
+            if not resolved_owner.db_path.exists():
+                return None, f"runtime DB does not exist: {resolved_owner.db_path}"
+            try:
+                runtime = resolved_owner.open_runtime_store()
+            except (ExecutionProjectActivationError, ConfigError, OSError, RuntimeError, ValueError) as exc:
+                return None, f"runtime DB could not be opened for canonical owner: {exc}"
+            return _CrossProjectOwningRuntime(
+                config=runtime.config,
+                runtime_context=runtime.runtime_context,
+                store=runtime.store,
+            ), None
+
+    try:
+        owner_config = Config.load_execution(owner_project_dir)
+    except (ConfigError, OSError, RuntimeError, ValueError, UnicodeError) as exc:
+        return None, f"canonical project config at {owner_project_dir} is unavailable: {exc}"
+
+    if owner_config.project_id != project.config.project_id:
+        return (
+            None,
+            f"canonical project_id {owner_config.project_id!r} does not match evaluated project_id {project.config.project_id!r}",
+        )
+
+    owner_runtime_context = RuntimeExecutionContext.from_config(owner_config)
+    if not owner_runtime_context.db_path.exists():
+        return None, f"runtime DB does not exist: {owner_runtime_context.db_path}"
+
+    owner_store = None
+    if root_store is not None:
+        try:
+            owner_store = SqliteTaskStore.from_config(owner_config)
+        except Exception as exc:  # pragma: no cover - defensive normalization for store bootstrap errors.
+            return None, f"runtime DB could not be opened for budget evidence: {exc}"
+
+    return _CrossProjectOwningRuntime(
+        config=owner_config,
+        runtime_context=owner_runtime_context,
+        store=owner_store,
+    ), None
+
+
 def _aggregate_cross_project_verify_result(
     *,
     command: str,
@@ -7423,7 +7631,9 @@ def _run_verify_commands_for_projects(
 
     project_results: list[ProjectReviewVerifyResult] = []
     section_entries: list[str] = []
-    owning_scope_root = _project_boundary(config).scope_root
+    boundary = _project_boundary(config)
+    owning_repo_root = boundary.repo_root
+    owning_scope_root = boundary.scope_root
     for project in affected.projects:
         scope = _format_repo_project_scope(project.scope_root)
         project_cwd = worktree_path if project.scope_root == Path(".") else worktree_path / project.scope_root
@@ -7448,18 +7658,43 @@ def _run_verify_commands_for_projects(
             )
             continue
 
+        owning_runtime, owning_runtime_error = _resolve_cross_project_owning_runtime(
+            root_config=config,
+            root_store=store,
+            root_runtime_context=runtime_context,
+            owning_repo_root=owning_repo_root,
+            owning_scope_root=owning_scope_root,
+            project=project,
+        )
+        if owning_runtime is None:
+            result = _cross_project_unavailable_result(
+                project,
+                scope=scope,
+                project_cwd=project_cwd,
+                reviewed_branch=reviewed_branch,
+                reviewed_head_sha=reviewed_head_sha,
+                reviewed_tree_sha=reviewed_tree_sha,
+                reviewed_base_sha=reviewed_base_sha,
+                failure=owning_runtime_error or "unknown runtime resolution failure",
+            )
+            project_results.append(
+                ProjectReviewVerifyResult(
+                    project=project,
+                    scope=scope,
+                    working_directory=str(project_cwd),
+                    result=result,
+                )
+            )
+            section_entries.extend([f"### {scope}", "", *_strip_review_verify_heading(_format_review_verify_result(result)), ""])
+            continue
+
         project_timeout_seconds = timeout_seconds
         project_timeout_grace_seconds = timeout_grace_seconds
-        if store is not None:
-            project_store = (
-                store
-                if project.config.project_id == config.project_id or project.scope_root == owning_scope_root
-                else SqliteTaskStore.from_config(project.config)
-            )
+        if owning_runtime.store is not None:
             try:
                 project_timeout_seconds, project_timeout_grace_seconds = resolve_lifecycle_verify_timeout_settings(
                     project.config,
-                    project_store,
+                    owning_runtime.store,
                     scope=scope,
                     verify_command=project.verify_command,
                 )
@@ -7488,10 +7723,10 @@ def _run_verify_commands_for_projects(
                 continue
 
         budget_margin_failure = None
-        if store is not None:
+        if owning_runtime.store is not None:
             budget_margin_failure = _lifecycle_verify_budget_margin_failure(
                 config=project.config,
-                store=project_store,
+                store=owning_runtime.store,
                 owner_task=task,
                 command=project.verify_command,
                 timeout_seconds=project_timeout_seconds,
@@ -7504,29 +7739,37 @@ def _run_verify_commands_for_projects(
         if budget_margin_failure is not None:
             result = budget_margin_failure
         else:
-            project_runtime_context = (
-                runtime_context
-                if runtime_context is not None
-                and project.config.project_id == config.project_id
-                and project.scope_root == owning_scope_root
-                else project.runtime_context
-            )
-            result = _run_review_verify_command(
-                project.verify_command,
-                cwd=project_cwd,
-                env=normalize_subprocess_env(project_runtime_context.env, project_cwd),
-                runtime_context=project_runtime_context,
-                config=project.config,
-                reviewed_branch=reviewed_branch,
-                reviewed_head_sha=reviewed_head_sha,
-                reviewed_tree_sha=reviewed_tree_sha,
-                reviewed_base_sha=reviewed_base_sha,
-                timeout_seconds=project_timeout_seconds,
-                timeout_grace_seconds=project_timeout_grace_seconds,
-                heartbeat_threshold_seconds=heartbeat_threshold_seconds,
-                heartbeat_interval_seconds=heartbeat_interval_seconds,
-                on_heartbeat=heartbeat_for_project(scope) if heartbeat_for_project is not None else None,
-            )
+            project_runtime_context = owning_runtime.runtime_context
+            try:
+                result = _run_review_verify_command(
+                    project.verify_command,
+                    cwd=project_cwd,
+                    env=normalize_subprocess_env(project_runtime_context.env, project_cwd),
+                    runtime_context=project_runtime_context,
+                    config=project.config,
+                    reviewed_branch=reviewed_branch,
+                    reviewed_head_sha=reviewed_head_sha,
+                    reviewed_tree_sha=reviewed_tree_sha,
+                    reviewed_base_sha=reviewed_base_sha,
+                    timeout_seconds=project_timeout_seconds,
+                    timeout_grace_seconds=project_timeout_grace_seconds,
+                    heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                    on_heartbeat=heartbeat_for_project(scope) if heartbeat_for_project is not None else None,
+                )
+            except FileNotFoundError as exc:
+                if project_runtime_context.db_path.exists():
+                    raise
+                result = _cross_project_unavailable_result(
+                    project,
+                    scope=scope,
+                    project_cwd=project_cwd,
+                    reviewed_branch=reviewed_branch,
+                    reviewed_head_sha=reviewed_head_sha,
+                    reviewed_tree_sha=reviewed_tree_sha,
+                    reviewed_base_sha=reviewed_base_sha,
+                    failure=str(exc),
+                )
         project_results.append(
             ProjectReviewVerifyResult(
                 project=project,
