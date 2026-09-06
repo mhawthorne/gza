@@ -725,8 +725,9 @@ def build_docker_cmd(
     env_source = os.environ if host_env is None else host_env
     stdio_flag = "-it" if interactive else "-i"
     venv_tmpfs_target = posixpath.join(docker_workdir or "/workspace", ".venv")
+    group_add_env = {} if host_env is None else host_env
     group_add_ids: set[str] = set()
-    for group_add_id in _iter_docker_group_add_values(env_source, docker_env):
+    for group_add_id in _iter_docker_group_add_values(group_add_env, docker_env):
         group_add_ids.add(group_add_id)
     cmd = [
         "timeout", f"{timeout_minutes}m",

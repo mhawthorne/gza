@@ -564,6 +564,7 @@ class LandingCoordinator:
     runtime_context: Any | None = None
     verify_action_context: AdvanceActionExecutionContext | None = None
     execute_verify_action: LandingAdvanceExecutor | None = None
+    review_executor: LandingReviewExecutor | None = None
     live_tree_fingerprint_resolver: LandingLiveTreeResolver | None = None
     create_full_review: Callable[..., DbTask] = create_review_task
     create_resolution_review: Callable[..., DbTask] = create_resolution_review_task
@@ -1093,6 +1094,8 @@ class LandingCoordinator:
                 steps.append(step)
                 if blocked is not None:
                     return self._blocked_result(request, identity, steps, blocked)
+                if decision is None:
+                    continue
                 return self._run_policy_and_merge_phases(
                     request=request,
                     identity=identity,
@@ -2725,6 +2728,50 @@ class LandingCoordinator:
                 review_result.blocked,
                 None,
             )
+        if review_result.status in {"created", "pending"} and self.review_executor is not None:
+            review = review_result.review_task
+            if review is None or review.id is None:
+                blocked = LandBlocked(
+                    "required-review-unavailable",
+                    "post-rebase review identity is unavailable",
+                    _evidence_refs(identity.owner_task_id, identity.source_sha),
+                )
+                return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None
+            try:
+                rc = self.review_executor(self.config, review.id)
+            except Exception as exc:
+                blocked = LandBlocked(
+                    "required-review-unavailable",
+                    _exception_fact("post-rebase review execution failed", exc),
+                    _evidence_refs(review.id, identity.owner_task_id, identity.source_sha),
+                )
+                return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None
+            if rc != 0:
+                blocked = LandBlocked(
+                    "required-review-unavailable",
+                    f"post-rebase review {review.id} exited {rc}",
+                    _evidence_refs(review.id, identity.owner_task_id, identity.source_sha),
+                )
+                return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None
+            refreshed = self.store.get(review.id)
+            if refreshed is None or refreshed.status != "completed":
+                blocked = LandBlocked(
+                    "required-review-unavailable",
+                    f"post-rebase review {review.id} did not complete",
+                    _evidence_refs(review.id, identity.owner_task_id, identity.source_sha),
+                )
+                return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None
+            return (
+                LandStep(
+                    "post_rebase_review",
+                    "completed",
+                    f"post-rebase review {review.id} completed; reloading landing state",
+                    evidence_refs=_evidence_refs(review.id, identity.source_sha, identity.target_sha),
+                ),
+                None,
+                None,
+            )
+
         if review_result.status in {"created", "pending", "in_progress"}:
             review = review_result.review_task
             blocked = LandBlocked(
@@ -3710,6 +3757,7 @@ LandingAdvanceExecutor = Callable[
     [DbTask, dict[str, Any], AdvanceActionExecutionContext],
     AdvanceActionExecutionResult,
 ]
+LandingReviewExecutor = Callable[[Any, str], int]
 
 _LOG = logging.getLogger(__name__)
 _INTERNAL_SENTENCE_TERMINATOR_RE = re.compile(r"([.!?;:])\s+")
@@ -7550,6 +7598,7 @@ def create_production_landing_coordinator(
         create_rebase_task=_create_rebase_task,
         rebase_executor=_run_task_backed_rebase,
         inspect_policy_facts=inspect_policy_facts,
+        review_executor=runner,
         landing_judge=durable_judge,
         execute_merge=execute_land_merge,
         finalize_merge=finalize_land_merge,

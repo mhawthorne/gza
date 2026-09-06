@@ -916,6 +916,21 @@ class TestBuildDockerCmd:
 
         assert "--group-add" not in cmd
 
+    def test_docker_run_ignores_ambient_supplemental_groups(self, tmp_path):
+        """Ambient host variables should not add container groups without runtime input."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        with patch.dict(os.environ, {"GZA_DOCKER_GROUP_ADD": "1,2"}, clear=False):
+            cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10)
+
+        assert "--group-add" not in cmd
+
     def test_docker_run_adds_verify_snapshot_groups_from_env(self, tmp_path):
         """Container processes should receive declared snapshot GIDs for writable verify DBs."""
         docker_config = DockerConfig(

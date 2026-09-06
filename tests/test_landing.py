@@ -53,11 +53,12 @@ from gza.landing import (
     refresh_landing_authorization,
     run_landing_post_rebase_review_transition,
 )
-from gza.merge_services import MergeLandingAuthorization
+from gza.merge_services import ManualMergeExecutionResult, MergeLandingAuthorization
 from gza.rebase_service import RebaseServiceRequest, RebaseServiceResult
+from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance
 from gza.review_scope import build_resolution_review_scope, build_spec_coherence_review_scope
-from gza.review_tasks import DuplicateReviewError
-from gza.review_verdict import ParsedReviewReport, ReviewFinding
+from gza.review_tasks import DuplicateReviewError, build_deferred_blocker_prompt, format_blocker_finding_context
+from gza.review_verdict import ParsedReviewReport, ReviewFinding, parse_review_report
 from gza.review_verify_state import (
     VerifyGateDecision,
     VerifyGateLookup,
@@ -2516,40 +2517,34 @@ def _completed_impl_with_stored_unit(
     return refreshed, unit
 
 
-def _sqlite_task_snapshot(store: SqliteTaskStore) -> tuple[tuple[Any, ...], ...]:
+def _sqlite_table_snapshot(store: SqliteTaskStore, table: str) -> tuple[tuple[Any, ...], ...]:
+    if table not in {"tasks", "merge_units", "merge_unit_tasks", "task_artifacts"}:
+        raise ValueError(f"unsupported snapshot table: {table}")
     with store._connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, status, task_type, branch, merge_status, merged_at, completion_reason
-            FROM tasks
-            ORDER BY id
-            """
-        ).fetchall()
-    return tuple(tuple(row) for row in rows)
+        columns = tuple(str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall())
+        assert columns
+        selected = ", ".join(f'"{column}"' for column in columns)
+        rows = conn.execute(f"SELECT {selected} FROM {table} ORDER BY rowid").fetchall()
+    return tuple(tuple(row[column] for column in columns) for row in rows)
+
+
+def _landing_durable_snapshot(store: SqliteTaskStore) -> dict[str, tuple[tuple[Any, ...], ...]]:
+    return {
+        table: _sqlite_table_snapshot(store, table)
+        for table in ("tasks", "merge_units", "merge_unit_tasks", "task_artifacts")
+    }
+
+
+def _sqlite_task_snapshot(store: SqliteTaskStore) -> tuple[tuple[Any, ...], ...]:
+    return _sqlite_table_snapshot(store, "tasks")
 
 
 def _sqlite_merge_unit_snapshot(store: SqliteTaskStore) -> tuple[tuple[Any, ...], ...]:
-    with store._connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, source_branch, target_branch, state, owner_task_id, merged_at, merge_source
-            FROM merge_units
-            ORDER BY id
-            """
-        ).fetchall()
-    return tuple(tuple(row) for row in rows)
+    return _sqlite_table_snapshot(store, "merge_units")
 
 
 def _sqlite_artifact_snapshot(store: SqliteTaskStore) -> tuple[tuple[Any, ...], ...]:
-    with store._connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, task_id, kind, label, path, byte_size, sha256, status, head_sha, metadata_json
-            FROM task_artifacts
-            ORDER BY id
-            """
-        ).fetchall()
-    return tuple(tuple(row) for row in rows)
+    return _sqlite_table_snapshot(store, "task_artifacts")
 
 
 def _persist_exact_landing_pending_finalization(
@@ -3845,6 +3840,21 @@ def _park_for_review_blocker_adjudication(store: SqliteTaskStore, impl: Task) ->
             action_reason="review-blocker-adjudication-needed",
             evidence_fingerprint="park-adjudication-needed",
             parked_reason="review-blocker-adjudication-needed",
+            observed_at=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+        )
+    )
+
+
+def _park_for_review_max_cycles(store: SqliteTaskStore, impl: Task) -> None:
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind="task",
+            subject_id=impl.id or "",
+            subject_task_id=impl.id,
+            action_type="max_cycles_reached",
+            action_reason="review-max-cycles-reached",
+            evidence_fingerprint="park-review-max-cycles",
+            parked_reason="review-max-cycles-reached",
             observed_at=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
         )
     )
@@ -5665,6 +5675,433 @@ def test_landing_coordinator_guarded_defers_blockers_after_final_preflight_and_m
     assert deferred.urgent is True
     assert deferred.create_pr is True
     assert [step.phase for step in result.steps[-4:]] == ["judge", "defer_blockers", "merge", "post_merge_verify"]
+
+
+def _motivating_full_cycle_landing_fixture(tmp_path) -> dict[str, Any]:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "motivating guarded landing", "feature/landing")
+    assert impl.id is not None
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    stale_review = _completed_full_review(store, impl, head="source-before", verdict="APPROVED")
+    _park_for_review_max_cycles(store, impl)
+    git = _LandingSourceGit(
+        {"feature/landing": "source-before", "main": "target-a"},
+        local_branches={"feature/landing"},
+        can_merge_refs=set(),
+    )
+    state: dict[str, Any] = {
+        "store": store,
+        "config": config,
+        "impl": impl,
+        "unit": unit,
+        "git": git,
+        "stale_review_id": stale_review.id,
+        "rebase_done": False,
+        "coordinator": None,
+        "latest_identity": None,
+        "latest_facts": None,
+        "review_executor_calls": [],
+        "order": [],
+    }
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        coordinator = state["coordinator"]
+        assert coordinator is not None
+        saved = coordinator.inspect_policy_facts
+        coordinator.inspect_policy_facts = None
+        try:
+            facts = coordinator._landing_policy_facts(identity)
+        finally:
+            coordinator.inspect_policy_facts = saved
+        state["latest_identity"] = identity
+        state["latest_facts"] = facts
+        return facts
+
+    def execute_rebase_service(**kwargs: Any) -> RebaseServiceResult:
+        state["order"].append("rebase")
+        request = kwargs["request"]
+        rebase = store.add("landing conflict rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+        store.mark_completed(rebase, has_commits=True, branch="feature/landing", changed_diff=False)
+        _persist_landing_rebase_outcome(
+            store,
+            rebase,
+            impl,
+            source_before="source-before",
+            target_before="target-a",
+            source_after="source-after",
+            target_after="target-a",
+            status="provider_conflict_resolved",
+            changed_diff=False,
+            provider_conflict_resolved=True,
+        )
+        state["rebase_done"] = True
+        git.heads["feature/landing"] = "source-after"
+        git.ancestors.add(("target-a", "source-after"))
+        git.can_merge_refs = {("feature/landing", "main")}
+        _persist_lifecycle_verify_for_landing(store, config, impl, reviewed_head="source-after")
+        return RebaseServiceResult(
+            status="provider_conflict_resolved",
+            parent_task_id=request.parent_task_id,
+            branch=request.branch,
+            target_ref=request.target_branch,
+            rebase_task_id=rebase.id,
+            changed_diff=False,
+            artifact_id=1,
+            artifact_key="rebase-outcome-1",
+            source_head_before="source-before",
+            target_head_before="target-a",
+            source_head_after="source-after",
+            target_head_after="target-a",
+        )
+
+    def review_executor(_config: Any, review_id: str) -> int:
+        state["order"].append("review")
+        state["review_executor_calls"].append(review_id)
+        review = store.get(review_id)
+        assert review is not None
+        assert review.task_type == "review"
+        assert review.status == "pending"
+        assert review.review_scope is not None and "resolution" in review.review_scope
+        assert review.review_verify_head_sha is None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+        review.review_verify_head_sha = "source-after"
+        review.output_content = _review_report_with_findings(
+            "CHANGES_REQUESTED",
+            blockers=(("B1", "Out-of-scope landing polish", "docs/internal/landing.md:12"),),
+        )
+        store.update(review)
+        _add_review_blocker_resolution(
+            store,
+            impl=impl,
+            review=review,
+            title="Out-of-scope landing polish",
+            path="docs/internal/landing.md:12",
+            head="source-after",
+            target_head="target-a",
+            reason="out_of_scope",
+        )
+        return 0
+
+    def judge() -> LandingJudgment:
+        state["order"].append("judge")
+        identity = state["latest_identity"]
+        facts = state["latest_facts"]
+        assert identity is not None
+        assert facts is not None
+        assert facts.review is not None
+        assert facts.review.review_id is not None
+        review = store.get(facts.review.review_id)
+        assert review is not None
+        from gza.landing import _landing_judge_evidence
+        from gza.landing_judge import LandingJudgeBlockerIdentity, LandingJudgeIdentity, build_landing_judge_prompt
+
+        evidence = _landing_judge_evidence(store, config, git, identity, facts, review)
+        judge_identity = LandingJudgeIdentity(
+            implementation_id=identity.owner_task_id,
+            merge_unit_id=identity.merge_unit_id,
+            review_id=facts.review.review_id,
+            reviewed_head=facts.review.reviewed_head,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            verify_identity=evidence["verify_identity"],
+            authoritative_scope_identity=evidence["authoritative_scope_identity"],
+            adjudication_artifact_identities=facts.adjudication_fingerprints,
+            adjudication_content_identity=evidence["adjudication_content_identity"],
+            blocker_identities=tuple(
+                LandingJudgeBlockerIdentity(blocker.finding_id, blocker.fingerprint or "")
+                for blocker in facts.open_blockers
+            ),
+            decision_context_digest=evidence["context"].digest,
+        )
+        prompt = build_landing_judge_prompt(
+            identity=judge_identity,
+            task_prompt=evidence["context"].task_prompt,
+            authoritative_review_scope=evidence["context"].authoritative_review_scope,
+            plan_context=evidence["context"].plan_context,
+            implementation_summary=evidence["context"].implementation_summary,
+            review_output=evidence["context"].review_output,
+            verify_evidence=evidence["context"].verify_evidence,
+            diff_context=evidence["context"].diff_context,
+            adjudication_context=evidence["context"].adjudication_context,
+            blockers=evidence["context"].blockers,
+        )
+        artifact = _persist_test_landing_judgment(store, impl, review, judge_identity, prompt)
+        return LandingJudgment("LAND", artifact_id=str(artifact.id), key=judge_identity.key)
+
+    def merge(identity: Any, decision: LandingPolicyDecision, provenance: str) -> ManualMergeExecutionResult:
+        from gza.cli.git_ops import _create_or_reuse_deferred_blocker_tasks
+
+        state["order"].append("merge")
+        assert provenance == "manual_land_escalated"
+        assert decision.allowed_overrides == (
+            "defer-review-blockers",
+            "parked:review-max-cycles-reached",
+        )
+        facts = state["latest_facts"]
+        assert facts is not None
+        assert facts.review is not None
+        review_id = facts.review.review_id
+        assert review_id is not None
+        review = store.get(review_id)
+        assert review is not None
+        findings = tuple(parse_review_report(review.output_content).findings)
+        created, reused = _create_or_reuse_deferred_blocker_tasks(
+            store,
+            config=config,
+            review_task=review,
+            impl_task=identity.owner_task,
+            findings=findings,
+            trigger_source="manual_land",
+        )
+        _simulate_no_ff_landing_git_merge(git, merge_sha="target-after")
+        return ManualMergeExecutionResult(
+            rc=0,
+            status="merged",
+            created_deferred_blockers=created,
+            reused_deferred_blockers=reused,
+        )
+
+    def post_merge_verify(identity: Any) -> LandPostMergeVerifySuccess:
+        from gza.main_integration_verify import run_main_integration_verify
+
+        state["order"].append("post_merge_verify")
+        checkpoint = run_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="manual_land",
+            resolved_head_sha=git.heads["main"],
+        )
+        return LandPostMergeVerifySuccess(
+            checkpoint_id=checkpoint.task.id if checkpoint.task is not None else None,
+            target_head=checkpoint.head_sha,
+            tree_fingerprint=checkpoint.tree_fingerprint,
+            gate_identity=identity.target_branch,
+        )
+
+    def finalize(identity: Any, decision: Any, provenance: str) -> ManualMergeExecutionResult:
+        state["order"].append("finalize")
+        return _finalize_landing_merge_state(store, identity, decision, provenance)
+
+    state.update(
+        {
+            "inspect": inspect,
+            "execute_rebase_service": execute_rebase_service,
+            "review_executor": review_executor,
+            "judge": judge,
+            "merge": merge,
+            "post_merge_verify": post_merge_verify,
+            "finalize": finalize,
+        }
+    )
+    return state
+
+
+def test_landing_coordinator_full_cycle_guarded_conflict_resolution_lands_with_post_merge_verify(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    fixture = _motivating_full_cycle_landing_fixture(tmp_path)
+    store: SqliteTaskStore = fixture["store"]
+    impl: Task = fixture["impl"]
+    unit = fixture["unit"]
+    git: _LandingSourceGit = fixture["git"]
+    git.repo_dir = tmp_path
+    git.trees["target-after"] = TREE_A
+
+    def verify_command(*_args: Any, **_kwargs: Any) -> Any:
+        return ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+            reviewed_branch="main",
+            reviewed_head_sha="target-after",
+            reviewed_base_sha="target-a",
+            working_directory=str(tmp_path),
+            failure=None,
+            output=(
+                "verify output\n"
+                f"gza-verify phase=passed name=unit duration_seconds=1.0 tree_fingerprint={TREE_A}\n"
+            ),
+        )
+
+    monkeypatch.setattr("gza.main_integration_verify._run_review_verify_command", verify_command)
+
+    coordinator = LandingCoordinator(
+        store=store,
+        git=git,
+        config=fixture["config"],
+        inspect_policy_facts=fixture["inspect"],
+        create_rebase_task=_unused_rebase_factory,
+        rebase_executor=_unused_rebase_executor,
+        execute_rebase_service=fixture["execute_rebase_service"],
+        review_executor=fixture["review_executor"],
+        landing_judge=fixture["judge"],
+        execute_merge=fixture["merge"],
+        finalize_merge=fixture["finalize"],
+        post_merge_verifier=fixture["post_merge_verify"],
+    )
+    fixture["coordinator"] = coordinator
+
+    result = coordinator.run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is None
+    assert result.post_merge_verify_failure is None
+    assert result.merged is True
+    assert result.merge_provenance == "manual_land_escalated"
+    assert result.judgment_artifact_id is not None
+    assert result.judgment_key is not None
+    assert fixture["order"] == ["rebase", "review", "judge", "merge", "post_merge_verify", "finalize"]
+    persisted_unit = store.get_merge_unit(unit.id)
+    assert persisted_unit is not None
+    assert persisted_unit.state == "merged"
+    assert persisted_unit.merge_source == "manual_land_escalated"
+    review_tasks = [task for task in store.get_all() if task.task_type == "review"]
+    resolution_reviews = [task for task in review_tasks if task.review_scope and "resolution" in task.review_scope]
+    assert len(resolution_reviews) == 1
+    assert len(review_tasks) == 2
+    resolution_review = store.get(resolution_reviews[0].id or "")
+    assert resolution_review is not None
+    assert fixture["review_executor_calls"] == [resolution_review.id]
+    assert resolution_review.status == "completed"
+    assert resolution_review.review_verify_head_sha == "source-after"
+    assert "Out-of-scope landing polish" in (resolution_review.output_content or "")
+    deferred = store.get(result.deferred_task_ids[0])
+    assert deferred is not None
+    assert deferred.urgent is True
+    assert deferred.create_pr is True
+    assert deferred.depends_on == impl.id
+    assert deferred.based_on == resolution_review.id
+    judgment_artifact = store.get_artifact(int(result.judgment_artifact_id), task_id=impl.id)
+    assert judgment_artifact is not None
+    assert judgment_artifact.kind == "landing_judgment"
+    assert judgment_artifact.status == "LAND"
+    assert judgment_artifact.head_sha == "source-after"
+    assert judgment_artifact.metadata is not None
+    assert judgment_artifact.metadata["key"] == result.judgment_key
+    pending_artifacts = store.list_artifacts(impl.id, kind="landing_pending_finalization")
+    assert pending_artifacts
+    assert pending_artifacts[0].metadata is not None
+    assert pending_artifacts[0].metadata["post_merge_target_sha"] == "target-after"
+    from gza.main_integration_verify import load_main_integration_verify_state
+
+    checkpoint = load_main_integration_verify_state(store)
+    assert checkpoint is not None
+    assert checkpoint.task is not None
+    assert checkpoint.head_sha == "target-after"
+    assert checkpoint.tree_fingerprint == TREE_A
+    assert any(
+        step.phase == "post_merge_verify"
+        and checkpoint.task.id in step.evidence_refs
+        and "target-after" in step.evidence_refs
+        for step in result.steps
+    )
+    assert [step.phase for step in result.steps].count("post_rebase_review") == 1
+    assert any(
+        step.phase == "post_rebase_review"
+        and step.status == "completed"
+        and resolution_review.id in step.summary
+        for step in result.steps
+    )
+    _assert_no_improve_rows(store)
+    before_rerun = _landing_durable_snapshot(store)
+
+    rerun = LandingCoordinator(
+        store=store,
+        git=git,
+        config=fixture["config"],
+        inspect_policy_facts=lambda *_args: (_ for _ in ()).throw(AssertionError("rerun must be terminal")),
+        execute_rebase_service=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("rebase must not rerun")),
+        review_executor=lambda *_args: (_ for _ in ()).throw(AssertionError("review must not rerun")),
+        landing_judge=lambda: (_ for _ in ()).throw(AssertionError("judge must not rerun")),
+        execute_merge=lambda *_args: (_ for _ in ()).throw(AssertionError("merge must not rerun")),
+        post_merge_verifier=lambda *_args: (_ for _ in ()).throw(AssertionError("verify must not rerun")),
+    ).run(LandRequest(task_id=impl.id))
+
+    assert rerun.blocked is None
+    assert rerun.already_merged is True
+    assert rerun.terminal_outcome == "merged"
+    assert _landing_durable_snapshot(store) == before_rerun
+
+
+def test_landing_coordinator_full_cycle_dry_run_has_zero_mutation(tmp_path) -> None:
+    fixture = _motivating_full_cycle_landing_fixture(tmp_path)
+    store: SqliteTaskStore = fixture["store"]
+    impl: Task = fixture["impl"]
+    git: _LandingSourceGit = fixture["git"]
+    before = _landing_durable_snapshot(store)
+    before_heads = dict(git.heads)
+
+    coordinator = LandingCoordinator(
+        store=store,
+        git=git,
+        config=fixture["config"],
+        inspect_policy_facts=fixture["inspect"],
+        create_rebase_task=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no dry-run rebase task")),
+        rebase_executor=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no dry-run rebase executor")),
+        execute_rebase_service=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("no dry-run rebase service")),
+        landing_judge=lambda: (_ for _ in ()).throw(AssertionError("no dry-run judge")),
+        execute_merge=lambda *_args: (_ for _ in ()).throw(AssertionError("no dry-run merge")),
+        post_merge_verifier=lambda *_args: (_ for _ in ()).throw(AssertionError("no dry-run post-merge verify")),
+    )
+    fixture["coordinator"] = coordinator
+    result = coordinator.run(LandRequest(task_id=impl.id, dry_run=True))
+
+    assert result.blocked is None
+    assert result.merged is False
+    assert result.steps[-1].phase == "rebase"
+    assert result.steps[-1].status == "conditional"
+    assert "execution required" in result.steps[-1].summary
+    assert _landing_durable_snapshot(store) == before
+    assert git.heads == before_heads
+    assert git.mutation_calls == []
+    assert fixture["order"] == []
+
+
+def test_landing_coordinator_target_advancement_after_judgment_stops_without_second_budget(tmp_path) -> None:
+    fixture = _motivating_full_cycle_landing_fixture(tmp_path)
+    store: SqliteTaskStore = fixture["store"]
+    impl: Task = fixture["impl"]
+    git: _LandingSourceGit = fixture["git"]
+    original_judge = fixture["judge"]
+
+    def advancing_judge() -> LandingJudgment:
+        judgment = original_judge()
+        git.heads["main"] = "target-b"
+        return judgment
+
+    coordinator = LandingCoordinator(
+        store=store,
+        git=git,
+        config=fixture["config"],
+        inspect_policy_facts=fixture["inspect"],
+        create_rebase_task=_unused_rebase_factory,
+        rebase_executor=_unused_rebase_executor,
+        execute_rebase_service=fixture["execute_rebase_service"],
+        review_executor=fixture["review_executor"],
+        landing_judge=advancing_judge,
+        execute_merge=lambda *_args: (_ for _ in ()).throw(AssertionError("merge must not run after target moves")),
+        finalize_merge=fixture["finalize"],
+        post_merge_verifier=fixture["post_merge_verify"],
+    )
+    fixture["coordinator"] = coordinator
+    result = coordinator.run(LandRequest(task_id=impl.id))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "identity-proof-unavailable"
+    assert result.blocked.fact == "target head changed after landing authorization"
+    assert fixture["order"] == ["rebase", "review", "judge"]
+    assert [step.phase for step in result.steps].count("rebase") == 1
+    assert [step.phase for step in result.steps].count("post_rebase_review") == 1
+    assert all(step.phase not in {"defer_blockers", "merge", "post_merge_verify"} for step in result.steps)
+    assert store.list_artifacts(impl.id, kind="landing_pending_finalization") == []
+    assert store.get_merge_unit(fixture["unit"].id).state == "unmerged"  # type: ignore[union-attr]
+    assert len([task for task in store.get_all() if task.task_type == "review"]) == 2
+    _assert_no_improve_rows(store)
 
 
 def test_landing_coordinator_requires_post_merge_verifier_before_merge(tmp_path) -> None:
@@ -8692,6 +9129,7 @@ def test_landing_adjudication_identity_changes_when_reason_changes_with_stable_a
 
 def _verify_config(tmp_path) -> Config:
     config = Config(project_dir=tmp_path, project_name="test-project")
+    config.model = "test-model"
     config.verify_command = "./bin/tests"
     config.autonomous_verify_timeout_seconds = 120
     config.review_verify_timeout_grace_seconds = 5.0
@@ -9437,6 +9875,17 @@ def _persist_landing_rebase_outcome(
     changed_diff: bool = False,
     provider_conflict_resolved: bool = True,
 ) -> Any:
+    rebase.review_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip=source_before,
+            target_at_start=target_before,
+            merge_base_at_start="base-a",
+        ),
+        resolved_head_sha=source_after,
+        resolved_target_sha=target_after,
+        changed_diff_boundary_proven=True,
+    )
+    store.update(rebase)
     metadata = {
         "schema_version": 1,
         "parent_task_id": impl.id,
