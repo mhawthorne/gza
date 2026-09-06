@@ -1264,6 +1264,116 @@ class TestVerifyFixTasks:
         assert "- Reviewed head: `old-head`" in rendered
         assert "- Operative head: `new-head`" in rendered
 
+    def test_resolve_verify_fix_operative_epoch_rejects_legacy_same_tree_head_rewrite(
+        self, tmp_path: Path
+    ) -> None:
+        config, store = _make_store(tmp_path)
+        config.verify_command = "./bin/tests"
+        config.autonomous_verify_timeout_seconds = 1800
+        config.review_verify_timeout_grace_seconds = 5.0
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/test"
+        store.update(impl)
+        recorded_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="old-head",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        legacy = store.add(
+            build_verify_fix_prompt(impl.id, recorded_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        git = MagicMock()
+        git.rev_parse_if_exists.return_value = "new-head"
+        git.resolve_refs.return_value = {"feature/test": "tree-same"}
+
+        with pytest.raises(VerifyFixContextError, match="stale for the live branch"):
+            resolve_verify_fix_operative_epoch(store, config, task=legacy, git=git)
+
+    def test_resolve_verify_fix_operative_epoch_runs_legacy_exact_live_head(
+        self, tmp_path: Path
+    ) -> None:
+        config, store = _make_store(tmp_path)
+        config.verify_command = "./bin/tests"
+        config.autonomous_verify_timeout_seconds = 1800
+        config.review_verify_timeout_grace_seconds = 5.0
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/test"
+        store.update(impl)
+        recorded_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="same-head",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        legacy = store.add(
+            build_verify_fix_prompt(impl.id, recorded_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        git = MagicMock()
+        git.rev_parse_if_exists.return_value = "same-head"
+        git.resolve_refs.return_value = {"feature/test": "live-tree"}
+
+        resolved_impl, operative_epoch, origin_epoch = resolve_verify_fix_operative_epoch(
+            store,
+            config,
+            task=legacy,
+            git=git,
+        )
+
+        assert resolved_impl.id == impl.id
+        assert origin_epoch == recorded_epoch
+        assert operative_epoch.reviewed_branch == "feature/test"
+        assert operative_epoch.reviewed_head_sha == "same-head"
+        assert operative_epoch.reviewed_tree_sha == "live-tree"
+
+    def test_resolve_verify_fix_operative_epoch_rejects_legacy_supplied_operative_mismatch(
+        self, tmp_path: Path
+    ) -> None:
+        config, store = _make_store(tmp_path)
+        config.verify_command = "./bin/tests"
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        recorded_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="old-head",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        legacy = store.add(
+            build_verify_fix_prompt(impl.id, recorded_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        supplied_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="new-head",
+            reviewed_tree_sha="tree-same",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+
+        with pytest.raises(VerifyFixContextError, match="stale for the retained operative epoch"):
+            resolve_verify_fix_operative_epoch(
+                store,
+                config,
+                task=legacy,
+                verify_epoch=supplied_epoch,
+                git=MagicMock(),
+            )
+
     def test_resolve_verify_fix_context_fails_closed_when_structured_live_epoch_unavailable(
         self, tmp_path: Path
     ) -> None:

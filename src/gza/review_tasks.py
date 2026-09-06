@@ -429,7 +429,8 @@ def resolve_verify_fix_operative_epoch(
     Structured verify-fix artifacts are origin provenance. When the live owner
     branch has been rewritten to an equivalent tree, execution must bind exact
     head guards to the current live epoch instead of the historical artifact
-    head. Legacy prompt-only rows keep their old head-only identity.
+    head. Legacy prompt-only rows must prove the live/supplied operative epoch
+    is exactly the recorded non-empty branch and head before execution.
     """
     resolved_impl = impl_task
     supplied_operative_epoch = verify_epoch
@@ -455,7 +456,7 @@ def resolve_verify_fix_operative_epoch(
                 )
         if origin_epoch is None:
             origin_epoch = parsed_epoch
-        elif supplied_operative_epoch is not None and structured_identity:
+        elif supplied_operative_epoch is not None:
             origin_epoch = parsed_epoch
 
     if resolved_impl is None or resolved_impl.id is None:
@@ -466,7 +467,14 @@ def resolve_verify_fix_operative_epoch(
         )
 
     if supplied_operative_epoch is not None:
-        if structured_identity and not verify_epoch_matches(expected=supplied_operative_epoch, candidate=origin_epoch):
+        if structured_identity:
+            epoch_matches = verify_epoch_matches(expected=supplied_operative_epoch, candidate=origin_epoch)
+        else:
+            epoch_matches = _verify_fix_exact_branch_head_matches(
+                expected=supplied_operative_epoch,
+                candidate=origin_epoch,
+            )
+        if not epoch_matches:
             raise VerifyFixContextError(
                 f"verify_fix for {resolved_impl.id} stored failed/source epoch is stale for the retained operative epoch. "
                 f"Stored origin: branch={origin_epoch.reviewed_branch} head={origin_epoch.reviewed_head_sha} "
@@ -475,9 +483,6 @@ def resolve_verify_fix_operative_epoch(
                 f"head={supplied_operative_epoch.reviewed_head_sha} tree={supplied_operative_epoch.reviewed_tree_sha}."
             )
         return resolved_impl, supplied_operative_epoch, origin_epoch
-
-    if not structured_identity:
-        return resolved_impl, origin_epoch, origin_epoch
 
     live_git = git
     if live_git is None:
@@ -493,7 +498,11 @@ def resolve_verify_fix_operative_epoch(
             f"verify_fix for {resolved_impl.id} could not resolve the current operative verify epoch "
             "from the live implementation branch/head."
         )
-    if not verify_epoch_matches(expected=current_epoch, candidate=origin_epoch):
+    if structured_identity:
+        epoch_matches = verify_epoch_matches(expected=current_epoch, candidate=origin_epoch)
+    else:
+        epoch_matches = _verify_fix_exact_branch_head_matches(expected=current_epoch, candidate=origin_epoch)
+    if not epoch_matches:
         raise VerifyFixContextError(
             f"verify_fix for {resolved_impl.id} stored failed/source epoch is stale for the live branch. "
             f"Stored origin: branch={origin_epoch.reviewed_branch} head={origin_epoch.reviewed_head_sha} "
@@ -502,6 +511,24 @@ def resolve_verify_fix_operative_epoch(
             f"tree={current_epoch.reviewed_tree_sha}."
         )
     return resolved_impl, current_epoch, origin_epoch
+
+
+def _verify_fix_exact_branch_head_matches(*, expected: VerifyEpoch, candidate: VerifyEpoch) -> bool:
+    """Return whether legacy verify_fix identity has exact non-empty branch/head proof."""
+    if not (
+        isinstance(expected.reviewed_branch, str)
+        and expected.reviewed_branch.strip()
+        and isinstance(candidate.reviewed_branch, str)
+        and candidate.reviewed_branch.strip()
+    ):
+        return False
+    if expected.reviewed_branch != candidate.reviewed_branch:
+        return False
+    return bool(
+        expected.reviewed_head_sha
+        and candidate.reviewed_head_sha
+        and expected.reviewed_head_sha == candidate.reviewed_head_sha
+    )
 
 
 def parse_verify_fix_prompt(prompt: str) -> tuple[str, VerifyEpoch] | None:

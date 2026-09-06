@@ -20324,6 +20324,83 @@ class TestExtractedRunInnerHelpers:
         assert rc == 0
         assert events == ["resolve", "provider", "complete"]
 
+    def test_run_inner_rejects_legacy_verify_fix_head_rewrite_before_provider(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Legacy prompt-only verify_fix execution must prove exact live head before provider run."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "verify_command: ./bin/tests\n"
+            "autonomous_verify_timeout_seconds: 120\n"
+            "review_verify_timeout_grace_seconds: 5\n"
+            "use_docker: false\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.slug = "20260817-impl-verify-fix-legacy"
+        impl.status = "completed"
+        impl.branch = "feature/verify-fix-legacy"
+        impl.has_commits = True
+        store.update(impl)
+
+        origin_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="old-head",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, origin_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.slug = "20260817-verify-fix-legacy"
+        verify_fix.branch = impl.branch
+        store.update(verify_fix)
+
+        worktree_path = config.worktree_path / verify_fix.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+
+        provider = Mock()
+        provider.name = "TestProvider"
+        provider.run.return_value = RunResult(exit_code=0, duration_seconds=1.0)
+
+        main_git = Mock(spec=Git)
+        main_git.default_branch.return_value = "main"
+        worktree_git = Mock(spec=Git)
+        worktree_git.repo_dir = worktree_path
+        worktree_git.rev_parse_if_exists.return_value = "new-head"
+        worktree_git.resolve_refs.return_value = {impl.branch: "tree-same"}
+        worktree_git.status_porcelain.return_value = set()
+
+        with (
+            patch("gza.runner.Git", return_value=worktree_git),
+            patch("gza.runner._resolve_code_task_branch_name", return_value=impl.branch),
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner._restore_wip_changes"),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._fail_if_workspace_not_populated", return_value=False),
+            patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
+        ):
+            rc = _run_inner(verify_fix, config, config, store, provider, main_git, resume=False)
+
+        assert rc == 1
+        provider.run.assert_not_called()
+        refreshed = store.get(verify_fix.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "VERIFY_FIX_CONTEXT_ERROR"
+
     def test_run_inner_marks_retry_recovery_rebase_baseline_as_recovered(
         self,
         tmp_path: Path,
