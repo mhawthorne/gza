@@ -67,12 +67,20 @@ def cmd_land(args: argparse.Namespace) -> int:
             reconcile_terminal_state=reconcile_terminal_merge_truth(git),
         )
         unit = store.resolve_merge_unit_subject(task_id)
-        pending_finalization = False
-        if unit is not None and unit.state == "unmerged" and unit.owner_task_id:
-            pending_finalization = bool(store.list_artifacts(unit.owner_task_id, kind="landing_pending_finalization"))
-        if pending_finalization:
-            coordinator_collaborators = terminal_collaborators
-        else:
+        skip_terminal_probe = False
+        if unit is not None and unit.state == "unmerged":
+            pending_finalization = False
+            if unit.owner_task_id:
+                pending_finalization = bool(store.list_artifacts(unit.owner_task_id, kind="landing_pending_finalization"))
+            source_contained = False
+            try:
+                source_contained = git.is_merged(unit.source_branch, unit.target_branch)
+            except Exception:
+                source_contained = True
+            if pending_finalization or source_contained:
+                coordinator_collaborators = terminal_collaborators
+                skip_terminal_probe = True
+        if not skip_terminal_probe:
             terminal_result = land_terminal_state(
                 store,
                 LandRequest(task_id=task_id, policy=policy, dry_run=bool(args.dry_run)),

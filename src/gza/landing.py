@@ -408,6 +408,7 @@ class LandingPendingFinalization:
     authorization: MergeLandingAuthorization
     provenance: Literal["manual_land", "manual_land_escalated"]
     post_merge_target_sha: str
+    prepared_target_sha: str | None = None
     deferred_task_ids: tuple[str, ...] = ()
     followup_task_ids: tuple[str, ...] = ()
 
@@ -909,15 +910,15 @@ class LandingCoordinator:
 
             terminal_unit = self.store.get_merge_unit(identity.merge_unit_id) if identity.merge_unit_id else None
             if terminal_unit is not None:
-                has_pending_finalization = (
-                    terminal_unit.state == "unmerged"
-                    and self._load_pending_finalization(identity) is not None
-                )
+                if terminal_unit.state == "unmerged" and request.dry_run and self._load_pending_finalization(identity) is not None:
+                    return self._run_pending_finalization_replay(
+                        request=request,
+                        identity=identity,
+                        steps=steps,
+                    )
                 if (
                     terminal_unit.state == "unmerged"
                     and (
-                        has_pending_finalization
-                        or
                         identity.already_merged
                         or (
                             identity.merge_truth is not None
@@ -1169,6 +1170,31 @@ class LandingCoordinator:
             authorization = landing_merge_authorization_from_facts(identity=identity, facts=facts, decision=decision)
         except ValueError:
             authorization = None
+        prepared_failure = self._persist_pending_finalization(
+            identity=identity,
+            authorization=authorization,
+            provenance=provenance,
+            post_merge_target_sha=None,
+            deferred_ids=(),
+            followup_ids=(),
+            prepared=True,
+        )
+        if prepared_failure is not None:
+            blocked = LandBlocked(
+                "materialization-or-persistence-failed",
+                prepared_failure.fact,
+                prepared_failure.evidence_refs,
+            )
+            steps.append(
+                LandStep(
+                    "merge",
+                    "blocked",
+                    blocked.fact,
+                    blocked=blocked,
+                    evidence_refs=blocked.evidence_refs,
+                )
+            )
+            return self._blocked_result(request, identity, steps, blocked)
         if identity.already_merged:
             merge_result = ManualMergeExecutionResult(rc=0, status="merged")
         else:
@@ -1697,22 +1723,33 @@ class LandingCoordinator:
         identity: LandingResolvedIdentity,
         authorization: MergeLandingAuthorization | None,
         provenance: Literal["manual_land", "manual_land_escalated"],
-        post_merge_target_sha: str,
+        post_merge_target_sha: str | None,
         deferred_ids: tuple[str, ...],
         followup_ids: tuple[str, ...],
+        prepared: bool = False,
     ) -> LandPostMergeVerifyFailure | None:
         if authorization is None:
             return LandPostMergeVerifyFailure(
                 status="state_persistence_failed",
                 fact="landing pending-finalization authorization identity is unavailable",
-                target_head=post_merge_target_sha,
+                target_head=post_merge_target_sha or identity.target_sha,
                 gate_identity=identity.target_branch,
-                evidence_refs=_evidence_refs(identity.owner_task_id, identity.merge_unit_id, post_merge_target_sha),
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.merge_unit_id, post_merge_target_sha, identity.target_sha),
+            )
+        proof_target_sha = post_merge_target_sha or identity.target_sha
+        if proof_target_sha is None:
+            return LandPostMergeVerifyFailure(
+                status="state_persistence_failed",
+                fact="landing pending-finalization target identity is unavailable",
+                gate_identity=identity.target_branch,
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.merge_unit_id, identity.target_branch),
             )
         payload = {
             "kind": "landing_pending_finalization",
+            "stage": "prepared" if prepared else "pending",
             "authorization": authorization.__dict__,
             "provenance": provenance,
+            "prepared_target_sha": authorization.target_sha,
             "post_merge_target_sha": post_merge_target_sha,
             "deferred_task_ids": tuple(deferred_ids),
             "followup_task_ids": tuple(followup_ids),
@@ -1737,9 +1774,9 @@ class LandingCoordinator:
             return LandPostMergeVerifyFailure(
                 status="state_persistence_failed",
                 fact=_exception_fact("landing pending-finalization proof persistence failed", exc),
-                target_head=post_merge_target_sha,
+                target_head=proof_target_sha,
                 gate_identity=identity.target_branch,
-                evidence_refs=_evidence_refs(identity.owner_task_id, identity.merge_unit_id, post_merge_target_sha),
+                evidence_refs=_evidence_refs(identity.owner_task_id, identity.merge_unit_id, proof_target_sha),
             )
         return None
 
@@ -1807,7 +1844,19 @@ class LandingCoordinator:
             return None
         provenance = metadata.get("provenance")
         post_merge_target_sha = metadata.get("post_merge_target_sha")
-        if provenance not in {"manual_land", "manual_land_escalated"} or not isinstance(post_merge_target_sha, str):
+        prepared_target_sha = metadata.get("prepared_target_sha")
+        stage = metadata.get("stage")
+        if provenance not in {"manual_land", "manual_land_escalated"}:
+            return None
+        if stage is not None and stage not in {"prepared", "pending"}:
+            return None
+        if post_merge_target_sha is not None and not isinstance(post_merge_target_sha, str):
+            return None
+        if prepared_target_sha is not None and not isinstance(prepared_target_sha, str):
+            return None
+        if isinstance(post_merge_target_sha, str) and not post_merge_target_sha.strip():
+            return None
+        if isinstance(prepared_target_sha, str) and not prepared_target_sha.strip():
             return None
         if authorization.owner_task_id != identity.owner_task_id:
             return None
@@ -1819,18 +1868,54 @@ class LandingCoordinator:
             return None
         if authorization.target_branch != identity.target_branch:
             return None
-        if post_merge_target_sha != identity.target_sha:
-            return None
         current_target_sha = self._current_target_sha(identity)
-        if current_target_sha != post_merge_target_sha:
+        if not isinstance(current_target_sha, str) or not current_target_sha.strip():
             return None
+        if stage is None:
+            if not isinstance(post_merge_target_sha, str):
+                return None
+            if prepared_target_sha is not None and prepared_target_sha != authorization.target_sha:
+                return None
+            artifact_stage = "pending"
+        elif stage == "pending":
+            if not isinstance(post_merge_target_sha, str):
+                return None
+            if prepared_target_sha != authorization.target_sha:
+                return None
+            artifact_stage = "pending"
+        else:
+            if post_merge_target_sha is not None:
+                return None
+            if prepared_target_sha != authorization.target_sha:
+                return None
+            artifact_stage = "prepared"
+        if artifact_stage == "pending":
+            if post_merge_target_sha != identity.target_sha:
+                return None
+            if current_target_sha != post_merge_target_sha:
+                return None
+            replay_target_sha = cast(str, post_merge_target_sha)
+        else:
+            if identity.target_sha != current_target_sha:
+                return None
+            git = self.git
+            if git is None:
+                return None
+            try:
+                source_contained = cast(Git, git).is_merged(identity.source_ref or identity.source_sha or "", identity.target_branch)
+            except Exception:
+                return None
+            if not source_contained:
+                return None
+            replay_target_sha = current_target_sha
         deferred_ids = tuple(str(item) for item in metadata.get("deferred_task_ids", ()) if str(item).strip())
         followup_ids = tuple(str(item) for item in metadata.get("followup_task_ids", ()) if str(item).strip())
         return LandingPendingFinalization(
             artifact_id=artifact_id,
             authorization=authorization,
             provenance=cast(Literal["manual_land", "manual_land_escalated"], provenance),
-            post_merge_target_sha=post_merge_target_sha,
+            post_merge_target_sha=replay_target_sha,
+            prepared_target_sha=prepared_target_sha,
             deferred_task_ids=deferred_ids,
             followup_task_ids=followup_ids,
         )

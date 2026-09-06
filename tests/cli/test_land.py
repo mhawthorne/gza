@@ -21,6 +21,7 @@ from gza.landing import (
     TerminalProof,
     reconcile_terminal_merge_truth,
 )
+from gza.merge_services import MergeLandingAuthorization
 from gza.sync_ops import BranchSyncResult
 from tests.cli.conftest import invoke_gza, make_store, setup_config
 
@@ -731,7 +732,7 @@ def test_land_cli_reports_initial_terminal_result(
 
 @pytest.mark.parametrize(
     ("state", "has_commits"),
-    [("empty", False), ("redundant", True), ("merged", True)],
+    [("empty", False), ("redundant", True)],
 )
 @pytest.mark.parametrize("dry_run", [False, True])
 def test_land_cli_reconciles_unmerged_terminal_state_from_canonical_git_proof(
@@ -788,12 +789,8 @@ def test_land_cli_reconciles_unmerged_terminal_state_from_canonical_git_proof(
     assert f"source {unit.source_branch}" in result.stdout
     assert f"target {unit.target_branch}" in result.stdout
     assert f"known outcome {state}" in result.stdout
-    if state == "merged":
-        assert "already merged" in result.stdout
-        assert "terminal no-work state" not in result.stdout
-    else:
-        assert f"terminal no-work state {state}" in result.stdout
-        assert "already merged" not in result.stdout
+    assert f"terminal no-work state {state}" in result.stdout
+    assert "already merged" not in result.stdout
     if dry_run:
         assert result.stdout.startswith("Dry run: ")
         assert "would reconcile" in result.stdout
@@ -805,8 +802,109 @@ def test_land_cli_reconciles_unmerged_terminal_state_from_canonical_git_proof(
     assert store.get_merge_unit(unit_id).state == expected_durable_state  # type: ignore[union-attr]
     assert ("branch_exists", store.get_merge_unit(unit_id).source_branch) in proof_git.calls  # type: ignore[union-attr]
     assert any(call[0] == "count_commits_ahead" for call in proof_git.calls)
-    if state == "merged":
-        assert any(call[0] == "is_on_first_parent_history" for call in proof_git.calls)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_land_cli_refuses_unmerged_contained_state_without_pending_finalization_proof(
+    tmp_path: Path,
+    *,
+    dry_run: bool,
+) -> None:
+    store, task_id, unit_id = _task_with_unit(tmp_path, state="unmerged", has_commits=True)
+    proof_git = TerminalProofGit(
+        merged=True,
+        source_sha="b" * 40,
+        target_sha="a" * 40,
+        commits_ahead=0,
+        net_diff=False,
+        on_first_parent=False,
+    )
+    args = ["land", task_id, "--project", str(tmp_path)]
+    if dry_run:
+        args.append("--dry-run")
+
+    with patch("gza.cli.land.Git", return_value=proof_git):
+        result = invoke_gza(*args, cwd=tmp_path)
+
+    assert result.returncode == 1
+    assert "no exact pending-finalization proof exists" in result.stdout
+    assert "already merged" not in result.stdout
+    assert store.get_merge_unit(unit_id).state == "unmerged"  # type: ignore[union-attr]
+    unit = store.get_merge_unit(unit_id)
+    assert unit is not None
+    assert ("is_merged", f"{unit.source_branch}->{unit.target_branch}") in proof_git.calls
+
+
+def test_land_cli_refuses_malformed_pending_finalization_proof_before_verify_or_finalize(
+    tmp_path: Path,
+) -> None:
+    store, task_id, unit_id = _task_with_unit(tmp_path, state="unmerged", has_commits=True)
+    unit = store.get_merge_unit(unit_id)
+    assert unit is not None
+    authorization = MergeLandingAuthorization(
+        owner_task_id=task_id,
+        merge_unit_id=unit_id,
+        source_ref=unit.source_branch,
+        target_branch=unit.target_branch,
+        source_sha="b" * 40,
+        target_sha="c" * 40,
+        representative_task_id=task_id,
+        member_task_ids=(task_id,),
+        review_id="gza-review",
+        reviewed_head="b" * 40,
+        review_mode="plain_full",
+        review_verdict="APPROVED",
+        verify_epoch="verify-1",
+        verify_verdict="passed",
+        verify_gate_identity=unit.target_branch,
+    )
+    store.add_artifact(
+        task_id,
+        kind="landing_pending_finalization",
+        label="landing_pending_finalization",
+        path=f".gza/artifacts/{task_id}/landing-pending-finalization-malformed.json",
+        content_type="application/json",
+        byte_size=1,
+        sha256="a" * 64,
+        producer="test",
+        status="pending",
+        head_sha="b" * 40,
+        metadata={
+            "kind": "landing_pending_finalization",
+            "stage": "pending",
+            "authorization": authorization.__dict__,
+            "provenance": "manual_land",
+            "prepared_target_sha": "c" * 40,
+            "post_merge_target_sha": None,
+            "deferred_task_ids": (),
+            "followup_task_ids": (),
+        },
+    )
+    proof_git = TerminalProofGit(
+        merged=True,
+        source_sha="b" * 40,
+        target_sha="a" * 40,
+        commits_ahead=0,
+        net_diff=False,
+        on_first_parent=False,
+    )
+
+    with (
+        patch("gza.cli.land.Git", return_value=proof_git),
+        patch(
+            "gza.main_integration_verify.check_main_integration_verify",
+            side_effect=AssertionError("post-merge verification must not run for malformed replay proof"),
+        ),
+        patch(
+            "gza.cli.land.mark_merge_subject_merged",
+            side_effect=AssertionError("merged state must not be finalized for malformed replay proof"),
+        ),
+    ):
+        result = invoke_gza("land", task_id, "--project", str(tmp_path), cwd=tmp_path)
+
+    assert result.returncode == 1
+    assert "no exact pending-finalization proof exists" in result.stdout
+    assert store.get_merge_unit(unit_id).state == "unmerged"  # type: ignore[union-attr]
 
 
 @pytest.mark.parametrize("state", NO_WORK_STATES)

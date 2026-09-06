@@ -29,6 +29,7 @@ from gza.landing import (
     LandingRebaseFingerprint,
     LandingRebaseOutcomeIdentity,
     LandingReviewEvidence,
+    LandingResolvedIdentity,
     LandingSpecCoherenceEvidence,
     LandingSpecCoherenceFingerprint,
     LandingStateFingerprint,
@@ -50,6 +51,7 @@ from gza.landing import (
     inspect_current_landing_verify_evidence,
     run_landing_post_rebase_review_transition,
 )
+from gza.merge_services import MergeLandingAuthorization
 from gza.rebase_service import RebaseServiceRequest, RebaseServiceResult
 from gza.review_scope import build_resolution_review_scope, build_spec_coherence_review_scope
 from gza.review_tasks import DuplicateReviewError
@@ -2392,6 +2394,96 @@ def _finalize_landing_merge_state(
         merge_source=provenance,
     )
     return ManualMergeExecutionResult(rc=0, status="merged")
+
+
+def _pending_finalization_identity_and_authorization(
+    store: SqliteTaskStore,
+    impl: Task,
+    *,
+    current_target_sha: str = "merge-a",
+    prepared_target_sha: str = "target-a",
+) -> tuple[Any, MergeLandingAuthorization]:
+    assert impl.id is not None
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    identity = LandingResolvedIdentity(
+        selected_task_id=impl.id,
+        owner_task=impl,
+        representative_task=impl,
+        merge_unit_id=unit.id,
+        merge_unit_state="unmerged",
+        source_branch="feature/landing",
+        source_ref="feature/landing",
+        source_sha="head-a",
+        target_branch="main",
+        target_sha=current_target_sha,
+        current_branch="main",
+        member_task_ids=(impl.id,),
+        already_merged=True,
+    )
+    authorization = MergeLandingAuthorization(
+        owner_task_id=impl.id,
+        merge_unit_id=unit.id,
+        source_ref="feature/landing",
+        target_branch="main",
+        source_sha="head-a",
+        target_sha=prepared_target_sha,
+        representative_task_id=impl.id,
+        member_task_ids=(impl.id,),
+        review_id="gza-review",
+        reviewed_head="head-a",
+        review_mode="plain_full",
+        review_verdict="APPROVED",
+        verify_epoch="verify-1",
+        verify_verdict="passed",
+        verify_gate_identity="main",
+    )
+    return identity, authorization
+
+
+def _pending_finalization_metadata(
+    authorization: MergeLandingAuthorization,
+    *,
+    stage: Any = "prepared",
+    prepared_target_sha: Any = "target-a",
+    post_merge_target_sha: Any = None,
+) -> dict[str, Any]:
+    metadata = {
+        "kind": "landing_pending_finalization",
+        "stage": stage,
+        "authorization": authorization.__dict__,
+        "provenance": "manual_land",
+        "prepared_target_sha": prepared_target_sha,
+        "post_merge_target_sha": post_merge_target_sha,
+        "deferred_task_ids": (),
+        "followup_task_ids": (),
+    }
+    if stage == "__missing__":
+        metadata.pop("stage")
+    return metadata
+
+
+def _persist_pending_finalization_artifact(
+    store: SqliteTaskStore,
+    impl: Task,
+    metadata: dict[str, Any],
+) -> None:
+    assert impl.id is not None
+    body = json.dumps(metadata, sort_keys=True, default=str)
+    digest = sha256(body.encode()).hexdigest()
+    store.add_artifact(
+        impl.id,
+        kind="landing_pending_finalization",
+        label="landing_pending_finalization",
+        path=f".gza/artifacts/{impl.id}/landing-pending-finalization-test-{digest}.json",
+        content_type="application/json",
+        byte_size=len(body.encode()),
+        sha256=digest,
+        producer="test",
+        status="pending",
+        head_sha="head-a",
+        metadata=metadata,
+    )
 
 
 def _completed_impl_with_stored_unit(
@@ -5780,6 +5872,173 @@ def test_landing_coordinator_reruns_partial_git_merge_checkpoint_and_finalizes_o
     assert refreshed.merge_source == "manual_land"
 
 
+@pytest.mark.parametrize(
+    ("case_name", "metadata_overrides", "expected_loaded"),
+    [
+        (
+            "valid_prepared",
+            {"stage": "prepared", "prepared_target_sha": "target-a", "post_merge_target_sha": None},
+            True,
+        ),
+        (
+            "valid_pending",
+            {"stage": "pending", "prepared_target_sha": "target-a", "post_merge_target_sha": "merge-a"},
+            True,
+        ),
+        (
+            "valid_legacy_pending",
+            {"stage": "__missing__", "prepared_target_sha": None, "post_merge_target_sha": "merge-a"},
+            True,
+        ),
+        (
+            "missing_stage_without_post_merge_sha",
+            {"stage": "__missing__", "prepared_target_sha": "target-a", "post_merge_target_sha": None},
+            False,
+        ),
+        (
+            "unknown_stage",
+            {"stage": "complete", "prepared_target_sha": "target-a", "post_merge_target_sha": "merge-a"},
+            False,
+        ),
+        (
+            "pending_null_post_merge_sha",
+            {"stage": "pending", "prepared_target_sha": "target-a", "post_merge_target_sha": None},
+            False,
+        ),
+        (
+            "prepared_with_post_merge_sha",
+            {"stage": "prepared", "prepared_target_sha": "target-a", "post_merge_target_sha": "merge-a"},
+            False,
+        ),
+        (
+            "non_string_post_merge_sha",
+            {"stage": "pending", "prepared_target_sha": "target-a", "post_merge_target_sha": 123},
+            False,
+        ),
+        (
+            "non_string_prepared_target_sha",
+            {"stage": "prepared", "prepared_target_sha": 123, "post_merge_target_sha": None},
+            False,
+        ),
+        (
+            "mismatched_prepared_target_sha",
+            {"stage": "prepared", "prepared_target_sha": "target-b", "post_merge_target_sha": None},
+            False,
+        ),
+    ],
+)
+def test_pending_finalization_parser_is_stage_discriminated_and_fail_closed(
+    tmp_path,
+    case_name: str,
+    metadata_overrides: dict[str, Any],
+    expected_loaded: bool,
+) -> None:
+    del case_name
+    store = _coordinator_store(tmp_path)
+    impl = _completed_impl(store, "parser replay", "feature/landing")
+    identity, authorization = _pending_finalization_identity_and_authorization(store, impl)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "merge-a"},
+        local_branches={"feature/landing"},
+        merged_refs={("feature/landing", "main")},
+    )
+    coordinator = LandingCoordinator(store=store, git=git)
+
+    parsed = coordinator._pending_finalization_from_metadata(
+        identity,
+        "artifact-1",
+        _pending_finalization_metadata(authorization, **metadata_overrides),
+    )
+
+    if expected_loaded:
+        assert parsed is not None
+        assert parsed.post_merge_target_sha == "merge-a"
+        assert parsed.prepared_target_sha == metadata_overrides["prepared_target_sha"]
+    else:
+        assert parsed is None
+
+
+@pytest.mark.parametrize(
+    ("case_name", "metadata_overrides"),
+    [
+        (
+            "missing_stage_without_post_merge_sha",
+            {"stage": "__missing__", "prepared_target_sha": "target-a", "post_merge_target_sha": None},
+        ),
+        (
+            "unknown_stage",
+            {"stage": "complete", "prepared_target_sha": "target-a", "post_merge_target_sha": "merge-a"},
+        ),
+        (
+            "pending_null_post_merge_sha",
+            {"stage": "pending", "prepared_target_sha": "target-a", "post_merge_target_sha": None},
+        ),
+        (
+            "prepared_with_post_merge_sha",
+            {"stage": "prepared", "prepared_target_sha": "target-a", "post_merge_target_sha": "merge-a"},
+        ),
+        (
+            "non_string_post_merge_sha",
+            {"stage": "pending", "prepared_target_sha": "target-a", "post_merge_target_sha": ["merge-a"]},
+        ),
+        (
+            "non_string_prepared_target_sha",
+            {"stage": "prepared", "prepared_target_sha": ["target-a"], "post_merge_target_sha": None},
+        ),
+        (
+            "mismatched_prepared_target_sha",
+            {"stage": "prepared", "prepared_target_sha": "target-b", "post_merge_target_sha": None},
+        ),
+    ],
+)
+def test_landing_coordinator_rejects_malformed_pending_finalization_without_verify_or_finalize(
+    tmp_path,
+    case_name: str,
+    metadata_overrides: dict[str, Any],
+) -> None:
+    del case_name
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "malformed replay", "feature/landing")
+    assert impl.id is not None
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    identity, authorization = _pending_finalization_identity_and_authorization(store, impl)
+    _persist_pending_finalization_artifact(
+        store,
+        impl,
+        _pending_finalization_metadata(authorization, **metadata_overrides),
+    )
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "merge-a"},
+        local_branches={"feature/landing"},
+        merged_refs={("feature/landing", "main")},
+        ancestors={("head-a", "merge-a")},
+    )
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        post_merge_verifier=lambda _identity: (_ for _ in ()).throw(
+            AssertionError("post-merge verification must not run for malformed replay proof")
+        ),
+        finalize_merge=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("merged state must not be finalized for malformed replay proof")
+        ),
+    ).run(LandRequest(task_id=identity.owner_task_id))
+
+    refreshed = store.get_merge_unit(unit.id)
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "merge-proof-unavailable"
+    assert "no exact pending-finalization proof exists" in result.blocked.fact
+    assert result.merged is False
+    assert result.post_merge_verify_failure is None
+    assert refreshed is not None
+    assert refreshed.state == "unmerged"
+    assert refreshed.merge_source is None
+
+
 def test_landing_coordinator_guarded_rerun_replays_pending_no_ff_merge_without_duplicate_side_effects(
     tmp_path,
 ) -> None:
@@ -6494,6 +6753,108 @@ def test_cmd_land_dry_run_reports_pending_finalization_without_replay_side_effec
     assert _sqlite_merge_unit_snapshot(store) == before_units
     assert git.heads == before_refs
     assert git.mutation_calls == []
+
+
+def test_cmd_land_recovers_prepared_pending_identity_after_post_merge_artifact_failure(
+    monkeypatch,
+    capsys,
+    tmp_path,
+) -> None:
+    from gza.cli import land as land_cli
+    from gza.cli.git_ops import _MergeSingleTaskResult
+
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "CLI prepared replay landing", "feature/landing")
+    assert impl.id is not None
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    _completed_full_review(store, impl, head="head-a", verdict="APPROVED")
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    merge_calls: list[str] = []
+    mark_calls: list[str] = []
+    verify_statuses = ["failed", "passed"]
+    original_add_artifact = store.add_artifact
+    artifact_calls: list[str] = []
+
+    def flaky_add_artifact(*args: Any, **kwargs: Any) -> Any:
+        metadata = kwargs.get("metadata")
+        if isinstance(metadata, dict):
+            artifact_calls.append(str(metadata.get("stage")))
+        if len(artifact_calls) == 2:
+            raise RuntimeError("artifact store unavailable after merge")
+        return original_add_artifact(*args, **kwargs)
+
+    def merge_single(*_args: Any, **_kwargs: Any) -> _MergeSingleTaskResult:
+        merge_calls.append("git_merge")
+        _simulate_no_ff_landing_git_merge(git, merge_sha="merge-a")
+        return _MergeSingleTaskResult(rc=0, status="merged")
+
+    def main_verify(*_args: Any, **_kwargs: Any) -> Any:
+        status = verify_statuses.pop(0)
+        state = SimpleNamespace(
+            task=SimpleNamespace(id=f"gza-main-verify-{status}"),
+            head_sha="merge-a",
+            tree_fingerprint=TREE_A,
+            verify_status=status,
+            alert_message="main verify RED - merges halted" if status == "failed" else None,
+        )
+        return SimpleNamespace(
+            state=state,
+            is_current=True,
+            merges_halted=status != "passed",
+            needs_attention=status != "passed",
+        )
+
+    def mark(store_arg: Any, *, merge_subject: Any, merge_unit_id: str | None, merge_source: str) -> None:
+        del store_arg, merge_subject, merge_unit_id
+        mark_calls.append(merge_source)
+        _finalize_landing_merge_state(store, SimpleNamespace(owner_task=impl, merge_unit_id=unit.id), None, merge_source)
+
+    monkeypatch.setattr(land_cli.Config, "load", lambda _project_dir: config)
+    monkeypatch.setattr(land_cli, "get_store", lambda _config, open_mode="readwrite": store)
+    monkeypatch.setattr(land_cli, "resolve_id", lambda _config, task_id: task_id)
+    monkeypatch.setattr(land_cli, "Git", lambda _project_dir: git)
+    monkeypatch.setattr(land_cli, "mark_merge_subject_merged", mark)
+    monkeypatch.setattr(store, "add_artifact", flaky_add_artifact)
+    monkeypatch.setattr("gza.cli.git_ops._merge_single_task", merge_single)
+    monkeypatch.setattr("gza.main_integration_verify.check_main_integration_verify", main_verify)
+
+    first_rc = land_cli.cmd_land(argparse.Namespace(project_dir=tmp_path, task_id=impl.id, policy="guarded", dry_run=False))
+    first_output = capsys.readouterr().out
+
+    assert first_rc == 1
+    assert "Git merged" in first_output
+    assert "pending-finalization proof persistence failed" in first_output
+    assert merge_calls == ["git_merge"]
+    assert mark_calls == []
+    assert store.get_merge_unit(unit.id).state == "unmerged"  # type: ignore[union-attr]
+    assert artifact_calls == ["prepared", "pending"]
+
+    second_rc = land_cli.cmd_land(argparse.Namespace(project_dir=tmp_path, task_id=impl.id, policy="guarded", dry_run=False))
+    second_output = capsys.readouterr().out
+
+    assert second_rc == 1
+    assert "Git merged" in second_output
+    assert "integration verification failed" in second_output
+    assert "main verify RED" in second_output
+    assert merge_calls == ["git_merge"]
+    assert mark_calls == []
+    assert store.get_merge_unit(unit.id).state == "unmerged"  # type: ignore[union-attr]
+
+    third_rc = land_cli.cmd_land(argparse.Namespace(project_dir=tmp_path, task_id=impl.id, policy="guarded", dry_run=False))
+    third_output = capsys.readouterr().out
+
+    assert third_rc == 0
+    assert "Landed" in third_output
+    assert merge_calls == ["git_merge"]
+    assert mark_calls == ["manual_land"]
+    assert store.get_merge_unit(unit.id).state == "merged"  # type: ignore[union-attr]
 
 
 def _persist_test_landing_judgment(
