@@ -56,7 +56,13 @@ from gza.review_scope import (
     parse_resolution_review_scope,
     parse_spec_coherence_review_scope,
 )
-from gza.review_tasks import DuplicateReviewError, create_resolution_review_task, create_review_task
+from gza.review_tasks import (
+    DuplicateReviewError,
+    build_deferred_blocker_prompt,
+    create_resolution_review_task,
+    create_review_task,
+    format_blocker_finding_context,
+)
 from gza.review_verdict import (
     ReviewFinding,
     get_review_finding_fingerprint,
@@ -2147,6 +2153,8 @@ class LandingOpenBlocker:
     blocker_class: LandingBlockerClass = "unknown"
     fingerprint: str | None = None
     source: str | None = None
+    deferred_task_prompt_sha256: str | None = None
+    deferred_task_review_scope_sha256: str | None = None
 
     def __post_init__(self) -> None:
         finding_id = _normalize_required_ref(self.finding_id, "blocker finding ID")
@@ -2155,6 +2163,16 @@ class LandingOpenBlocker:
         object.__setattr__(self, "finding_id", finding_id)
         object.__setattr__(self, "source", source)
         object.__setattr__(self, "fingerprint", fingerprint)
+        object.__setattr__(
+            self,
+            "deferred_task_prompt_sha256",
+            _normalize_optional_identity(self.deferred_task_prompt_sha256),
+        )
+        object.__setattr__(
+            self,
+            "deferred_task_review_scope_sha256",
+            _normalize_optional_identity(self.deferred_task_review_scope_sha256),
+        )
 
 
 @dataclass(frozen=True)
@@ -2516,6 +2534,15 @@ def landing_merge_authorization_from_facts(
         review_verdict=review.verdict if review is not None else None,
         blocker_identities=tuple(_landing_authorization_blocker_identity(blocker) for blocker in facts.open_blockers),
         blocker_fingerprints=tuple(blocker.fingerprint for blocker in facts.open_blockers if blocker.fingerprint),
+        deferred_blocker_task_identities=tuple(
+            _landing_authorization_deferred_blocker_task_identity(
+                blocker,
+                review_id=review.review_id,
+                impl_task_id=identity.owner_task_id,
+            )
+            for blocker in facts.open_blockers
+            if review is not None
+        ),
         followup_identities=tuple(
             item.fingerprint_key for item in decision.followup_materialization_identities
         ),
@@ -4844,6 +4871,12 @@ def _landing_open_blockers_from_review(
                 blocker_class=blocker_class,
                 source=f"review:{review.review_id}",
                 fingerprint=fingerprint,
+                deferred_task_prompt_sha256=_landing_deferred_task_prompt_sha256(
+                    review.review_id,
+                    identity.owner_task_id if identity is not None else None,
+                    finding,
+                ),
+                deferred_task_review_scope_sha256=_landing_deferred_task_review_scope_sha256(finding),
             )
         )
     return tuple(blockers)
@@ -4948,6 +4981,44 @@ def _landing_authorization_blocker_identity(blocker: LandingOpenBlocker) -> str:
         "deferrable": blocker.deferrable,
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _landing_authorization_deferred_blocker_task_identity(
+    blocker: LandingOpenBlocker,
+    *,
+    review_id: str | None,
+    impl_task_id: str,
+) -> str:
+    if not review_id:
+        raise ValueError("deferred blocker task authorization requires review identity")
+    if not blocker.deferred_task_prompt_sha256 or not blocker.deferred_task_review_scope_sha256:
+        raise ValueError("deferred blocker task authorization requires exact task content identity")
+    payload = {
+        "finding_id": blocker.finding_id,
+        "review_id": review_id,
+        "impl_task_id": impl_task_id,
+        "prompt_sha256": blocker.deferred_task_prompt_sha256,
+        "review_scope_sha256": blocker.deferred_task_review_scope_sha256,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _landing_deferred_task_prompt_sha256(
+    review_id: str | None,
+    impl_task_id: str | None,
+    finding: ReviewFinding,
+) -> str | None:
+    if not review_id or not impl_task_id:
+        return None
+    return _landing_sha256_text(build_deferred_blocker_prompt(review_id, impl_task_id, finding))
+
+
+def _landing_deferred_task_review_scope_sha256(finding: ReviewFinding) -> str:
+    return _landing_sha256_text(format_blocker_finding_context(finding))
+
+
+def _landing_sha256_text(text: str) -> str:
+    return "sha256:" + sha256(text.encode()).hexdigest()
 
 
 def _inspect_landing_adjudication_fingerprints(

@@ -1,6 +1,8 @@
 """Tests for git-oriented CLI helpers."""
 
 import argparse
+import hashlib
+import json
 import sqlite3
 import sys
 from contextlib import ExitStack, contextmanager
@@ -89,6 +91,7 @@ from gza.review_scope import build_spec_coherence_review_scope, declares_resolut
 from gza.review_tasks import (
     CappedReviewBlockerMaterializationError,
     build_capped_review_blocker_prompt,
+    build_deferred_blocker_prompt,
     build_deferred_blocker_prompt_prefix,
     build_followup_prompt,
     create_or_reuse_capped_review_blocker_task,
@@ -1332,6 +1335,14 @@ def _landing_authorization(**overrides: Any) -> MergeLandingAuthorization:
             '"fingerprint":"blocker:a","source":"review:testproject-2"}',
         ),
         "blocker_fingerprints": ("blocker:a",),
+        "deferred_blocker_task_identities": (
+            _landing_deferred_blocker_task_identity(
+                "testproject-2",
+                "testproject-1",
+                "B1",
+                "fix it",
+            ),
+        ),
         "followup_identities": ('{"finding":"F1","review":"testproject-2"}',),
         "followup_fingerprints": ("followup:a",),
         "verify_epoch": "verify-1",
@@ -1354,18 +1365,69 @@ def _landing_blocker_identity(review_id: str, finding_id: str = "B1", fingerprin
     )
 
 
+def _landing_deferred_blocker_task_identity(
+    review_id: str,
+    impl_task_id: str,
+    finding_id: str = "B1",
+    fix: str = "fix it",
+    finding: ReviewFinding | None = None,
+) -> str:
+    if finding is None:
+        finding = ReviewFinding(
+            id=finding_id,
+            severity="BLOCKER",
+            title="Deferred blocker",
+            body="Body",
+            evidence="Evidence",
+            impact="Impact",
+            fix_or_followup=fix,
+            tests="Tests",
+            open_state_citation="Citation",
+        )
+    prompt = build_deferred_blocker_prompt(review_id, impl_task_id, finding)
+    review_scope = format_blocker_finding_context(finding)
+    return json.dumps(
+        {
+            "finding_id": finding_id,
+            "review_id": review_id,
+            "impl_task_id": impl_task_id,
+            "prompt_sha256": "sha256:" + hashlib.sha256(prompt.encode()).hexdigest(),
+            "review_scope_sha256": "sha256:" + hashlib.sha256(review_scope.encode()).hexdigest(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def _deferred_blocker_task(store: Any, impl: DbTask, review_id: str, finding_id: str = "B1", **kwargs: Any) -> DbTask:
     assert impl.id is not None
+    prompt = kwargs.pop("prompt", None)
+    review_scope = kwargs.pop("review_scope", None)
+    if prompt is None or review_scope is None:
+        finding = ReviewFinding(
+            id=finding_id,
+            severity="BLOCKER",
+            title="Deferred blocker",
+            body="Body",
+            evidence="Evidence",
+            impact="Impact",
+            fix_or_followup="fix it",
+            tests="Tests",
+            open_state_citation="Citation",
+        )
+        prompt = prompt or build_deferred_blocker_prompt(review_id, impl.id, finding)
+        review_scope = review_scope or format_blocker_finding_context(finding)
     values = {
         "task_type": "implement",
         "based_on": review_id,
         "depends_on": impl.id,
         "urgent": True,
         "create_pr": True,
+        "review_scope": review_scope,
     }
     values.update(kwargs)
     return store.add(
-        build_deferred_blocker_prompt_prefix(review_id, impl.id, finding_id) + " fix it",
+        prompt,
         **values,
     )
 
@@ -1545,6 +1607,105 @@ def test_manual_merge_boundary_stable_landing_authorization_materializes_before_
     assert artifacts[0].metadata["authorization"]["judgment_key"] == "judge-key"
 
 
+@pytest.mark.parametrize("change_kind", ("title_anchor", "body_impact_required_fix"))
+def test_manual_merge_boundary_refuses_reused_stale_deferred_blocker_content_before_merge(
+    tmp_path: Path,
+    change_kind: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_merge_task(store, f"Stale deferred blocker {change_kind}", "feature/landing-auth")
+    assert task.id is not None
+    assert store.get_or_create_merge_unit_for_task(task) is not None
+    review_id = "testproject-2"
+    old_finding = ReviewFinding(
+        id="B1",
+        severity="BLOCKER",
+        title="Old blocker title",
+        body="Old blocker body",
+        evidence="Old evidence",
+        impact="Old impact",
+        fix_or_followup="old fix",
+        tests="old tests",
+        open_state_citation="old citation",
+    )
+    if change_kind == "title_anchor":
+        current_finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="New blocker title",
+            body=old_finding.body,
+            evidence="New evidence path",
+            impact=old_finding.impact,
+            fix_or_followup=old_finding.fix_or_followup,
+            tests=old_finding.tests,
+            open_state_citation=old_finding.open_state_citation,
+        )
+        current_fingerprint = "blocker:new-title-anchor"
+    else:
+        current_finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title=old_finding.title,
+            body="New decision-bearing body",
+            evidence=old_finding.evidence,
+            impact="New impact",
+            fix_or_followup="new required fix",
+            tests="new required tests",
+            open_state_citation="new citation",
+        )
+        current_fingerprint = "blocker:stable-title-anchor"
+    stale_task = _deferred_blocker_task(
+        store,
+        task,
+        review_id,
+        "B1",
+        prompt=build_deferred_blocker_prompt(review_id, task.id, old_finding),
+        review_scope=format_blocker_finding_context(old_finding),
+    )
+    authorized = _landing_authorization(
+        owner_task_id=task.id,
+        review_id=review_id,
+        blocker_identities=(_landing_blocker_identity(review_id, "B1", current_fingerprint),),
+        blocker_fingerprints=(current_fingerprint,),
+        deferred_blocker_task_identities=(
+            _landing_deferred_blocker_task_identity(review_id, task.id, "B1", finding=current_finding),
+        ),
+    )
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(side_effect=AssertionError("merge must not run with stale deferred blocker content")),
+        rev_parse_if_exists=MagicMock(
+            side_effect=lambda ref: {
+                task.branch: authorized.source_sha,
+                "main": authorized.target_sha,
+            }.get(ref)
+        ),
+    )
+    hooks = replace(
+        _manual_merge_service_hooks(),
+        load_landing_authorization=lambda: authorized,
+        materialize_deferred_blockers=lambda _task: ([], [stale_task]),
+        materialize_followups=MagicMock(side_effect=AssertionError("follow-ups must not materialize after deferred refusal")),
+    )
+    request = replace(
+        _manual_merge_service_request(tmp_path, store, git, task, merge_source="manual_land_escalated"),
+        landing_authorization=authorized,
+        authorized_source_ref_sha=authorized.source_sha,
+        expected_preflight_target_sha=authorized.target_sha,
+    )
+    store.set_merge_unit_state = MagicMock(side_effect=AssertionError("state must not change"))  # type: ignore[method-assign]
+
+    result = execute_manual_merge(request, hooks)
+
+    assert result.status == "deferred_blocker_materialization_failed"
+    assert "task property mismatch" in (result.block_reason or "")
+    git.merge.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("scenario", "expected_finding_ids", "materialized"),
     [
@@ -1576,6 +1737,10 @@ def test_manual_merge_boundary_refuses_incomplete_guarded_deferred_blockers_befo
         review_id=review_id,
         blocker_identities=blocker_identities,
         blocker_fingerprints=tuple(f"blocker:{finding_id.lower()}" for finding_id in expected_finding_ids),
+        deferred_blocker_task_identities=tuple(
+            _landing_deferred_blocker_task_identity(review_id, task.id, finding_id)
+            for finding_id in expected_finding_ids
+        ),
     )
     git = SimpleNamespace(
         repo_dir=tmp_path,
@@ -1628,6 +1793,10 @@ def test_manual_merge_boundary_accepts_exact_guarded_deferred_blocker_set_before
             _landing_blocker_identity(review_id, "B2", "blocker:b2"),
         ),
         blocker_fingerprints=("blocker:b1", "blocker:b2"),
+        deferred_blocker_task_identities=(
+            _landing_deferred_blocker_task_identity(review_id, task.id, "B1"),
+            _landing_deferred_blocker_task_identity(review_id, task.id, "B2"),
+        ),
     )
     order: list[str] = []
     blockers = [

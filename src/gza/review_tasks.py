@@ -2412,14 +2412,25 @@ def find_existing_deferred_blocker_task(
     review_task_id: str,
     impl_task_id: str,
     finding_id: str,
+    prompt: str | None = None,
+    review_scope: str | None = None,
 ) -> Task | None:
-    """Return an existing auto-created deferred blocker task for (review, finding), if any."""
+    """Return an existing auto-created deferred blocker task for (review, finding), if any.
+
+    When ``prompt`` and ``review_scope`` are supplied, the row must match the exact
+    current blocker content, not just the durable review/finding prefix.
+    """
     prefix = build_deferred_blocker_prompt_prefix(review_task_id, impl_task_id, finding_id)
     for child in store.get_based_on_children(review_task_id):
         if child.task_type != "implement":
             continue
-        if child.prompt.strip().startswith(prefix):
-            return child
+        if not child.prompt.strip().startswith(prefix):
+            continue
+        if prompt is not None and child.prompt != prompt:
+            continue
+        if review_scope is not None and child.review_scope != review_scope:
+            continue
+        return child
     return None
 
 
@@ -2567,27 +2578,30 @@ def create_or_reuse_deferred_blocker_task(
     if impl_task.id is None:
         raise ValueError("Cannot create deferred blocker for implementation without an ID.")
 
-    existing = find_existing_deferred_blocker_task(
-        store,
-        review_task_id=review_task.id,
-        impl_task_id=impl_task.id,
-        finding_id=finding.id,
-    )
-    if existing is not None:
-        return existing, False
-
     prompt = build_deferred_blocker_prompt(
         review_task.id,
         impl_task.id,
         finding,
     )
+    review_scope = format_blocker_finding_context(finding)
+    existing = find_existing_deferred_blocker_task(
+        store,
+        review_task_id=review_task.id,
+        impl_task_id=impl_task.id,
+        finding_id=finding.id,
+        prompt=prompt,
+        review_scope=review_scope,
+    )
+    if existing is not None:
+        return existing, False
+
     _require_model_for_created_task(config, "implement")
     created = store.add(
         prompt=prompt,
         task_type="implement",
         based_on=review_task.id,
         depends_on=impl_task.id,
-        review_scope=format_blocker_finding_context(finding),
+        review_scope=review_scope,
         tags=resolve_derived_task_tags(impl_task),
         trigger_source=trigger_source,
         create_pr=True,

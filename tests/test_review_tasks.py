@@ -28,6 +28,7 @@ from gza.review_tasks import (
     build_auto_review_prompt,
     build_capped_review_blocker_prompt,
     build_capped_review_blocker_prompt_prefix,
+    build_deferred_blocker_prompt,
     build_deferred_blocker_prompt_prefix,
     build_followup_prompt,
     build_followup_prompt_prefix,
@@ -3270,7 +3271,8 @@ class TestFollowupTasks:
         existing = _task(
             id="gza-501",
             task_type="implement",
-            prompt="Deferred blocker B1 from review gza-200 for task gza-101: fix flaky verify gate",
+            prompt=build_deferred_blocker_prompt(review_task.id, impl_task.id, finding),
+            review_scope=format_blocker_finding_context(finding),
         )
         store.get_based_on_children.return_value = [existing]
 
@@ -3285,6 +3287,59 @@ class TestFollowupTasks:
         assert reused is existing
         assert created_now is False
         store.add.assert_not_called()
+
+    def test_create_or_reuse_deferred_blocker_task_creates_current_row_when_prefix_match_is_stale(self):
+        store = MagicMock()
+        review_task = _task(id="gza-200", task_type="review")
+        impl_task = _task(id="gza-101", task_type="implement", tags=("202606-recovery",))
+        old_finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="Old title",
+            body="Old body",
+            evidence="Old evidence",
+            impact="Old impact",
+            fix_or_followup="old fix",
+            tests="old tests",
+            open_state_citation="old citation",
+        )
+        current_finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="Old title",
+            body="New decision-bearing body",
+            evidence="Old evidence",
+            impact="New impact",
+            fix_or_followup="new required fix",
+            tests="new tests",
+            open_state_citation="new citation",
+        )
+        stale = _task(
+            id="gza-501",
+            task_type="implement",
+            prompt=build_deferred_blocker_prompt(review_task.id, impl_task.id, old_finding),
+            review_scope=format_blocker_finding_context(old_finding),
+        )
+        created_task = _task(id="gza-502", task_type="implement")
+        store.get_based_on_children.return_value = [stale]
+        store.add.return_value = created_task
+
+        created, created_now = create_or_reuse_deferred_blocker_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=current_finding,
+            trigger_source="manual",
+        )
+
+        assert created is created_task
+        assert created_now is True
+        assert store.add.call_args.kwargs["prompt"] == build_deferred_blocker_prompt(
+            review_task.id,
+            impl_task.id,
+            current_finding,
+        )
+        assert store.add.call_args.kwargs["review_scope"] == format_blocker_finding_context(current_finding)
 
     def test_create_or_reuse_deferred_blocker_task_creates_expected_shape(self):
         store = MagicMock()

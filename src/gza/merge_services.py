@@ -88,6 +88,7 @@ class MergeLandingAuthorization:
     review_verdict: str | None = None
     blocker_identities: tuple[str, ...] = ()
     blocker_fingerprints: tuple[str, ...] = ()
+    deferred_blocker_task_identities: tuple[str, ...] = ()
     followup_identities: tuple[str, ...] = ()
     followup_fingerprints: tuple[str, ...] = ()
     verify_epoch: str | None = None
@@ -102,6 +103,11 @@ class MergeLandingAuthorization:
         object.__setattr__(self, "allowed_overrides", tuple(sorted(set(self.allowed_overrides))))
         object.__setattr__(self, "blocker_identities", tuple(sorted(set(self.blocker_identities))))
         object.__setattr__(self, "blocker_fingerprints", tuple(sorted(set(self.blocker_fingerprints))))
+        object.__setattr__(
+            self,
+            "deferred_blocker_task_identities",
+            tuple(sorted(set(self.deferred_blocker_task_identities))),
+        )
         object.__setattr__(self, "followup_identities", tuple(sorted(set(self.followup_identities))))
         object.__setattr__(self, "followup_fingerprints", tuple(sorted(set(self.followup_fingerprints))))
         object.__setattr__(self, "adjudication_fingerprints", tuple(sorted(set(self.adjudication_fingerprints))))
@@ -913,6 +919,7 @@ def _validate_landing_deferred_blocker_materialization(
             mismatches.append(f"{task.id or '<unknown>'}:duplicate")
             continue
         actual[identity] = task
+        expected_task_identity = expected.get(identity)
         if task.task_type != "implement":
             mismatches.append(f"{task.id or '<unknown>'}:task_type")
         if task.based_on != identity[1]:
@@ -923,9 +930,16 @@ def _validate_landing_deferred_blocker_materialization(
             mismatches.append(f"{task.id or '<unknown>'}:urgent")
         if task.create_pr is not True:
             mismatches.append(f"{task.id or '<unknown>'}:create_pr")
-    if not expected or set(actual) != expected or mismatches:
-        missing = sorted(expected - set(actual))
-        unexpected = sorted(set(actual) - expected)
+        if expected_task_identity is None:
+            continue
+        if _sha256_text(task.prompt) != expected_task_identity.get("prompt_sha256"):
+            mismatches.append(f"{task.id or '<unknown>'}:prompt")
+        if _sha256_text(task.review_scope or "") != expected_task_identity.get("review_scope_sha256"):
+            mismatches.append(f"{task.id or '<unknown>'}:review_scope")
+    expected_keys = set(expected)
+    if not expected or set(actual) != expected_keys or mismatches:
+        missing = sorted(expected_keys - set(actual))
+        unexpected = sorted(set(actual) - expected_keys)
         parts: list[str] = []
         if not expected:
             parts.append("no complete authorized blocker identity")
@@ -955,24 +969,52 @@ def _validate_landing_deferred_blocker_materialization(
 
 def _authorized_deferred_blocker_identities(
     authorization: MergeLandingAuthorization,
-) -> set[tuple[str, str, str]]:
-    expected: set[tuple[str, str, str]] = set()
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    expected: dict[tuple[str, str, str], dict[str, Any]] = {}
     if not authorization.review_id:
         return expected
+    task_identities_by_finding: dict[str, dict[str, Any]] = {}
+    for raw in authorization.deferred_blocker_task_identities:
+        try:
+            task_payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        if not isinstance(task_payload, dict):
+            return {}
+        finding_id = task_payload.get("finding_id")
+        review_id = task_payload.get("review_id")
+        impl_task_id = task_payload.get("impl_task_id")
+        prompt_sha256 = task_payload.get("prompt_sha256")
+        review_scope_sha256 = task_payload.get("review_scope_sha256")
+        if (
+            not isinstance(finding_id, str)
+            or not finding_id.strip()
+            or review_id != authorization.review_id
+            or impl_task_id != authorization.owner_task_id
+            or not isinstance(prompt_sha256, str)
+            or not prompt_sha256.strip()
+            or not isinstance(review_scope_sha256, str)
+            or not review_scope_sha256.strip()
+        ):
+            return {}
+        task_identities_by_finding[finding_id.strip()] = task_payload
     for raw in authorization.blocker_identities:
         try:
             payload = json.loads(raw)
         except (TypeError, ValueError, json.JSONDecodeError):
-            return set()
+            return {}
         if not isinstance(payload, dict):
-            return set()
+            return {}
         finding_id = payload.get("finding_id")
         source = payload.get("source")
         if not isinstance(finding_id, str) or not finding_id.strip():
-            return set()
+            return {}
         if source != f"review:{authorization.review_id}":
-            return set()
-        expected.add((finding_id.strip(), authorization.review_id, authorization.owner_task_id))
+            return {}
+        task_identity = task_identities_by_finding.get(finding_id.strip())
+        if task_identity is None:
+            return {}
+        expected[(finding_id.strip(), authorization.review_id, authorization.owner_task_id)] = task_identity
     return expected
 
 
@@ -984,6 +1026,10 @@ def _materialized_deferred_blocker_identity(task: DbTask) -> tuple[str, str, str
     if not finding_id or not review_task_id or not impl_task_id:
         return None
     return finding_id, review_task_id, impl_task_id
+
+
+def _sha256_text(text: str) -> str:
+    return "sha256:" + sha256(text.encode()).hexdigest()
 
 
 def _persist_landing_merge_authorization_audit(
