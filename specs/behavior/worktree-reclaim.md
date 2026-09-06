@@ -204,16 +204,16 @@ ever wanted, it is an additive feature layered on top of this gate, not a change
 ---
 
 *Implementation note (non-normative): at the time of writing, workspace acquisition happens
-in the task runner's code-task worktree setup (`_setup_code_task_worktree` in `runner.py`),
-which calls `cleanup_worktree_for_branch(..., force=True)` and bare
-`git.worktree_remove(..., force=True)` to clear any existing worktree before re-adding. The
-`force=True` path bypasses the runner's own uncommitted-changes guard
-(`cleanup_worktree_for_branch` raises on a dirty worktree only when `force=False`), and three
-of the teardown call sites invoke `git.worktree_remove` directly, bypassing even the
-foreign-worktree permitted-roots check. There is more than one teardown site — at the time of
-writing, `runner.py` lines 2554, 5112, 5119, 6458, and 6816 — so the gate is NOT a single
-chokepoint today. Closing the conformance gap means routing **every** worktree teardown
-through one guarded reclaim helper that applies this gate (dirty → fail with a legible reason;
-clean → reclaim or fail per `worktree_auto_reclaim_clean`; foreign → refuse), rather than
-hardening any one call site. The runner is the right home because every caller — watch,
-manual `gza work`, inline runs, recovery — reaches worktree acquisition through it.*
+in the task runner's code-task worktree setup (`_setup_code_task_worktree` in `runner.py`).
+Completed-task stale redispatch re-entry now validates live branch head provenance and uses
+clean-only reclaim before reusing the task-owned branch. Other setup and teardown paths still
+include `cleanup_worktree_for_branch(..., force=True)` or direct
+`git.worktree_remove(..., force=True)` calls. The `force=True` path bypasses the runner's own
+uncommitted-changes guard (`cleanup_worktree_for_branch` raises on a dirty worktree only when
+`force=False`), and direct teardown call sites bypass even the foreign-worktree
+permitted-roots check. There is more than one teardown site, so the gate is NOT a single
+chokepoint today. Closing the remaining conformance gap means routing **every** worktree
+teardown through one guarded reclaim helper that applies this gate (dirty → fail with a
+legible reason; clean → reclaim or fail per `worktree_auto_reclaim_clean`; foreign → refuse),
+rather than hardening any one call site. The runner is the right home because every caller —
+watch, manual `gza work`, inline runs, recovery — reaches worktree acquisition through it.*

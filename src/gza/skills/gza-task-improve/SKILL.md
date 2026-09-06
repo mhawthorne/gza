@@ -206,6 +206,7 @@ try:
             slug_override=slug_override,
             branch_strategy=config.branch_strategy,
             explicit_type=created.task_type_hint,
+            task_id_for_branch=created.id,
         )
         store.update(created)
 

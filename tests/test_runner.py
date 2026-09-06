@@ -36,7 +36,7 @@ from gza.branch_resolution import resolve_rebase_target_branch
 from gza.canonical_checkout import CanonicalCheckoutStatus
 from gza.cli import _create_improve_task, _create_rebase_task
 from gza.cli.advance_engine import determine_next_action
-from gza.config import BranchStrategy, Config
+from gza.config import BranchStrategy, Config, ConfigError
 from gza.db import DuplicateActiveChildError, SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError, ResolvedMergeSourceRef
 from gza.github import GitHub, GitHubError, PullRequestDetails
@@ -8515,6 +8515,64 @@ class TestTaskIdExistsBranchStrategy:
         # Base "fix/add-a-new-feature" was taken; should get a -2 suffix
         assert task_id.endswith("-2")
 
+    def test_task_id_pattern_collision_probe_uses_real_task_id(self):
+        """Branch collision checks should format {task_id} with the assigned row id."""
+        git = Mock(spec=Git)
+        git.branch_exists.return_value = True
+        strategy = BranchStrategy(pattern="{project}/{task_id}-{slug}", default_type="feature")
+
+        result = _slug_exists(
+            "20260407-my-task",
+            log_path=None,
+            git=git,
+            project_name="myproject",
+            prompt="My task",
+            branch_strategy=strategy,
+            task_id_for_branch="gza-123",
+        )
+
+        assert result is True
+        git.branch_exists.assert_called_once_with("myproject/gza-123-my-task")
+
+    def test_generate_slug_probes_task_id_pattern_with_real_task_id(self):
+        """generate_slug should suffix against the real future branch name when possible."""
+        git = Mock(spec=Git)
+        strategy = BranchStrategy(pattern="{project}/{task_id}-{slug}", default_type="feature")
+
+        def branch_exists(name: str) -> bool:
+            return name == "myproject/gza-123-my-task"
+
+        git.branch_exists.side_effect = branch_exists
+
+        task_id = generate_slug(
+            "My task",
+            log_path=None,
+            git=git,
+            project_name="myproject",
+            branch_strategy=strategy,
+            task_id_for_branch="gza-123",
+        )
+
+        assert task_id.endswith("-2")
+
+    def test_generate_slug_task_id_only_branch_collision_fails_without_suffix_loop(self):
+        """Slug suffixing should stop when the rendered branch cannot change."""
+        git = Mock(spec=Git)
+        git.branch_exists.return_value = True
+        strategy = BranchStrategy(pattern="{project}/{task_id}", default_type="feature")
+
+        with pytest.raises(ConfigError, match="cannot be resolved by suffixing"):
+            generate_slug(
+                "My task",
+                log_path=None,
+                git=git,
+                project_name="myproject",
+                branch_strategy=strategy,
+                task_id_for_branch="gza-123",
+            )
+
+        assert all("my-task-2" not in call.args[0] for call in git.branch_exists.call_args_list)
+
 
 class TestComputeSlugOverride:
     """Tests for _compute_slug_override helper."""
@@ -14053,6 +14111,317 @@ class TestExtractedRunInnerHelpers:
         )
         git.worktree_add_existing.assert_called_once_with(worktree_path, "feature/existing")
         git._run.assert_not_called()
+
+    def test_setup_code_task_worktree_reuses_own_completed_branch_with_matching_head(self, tmp_path: Path):
+        """Re-entered completed work should reuse only a branch proven by merge-unit head."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = self._make_config(tmp_path)
+        config.worktree_path = tmp_path / "worktrees"
+        config.interactive_worktree_dir = ""
+        task = store.add(prompt="completed task", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260903-completed-task"
+        task.branch = "feature/completed-task"
+        task.has_commits = True
+        store.update(task)
+        unit = store.create_merge_unit(
+            source_branch="feature/completed-task",
+            target_branch="main",
+            owner_task_id=task.id,
+            head_sha="head-completed",
+        )
+        store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+        git = Mock(spec=Git)
+        git.env = {}
+        git.branch_exists.return_value = True
+        git.rev_parse_if_exists.return_value = "head-completed"
+        git.worktree_list.return_value = []
+        git.worktree_add_existing.return_value = None
+
+        worktree_path = config.worktree_path / "20260903-completed-task"
+
+        with patch("gza.runner.cleanup_worktree_for_branch", return_value=None) as mock_cleanup:
+            result = _setup_code_task_worktree(
+                task,
+                config,
+                git,
+                store=store,
+                branch_name="feature/completed-task",
+                worktree_path=worktree_path,
+                default_branch="main",
+                resume=False,
+            )
+
+        assert result.ok is True
+        mock_cleanup.assert_called_once_with(
+            git,
+            "feature/completed-task",
+            force=False,
+            permitted_root_paths=managed_worktree_root_paths(config),
+        )
+        git.worktree_add_existing.assert_called_once_with(worktree_path, "feature/completed-task")
+        git.worktree_add.assert_not_called()
+
+    def test_setup_code_task_worktree_reuses_clean_exact_completed_worktree(self, tmp_path: Path):
+        """Exact-path completed re-entry still succeeds after clean-worktree proof."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = self._make_config(tmp_path)
+        config.worktree_path = tmp_path / "worktrees"
+        task = store.add(prompt="completed task", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260903-completed-task"
+        task.branch = "feature/completed-task"
+        task.has_commits = True
+        store.update(task)
+        unit = store.create_merge_unit(
+            source_branch="feature/completed-task",
+            target_branch="main",
+            owner_task_id=task.id,
+            head_sha="head-completed",
+        )
+        store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+        worktree_path = config.worktree_path / "20260903-completed-task"
+        worktree_path.mkdir(parents=True)
+        git = Mock(spec=Git)
+        git.env = {}
+        git.branch_exists.return_value = True
+        git.rev_parse_if_exists.return_value = "head-completed"
+        worktree_git = Mock(spec=Git)
+        worktree_git.has_changes.return_value = False
+
+        with (
+            patch("gza.runner.active_worktree_path_for_branch", return_value=worktree_path) as mock_active,
+            patch("gza.runner.cleanup_worktree_for_branch") as mock_cleanup,
+            patch("gza.runner.Git", return_value=worktree_git) as mock_git_cls,
+        ):
+            result = _setup_code_task_worktree(
+                task,
+                config,
+                git,
+                store=store,
+                branch_name="feature/completed-task",
+                worktree_path=worktree_path,
+                default_branch="main",
+                resume=False,
+            )
+
+        assert result.ok is True
+        mock_active.assert_called_once_with(git, "feature/completed-task")
+        mock_git_cls.assert_called_once_with(worktree_path.resolve(strict=False), env=git.env)
+        worktree_git.has_changes.assert_called_once_with(include_untracked=True)
+        mock_cleanup.assert_not_called()
+        git.worktree_remove.assert_not_called()
+        git.worktree_add_existing.assert_not_called()
+        git.worktree_add.assert_not_called()
+
+    def test_setup_code_task_worktree_refuses_dirty_exact_completed_worktree(self, tmp_path: Path):
+        """Dirty exact-path completed re-entry must fail closed and preserve files."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = self._make_config(tmp_path)
+        config.worktree_path = tmp_path / "worktrees"
+        task = store.add(prompt="completed task", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260903-completed-task"
+        task.branch = "feature/completed-task"
+        task.has_commits = True
+        store.update(task)
+        unit = store.create_merge_unit(
+            source_branch="feature/completed-task",
+            target_branch="main",
+            owner_task_id=task.id,
+            head_sha="head-completed",
+        )
+        store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+        worktree_path = config.worktree_path / "20260903-completed-task"
+        dirty_file = worktree_path / "scratch.txt"
+        dirty_file.parent.mkdir(parents=True)
+        dirty_file.write_text("keep me")
+        git = Mock(spec=Git)
+        git.env = {}
+        git.branch_exists.return_value = True
+        git.rev_parse_if_exists.return_value = "head-completed"
+        worktree_git = Mock(spec=Git)
+        worktree_git.has_changes.return_value = True
+
+        with (
+            patch("gza.runner.active_worktree_path_for_branch", return_value=worktree_path) as mock_active,
+            patch("gza.runner.cleanup_worktree_for_branch") as mock_cleanup,
+            patch("gza.runner.Git", return_value=worktree_git) as mock_git_cls,
+        ):
+            result = _setup_code_task_worktree(
+                task,
+                config,
+                git,
+                store=store,
+                branch_name="feature/completed-task",
+                worktree_path=worktree_path,
+                default_branch="main",
+                resume=False,
+            )
+
+        assert result.ok is False
+        assert result.phase == "worktree_reclaim_dirty"
+        assert "has uncommitted changes" in (result.message or "")
+        assert dirty_file.read_text() == "keep me"
+        mock_active.assert_called_once_with(git, "feature/completed-task")
+        mock_git_cls.assert_called_once_with(worktree_path.resolve(strict=False), env=git.env)
+        worktree_git.has_changes.assert_called_once_with(include_untracked=True)
+        mock_cleanup.assert_not_called()
+        git.worktree_remove.assert_not_called()
+        git.worktree_add_existing.assert_not_called()
+        git.worktree_add.assert_not_called()
+
+    def test_setup_code_task_worktree_refuses_completed_branch_when_head_mismatches(self, tmp_path: Path):
+        """Persisted has_commits is advisory until the live branch matches merge-unit provenance."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = self._make_config(tmp_path)
+        task = store.add(prompt="completed task", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260903-completed-task"
+        task.branch = "feature/completed-task"
+        task.has_commits = True
+        store.update(task)
+        unit = store.create_merge_unit(
+            source_branch="feature/completed-task",
+            target_branch="main",
+            owner_task_id=task.id,
+            head_sha="recorded-head",
+        )
+        store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+        git = Mock(spec=Git)
+        git.branch_exists.return_value = True
+        git.rev_parse_if_exists.return_value = "replacement-head"
+
+        result = _setup_code_task_worktree(
+            task,
+            config,
+            git,
+            store=store,
+            branch_name="feature/completed-task",
+            worktree_path=tmp_path / "worktrees" / "20260903-completed-task",
+            default_branch="main",
+            resume=False,
+        )
+
+        assert result.ok is False
+        assert result.phase == "completed_branch_provenance"
+        git.worktree_add_existing.assert_not_called()
+        git.worktree_add.assert_not_called()
+        git.worktree_remove.assert_not_called()
+
+    def test_setup_code_task_worktree_single_mode_recreates_shared_branch(self, tmp_path: Path):
+        """Single-mode shared branch behavior must not use completed-task re-entry."""
+        config = self._make_config(tmp_path)
+        config.branch_mode = "single"
+        task = Task(
+            id="gza-1",
+            prompt="completed task",
+            task_type="implement",
+            slug="20260903-completed-task",
+            branch="testproj/gza-work",
+            has_commits=True,
+        )
+        git = Mock(spec=Git)
+        git.branch_exists.return_value = True
+        git._run.return_value = Mock(returncode=1)
+
+        result = _setup_code_task_worktree(
+            task,
+            config,
+            git,
+            branch_name="testproj/gza-work",
+            worktree_path=tmp_path / "worktrees" / "20260903-completed-task",
+            default_branch="main",
+            resume=False,
+        )
+
+        assert result.ok is True
+        git._run.assert_any_call("branch", "-D", "testproj/gza-work", check=False)
+        git.worktree_add.assert_called_once()
+        git.worktree_add_existing.assert_not_called()
+
+    def test_setup_code_task_worktree_refuses_dirty_completed_branch_reclaim(self, tmp_path: Path):
+        """Dirty registered worktrees must be left in place during stale redispatch."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = self._make_config(tmp_path)
+        task = store.add(prompt="completed task", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260903-completed-task"
+        task.branch = "feature/completed-task"
+        task.has_commits = True
+        store.update(task)
+        unit = store.create_merge_unit(
+            source_branch="feature/completed-task",
+            target_branch="main",
+            owner_task_id=task.id,
+            head_sha="head-completed",
+        )
+        store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+        dirty_worktree = tmp_path / "registered" / "20260903-completed-task"
+        dirty_file = dirty_worktree / "scratch.txt"
+        dirty_file.parent.mkdir(parents=True)
+        dirty_file.write_text("keep me")
+        git = Mock(spec=Git)
+        git.branch_exists.return_value = True
+        git.rev_parse_if_exists.return_value = "head-completed"
+        git.worktree_list.return_value = []
+
+        with patch(
+            "gza.runner.cleanup_worktree_for_branch",
+            side_effect=ValueError(f"Worktree at {dirty_worktree} has uncommitted changes."),
+        ) as mock_cleanup:
+            result = _setup_code_task_worktree(
+                task,
+                config,
+                git,
+                store=store,
+                branch_name="feature/completed-task",
+                worktree_path=tmp_path / "worktrees" / "20260903-completed-task",
+                default_branch="main",
+                resume=False,
+            )
+
+        assert result.ok is False
+        assert result.phase == "worktree_reclaim_dirty"
+        assert dirty_file.read_text() == "keep me"
+        mock_cleanup.assert_called_once_with(
+            git,
+            "feature/completed-task",
+            force=False,
+            permitted_root_paths=managed_worktree_root_paths(config),
+        )
+        git.worktree_remove.assert_not_called()
+        git.worktree_add_existing.assert_not_called()
+
+    def test_setup_code_task_worktree_does_not_reuse_unowned_existing_branch(self, tmp_path: Path):
+        """An existing branch without same-task commit proof remains a collision."""
+        config = self._make_config(tmp_path)
+        task = Task(
+            id="gza-1",
+            prompt="new task",
+            task_type="implement",
+            slug="20260903-new-task",
+            branch=None,
+            has_commits=True,
+        )
+        git = Mock(spec=Git)
+        git.branch_exists.return_value = True
+        git._run.return_value = Mock(returncode=1)
+        git.worktree_add.side_effect = GitError("fatal: a branch named 'feature/new-task' already exists")
+
+        result = _setup_code_task_worktree(
+            task,
+            config,
+            git,
+            branch_name="feature/new-task",
+            worktree_path=tmp_path / "worktrees" / "20260903-new-task",
+            default_branch="main",
+            resume=False,
+        )
+
+        assert result.ok is False
+        assert result.phase == "worktree_add"
+        git.worktree_add_existing.assert_not_called()
 
     def test_complete_code_task_marks_failed_when_no_changes_and_no_commits(self, tmp_path: Path):
         """Completion helper should fail task when provider produced neither changes nor commits."""

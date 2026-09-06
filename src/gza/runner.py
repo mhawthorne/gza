@@ -99,6 +99,7 @@ from .git import (
     GitApplyResult,
     GitError,
     GitStatusError,
+    active_worktree_path_for_branch,
     cleanup_worktree_for_branch,
     git_error_indicates_containerized_worktree_metadata_failure,
     is_rebase_in_progress,
@@ -2209,6 +2210,7 @@ def prepare_task_startup_phase(
             slug_override=slug_override,
             branch_strategy=config.branch_strategy,
             explicit_type=task.task_type_hint,
+            task_id_for_branch=task.id,
         )
 
     ensure_task_log_paths(config, store, task)
@@ -3526,6 +3528,7 @@ def generate_slug(
     slug_override: str | None = None,
     branch_strategy: "BranchStrategy | None" = None,
     explicit_type: str | None = None,
+    task_id_for_branch: str | None = None,
 ) -> str:
     """Generate a task slug in YYYYMMDD-{project_prefix}-slug format, with suffix for retries."""
     if existing_id:
@@ -3556,6 +3559,7 @@ def generate_slug(
         branch_strategy=branch_strategy,
         explicit_type=explicit_type,
         project_prefix=project_prefix,
+        task_id_for_branch=task_id_for_branch,
         store=store,
         exclude_task_id=exclude_task_id,
     ):
@@ -3564,6 +3568,32 @@ def generate_slug(
     # Find next available suffix
     suffix = 2
     new_id = f"{base_id}-{suffix}"
+    if git and project_name and branch_strategy is not None:
+        base_branch = _slug_branch_name(
+            base_id,
+            project_name=project_name,
+            prompt=prompt,
+            branch_strategy=branch_strategy,
+            explicit_type=explicit_type,
+            project_prefix=project_prefix,
+            task_id_for_branch=task_id_for_branch,
+        )
+        suffixed_branch = _slug_branch_name(
+            new_id,
+            project_name=project_name,
+            prompt=prompt,
+            branch_strategy=branch_strategy,
+            explicit_type=explicit_type,
+            project_prefix=project_prefix,
+            task_id_for_branch=task_id_for_branch,
+        )
+        if base_branch == suffixed_branch and git.branch_exists(base_branch):
+            raise ConfigError(
+                "Branch collision cannot be resolved by suffixing the task slug because "
+                f"branch_strategy pattern {branch_strategy.pattern!r} renders the same branch "
+                f"'{base_branch}' for every suffix. Include '{{slug}}' or '{{task_slug}}' in "
+                "the pattern, or remove the existing branch."
+            )
     while _slug_exists(
         new_id,
         log_path=log_path,
@@ -3573,6 +3603,7 @@ def generate_slug(
         branch_strategy=branch_strategy,
         explicit_type=explicit_type,
         project_prefix=project_prefix,
+        task_id_for_branch=task_id_for_branch,
         store=store,
         exclude_task_id=exclude_task_id,
     ):
@@ -3680,6 +3711,7 @@ def _slug_exists(
     branch_strategy: "BranchStrategy | None" = None,
     explicit_type: str | None = None,
     project_prefix: str | None = None,
+    task_id_for_branch: str | None = None,
     store: SqliteTaskStore | None = None,
     exclude_task_id: str | None = None,
 ) -> bool:
@@ -3701,9 +3733,7 @@ def _slug_exists(
                 prompt=prompt,
                 default_type=branch_strategy.default_type,
                 explicit_type=explicit_type,
-                # task.id is not yet assigned at slug-generation time; patterns
-                # that depend on {task_id} won't collision-check cleanly.
-                task_id="",
+                task_id=task_id_for_branch or "",
                 project_prefix=project_prefix or "",
             )
         else:
@@ -3712,6 +3742,29 @@ def _slug_exists(
         if git.branch_exists(branch_name):
             return True
     return False
+
+
+def _slug_branch_name(
+    task_slug: str,
+    *,
+    project_name: str,
+    prompt: str,
+    branch_strategy: BranchStrategy,
+    explicit_type: str | None,
+    project_prefix: str | None,
+    task_id_for_branch: str | None,
+) -> str:
+    """Render the branch name that a candidate slug would create."""
+    return generate_branch_name(
+        pattern=branch_strategy.pattern,
+        project_name=project_name,
+        task_slug=task_slug,
+        prompt=prompt,
+        default_type=branch_strategy.default_type,
+        explicit_type=explicit_type,
+        task_id=task_id_for_branch or "",
+        project_prefix=project_prefix or "",
+    )
 
 
 def build_prompt(
@@ -11011,6 +11064,7 @@ def run(
                 slug_override=slug_override,
                 branch_strategy=config.branch_strategy,
                 explicit_type=task.task_type_hint,
+                task_id_for_branch=task.id,
             )
         except GitError as exc:
             message = str(exc)
@@ -11252,11 +11306,125 @@ def _select_worktree_base_ref(git: Git, default_branch: str) -> str:
     return default_branch
 
 
+def _completed_task_branch_reentry_result(
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore | None,
+    git: Git,
+    *,
+    branch_name: str,
+    worktree_path: Path,
+) -> WorkspaceSetupResult | None:
+    """Return the completed-task re-entry result when this task owns the live branch."""
+    if (
+        config.branch_mode != "multi"
+        or task.same_branch
+        or task.branch != branch_name
+        or task.has_commits is not True
+        or not git.branch_exists(branch_name)
+    ):
+        return None
+
+    if task.id is None or store is None:
+        message = (
+            f"Refusing to reuse completed task branch {branch_name}: "
+            "missing durable task identity for branch provenance validation."
+        )
+        error_message(f"Error: {message}")
+        return WorkspaceSetupResult(ok=False, message=message, phase="completed_branch_provenance", branch=branch_name)
+
+    merge_unit = store.resolve_merge_unit_for_task(task.id)
+    if merge_unit is None or merge_unit.source_branch != branch_name or not merge_unit.head_sha:
+        message = (
+            f"Refusing to reuse completed task branch {branch_name}: "
+            "missing matching merge-unit head provenance."
+        )
+        error_message(f"Error: {message}")
+        return WorkspaceSetupResult(ok=False, message=message, phase="completed_branch_provenance", branch=branch_name)
+
+    live_head = git.rev_parse_if_exists(branch_name)
+    if live_head != merge_unit.head_sha:
+        message = (
+            f"Refusing to reuse completed task branch {branch_name}: live branch head "
+            f"{live_head or 'unavailable'} does not match recorded task head {merge_unit.head_sha}."
+        )
+        error_message(f"Error: {message}")
+        return WorkspaceSetupResult(ok=False, message=message, phase="completed_branch_provenance", branch=branch_name)
+
+    try:
+        existing_worktree_path = active_worktree_path_for_branch(git, branch_name)
+        if existing_worktree_path is not None and existing_worktree_path.resolve(strict=False) == worktree_path.resolve(
+            strict=False
+        ):
+            resolved_worktree_path = existing_worktree_path.resolve(strict=False)
+            existing_worktree_git = Git(resolved_worktree_path, env=git.env)
+            if existing_worktree_git.has_changes(include_untracked=True):
+                raise ValueError(
+                    f"Worktree at {resolved_worktree_path} has uncommitted changes.\n"
+                    f"\nOptions:\n"
+                    f"  1. cd {resolved_worktree_path} and commit or discard changes\n"
+                    f"  2. Use --force to remove the worktree anyway (loses changes)"
+                )
+            console.print(f"Reusing existing task worktree: {worktree_path}")
+            return WorkspaceSetupResult(ok=True, branch=branch_name)
+
+        cleanup_worktree_for_branch(
+            git,
+            branch_name,
+            force=False,
+            permitted_root_paths=managed_worktree_root_paths(config),
+        )
+        if worktree_path.exists():
+            target_git = Git(worktree_path, env=git.env)
+            if target_git.has_changes(include_untracked=True):
+                message = (
+                    f"Refusing to remove dirty target worktree at {worktree_path}. "
+                    "Commit, discard, or move those changes before redispatching the task."
+                )
+                error_message(f"Error: {message}")
+                return WorkspaceSetupResult(
+                    ok=False,
+                    message=message,
+                    phase="target_worktree_dirty",
+                    branch=branch_name,
+                )
+            git.worktree_remove(worktree_path, force=False)
+
+        console.print(f"Reusing task branch with existing commits: {worktree_path}")
+        git.worktree_add_existing(worktree_path, branch_name)
+        return WorkspaceSetupResult(ok=True, branch=branch_name)
+    except ValueError as e:
+        message = str(e)
+        error_message(f"Error: {message}")
+        return WorkspaceSetupResult(
+            ok=False,
+            message=message,
+            phase="worktree_reclaim_dirty",
+            branch=branch_name,
+            error_type=e.__class__.__name__,
+            error_detail=message,
+        )
+    except GitError as e:
+        message = f"Could not check out completed task branch {branch_name} in worktree: {e}"
+        error_message(f"Error: {message}")
+        resolved_failure = _resolved_git_failure(e)
+        return WorkspaceSetupResult(
+            ok=False,
+            message=message,
+            failure_reason=resolved_failure.reason,
+            phase="worktree_add_existing",
+            branch=branch_name,
+            error_type=e.__class__.__name__,
+            error_detail=str(e),
+        )
+
+
 def _setup_code_task_worktree(
     task: Task,
     config: Config,
     git: Git,
     *,
+    store: SqliteTaskStore | None = None,
     branch_name: str,
     worktree_path: Path,
     default_branch: str,
@@ -11305,6 +11473,18 @@ def _setup_code_task_worktree(
                 error_type=e.__class__.__name__,
                 error_detail=str(e),
             )
+
+    if not resume:
+        completed_reentry = _completed_task_branch_reentry_result(
+            task,
+            config,
+            store,
+            git,
+            branch_name=branch_name,
+            worktree_path=worktree_path,
+        )
+        if completed_reentry is not None:
+            return completed_reentry
 
     # Delete existing branch if in single mode (worktree_add will recreate it)
     if config.branch_mode == "single" and git.branch_exists(branch_name):
@@ -12532,6 +12712,7 @@ def _run_inner(
             task,
             config,
             git,
+            store=store,
             branch_name=branch_name,
             worktree_path=worktree_path,
             default_branch=default_branch,

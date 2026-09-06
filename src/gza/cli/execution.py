@@ -1268,6 +1268,7 @@ def _create_extract_task(
                 project_prefix=config.project_prefix,
                 branch_strategy=config.branch_strategy,
                 explicit_type=impl_task.task_type_hint,
+                task_id_for_branch=impl_task.id,
             )
             store.update(impl_task)
 
