@@ -913,7 +913,8 @@ class TestBuildDockerCmd:
             env_vars=[],
         )
 
-        cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10)
+        with patch.dict(os.environ, {"GZA_DOCKER_GROUP_ADD": str(os.getgid())}):
+            cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10)
 
         assert "--group-add" not in cmd
 

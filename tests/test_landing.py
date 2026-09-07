@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 import pytest
 
+import gza.landing as landing_module
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task, WatchProgressObservation
 from gza.landing import (
@@ -144,13 +145,6 @@ def _run_landing_review_transition_with_poisoned_review_routes(
     _assert_no_improve_action(result)
     assert result.status == "reused_completed"
     assert result.review_task == review
-    decision = transition.decision
-    assert decision.allowed is True
-    assert decision.allowed_overrides == (
-        "defer-review-blockers",
-        "parked:review-max-cycles-reached",
-    )
-    assert decision.judgment_verdict == "LAND"
     _assert_no_review_or_improve_rows_after_landing_review(store, {review.id or ""})
     return transition
 
@@ -4303,6 +4297,469 @@ def test_landing_coordinator_dry_run_uses_automatic_review_recovery_descendant(t
     assert fingerprint.review.review_id == retry.id
 
 
+def _store_backed_post_rebase_resolution_case(
+    tmp_path,
+    *,
+    rebase_case: str | None = None,
+    review_scope_overrides: dict[str, Any] | None = None,
+) -> tuple[SqliteTaskStore, Config, Task, Task, Task, _LandingSourceGit]:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "store-backed post-rebase review binding", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+    rebase = _landing_rebase(store, impl)
+    _persist_landing_rebase_outcome(
+        store,
+        rebase,
+        impl,
+        source_before="pre-head-a",
+        target_before="target-a",
+        merge_base_before="merge-base-a",
+        source_after="head-a",
+        target_after="target-a",
+        status="provider_conflict_resolved",
+        changed_diff=True,
+        provider_conflict_resolved=True,
+    )
+    if rebase_case == "wrong-task-type":
+        rebase.task_type = "implement"
+        store.update(rebase)
+    elif rebase_case == "wrong-lineage":
+        other = store.add("Other implementation", task_type="implement")
+        rebase.based_on = other.id
+        store.update(rebase)
+    elif rebase_case == "missing-provenance":
+        rebase.review_scope = None
+        store.update(rebase)
+    elif rebase_case == "malformed-provenance":
+        rebase.review_scope = "Rebase diff provenance: no"
+        store.update(rebase)
+    elif rebase_case == "incomplete-provenance":
+        rebase.review_scope = build_rebase_diff_provenance(
+            baseline=RebaseDiffBaseline(
+                old_tip="pre-head-a",
+                target_at_start="target-a",
+                merge_base_at_start=None,
+            ),
+            resolved_head_sha="head-a",
+            resolved_target_sha="target-a",
+        )
+        store.update(rebase)
+    elif rebase_case == "head-mismatched":
+        rebase.review_scope = build_rebase_diff_provenance(
+            baseline=RebaseDiffBaseline(
+                old_tip="pre-head-a",
+                target_at_start="target-a",
+                merge_base_at_start="merge-base-a",
+            ),
+            resolved_head_sha="other-head",
+            resolved_target_sha="target-a",
+        )
+        store.update(rebase)
+    elif rebase_case == "target-mismatched":
+        rebase.review_scope = build_rebase_diff_provenance(
+            baseline=RebaseDiffBaseline(
+                old_tip="pre-head-a",
+                target_at_start="target-a",
+                merge_base_at_start="merge-base-a",
+            ),
+            resolved_head_sha="head-a",
+            resolved_target_sha="other-target",
+        )
+        store.update(rebase)
+    elif rebase_case is not None:
+        raise AssertionError(f"unknown rebase case: {rebase_case}")
+
+    review_kwargs = {
+        "resolved_head": "head-a",
+        "target": "target-a",
+        "verify_head": "head-a",
+        "pre_rebase_head": "pre-head-a",
+        "pre_rebase_target": "target-a",
+        "pre_rebase_merge_base": "merge-base-a",
+        "completed_at": datetime(2026, 8, 26, 12, 30, tzinfo=UTC),
+    }
+    if review_scope_overrides:
+        review_kwargs.update(review_scope_overrides)
+    stale = _resolution_review(store, impl, rebase, status="completed", **review_kwargs)
+    git = _LandingSourceGit(
+        {"feature/landing": "head-a", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-a")},
+    )
+    return store, config, impl, rebase, stale, git
+
+
+@pytest.mark.parametrize(
+    "rebase_case",
+    (
+        "wrong-task-type",
+        "wrong-lineage",
+        "missing-provenance",
+        "malformed-provenance",
+        "incomplete-provenance",
+        "head-mismatched",
+        "target-mismatched",
+    ),
+)
+def test_landing_default_inspector_rejects_resolution_review_when_rebase_identity_unbindable(
+    tmp_path,
+    rebase_case: str,
+) -> None:
+    store, config, impl, _rebase, stale, git = _store_backed_post_rebase_resolution_case(
+        tmp_path,
+        rebase_case=rebase_case,
+    )
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    facts = coordinator._landing_policy_facts(identity)
+
+    assert facts.review is not None
+    assert facts.review.review_id == stale.id
+    assert facts.review.current is False
+    assert facts.review.identity_matched is False
+    assert coordinator._first_execution_required_phase(identity, facts, policy="guarded") == "post_rebase_review"
+
+
+def test_landing_default_inspector_rejects_resolution_review_referencing_missing_rebase_row(tmp_path) -> None:
+    store, config, impl, rebase, stale, git = _store_backed_post_rebase_resolution_case(tmp_path)
+    stale.review_scope = build_resolution_review_scope(
+        implementation_task_id=impl.id,
+        rebase_task_id="gza-missing-rebase",
+        resolved_head_sha="head-a",
+        resolved_target_sha="target-a",
+        pre_rebase_head_sha="pre-head-a",
+        pre_rebase_target_sha="target-a",
+        pre_rebase_merge_base_sha="merge-base-a",
+    )
+    store.update(stale)
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    facts = coordinator._landing_policy_facts(identity)
+
+    assert rebase.id != "gza-missing-rebase"
+    assert facts.review is not None
+    assert facts.review.review_id == stale.id
+    assert facts.review.current is False
+    assert facts.review.identity_matched is False
+    assert coordinator._first_execution_required_phase(identity, facts, policy="guarded") == "post_rebase_review"
+
+
+@pytest.mark.parametrize("field", ("head", "target", "merge_base"))
+@pytest.mark.parametrize("case", ("missing", "mismatched"))
+def test_landing_default_inspector_rejects_resolution_review_with_stale_pre_rebase_scope(
+    tmp_path,
+    field: str,
+    case: str,
+) -> None:
+    values = {
+        "pre_rebase_head": "pre-head-a",
+        "pre_rebase_target": "target-a",
+        "pre_rebase_merge_base": "merge-base-a",
+    }
+    key = f"pre_rebase_{field}"
+    values[key] = None if case == "missing" else f"other-{field}"
+    store, config, impl, _rebase, stale, git = _store_backed_post_rebase_resolution_case(
+        tmp_path,
+        review_scope_overrides=values,
+    )
+    coordinator = LandingCoordinator(store=store, git=git, config=config)
+
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    facts = coordinator._landing_policy_facts(identity)
+
+    assert facts.review is not None
+    assert facts.review.review_id == stale.id
+    assert facts.review.current is False
+    assert facts.review.identity_matched is False
+    assert coordinator._first_execution_required_phase(identity, facts, policy="guarded") == "post_rebase_review"
+
+
+@pytest.mark.parametrize(
+    "rebase_case",
+    (
+        "wrong-task-type",
+        "wrong-lineage",
+        "missing-provenance",
+        "malformed-provenance",
+        "incomplete-provenance",
+        "head-mismatched",
+        "target-mismatched",
+    ),
+)
+def test_landing_coordinator_creates_one_full_fallback_when_rebase_identity_unbindable(
+    tmp_path,
+    rebase_case: str,
+) -> None:
+    store, config, impl, _rebase, stale, git = _store_backed_post_rebase_resolution_case(
+        tmp_path,
+        rebase_case=rebase_case,
+    )
+    created: list[Task] = []
+
+    def create_full(*_args: Any, **_kwargs: Any) -> Task:
+        review = store.add("Created full fallback", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_verify_head_sha = "head-a"
+        store.update(review)
+        created.append(review)
+        return review
+
+    coordinator = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        create_full_review=create_full,
+        create_resolution_review=_fail_improve_or_review_route,
+        execute_merge=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not merge")),
+    )
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    facts = coordinator._landing_policy_facts(identity)
+
+    step, blocked, _decision, _selected_facts = coordinator._run_post_rebase_review_phase(
+        identity,
+        facts,
+        policy="guarded",
+    )
+
+    assert blocked is not None
+    assert blocked.reason_code == "required-review-unavailable"
+    assert step.phase == "post_rebase_review"
+    assert len(created) == 1
+    assert created[0].review_verify_head_sha == "head-a"
+    assert created[0].review_scope is None
+    assert created[0].id != stale.id
+
+
+@pytest.mark.parametrize("field", ("head", "target", "merge_base"))
+@pytest.mark.parametrize("case", ("missing", "mismatched"))
+def test_landing_coordinator_creates_one_replacement_resolution_review_when_pre_rebase_scope_stale(
+    tmp_path,
+    field: str,
+    case: str,
+) -> None:
+    values = {
+        "pre_rebase_head": "pre-head-a",
+        "pre_rebase_target": "target-a",
+        "pre_rebase_merge_base": "merge-base-a",
+    }
+    values[f"pre_rebase_{field}"] = None if case == "missing" else f"other-{field}"
+    store, config, impl, rebase, stale, git = _store_backed_post_rebase_resolution_case(
+        tmp_path,
+        review_scope_overrides=values,
+    )
+    created: list[Task] = []
+
+    def create_resolution(*_args: Any, **kwargs: Any) -> Task:
+        review = _resolution_review(
+            store,
+            impl,
+            rebase,
+            status="pending",
+            resolved_head=kwargs["resolved_head_sha"],
+            target=kwargs["resolved_target_sha"],
+            verify_head=kwargs["resolved_head_sha"],
+            pre_rebase_target="target-a",
+        )
+        created.append(review)
+        return review
+
+    coordinator = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        create_full_review=_fail_improve_or_review_route,
+        create_resolution_review=create_resolution,
+        execute_merge=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not merge")),
+    )
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    facts = coordinator._landing_policy_facts(identity)
+
+    step, blocked, _decision, _selected_facts = coordinator._run_post_rebase_review_phase(
+        identity,
+        facts,
+        policy="guarded",
+    )
+
+    assert blocked is not None
+    assert blocked.reason_code == "required-review-unavailable"
+    assert step.phase == "post_rebase_review"
+    assert len(created) == 1
+    assert created[0].id != stale.id
+    assert created[0].review_verify_head_sha == "head-a"
+    assert created[0].review_scope is not None
+
+
+def test_landing_coordinator_reuses_exact_full_fallback_when_unbindable_rebase_review_budget_spent(
+    tmp_path,
+) -> None:
+    store, config, impl, _rebase, stale, git = _store_backed_post_rebase_resolution_case(
+        tmp_path,
+        rebase_case="missing-provenance",
+    )
+    full = _completed_full_review(
+        store,
+        impl,
+        head="head-a",
+        completed_at=datetime(2026, 8, 26, 12, 10, tzinfo=UTC),
+    )
+    coordinator = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        create_full_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no create")),
+        create_resolution_review=_fail_improve_or_review_route,
+        execute_merge=lambda *_args, **_kwargs: ManualMergeExecutionResult(success=False, message="stop before merge"),
+    )
+    coordinator.post_rebase_review_budget_used = True
+
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    facts = coordinator._landing_policy_facts(identity)
+
+    step, blocked, decision, selected_facts = coordinator._run_post_rebase_review_phase(
+        identity,
+        facts,
+        policy="guarded",
+    )
+
+    assert blocked is None
+    assert decision is not None
+    assert decision.allowed is True
+    assert selected_facts.review is not None
+    assert selected_facts.review.review_id == full.id
+    assert selected_facts.review.mode == "plain_full"
+    assert selected_facts.review.verdict == "APPROVED"
+    assert selected_facts.review.followup_findings == ()
+    assert selected_facts.open_blockers == ()
+    authorization = landing_module.landing_merge_authorization_from_facts(
+        identity=identity,
+        facts=selected_facts,
+        decision=decision,
+    )
+    assert authorization.review_id == full.id
+    assert authorization.review_mode == "plain_full"
+    assert authorization.review_verdict == "APPROVED"
+    assert authorization.blocker_identities == ()
+    assert step.status == "completed"
+    assert str(full.id) in step.summary
+    assert str(stale.id) not in step.summary
+
+
+def test_landing_coordinator_blocks_unbindable_rebase_full_fallback_when_budget_spent(
+    tmp_path,
+) -> None:
+    store, config, impl, _rebase, _stale, git = _store_backed_post_rebase_resolution_case(
+        tmp_path,
+        rebase_case="missing-provenance",
+    )
+    coordinator = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        create_full_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("budget spent")),
+        create_resolution_review=_fail_improve_or_review_route,
+        execute_merge=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not merge")),
+    )
+    coordinator.post_rebase_review_budget_used = True
+
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    facts = coordinator._landing_policy_facts(identity)
+
+    _step, blocked, _decision, _selected_facts = coordinator._run_post_rebase_review_phase(
+        identity,
+        facts,
+        policy="guarded",
+    )
+
+    assert blocked is not None
+    assert blocked.reason_code == "bounded-attempt-exhausted"
+
+
+def test_landing_coordinator_reuses_exact_resolution_replacement_when_pre_rebase_scope_stale_budget_spent(
+    tmp_path,
+) -> None:
+    store, config, impl, rebase, stale, git = _store_backed_post_rebase_resolution_case(
+        tmp_path,
+        review_scope_overrides={"pre_rebase_merge_base": "other-merge-base"},
+    )
+    exact = _resolution_review(
+        store,
+        impl,
+        rebase,
+        status="completed",
+        resolved_head="head-a",
+        target="target-a",
+        verify_head="head-a",
+        pre_rebase_target="target-a",
+        completed_at=datetime(2026, 8, 26, 12, 10, tzinfo=UTC),
+    )
+    coordinator = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        create_full_review=_fail_improve_or_review_route,
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no create")),
+        execute_merge=lambda *_args, **_kwargs: ManualMergeExecutionResult(success=False, message="stop before merge"),
+    )
+    coordinator.post_rebase_review_budget_used = True
+
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    facts = coordinator._landing_policy_facts(identity)
+
+    step, blocked, _decision, _selected_facts = coordinator._run_post_rebase_review_phase(
+        identity,
+        facts,
+        policy="guarded",
+    )
+
+    assert blocked is None
+    assert step.status == "completed"
+    assert str(exact.id) in step.summary
+    assert str(stale.id) not in step.summary
+
+
+def test_landing_coordinator_blocks_stale_pre_rebase_resolution_replacement_when_budget_spent(
+    tmp_path,
+) -> None:
+    store, config, impl, _rebase, _stale, git = _store_backed_post_rebase_resolution_case(
+        tmp_path,
+        review_scope_overrides={"pre_rebase_merge_base": "other-merge-base"},
+    )
+    coordinator = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        create_full_review=_fail_improve_or_review_route,
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("budget spent")),
+        execute_merge=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not merge")),
+    )
+    coordinator.post_rebase_review_budget_used = True
+
+    identity = coordinator._resolve_identity(LandRequest(task_id=impl.id), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    facts = coordinator._landing_policy_facts(identity)
+
+    _step, blocked, _decision, _selected_facts = coordinator._run_post_rebase_review_phase(
+        identity,
+        facts,
+        policy="guarded",
+    )
+
+    assert blocked is not None
+    assert blocked.reason_code == "bounded-attempt-exhausted"
+
+
 def test_landing_coordinator_dry_run_uses_merge_unit_attached_spec_review_evidence(tmp_path) -> None:
     store = _coordinator_store(tmp_path)
     config = _verify_config(tmp_path)
@@ -5601,6 +6058,255 @@ def test_landing_coordinator_strict_changes_requested_stops_without_review_or_im
     assert result.blocked.reason_code == "nondeferrable-blocker"
     assert all(step.phase != "post_rebase_review" for step in result.steps)
     _assert_no_review_or_improve_rows_after_landing_review(store, {review.id or ""})
+
+
+@pytest.mark.parametrize("wrong_review_mode", ("unrelated_head", "resolution"))
+def test_landing_coordinator_preserves_exact_carry_forward_changes_requested_over_newer_approval(
+    tmp_path,
+    wrong_review_mode: str,
+) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "strict carry-forward chronology", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl, reviewed_head="head-b")
+    rebase = _landing_rebase(
+        store,
+        impl,
+        old_tip="head-a",
+        target_at_start="target-a",
+        merge_base_at_start="base-a",
+        resolved_head="head-b",
+        resolved_target="target-a",
+    )
+    _persist_landing_rebase_outcome(
+        store,
+        rebase,
+        impl,
+        source_before="head-a",
+        target_before="target-a",
+        merge_base_before="base-a",
+        source_after="head-b",
+        target_after="target-a",
+        status="completed_mechanical",
+        changed_diff=False,
+        provider_conflict_resolved=False,
+    )
+    exact = _completed_full_review(
+        store,
+        impl,
+        head="head-a",
+        verdict="CHANGES_REQUESTED",
+        completed_at=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+    )
+    if wrong_review_mode == "unrelated_head":
+        wrong = _completed_full_review(
+            store,
+            impl,
+            head="other-head",
+            verdict="APPROVED",
+            completed_at=datetime(2026, 8, 26, 12, 1, tzinfo=UTC),
+        )
+    else:
+        wrong = _resolution_review(
+            store,
+            impl,
+            rebase,
+            status="completed",
+            resolved_head="head-b",
+            target="target-a",
+            verify_head="head-b",
+            pre_rebase_head="head-a",
+            pre_rebase_target="target-a",
+            pre_rebase_merge_base="base-a",
+            verdict="APPROVED",
+            completed_at=datetime(2026, 8, 26, 12, 1, tzinfo=UTC),
+        )
+    git = _LandingSourceGit(
+        {"feature/landing": "head-b", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-b")},
+    )
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            rebase_status="completed",
+            rebase_resolution_kind="mechanical",
+            rebase_changed_diff=False,
+            rebase_outcome_id="mechanical-a-to-b",
+            rebase_attempted_source_head="head-a",
+            rebase_attempted_target_head="target-a",
+            rebase_target_contained=True,
+            rebase_provider_resolution_proof=False,
+            review=_review(
+                review_id=wrong.id,
+                verdict="APPROVED",
+                current=False,
+                identity_matched=False,
+                reviewed_head=wrong.review_verify_head_sha,
+            ),
+        )
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        inspect_policy_facts=inspect,
+        create_full_review=_fail_improve_or_review_route,
+        create_resolution_review=_fail_improve_or_review_route,
+    ).run(LandRequest(task_id=impl.id, policy="strict"))
+
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "nondeferrable-blocker"
+    assert f"review:{exact.id}" in result.blocked.evidence_refs
+    assert f"review:{wrong.id}" not in result.blocked.evidence_refs
+    assert all(step.phase != "merge" for step in result.steps)
+
+    production = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        live_tree_fingerprint_resolver=lambda: TREE_A,
+        create_full_review=_fail_improve_or_review_route,
+        create_resolution_review=_fail_improve_or_review_route,
+    )
+    identity = production._resolve_identity(LandRequest(task_id=impl.id, policy="strict"), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    assert refresh_landing_authorization(
+        production,
+        identity,
+        LandingPolicyDecision(True),
+        policy="strict",
+    ) is None
+
+
+def test_landing_coordinator_preserves_exact_carry_forward_approval_over_newer_changes_requested(
+    tmp_path,
+) -> None:
+    store = _coordinator_store(tmp_path)
+    config = _verify_config(tmp_path)
+    impl = _completed_impl(store, "strict carry-forward inverse chronology", "feature/landing")
+    assert impl.id is not None
+    _persist_lifecycle_verify_for_landing(store, config, impl, reviewed_head="head-b")
+    rebase = _landing_rebase(
+        store,
+        impl,
+        old_tip="head-a",
+        target_at_start="target-a",
+        merge_base_at_start="base-a",
+        resolved_head="head-b",
+        resolved_target="target-a",
+    )
+    _persist_landing_rebase_outcome(
+        store,
+        rebase,
+        impl,
+        source_before="head-a",
+        target_before="target-a",
+        merge_base_before="base-a",
+        source_after="head-b",
+        target_after="target-a",
+        status="completed_mechanical",
+        changed_diff=False,
+        provider_conflict_resolved=False,
+    )
+    exact = _completed_full_review(
+        store,
+        impl,
+        head="head-a",
+        verdict="APPROVED",
+        completed_at=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+    )
+    wrong = _completed_full_review(
+        store,
+        impl,
+        head="other-head",
+        verdict="CHANGES_REQUESTED",
+        completed_at=datetime(2026, 8, 26, 12, 1, tzinfo=UTC),
+    )
+    git = _LandingSourceGit(
+        {"feature/landing": "head-b", "main": "target-a"},
+        local_branches={"feature/landing"},
+        ancestors={("target-a", "head-b")},
+    )
+    merged: list[tuple[str | None, str | None]] = []
+
+    def inspect(identity: Any) -> LandingPolicyFacts:
+        return _green_facts(
+            task_id=identity.owner_task_id,
+            source_head=identity.source_sha,
+            target_head=identity.target_sha,
+            rebase_status="completed",
+            rebase_resolution_kind="mechanical",
+            rebase_changed_diff=False,
+            rebase_outcome_id="mechanical-a-to-b",
+            rebase_attempted_source_head="head-a",
+            rebase_attempted_target_head="target-a",
+            rebase_target_contained=True,
+            rebase_provider_resolution_proof=False,
+            review=_review(
+                review_id=wrong.id,
+                verdict="CHANGES_REQUESTED",
+                current=False,
+                identity_matched=False,
+                reviewed_head=wrong.review_verify_head_sha,
+            ),
+        )
+
+    def merge(identity: Any, decision: LandingPolicyDecision, provenance: str) -> ManualMergeExecutionResult:
+        assert provenance == "manual_land"
+        merged.append((exact.id, "APPROVED"))
+        _simulate_no_ff_landing_git_merge(git)
+        return ManualMergeExecutionResult(rc=0, status="merged")
+
+    production = LandingCoordinator(
+        store=store,
+        git=git,
+        config=config,
+        live_tree_fingerprint_resolver=lambda: TREE_A,
+        create_full_review=_fail_improve_or_review_route,
+        create_resolution_review=_fail_improve_or_review_route,
+    )
+    identity = production._resolve_identity(LandRequest(task_id=impl.id, policy="strict"), persist_reconciliation=False)
+    assert not isinstance(identity, LandBlocked)
+    refreshed = refresh_landing_authorization(
+        production,
+        identity,
+        LandingPolicyDecision(True),
+        policy="strict",
+    )
+    assert refreshed is not None
+    assert refreshed.review_id == exact.id
+    assert refreshed.review_verdict == "APPROVED"
+    assert refreshed.review_mode == "plain_full"
+
+    result = LandingCoordinator(
+        store=store,
+        git=git,
+        inspect_policy_facts=inspect,
+        create_full_review=_fail_improve_or_review_route,
+        create_resolution_review=_fail_improve_or_review_route,
+        execute_merge=merge,
+        finalize_merge=lambda identity, decision, provenance: _finalize_landing_merge_state(
+            store, identity, decision, provenance
+        ),
+        post_merge_verifier=lambda identity: _post_merge_success(identity),
+    ).run(LandRequest(task_id=impl.id, policy="strict"))
+
+    assert result.blocked is None
+    assert result.merged is True
+    assert merged == [(exact.id, "APPROVED")]
+    post_rebase_step = next(step for step in result.steps if step.phase == "post_rebase_review")
+    assert str(exact.id) in post_rebase_step.evidence_refs
+    assert str(wrong.id) not in post_rebase_step.evidence_refs
+    pending_artifacts = store.list_artifacts(impl.id, kind="landing_pending_finalization")
+    assert pending_artifacts
+    authorization = pending_artifacts[0].metadata["authorization"]
+    assert authorization["review_id"] == exact.id
+    assert authorization["review_verdict"] == "APPROVED"
+    assert authorization["review_mode"] == "plain_full"
 
 
 def test_landing_coordinator_guarded_defers_blockers_after_final_preflight_and_merges(tmp_path) -> None:
@@ -9869,6 +10575,7 @@ def _persist_landing_rebase_outcome(
     *,
     source_before: str = "source-before",
     target_before: str = "target-a",
+    merge_base_before: str = "merge-base-a",
     source_after: str = "source-a",
     target_after: str = "target-a",
     status: str = "provider_conflict_resolved",
@@ -9902,6 +10609,16 @@ def _persist_landing_rebase_outcome(
         "superseded": False,
         "completion_reason": None,
     }
+    rebase.review_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip=source_before,
+            target_at_start=target_before,
+            merge_base_at_start=merge_base_before,
+        ),
+        resolved_head_sha=source_after,
+        resolved_target_sha=target_after,
+    )
+    store.update(rebase)
     payload = json.dumps(metadata, sort_keys=True)
     return store.add_artifact(
         rebase.id or "",
@@ -9916,6 +10633,67 @@ def _persist_landing_rebase_outcome(
     )
 
 
+def _landing_rebase(
+    store: SqliteTaskStore,
+    impl,
+    *,
+    status: str = "completed",
+    task_type: str = "rebase",
+    based_on: str | None = None,
+    old_tip: str | None = "pre-head-a",
+    target_at_start: str | None = "pre-target-a",
+    merge_base_at_start: str | None = "merge-base-a",
+    resolved_head: str | None = "head-a",
+    resolved_target: str | None = "target-a",
+):
+    rebase = store.add(
+        "Rebase landing review",
+        task_type=task_type,
+        based_on=based_on if based_on is not None else impl.id,
+        same_branch=True,
+    )
+    rebase.status = status
+    if status == "completed":
+        rebase.completed_at = datetime(2026, 8, 26, 11, 0, tzinfo=UTC)
+    rebase.review_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip=old_tip,
+            target_at_start=target_at_start,
+            merge_base_at_start=merge_base_at_start,
+        ),
+        resolved_head_sha=resolved_head,
+        resolved_target_sha=resolved_target,
+    )
+    store.update(rebase)
+    return rebase
+
+
+def _unbindable_landing_rebase(store: SqliteTaskStore, impl, case: str) -> Task:
+    if case == "missing-row":
+        return Task(id="gza-missing-rebase", prompt="Missing rebase row", task_type="rebase", based_on=impl.id)
+    if case == "wrong-task-type":
+        return _landing_rebase(store, impl, task_type="implement")
+    if case == "wrong-lineage":
+        other = store.add("Other implementation", task_type="implement")
+        return _landing_rebase(store, impl, based_on=other.id)
+    if case == "missing-provenance":
+        rebase = store.add("Rebase landing review", task_type="rebase", based_on=impl.id, same_branch=True)
+        store.update(rebase)
+        return rebase
+    if case == "malformed-provenance":
+        rebase = store.add("Rebase landing review", task_type="rebase", based_on=impl.id, same_branch=True)
+        rebase.review_scope = "Rebase diff provenance: no"
+        store.update(rebase)
+        return rebase
+    if case == "incomplete-provenance":
+        return _landing_rebase(store, impl, merge_base_at_start=None)
+    if case == "mismatched-head":
+        return _landing_rebase(store, impl, resolved_head="other-head")
+    if case == "mismatched-target":
+        return _landing_rebase(store, impl, resolved_target="other-target")
+    raise AssertionError(f"unknown unbindable rebase case: {case}")
+
+
 def _resolution_review(
     store: SqliteTaskStore,
     impl,
@@ -9925,6 +10703,9 @@ def _resolution_review(
     resolved_head: str,
     target: str,
     verify_head: str | None = None,
+    pre_rebase_head: str | None = "pre-head-a",
+    pre_rebase_target: str | None = "pre-target-a",
+    pre_rebase_merge_base: str | None = "merge-base-a",
     verdict: str = "APPROVED",
     completed_at: datetime | None = None,
 ):
@@ -9938,14 +10719,54 @@ def _resolution_review(
         rebase_task_id=rebase.id,
         resolved_head_sha=resolved_head,
         resolved_target_sha=target,
+        pre_rebase_head_sha=pre_rebase_head,
+        pre_rebase_target_sha=pre_rebase_target,
+        pre_rebase_merge_base_sha=pre_rebase_merge_base,
     )
     review.review_verify_head_sha = verify_head
     store.update(review)
     return review
 
 
-def test_post_rebase_review_not_required_for_mechanical_unchanged_diff_with_rewritten_live_head(tmp_path) -> None:
+def test_post_rebase_review_creates_full_review_for_mechanical_unchanged_diff_without_prior_review(tmp_path) -> None:
     store, impl = _completed_impl_for_landing_review(tmp_path)
+    calls: list[str] = []
+
+    def fake_full_review(*_args: Any, **_kwargs: Any):
+        calls.append("created")
+        review = store.add("Created full review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_verify_head_sha = "head-b"
+        store.update(review)
+        return review
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            source_head="head-b",
+            target_head="target-a",
+            pre_rebase_source_head="head-a",
+            rebase_outcome_identity=_rebase_identity(
+                attempted_source_head="head-a",
+                live_source_head="head-b",
+            ),
+            rebase_outcome_kind="mechanical",
+            changed_diff=False,
+            conflict_resolved=False,
+        ),
+        create_full_review=fake_full_review,
+    )
+
+    assert result.status == "created"
+    assert result.need == "full"
+    assert result.review_budget_used is True
+    assert calls == ["created"]
+
+
+def test_post_rebase_review_not_required_for_mechanical_unchanged_diff_with_valid_prior_review(tmp_path) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    prior = _completed_full_review(store, impl, head="head-a")
 
     result = acquire_one_post_rebase_review(
         store,
@@ -9966,10 +10787,12 @@ def test_post_rebase_review_not_required_for_mechanical_unchanged_diff_with_rewr
 
     assert result.status == "not_required"
     assert result.review_budget_used is False
+    assert prior.status == "completed"
 
 
 def test_post_rebase_review_not_required_preserves_spent_budget(tmp_path) -> None:
     store, impl = _completed_impl_for_landing_review(tmp_path)
+    _completed_full_review(store, impl, head="head-a")
 
     result = acquire_one_post_rebase_review(
         store,
@@ -10030,6 +10853,7 @@ def test_post_rebase_review_not_required_for_supported_no_op_with_exact_proof(
     no_op_subtype: str,
 ) -> None:
     store, impl = _completed_impl_for_landing_review(tmp_path)
+    _completed_full_review(store, impl, head="head-a")
 
     result = acquire_one_post_rebase_review(
         store,
@@ -10045,6 +10869,476 @@ def test_post_rebase_review_not_required_for_supported_no_op_with_exact_proof(
 
     assert result.status == "not_required"
     assert result.review_budget_used is False
+
+
+@pytest.mark.parametrize(
+    ("prior_head", "prior_output"),
+    (
+        ("old-head", _review_report("APPROVED")),
+        ("head-a", "not a valid review verdict"),
+    ),
+)
+def test_post_rebase_review_refreshes_for_stale_or_malformed_prior_mechanical_review(
+    tmp_path,
+    prior_head: str,
+    prior_output: str,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    prior = _completed_full_review(store, impl, head=prior_head)
+    prior.output_content = prior_output
+    store.update(prior)
+    calls: list[str] = []
+
+    def fake_full_review(*_args: Any, **_kwargs: Any):
+        calls.append("created")
+        review = store.add("Created full review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_verify_head_sha = "head-b"
+        store.update(review)
+        return review
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            source_head="head-b",
+            target_head="target-a",
+            pre_rebase_source_head="head-a",
+            rebase_outcome_identity=_rebase_identity(
+                attempted_source_head="head-a",
+                live_source_head="head-b",
+            ),
+            rebase_outcome_kind="mechanical",
+            changed_diff=False,
+            conflict_resolved=False,
+        ),
+        create_full_review=fake_full_review,
+    )
+
+    assert result.status == "created"
+    assert result.need == "full"
+    assert result.review_budget_used is True
+    assert calls == ["created"]
+
+
+@pytest.mark.parametrize(
+    ("outcome_kind", "no_op_subtype"),
+    (
+        ("mechanical", None),
+        ("no_op", "already_contained"),
+        ("no_op", "superseded_contained"),
+        ("no_op", "unchanged_target"),
+        ("no_op", "moot"),
+    ),
+)
+@pytest.mark.parametrize("review_budget_used", (False, True))
+def test_post_rebase_review_does_not_reuse_malformed_same_head_historical_carry_forward(
+    tmp_path,
+    outcome_kind: str,
+    no_op_subtype: str | None,
+    review_budget_used: bool,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    prior = _completed_full_review(store, impl, head="head-a")
+    prior.output_content = "not a valid review verdict"
+    store.update(prior)
+    calls: list[str] = []
+
+    def fake_full_review(*_args: Any, **_kwargs: Any):
+        calls.append("created")
+        review = store.add("Created full review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_verify_head_sha = "head-a"
+        store.update(review)
+        return review
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            source_head="head-a",
+            target_head="target-a",
+            pre_rebase_source_head="head-a",
+            rebase_outcome_identity=_rebase_identity(outcome_kind=outcome_kind, no_op_subtype=no_op_subtype),
+            rebase_outcome_kind=outcome_kind,
+            changed_diff=False,
+            conflict_resolved=False,
+            review_budget_used=review_budget_used,
+        ),
+        create_full_review=fake_full_review,
+    )
+
+    if review_budget_used:
+        assert result.status == "blocked"
+        assert result.review_budget_used is True
+        assert result.blocked is not None
+        assert calls == []
+    else:
+        assert result.status == "created"
+        assert result.need == "full"
+        assert result.review_budget_used is True
+        assert result.review_task is not prior
+        assert calls == ["created"]
+
+
+@pytest.mark.parametrize(
+    "no_op_subtype",
+    ("already_contained", "superseded_contained", "unchanged_target", "moot"),
+)
+@pytest.mark.parametrize("review_budget_used", (False, True))
+def test_post_rebase_review_does_not_reuse_supported_no_op_same_head_review_when_identity_mismatches(
+    tmp_path,
+    no_op_subtype: str,
+    review_budget_used: bool,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    prior = _completed_full_review(store, impl, head="head-a")
+    calls: list[str] = []
+
+    def fake_full_review(*_args: Any, **_kwargs: Any):
+        calls.append("created")
+        review = store.add("Created full review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_verify_head_sha = "head-a"
+        store.update(review)
+        return review
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            source_head="head-a",
+            target_head="target-a",
+            rebase_outcome_identity=_rebase_identity(
+                outcome_kind="no_op",
+                no_op_subtype=no_op_subtype,
+                attempted_source_head="other-head",
+            ),
+            rebase_outcome_kind="no_op",
+            changed_diff=False,
+            review_budget_used=review_budget_used,
+        ),
+        create_full_review=fake_full_review,
+    )
+
+    if review_budget_used:
+        assert result.status == "blocked"
+        assert result.blocked is not None
+        assert result.blocked.reason_code == "bounded-attempt-exhausted"
+        assert result.review_budget_used is True
+        assert calls == []
+    else:
+        assert result.status == "created"
+        assert result.need == "full"
+        assert result.review_budget_used is True
+        assert result.review_task is not prior
+        assert calls == ["created"]
+
+
+@pytest.mark.parametrize(
+    "identity",
+    (
+        None,
+        _rebase_identity(attempted_source_head="old-head"),
+        _rebase_identity(attempted_target_head="old-target"),
+        _rebase_identity(live_source_head="other-head"),
+        _rebase_identity(live_target_head="other-target"),
+        _rebase_identity(target_contained=False),
+        _rebase_identity(provider_resolution_proof=True),
+        _rebase_identity(changed_diff=None),
+        _rebase_identity(outcome_kind="no_op", no_op_subtype=None),
+        _rebase_identity(outcome_kind="no_op", no_op_subtype="unsupported"),
+    ),
+)
+@pytest.mark.parametrize("review_budget_used", (False, True))
+def test_post_rebase_review_does_not_reuse_same_head_review_when_carry_forward_proof_is_missing_or_mismatched(
+    tmp_path,
+    identity: LandingRebaseOutcomeIdentity | None,
+    review_budget_used: bool,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    prior = _completed_full_review(store, impl, head="head-a")
+    calls: list[str] = []
+
+    def fake_full_review(*_args: Any, **_kwargs: Any):
+        calls.append("created")
+        review = store.add("Created full review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_verify_head_sha = "head-a"
+        store.update(review)
+        return review
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            source_head="head-a",
+            target_head="target-a",
+            pre_rebase_source_head="head-a",
+            rebase_outcome_identity=identity,
+            rebase_outcome_kind="mechanical" if identity is None or identity.outcome_kind == "mechanical" else "no_op",
+            changed_diff=False,
+            review_budget_used=review_budget_used,
+        ),
+        create_full_review=fake_full_review,
+    )
+
+    if review_budget_used:
+        assert result.status == "blocked"
+        assert result.blocked is not None
+        assert result.blocked.reason_code == "bounded-attempt-exhausted"
+        assert result.review_budget_used is True
+        assert calls == []
+    else:
+        assert result.status == "created"
+        assert result.need == "full"
+        assert result.review_budget_used is True
+        assert result.review_task is not prior
+        assert calls == ["created"]
+
+
+@pytest.mark.parametrize("older_status", ("completed", "failed"))
+@pytest.mark.parametrize("review_budget_used", (False, True))
+def test_post_rebase_review_excludes_stacked_malformed_same_head_historical_reviews(
+    tmp_path,
+    older_status: str,
+    review_budget_used: bool,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    older = _completed_full_review(
+        store,
+        impl,
+        head="head-a",
+        completed_at=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+    )
+    if older_status == "failed":
+        older.status = "failed"
+        older.output_content = None
+        store.update(older)
+    newest = _completed_full_review(
+        store,
+        impl,
+        head="head-a",
+        completed_at=datetime(2026, 8, 26, 12, 1, tzinfo=UTC),
+    )
+    newest.output_content = "not a valid review verdict"
+    store.update(newest)
+    calls: list[str] = []
+
+    def fake_full_review(*_args: Any, **_kwargs: Any):
+        calls.append("created")
+        review = store.add("Created full review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_verify_head_sha = "head-a"
+        store.update(review)
+        return review
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            source_head="head-a",
+            target_head="target-a",
+            pre_rebase_source_head="head-a",
+            rebase_outcome_identity=_rebase_identity(),
+            rebase_outcome_kind="mechanical",
+            changed_diff=False,
+            conflict_resolved=False,
+            review_budget_used=review_budget_used,
+        ),
+        create_full_review=fake_full_review,
+    )
+
+    if review_budget_used:
+        assert result.status == "blocked"
+        assert result.need == "full"
+        assert result.review_budget_used is True
+        assert result.blocked is not None
+        assert result.blocked.reason_code == "bounded-attempt-exhausted"
+        assert calls == []
+    else:
+        assert result.status == "created"
+        assert result.need == "full"
+        assert result.review_budget_used is True
+        assert result.review_task is not None
+        assert result.review_task.id not in {older.id, newest.id}
+        assert calls == ["created"]
+
+
+@pytest.mark.parametrize("review_budget_used", (False, True))
+def test_post_rebase_review_reuses_unmarked_live_head_full_review_after_distinct_mechanical_rebase(
+    tmp_path,
+    review_budget_used: bool,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    live_review = _completed_full_review(store, impl, head="head-b", verdict="APPROVED")
+    calls: list[str] = []
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            source_head="head-b",
+            target_head="target-a",
+            pre_rebase_source_head="head-a",
+            rebase_outcome_identity=_rebase_identity(
+                attempted_source_head="old-head-without-eligible-review",
+                live_source_head="head-b",
+            ),
+            rebase_outcome_kind="mechanical",
+            changed_diff=False,
+            conflict_resolved=False,
+            review_budget_used=review_budget_used,
+        ),
+        create_full_review=lambda *_args, **_kwargs: calls.append("created") or impl,
+    )
+
+    assert result.status == "reused_completed"
+    assert result.need == "full"
+    assert result.review_task == live_review
+    assert result.review_budget_used is review_budget_used
+    assert calls == []
+
+
+def test_post_rebase_review_rejects_malformed_unmarked_live_head_full_review_after_distinct_mechanical_rebase(
+    tmp_path,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    live_review = _completed_full_review(store, impl, head="head-b", verdict="APPROVED")
+    live_review.output_content = "not a valid review verdict"
+    store.update(live_review)
+    calls: list[str] = []
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            source_head="head-b",
+            target_head="target-a",
+            pre_rebase_source_head="head-a",
+            rebase_outcome_identity=_rebase_identity(
+                attempted_source_head="old-head-without-eligible-review",
+                live_source_head="head-b",
+            ),
+            rebase_outcome_kind="mechanical",
+            changed_diff=False,
+            conflict_resolved=False,
+            review_budget_used=True,
+        ),
+        create_full_review=lambda *_args, **_kwargs: calls.append("created") or impl,
+    )
+
+    assert result.status == "blocked"
+    assert result.need == "full"
+    assert result.review_task == live_review
+    assert result.review_budget_used is True
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "required-review-unavailable"
+    assert calls == []
+
+
+def test_post_rebase_review_reuses_current_fallback_epoch_full_review_on_reentry(tmp_path) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    _completed_full_review(store, impl, head="head-a")
+    created: list[Task] = []
+
+    def fake_full_review(*_args: Any, **_kwargs: Any):
+        review = store.add("Created full review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_verify_head_sha = "head-a"
+        store.update(review)
+        created.append(review)
+        return review
+
+    request = LandingPostRebaseReviewRequest(
+        impl_task=impl,
+        source_head="head-a",
+        target_head="target-a",
+        pre_rebase_source_head="head-a",
+        rebase_outcome_identity=_rebase_identity(attempted_source_head="old-head"),
+        rebase_outcome_kind="mechanical",
+        changed_diff=False,
+    )
+    first = acquire_one_post_rebase_review(store, request, create_full_review=fake_full_review)
+
+    assert first.status == "created"
+    assert first.review_task is not None
+    assert len(created) == 1
+
+    created_review = first.review_task
+    created_review.status = "completed"
+    created_review.completed_at = datetime(2026, 8, 26, 12, 2, tzinfo=UTC)
+    created_review.output_content = _review_report("APPROVED")
+    store.update(created_review)
+
+    second = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            source_head="head-a",
+            target_head="target-a",
+            pre_rebase_source_head="head-a",
+            rebase_outcome_identity=_rebase_identity(attempted_source_head="old-head"),
+            rebase_outcome_kind="mechanical",
+            changed_diff=False,
+            review_budget_used=first.review_budget_used,
+        ),
+        create_full_review=fake_full_review,
+    )
+
+    assert second.status == "reused_completed"
+    assert second.review_task == created_review
+    assert second.review_budget_used is True
+    assert len(created) == 1
+
+
+@pytest.mark.parametrize(
+    "exc",
+    (
+        OSError("report file unavailable"),
+        RuntimeError("parser exploded"),
+    ),
+)
+def test_mechanical_carry_forward_review_read_failure_blocks_without_creation_or_budget(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    exc: Exception,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    _completed_full_review(store, impl, head="head-a")
+    calls: list[str] = []
+
+    def raise_read_failure(*_args: Any, **_kwargs: Any):
+        raise exc
+
+    monkeypatch.setattr(landing_module, "get_review_report", raise_read_failure)
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            source_head="head-b",
+            target_head="target-a",
+            pre_rebase_source_head="head-a",
+            rebase_outcome_identity=_rebase_identity(
+                attempted_source_head="head-a",
+                live_source_head="head-b",
+            ),
+            rebase_outcome_kind="mechanical",
+            changed_diff=False,
+            conflict_resolved=False,
+        ),
+        create_full_review=lambda *_args, **_kwargs: calls.append("full") or impl,
+        create_resolution_review=lambda *_args, **_kwargs: calls.append("resolution") or impl,
+    )
+
+    assert result.status == "blocked"
+    assert result.need == "full"
+    assert result.review_budget_used is False
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "required-review-unavailable"
+    assert "could not be read" in result.blocked.fact
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -10127,7 +11421,7 @@ def test_post_rebase_review_blocks_without_creation_when_carry_forward_proof_inv
 
 def test_conflict_resolved_rebase_requires_one_resolution_review_even_when_diff_unchanged(tmp_path) -> None:
     store, impl = _completed_impl_for_landing_review(tmp_path)
-    rebase = store.add("Rebase landing review", task_type="rebase", based_on=impl.id, same_branch=True)
+    rebase = _landing_rebase(store, impl)
     created: list[str] = []
 
     def fake_resolution(*_args: Any, **kwargs: Any):
@@ -10167,7 +11461,11 @@ def test_recovered_and_resumed_rebases_require_one_review_even_when_diff_unchang
     provenance_complete: bool,
 ) -> None:
     store, impl = _completed_impl_for_landing_review(tmp_path)
-    rebase = store.add("Rebase landing review", task_type="rebase", based_on=impl.id, same_branch=True)
+    rebase = (
+        _landing_rebase(store, impl)
+        if provenance_complete
+        else store.add("Rebase landing review", task_type="rebase", based_on=impl.id, same_branch=True)
+    )
     created: list[str] = []
 
     def fake_resolution(*_args: Any, **kwargs: Any):
@@ -10216,6 +11514,458 @@ def test_recovered_and_resumed_rebases_require_one_review_even_when_diff_unchang
         assert result.review_task.review_scope is not None
     else:
         assert result.review_task.review_verify_head_sha == "head-a"
+
+
+@pytest.mark.parametrize("outcome_kind", ("provider_resolved", "recovered", "resumed", None))
+@pytest.mark.parametrize("rebase_identity", ("absent", "idless"))
+def test_unbindable_complete_resolution_provenance_falls_back_to_one_full_current_head_review(
+    tmp_path,
+    outcome_kind: str | None,
+    rebase_identity: str,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    rebase = None
+    if rebase_identity == "idless":
+        rebase = Task(id=None, prompt="ID-less rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    created: list[str] = []
+
+    def fake_full(*_args: Any, **_kwargs: Any):
+        created.append("full")
+        review = store.add("Full fallback", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_verify_head_sha = "head-a"
+        store.update(review)
+        return review
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            rebase_task=rebase,
+            source_head="head-a",
+            target_head="target-a",
+            rebase_outcome_kind=outcome_kind,
+            changed_diff=None if outcome_kind is None else True,
+            conflict_resolved=outcome_kind == "provider_resolved",
+            resolution_provenance_complete=True,
+        ),
+        create_full_review=fake_full,
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no resolution")),
+    )
+
+    assert result.status == "created"
+    assert result.need == "full"
+    assert result.review_budget_used is True
+    assert result.review_task is not None
+    assert result.review_task.review_verify_head_sha == "head-a"
+    assert created == ["full"]
+
+
+@pytest.mark.parametrize("outcome_kind", ("provider_resolved", "recovered", "resumed", None))
+@pytest.mark.parametrize(
+    "rebase_case",
+    (
+        "missing-row",
+        "wrong-task-type",
+        "wrong-lineage",
+        "missing-provenance",
+        "malformed-provenance",
+        "incomplete-provenance",
+        "mismatched-head",
+        "mismatched-target",
+    ),
+)
+def test_nonblank_unbindable_resolution_identity_falls_back_to_full_current_head_review(
+    tmp_path,
+    outcome_kind: str | None,
+    rebase_case: str,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    rebase = _unbindable_landing_rebase(store, impl, rebase_case)
+    created: list[str] = []
+
+    def fake_full(*_args: Any, **_kwargs: Any):
+        created.append("full")
+        review = store.add("Full fallback", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_verify_head_sha = "head-a"
+        store.update(review)
+        return review
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            rebase_task=rebase,
+            source_head="head-a",
+            target_head="target-a",
+            rebase_outcome_kind=outcome_kind,
+            changed_diff=None if outcome_kind is None else True,
+            conflict_resolved=outcome_kind == "provider_resolved",
+            resolution_provenance_complete=True,
+        ),
+        create_full_review=fake_full,
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no resolution")),
+    )
+
+    assert result.status == "created"
+    assert result.need == "full"
+    assert result.review_budget_used is True
+    assert result.review_task is not None
+    assert result.review_task.review_verify_head_sha == "head-a"
+    assert created == ["full"]
+
+
+@pytest.mark.parametrize("rebase_status", ("pending", "in_progress", "failed", "stopped"))
+def test_noncompleted_resolution_rebase_status_falls_back_to_full_current_head_review(
+    tmp_path,
+    rebase_status: str,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    rebase = _landing_rebase(store, impl, status=rebase_status)
+    created: list[str] = []
+
+    def fake_full(*_args: Any, **_kwargs: Any):
+        created.append("full")
+        review = store.add("Full fallback", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_verify_head_sha = "head-a"
+        store.update(review)
+        return review
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            rebase_task=rebase,
+            source_head="head-a",
+            target_head="target-a",
+            rebase_outcome_kind="provider_resolved",
+            changed_diff=True,
+            conflict_resolved=True,
+            resolution_provenance_complete=True,
+        ),
+        create_full_review=fake_full,
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no resolution")),
+    )
+
+    assert result.status == "created"
+    assert result.need == "full"
+    assert result.review_budget_used is True
+    assert result.review_task is not None
+    assert result.review_task.review_verify_head_sha == "head-a"
+    assert created == ["full"]
+
+
+def test_completed_resolution_rebase_status_keeps_resolution_review_available(tmp_path) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    rebase = _landing_rebase(store, impl, status="completed")
+    created: list[str] = []
+
+    def fake_resolution(*_args: Any, **kwargs: Any):
+        created.append("resolution")
+        review = store.add("Resolution review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_scope = build_resolution_review_scope(
+            implementation_task_id=impl.id,
+            rebase_task_id=rebase.id,
+            resolved_head_sha=kwargs["resolved_head_sha"],
+            resolved_target_sha=kwargs["resolved_target_sha"],
+            pre_rebase_head_sha="pre-head-a",
+            pre_rebase_target_sha="pre-target-a",
+            pre_rebase_merge_base_sha="merge-base-a",
+        )
+        review.review_verify_head_sha = kwargs["resolved_head_sha"]
+        store.update(review)
+        return review
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            rebase_task=rebase,
+            source_head="head-a",
+            target_head="target-a",
+            rebase_outcome_kind="provider_resolved",
+            changed_diff=True,
+            conflict_resolved=True,
+            resolution_provenance_complete=True,
+        ),
+        create_resolution_review=fake_resolution,
+    )
+
+    assert result.status == "created"
+    assert result.need == "resolution"
+    assert result.review_budget_used is True
+    assert created == ["resolution"]
+
+
+@pytest.mark.parametrize("rebase_status", ("pending", "in_progress", "failed", "stopped"))
+def test_noncompleted_resolution_rebase_status_reuses_exact_full_fallback_with_spent_budget(
+    tmp_path,
+    rebase_status: str,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    rebase = _landing_rebase(store, impl, status=rebase_status)
+    full = _completed_full_review(store, impl, head="head-a")
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            rebase_task=rebase,
+            source_head="head-a",
+            target_head="target-a",
+            rebase_outcome_kind="provider_resolved",
+            changed_diff=True,
+            conflict_resolved=True,
+            resolution_provenance_complete=True,
+            review_budget_used=True,
+        ),
+        create_full_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no create")),
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no resolution")),
+    )
+
+    assert result.status == "reused_completed"
+    assert result.need == "full"
+    assert result.review_task == full
+    assert result.review_budget_used is True
+
+
+@pytest.mark.parametrize("rebase_status", ("pending", "in_progress", "failed", "stopped"))
+def test_noncompleted_resolution_rebase_status_blocks_full_fallback_creation_when_budget_spent(
+    tmp_path,
+    rebase_status: str,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    rebase = _landing_rebase(store, impl, status=rebase_status)
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            rebase_task=rebase,
+            source_head="head-a",
+            target_head="target-a",
+            rebase_outcome_kind="provider_resolved",
+            changed_diff=True,
+            conflict_resolved=True,
+            resolution_provenance_complete=True,
+            review_budget_used=True,
+        ),
+        create_full_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("budget spent")),
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no resolution")),
+    )
+
+    assert result.status == "blocked"
+    assert result.need == "full"
+    assert result.review_budget_used is True
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "bounded-attempt-exhausted"
+
+
+@pytest.mark.parametrize("outcome_kind", ("provider_resolved", "recovered", "resumed", None))
+def test_unbindable_complete_resolution_provenance_reuses_exact_full_fallback_without_spending_again(
+    tmp_path,
+    outcome_kind: str | None,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    review = _completed_full_review(store, impl, head="head-a")
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            source_head="head-a",
+            target_head="target-a",
+            rebase_outcome_kind=outcome_kind,
+            changed_diff=None if outcome_kind is None else True,
+            conflict_resolved=outcome_kind == "provider_resolved",
+            resolution_provenance_complete=True,
+            review_budget_used=True,
+        ),
+        create_full_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no create")),
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no resolution")),
+    )
+
+    assert result.status == "reused_completed"
+    assert result.need == "full"
+    assert result.review_task == review
+    assert result.review_budget_used is True
+
+
+@pytest.mark.parametrize("outcome_kind", ("provider_resolved", "recovered", "resumed", None))
+@pytest.mark.parametrize(
+    "rebase_case",
+    (
+        "missing-row",
+        "wrong-task-type",
+        "wrong-lineage",
+        "missing-provenance",
+        "malformed-provenance",
+        "incomplete-provenance",
+        "mismatched-head",
+        "mismatched-target",
+    ),
+)
+def test_nonblank_unbindable_resolution_identity_reuses_exact_full_fallback_with_spent_budget(
+    tmp_path,
+    outcome_kind: str | None,
+    rebase_case: str,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    rebase = _unbindable_landing_rebase(store, impl, rebase_case)
+    review = _completed_full_review(store, impl, head="head-a")
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            rebase_task=rebase,
+            source_head="head-a",
+            target_head="target-a",
+            rebase_outcome_kind=outcome_kind,
+            changed_diff=None if outcome_kind is None else True,
+            conflict_resolved=outcome_kind == "provider_resolved",
+            resolution_provenance_complete=True,
+            review_budget_used=True,
+        ),
+        create_full_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no create")),
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no resolution")),
+    )
+
+    assert result.status == "reused_completed"
+    assert result.need == "full"
+    assert result.review_task == review
+    assert result.review_budget_used is True
+
+
+@pytest.mark.parametrize("outcome_kind", ("provider_resolved", "recovered", "resumed", None))
+@pytest.mark.parametrize("rebase_identity", ("absent", "idless"))
+def test_unbindable_complete_resolution_provenance_blocks_full_fallback_when_budget_spent(
+    tmp_path,
+    outcome_kind: str | None,
+    rebase_identity: str,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    rebase = None
+    if rebase_identity == "idless":
+        rebase = Task(id=None, prompt="ID-less rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            rebase_task=rebase,
+            source_head="head-a",
+            target_head="target-a",
+            rebase_outcome_kind=outcome_kind,
+            changed_diff=None if outcome_kind is None else True,
+            conflict_resolved=outcome_kind == "provider_resolved",
+            resolution_provenance_complete=True,
+            review_budget_used=True,
+        ),
+        create_full_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("budget spent")),
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no resolution")),
+    )
+
+    assert result.status == "blocked"
+    assert result.need == "full"
+    assert result.review_budget_used is True
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "bounded-attempt-exhausted"
+
+
+@pytest.mark.parametrize("outcome_kind", ("provider_resolved", "recovered", "resumed", None))
+@pytest.mark.parametrize(
+    "rebase_case",
+    (
+        "missing-row",
+        "wrong-task-type",
+        "wrong-lineage",
+        "missing-provenance",
+        "malformed-provenance",
+        "incomplete-provenance",
+        "mismatched-head",
+        "mismatched-target",
+    ),
+)
+def test_nonblank_unbindable_resolution_identity_blocks_full_fallback_when_budget_spent(
+    tmp_path,
+    outcome_kind: str | None,
+    rebase_case: str,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    rebase = _unbindable_landing_rebase(store, impl, rebase_case)
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            rebase_task=rebase,
+            source_head="head-a",
+            target_head="target-a",
+            rebase_outcome_kind=outcome_kind,
+            changed_diff=None if outcome_kind is None else True,
+            conflict_resolved=outcome_kind == "provider_resolved",
+            resolution_provenance_complete=True,
+            review_budget_used=True,
+        ),
+        create_full_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("budget spent")),
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no resolution")),
+    )
+
+    assert result.status == "blocked"
+    assert result.need == "full"
+    assert result.review_budget_used is True
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "bounded-attempt-exhausted"
+
+
+@pytest.mark.parametrize("review_status", ("pending", "completed"))
+def test_unbindable_resolution_review_scope_is_not_reused(
+    tmp_path,
+    review_status: str,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    rebase = _unbindable_landing_rebase(store, impl, "missing-provenance")
+    resolution = _resolution_review(
+        store,
+        impl,
+        rebase,
+        status=review_status,
+        resolved_head="head-a",
+        target="target-a",
+        verify_head="head-a",
+    )
+    full = _completed_full_review(store, impl, head="head-a")
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            rebase_task=rebase,
+            source_head="head-a",
+            target_head="target-a",
+            rebase_outcome_kind="provider_resolved",
+            changed_diff=True,
+            conflict_resolved=True,
+            resolution_provenance_complete=True,
+            review_budget_used=True,
+        ),
+        create_full_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no create")),
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no resolution")),
+    )
+
+    if review_status == "completed":
+        assert result.status == "reused_completed"
+        assert result.review_task == full
+    else:
+        assert result.status == "blocked"
+        assert result.review_task is None
+        assert result.blocked is not None
+        assert result.blocked.reason_code == "required-review-unavailable"
+    assert result.review_task != resolution
 
 
 @pytest.mark.parametrize("outcome_kind", (None, "unexpected"))
@@ -10295,7 +12045,7 @@ def test_active_resolution_review_with_contradictory_reviewed_head_blocks_withou
     active_status: str,
 ) -> None:
     store, impl = _completed_impl_for_landing_review(tmp_path)
-    rebase = store.add("Rebase landing review", task_type="rebase", based_on=impl.id, same_branch=True)
+    rebase = _landing_rebase(store, impl)
     active = _resolution_review(
         store,
         impl,
@@ -10353,7 +12103,7 @@ def test_full_post_rebase_review_rejects_blank_source_head(tmp_path) -> None:
 
 def test_completed_resolution_reviews_require_actual_reviewed_head(tmp_path) -> None:
     store, impl = _completed_impl_for_landing_review(tmp_path)
-    rebase = store.add("Rebase landing review", task_type="rebase", based_on=impl.id, same_branch=True)
+    rebase = _landing_rebase(store, impl)
     missing = _resolution_review(
         store,
         impl,
@@ -10406,13 +12156,118 @@ def test_completed_resolution_reviews_require_actual_reviewed_head(tmp_path) -> 
     assert calls == []
 
 
+@pytest.mark.parametrize("review_status", ("pending", "completed"))
+@pytest.mark.parametrize("field", ("head", "target", "merge_base"))
+@pytest.mark.parametrize("case", ("missing", "mismatched"))
+def test_resolution_reviews_require_exact_pre_rebase_scope_provenance(
+    tmp_path,
+    review_status: str,
+    field: str,
+    case: str,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    rebase = _landing_rebase(store, impl)
+    values = {
+        "head": "pre-head-a",
+        "target": "pre-target-a",
+        "merge_base": "merge-base-a",
+    }
+    values[field] = None if case == "missing" else f"other-{field}"
+    stale = _resolution_review(
+        store,
+        impl,
+        rebase,
+        status=review_status,
+        resolved_head="head-a",
+        target="target-a",
+        verify_head="head-a",
+        pre_rebase_head=values["head"],
+        pre_rebase_target=values["target"],
+        pre_rebase_merge_base=values["merge_base"],
+    )
+    created: list[str] = []
+
+    def fake_resolution(*_args: Any, **kwargs: Any):
+        created.append("created")
+        review = store.add("Replacement resolution review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_scope = build_resolution_review_scope(
+            implementation_task_id=impl.id,
+            rebase_task_id=rebase.id,
+            resolved_head_sha=kwargs["resolved_head_sha"],
+            resolved_target_sha=kwargs["resolved_target_sha"],
+            pre_rebase_head_sha="pre-head-a",
+            pre_rebase_target_sha="pre-target-a",
+            pre_rebase_merge_base_sha="merge-base-a",
+        )
+        review.review_verify_head_sha = kwargs["resolved_head_sha"]
+        store.update(review)
+        return review
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            rebase_task=rebase,
+            source_head="head-a",
+            target_head="target-a",
+            changed_diff=True,
+            resolution_provenance_complete=True,
+        ),
+        create_resolution_review=fake_resolution,
+    )
+
+    if review_status == "pending":
+        assert result.status == "blocked"
+        assert result.review_task is None
+        assert result.blocked is not None
+        assert result.blocked.reason_code == "required-review-unavailable"
+        assert stale.id in result.blocked.evidence_refs
+        assert created == []
+    else:
+        assert result.status == "created"
+        assert result.review_task != stale
+        assert created == ["created"]
+
+
+def test_completed_resolution_review_reuses_exact_pre_and_post_rebase_scope(tmp_path) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    rebase = _landing_rebase(store, impl)
+    exact = _resolution_review(
+        store,
+        impl,
+        rebase,
+        status="completed",
+        resolved_head="head-a",
+        target="target-a",
+        verify_head="head-a",
+    )
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            rebase_task=rebase,
+            source_head="head-a",
+            target_head="target-a",
+            changed_diff=True,
+            resolution_provenance_complete=True,
+        ),
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no create")),
+    )
+
+    assert result.status == "reused_completed"
+    assert result.review_task == exact
+    assert result.review_budget_used is False
+
+
 @pytest.mark.parametrize("missing_head", (None, "old-head"))
 def test_completed_resolution_review_with_missing_or_mismatched_actual_head_is_not_reused(
     tmp_path,
     missing_head: str | None,
 ) -> None:
     store, impl = _completed_impl_for_landing_review(tmp_path)
-    rebase = store.add("Rebase landing review", task_type="rebase", based_on=impl.id, same_branch=True)
+    rebase = _landing_rebase(store, impl)
     stale = _resolution_review(
         store,
         impl,
@@ -10449,7 +12304,7 @@ def test_active_incompatible_post_rebase_review_blocks_older_completed_reuse(
     active_status: str,
 ) -> None:
     store, impl = _completed_impl_for_landing_review(tmp_path)
-    rebase = store.add("Rebase landing review", task_type="rebase", based_on=impl.id, same_branch=True)
+    rebase = _landing_rebase(store, impl)
     _completed_full_review(store, impl, head="head-a", completed_at=datetime(2026, 8, 26, 12, 0, tzinfo=UTC))
     if need == "resolution":
         _resolution_review(
@@ -10508,7 +12363,7 @@ def test_exact_active_post_rebase_review_is_reused_or_waited_with_spent_budget(
     active_status: str,
 ) -> None:
     store, impl = _completed_impl_for_landing_review(tmp_path)
-    rebase = store.add("Rebase landing review", task_type="rebase", based_on=impl.id, same_branch=True)
+    rebase = _landing_rebase(store, impl)
     if need == "resolution":
         active = _resolution_review(
             store,
@@ -10613,6 +12468,9 @@ def test_completed_changes_requested_post_rebase_review_returns_without_second_r
     assert result.status == "reused_completed"
     assert result.review_task == review
     assert result.review_budget_used is False
+    assert transition.decision.blocked is not None
+    assert transition.decision.blocked.reason_code == "nondeferrable-blocker"
+    assert f"review:{review.id}" in transition.decision.blocked.evidence_refs
 
 
 def test_malformed_completed_post_rebase_review_blocks(tmp_path) -> None:
@@ -10641,6 +12499,73 @@ def test_malformed_completed_post_rebase_review_blocks(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("need", ("full", "resolution"))
+@pytest.mark.parametrize(
+    "exc",
+    (
+        OSError("report file unavailable"),
+        RuntimeError("parser exploded"),
+    ),
+)
+def test_exact_completed_post_rebase_review_read_failure_blocks_without_creation_or_budget(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    need: str,
+    exc: Exception,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    rebase = _landing_rebase(store, impl)
+    if need == "resolution":
+        review = _resolution_review(
+            store,
+            impl,
+            rebase,
+            status="completed",
+            resolved_head="head-a",
+            target="target-a",
+            verify_head="head-a",
+        )
+        request = LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            rebase_task=rebase,
+            source_head="head-a",
+            target_head="target-a",
+            changed_diff=True,
+            resolution_provenance_complete=True,
+        )
+    else:
+        review = _completed_full_review(store, impl, head="head-a")
+        request = LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            source_head="head-a",
+            target_head="target-a",
+            changed_diff=True,
+            resolution_provenance_complete=False,
+        )
+    calls: list[str] = []
+
+    def raise_read_failure(*_args: Any, **_kwargs: Any):
+        raise exc
+
+    monkeypatch.setattr(landing_module, "get_review_report", raise_read_failure)
+
+    result = acquire_one_post_rebase_review(
+        store,
+        request,
+        create_full_review=lambda *_args, **_kwargs: calls.append("full") or review,
+        create_resolution_review=lambda *_args, **_kwargs: calls.append("resolution") or review,
+    )
+
+    assert result.status == "blocked"
+    assert result.review_task == review
+    assert result.review_budget_used is False
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "required-review-unavailable"
+    assert review.id in result.blocked.evidence_refs
+    assert "could not be read" in result.blocked.fact
+    assert calls == []
+
+
+@pytest.mark.parametrize("need", ("full", "resolution"))
 @pytest.mark.parametrize("terminal_status", ("failed", "stopped"))
 def test_latest_exact_terminal_post_rebase_review_blocks_without_second_creation(
     tmp_path,
@@ -10648,7 +12573,7 @@ def test_latest_exact_terminal_post_rebase_review_blocks_without_second_creation
     terminal_status: str,
 ) -> None:
     store, impl = _completed_impl_for_landing_review(tmp_path)
-    rebase = store.add("Rebase landing review", task_type="rebase", based_on=impl.id, same_branch=True)
+    rebase = _landing_rebase(store, impl)
     _completed_full_review(
         store,
         impl,
@@ -10764,6 +12689,7 @@ def test_post_rebase_review_result_budget_is_monotonic_after_spent_entry(
         review_budget_used=True,
     )
     if case == "not_required":
+        _completed_full_review(store, impl, head="head-a")
         request = LandingPostRebaseReviewRequest(
             impl_task=impl,
             source_head="head-a",
@@ -10972,12 +12898,9 @@ def test_post_rebase_review_budget_sequence_never_allows_second_review_after_cha
     assert completed.review_result.review_budget_used is True
     assert completed.review_result.review_task == first.review_task
     _assert_no_improve_action(completed.review_result)
-    assert completed.decision.allowed is True
-    assert completed.decision.allowed_overrides == (
-        "defer-review-blockers",
-        "parked:review-max-cycles-reached",
-    )
-    assert completed.decision.judgment_verdict == "LAND"
+    assert completed.decision.blocked is not None
+    assert completed.decision.blocked.reason_code == "nondeferrable-blocker"
+    assert f"review:{first.review_task.id}" in completed.decision.blocked.evidence_refs
     _assert_no_review_or_improve_rows_after_landing_review(store, {first.review_task.id or ""})
 
     first.review_task.status = "pending"
@@ -11001,6 +12924,10 @@ def test_post_rebase_review_budget_sequence_never_allows_second_review_after_cha
     assert pending.review_budget_used is True
     _assert_no_improve_action(pending)
     _assert_no_improve_rows(store)
+
+    first.review_task.status = "completed"
+    first.review_task.completed_at = datetime(2026, 8, 26, 12, 1, tzinfo=UTC)
+    store.update(first.review_task)
 
     no_longer_required = acquire_one_post_rebase_review(
         store,

@@ -42,6 +42,11 @@ from gza.merge_services import (
 )
 from gza.merge_state import classify_branch_merge_state_for_target, recorded_head_has_remaining_net_diff
 from gza.query import get_implementation_review_evidence, get_same_branch_rebase_descendants_for_root
+from gza.rebase_diff import (
+    RebaseDiffProvenance,
+    parse_rebase_diff_provenance,
+    resolution_delta_provenance_is_complete,
+)
 from gza.rebase_service import (
     COMPLETED_REBASE_EXECUTION_STATUSES,
     REBASE_EXECUTION_OUTCOME_ARTIFACT_KIND,
@@ -180,6 +185,11 @@ LandingPostRebaseReviewStatus = Literal[
     "blocked",
 ]
 LandingPostRebaseReviewNeed = Literal["none", "resolution", "full"]
+
+_LANDING_FULL_REVIEW_FALLBACK_EPOCH_ARTIFACT_KIND = "landing_full_review_fallback_epoch"
+_LANDING_FULL_REVIEW_FALLBACK_EPOCH_SCHEMA_VERSION = 1
+_EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
 LandingRebaseOutcomeKind = Literal[
     "mechanical",
     "no_op",
@@ -1090,7 +1100,11 @@ class LandingCoordinator:
                 continue
 
             if first_boundary == "post_rebase_review":
-                step, blocked, decision = self._run_post_rebase_review_phase(identity, facts, policy=request.policy)
+                step, blocked, decision, selected_facts = self._run_post_rebase_review_phase(
+                    identity,
+                    facts,
+                    policy=request.policy,
+                )
                 steps.append(step)
                 if blocked is not None:
                     return self._blocked_result(request, identity, steps, blocked)
@@ -1099,7 +1113,7 @@ class LandingCoordinator:
                 return self._run_policy_and_merge_phases(
                     request=request,
                     identity=identity,
-                    facts=facts,
+                    facts=selected_facts,
                     steps=steps,
                     judge_required=False,
                     decision=decision,
@@ -2696,25 +2710,27 @@ class LandingCoordinator:
         facts: LandingPolicyFacts,
         *,
         policy: LandingPolicyName,
-    ) -> tuple[LandStep, LandBlocked | None, LandingPolicyDecision | None]:
+    ) -> tuple[LandStep, LandBlocked | None, LandingPolicyDecision | None, LandingPolicyFacts]:
         if identity.source_sha is None or identity.target_sha is None:
             blocked = LandBlocked(
                 "identity-proof-unavailable",
                 "exact local source or target ref proof is unavailable",
                 _evidence_refs(identity.owner_task_id, identity.source_ref, identity.target_branch),
             )
-            return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None
+            return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None, facts
         review_request = self._post_rebase_review_request(identity, facts)
+        transition_facts = self._facts_with_preserved_review_if_eligible(facts, review_request)
         transition = run_landing_post_rebase_review_transition(
             self.store,
             review_request,
             policy=policy,
-            facts=self._facts_with_preserved_review_if_eligible(facts, review_request),
+            facts=transition_facts,
             config=self.config,
             judge=self.landing_judge,
             create_full_review=self.create_full_review,
             create_resolution_review=self.create_resolution_review,
         )
+        selected_facts = transition.selected_facts
         self.post_rebase_review_budget_used = transition.review_result.review_budget_used
         review_result = transition.review_result
         if review_result.blocked is not None:
@@ -2727,6 +2743,7 @@ class LandingCoordinator:
                 ),
                 review_result.blocked,
                 None,
+                selected_facts,
             )
         if review_result.status in {"created", "pending"} and self.review_executor is not None:
             review = review_result.review_task
@@ -2736,7 +2753,7 @@ class LandingCoordinator:
                     "post-rebase review identity is unavailable",
                     _evidence_refs(identity.owner_task_id, identity.source_sha),
                 )
-                return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None
+                return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None, selected_facts
             try:
                 rc = self.review_executor(self.config, review.id)
             except Exception as exc:
@@ -2745,14 +2762,14 @@ class LandingCoordinator:
                     _exception_fact("post-rebase review execution failed", exc),
                     _evidence_refs(review.id, identity.owner_task_id, identity.source_sha),
                 )
-                return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None
+                return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None, selected_facts
             if rc != 0:
                 blocked = LandBlocked(
                     "required-review-unavailable",
                     f"post-rebase review {review.id} exited {rc}",
                     _evidence_refs(review.id, identity.owner_task_id, identity.source_sha),
                 )
-                return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None
+                return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None, selected_facts
             refreshed = self.store.get(review.id)
             if refreshed is None or refreshed.status != "completed":
                 blocked = LandBlocked(
@@ -2760,7 +2777,7 @@ class LandingCoordinator:
                     f"post-rebase review {review.id} did not complete",
                     _evidence_refs(review.id, identity.owner_task_id, identity.source_sha),
                 )
-                return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None
+                return LandStep("post_rebase_review", "blocked", blocked.fact, blocked=blocked), blocked, None, selected_facts
             return (
                 LandStep(
                     "post_rebase_review",
@@ -2770,6 +2787,7 @@ class LandingCoordinator:
                 ),
                 None,
                 None,
+                selected_facts,
             )
 
         if review_result.status in {"created", "pending", "in_progress"}:
@@ -2789,6 +2807,7 @@ class LandingCoordinator:
                 ),
                 blocked,
                 None,
+                selected_facts,
             )
         if review_result.status == "not_required":
             if not transition.decision.allowed and transition.decision.blocked is not None:
@@ -2801,16 +2820,18 @@ class LandingCoordinator:
                     ),
                     transition.decision.blocked,
                     transition.decision,
+                    selected_facts,
                 )
             return (
                 LandStep(
                     "post_rebase_review",
                     "skipped",
                     "mechanical unchanged rebase preserves eligible review evidence",
-                    evidence_refs=_review_evidence(facts.review, facts),
+                    evidence_refs=_review_evidence(selected_facts.review, selected_facts),
                 ),
                 None,
                 transition.decision,
+                selected_facts,
             )
         if not transition.decision.allowed and transition.decision.blocked is not None:
             return (
@@ -2822,10 +2843,12 @@ class LandingCoordinator:
                 ),
                 transition.decision.blocked,
                 transition.decision,
+                selected_facts,
             )
         review = review_result.review_task
         assert review is not None
-        verdict = _landing_review_verdict_from_task(self.config, review)
+        verdict_read = _landing_review_verdict_from_task(self.config, review)
+        verdict = verdict_read.verdict if verdict_read.failure is None else "unavailable"
         return (
             LandStep(
                 "post_rebase_review",
@@ -2835,6 +2858,7 @@ class LandingCoordinator:
             ),
             None,
             transition.decision,
+            selected_facts,
         )
 
     def _default_verify_action_context(self) -> AdvanceActionExecutionContext:
@@ -2893,21 +2917,39 @@ class LandingCoordinator:
         facts: LandingPolicyFacts,
         request: LandingPostRebaseReviewRequest,
     ) -> LandingPolicyFacts:
-        if facts.review is None:
-            return facts
-        if not facts.review.parseable or facts.review.status != "completed" or not facts.review.review_id:
-            return facts
-        need = _post_rebase_review_need(request, source_head=request.source_head, target_head=request.target_head)
+        need = _post_rebase_review_need(
+            self.store,
+            request,
+            config=self.config,
+            source_head=request.source_head,
+            target_head=request.target_head,
+        )
         if need != "none":
             return facts
+        source_head = _normalize_optional_identity(request.source_head)
+        if source_head is None:
+            return facts
+        carry_forward_review = _find_valid_post_rebase_carry_forward_review(
+            self.store,
+            request,
+            config=self.config,
+            source_head=source_head,
+        )
+        if not isinstance(carry_forward_review, DbTask):
+            return facts
+        review = _landing_review_evidence_from_task(
+            self.store,
+            self.config,
+            carry_forward_review,
+            identity=facts,
+            rebase=_rebase_fingerprint_from_facts(facts),
+            required=facts.review.required if facts.review is not None else True,
+            force_current=True,
+        )
         return replace(
             facts,
-            review=replace(
-                facts.review,
-                current=True,
-                identity_matched=True,
-                reviewed_head=facts.source_head,
-            ),
+            review=review,
+            open_blockers=_landing_open_blockers_from_review(review),
         )
 
     def _blocked_result(
@@ -3593,6 +3635,7 @@ class LandingPostRebaseReviewTransition:
 
     review_result: LandingPostRebaseReviewResult
     decision: LandingPolicyDecision
+    selected_facts: LandingPolicyFacts
 
 
 def run_landing_post_rebase_review_transition(
@@ -3621,24 +3664,26 @@ def run_landing_post_rebase_review_transition(
         create_full_review=create_full_review,
         create_resolution_review=create_resolution_review,
     )
-    decision = _consume_landing_post_rebase_review_result(
+    decision, selected_facts = _consume_landing_post_rebase_review_result(
         result,
         policy=policy,
+        store=store,
         facts=facts,
         config=config,
         judge=judge,
     )
-    return LandingPostRebaseReviewTransition(result, decision)
+    return LandingPostRebaseReviewTransition(result, decision, selected_facts)
 
 
 def _consume_landing_post_rebase_review_result(
     result: LandingPostRebaseReviewResult,
     *,
     policy: LandingPolicyName,
+    store: SqliteTaskStore,
     facts: LandingPolicyFacts,
     config: Any | None = None,
     judge: LandingJudge | None = None,
-) -> LandingPolicyDecision:
+) -> tuple[LandingPolicyDecision, LandingPolicyFacts]:
     """Consume landing's one-shot post-rebase review result.
 
     This is the landing-specific transition seam between acquiring a
@@ -3649,19 +3694,22 @@ def _consume_landing_post_rebase_review_result(
 
     if result.status == "blocked":
         assert result.blocked is not None
-        return LandingPolicyDecision(False, blocked=result.blocked)
+        return LandingPolicyDecision(False, blocked=result.blocked), facts
     if result.status in {"created", "pending", "in_progress"}:
-        return LandingPolicyDecision(
-            False,
-            blocked=LandBlocked(
-                "required-review-unavailable",
-                "post-rebase review has not completed",
-                _evidence_refs(
-                    result.review_task.id if result.review_task is not None else None,
-                    facts.task_id,
-                    facts.source_head,
+        return (
+            LandingPolicyDecision(
+                False,
+                blocked=LandBlocked(
+                    "required-review-unavailable",
+                    "post-rebase review has not completed",
+                    _evidence_refs(
+                        result.review_task.id if result.review_task is not None else None,
+                        facts.task_id,
+                        facts.source_head,
+                    ),
                 ),
             ),
+            facts,
         )
 
     policy_facts = facts
@@ -3670,42 +3718,48 @@ def _consume_landing_post_rebase_review_result(
         project_dir = Path(getattr(config, "project_dir", Path.cwd()))
         report = get_review_report(project_dir, result.review_task)
         if report.verdict not in {"APPROVED", "APPROVED_WITH_FOLLOWUPS", "CHANGES_REQUESTED", "NEEDS_DISCUSSION"}:
-            return LandingPolicyDecision(
-                False,
-                blocked=LandBlocked(
-                    "required-review-unavailable",
-                    "post-rebase review evidence is malformed or not merge-decision bearing",
-                    _evidence_refs(result.review_task.id, facts.source_head),
+            return (
+                LandingPolicyDecision(
+                    False,
+                    blocked=LandBlocked(
+                        "required-review-unavailable",
+                        "post-rebase review evidence is malformed or not merge-decision bearing",
+                        _evidence_refs(result.review_task.id, facts.source_head),
+                    ),
                 ),
+                facts,
             )
-        mode: LandingReviewMode = "resolution" if result.need == "resolution" else "plain_full"
-        if facts.review is not None:
-            review = replace(
-                facts.review,
-                status="completed",
-                mode=facts.review.mode if facts.review.mode != "unknown" else mode,
-                verdict=cast(LandingReviewVerdict, report.verdict),
-                current=True,
-                parseable=True,
-                identity_matched=True,
-                review_id=result.review_task.id,
-                reviewed_head=result.review_task.review_verify_head_sha or facts.source_head,
-            )
-        else:
-            review = LandingReviewEvidence(
-                required=True,
-                status="completed",
-                mode=mode,
-                verdict=cast(LandingReviewVerdict, report.verdict),
-                current=True,
-                parseable=True,
-                identity_matched=True,
-                review_id=result.review_task.id,
-                reviewed_head=result.review_task.review_verify_head_sha or facts.source_head,
-            )
+        review = _landing_review_evidence_from_task(
+            store,
+            config,
+            result.review_task,
+            identity=facts,
+            rebase=_rebase_fingerprint_from_facts(facts),
+            required=facts.review.required if facts.review is not None else True,
+            force_current=True,
+        )
         policy_facts = replace(facts, review=review)
+        policy_facts = replace(policy_facts, open_blockers=_landing_open_blockers_from_review(review))
 
-    return evaluate_landing_policy(policy=policy, facts=policy_facts, judge=judge)
+    return evaluate_landing_policy(policy=policy, facts=policy_facts, judge=judge), policy_facts
+
+
+@dataclass(frozen=True)
+class _ResolutionRebaseBinding:
+    rebase_task: DbTask
+    provenance: RebaseDiffProvenance
+
+
+@dataclass(frozen=True)
+class _LandingReviewVerdictReadFailure:
+    review_id: str | None
+    error: str
+
+
+@dataclass(frozen=True)
+class _LandingReviewVerdictRead:
+    verdict: str | None = None
+    failure: _LandingReviewVerdictReadFailure | None = None
 
 
 class LandingCreateReviewResult(Protocol):
@@ -4287,13 +4341,27 @@ def acquire_one_post_rebase_review(
                 _evidence_refs(request.impl_task.id),
             ),
         )
-    need = _post_rebase_review_need(request, source_head=source_head, target_head=target_head)
+    need = _post_rebase_review_need(store, request, config=config, source_head=source_head, target_head=target_head)
+    if isinstance(need, _LandingReviewVerdictReadFailure):
+        return LandingPostRebaseReviewResult(
+            status="blocked",
+            need="full",
+            review_budget_used=review_budget_used,
+            blocked=_verdict_read_failure_block(need, request.impl_task.id, source_head),
+        )
     if need == "none":
         return LandingPostRebaseReviewResult(
             status="not_required",
             need="none",
             review_budget_used=review_budget_used,
         )
+    if need == "resolution" and not _resolution_review_identity_is_bindable(
+        store,
+        request,
+        source_head=source_head,
+        target_head=target_head,
+    ):
+        need = "full"
     action = _post_rebase_review_action(request, need)
     if action is None:
         return LandingPostRebaseReviewResult(
@@ -4325,6 +4393,7 @@ def acquire_one_post_rebase_review(
             exact_active,
             subject_task_id=request.impl_task.id or "",
             action=action,
+            store=store,
             completed=False,
         ):
             status = "in_progress" if exact_active.status == "in_progress" else "pending"
@@ -4336,11 +4405,40 @@ def acquire_one_post_rebase_review(
                 review_budget_used=True,
             )
 
-    exact = _find_exact_landing_review(store, request.impl_task, action=action)
+    fallback_epoch_key = _landing_full_review_fallback_epoch_key(
+        request,
+        source_head=source_head,
+        target_head=target_head,
+        need=need,
+    )
+    excluded_exact_review_ids = _excluded_historical_carry_forward_review_ids(
+        store,
+        request,
+        config=config,
+        source_head=source_head,
+        target_head=target_head,
+        need=need,
+        fallback_epoch_key=fallback_epoch_key,
+    )
+    exact = _find_exact_landing_review(
+        store,
+        request.impl_task,
+        action=action,
+        exclude_review_ids=excluded_exact_review_ids,
+    )
     if exact is not None:
         if exact.status == "completed":
-            verdict = _landing_review_verdict_from_task(config, exact)
-            if verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS", "CHANGES_REQUESTED"}:
+            verdict_read = _landing_review_verdict_from_task(config, exact)
+            if verdict_read.failure is not None:
+                return LandingPostRebaseReviewResult(
+                    status="blocked",
+                    need=need,
+                    review_task=exact,
+                    action=action,
+                    review_budget_used=review_budget_used,
+                    blocked=_verdict_read_failure_block(verdict_read.failure, request.impl_task.id, source_head),
+                )
+            if verdict_read.verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS", "CHANGES_REQUESTED"}:
                 return LandingPostRebaseReviewResult(
                     status="reused_completed",
                     need=need,
@@ -4409,12 +4507,20 @@ def acquire_one_post_rebase_review(
             )
             review.review_verify_head_sha = source_head
             store.update(review)
+            if fallback_epoch_key is not None:
+                _persist_landing_full_review_fallback_epoch(
+                    store,
+                    review=review,
+                    fallback_epoch_key=fallback_epoch_key,
+                    source_head=source_head,
+                )
     except DuplicateReviewError as exc:
         active = exc.active_review
         if _landing_review_matches_required_identity(
             active,
             subject_task_id=request.impl_task.id or "",
             action=action,
+            store=store,
             completed=False,
         ):
             status = "in_progress" if active.status == "in_progress" else "pending"
@@ -5076,32 +5182,61 @@ def _inspect_query_landing_review_evidence(
             latest = review
     if latest is None:
         return LandingReviewEvidence(required=required, status="unavailable")
-    status = cast(LandingReviewStatus, latest.status if latest.status in {"completed", "failed", "pending", "in_progress"} else "unavailable")
-    resolution_declared = declares_resolution_review_mode(latest.review_scope)
+    return _landing_review_evidence_from_task(
+        store,
+        config,
+        latest,
+        identity=identity,
+        rebase=rebase,
+        required=required,
+    )
+
+
+def _landing_review_evidence_from_task(
+    store: SqliteTaskStore,
+    config: Any | None,
+    review_task: DbTask,
+    *,
+    identity: Any,
+    rebase: LandingRebaseFingerprint | None,
+    required: bool,
+    force_current: bool = False,
+) -> LandingReviewEvidence:
+    status = cast(
+        LandingReviewStatus,
+        review_task.status if review_task.status in {"completed", "failed", "pending", "in_progress"} else "unavailable",
+    )
+    resolution_declared = declares_resolution_review_mode(review_task.review_scope)
     mode: LandingReviewMode = "resolution" if resolution_declared else "plain_full"
-    report = _landing_review_report_from_task(config, latest) if latest.status == "completed" else None
+    report = _landing_review_report_from_task(config, review_task) if review_task.status == "completed" else None
     verdict = getattr(report, "verdict", None) if report is not None else None
     parseable = verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS", "CHANGES_REQUESTED", "NEEDS_DISCUSSION"}
-    reviewed_head = latest.review_verify_head_sha
-    identity_matched = latest.status == "completed" and parseable and reviewed_head == identity.source_sha
-    if resolution_declared:
+    expected_source_head = getattr(identity, "source_sha", None) or getattr(identity, "source_head", None)
+    reviewed_head = expected_source_head if force_current else review_task.review_verify_head_sha
+    identity_matched = review_task.status == "completed" and parseable and reviewed_head == expected_source_head
+    if resolution_declared and isinstance(identity, LandingResolvedIdentity):
         identity_matched = identity_matched and _resolution_review_scope_matches_landing_identity(
-            latest.review_scope,
+            review_task.review_scope,
             identity,
+            store=store,
             rebase=rebase,
         )
+    elif resolution_declared:
+        identity_matched = False
+    if force_current and review_task.status == "completed" and parseable:
+        identity_matched = True
     current = identity_matched
     findings = tuple(getattr(report, "findings", ())) if report is not None and identity_matched else ()
     blocker_count: int | None = None
-    if latest.status == "completed" and parseable and latest.output_content:
+    if review_task.status == "completed" and parseable and review_task.output_content:
         try:
-            blocker_count = summarize_review_blockers(latest.output_content).blocker_count
+            blocker_count = summarize_review_blockers(review_task.output_content).blocker_count
         except Exception:
             blocker_count = None
     blocker_validation, parsed_blockers = _validate_landing_finding_set(
         findings,
         severity="BLOCKER",
-        review_id=latest.id,
+        review_id=review_task.id,
         expected_count=blocker_count,
     )
     observed_followup_count = sum(1 for finding in findings if isinstance(finding, ReviewFinding) and finding.severity == "FOLLOWUP")
@@ -5109,7 +5244,7 @@ def _inspect_query_landing_review_evidence(
     followup_validation, followups = _validate_landing_finding_set(
         findings,
         severity="FOLLOWUP",
-        review_id=latest.id,
+        review_id=review_task.id,
         expected_count=expected_followup_count,
     )
     evidence = LandingReviewEvidence(
@@ -5120,9 +5255,9 @@ def _inspect_query_landing_review_evidence(
         current=current,
         parseable=parseable,
         identity_matched=identity_matched,
-        review_id=latest.id,
+        review_id=review_task.id,
         reviewed_head=reviewed_head,
-        followup_findings=_landing_followups_from_validated_findings(followups, review_id=latest.id) if identity_matched else (),
+        followup_findings=_landing_followups_from_validated_findings(followups, review_id=review_task.id) if identity_matched else (),
         blocker_validation=blocker_validation if identity_matched else None,
         followup_validation=followup_validation if identity_matched else None,
     )
@@ -5139,6 +5274,7 @@ def _resolution_review_scope_matches_landing_identity(
     review_scope: str | None,
     identity: LandingResolvedIdentity,
     *,
+    store: SqliteTaskStore,
     rebase: LandingRebaseFingerprint | None,
 ) -> bool:
     if identity.owner_task.id is None or identity.source_sha is None or identity.target_sha is None:
@@ -5151,11 +5287,17 @@ def _resolution_review_scope_matches_landing_identity(
         return False
     if scope is None:
         return False
-    return (
-        scope.implementation_task_id == identity.owner_task.id
-        and scope.rebase_task_id == rebase.rebase_task_id
-        and scope.resolved_head_sha == identity.source_sha
-        and scope.resolved_target_sha == identity.target_sha
+    if (
+        scope.implementation_task_id != identity.owner_task.id
+        or scope.rebase_task_id != rebase.rebase_task_id
+        or scope.resolved_head_sha != identity.source_sha
+        or scope.resolved_target_sha != identity.target_sha
+    ):
+        return False
+    return _resolution_review_scope_matches_rebase_binding(
+        store,
+        implementation_task_id=identity.owner_task.id,
+        metadata=scope,
     )
 
 
@@ -5337,7 +5479,8 @@ def _inspect_query_landing_spec_coherence_evidence(
             changed_paths_fingerprint=_changed_paths_fingerprint(changed_paths),
         )
     latest = max(spec_reviews, key=_task_recency_key)
-    verdict = _landing_review_verdict_from_task(None, latest) if latest.status == "completed" else None
+    verdict_read = _landing_review_verdict_from_task(config, latest) if latest.status == "completed" else None
+    verdict = verdict_read.verdict if verdict_read is not None and verdict_read.failure is None else None
     parseable = verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS", "CHANGES_REQUESTED", "NEEDS_DISCUSSION"}
     parsed_paths: tuple[str, ...] = ()
     try:
@@ -5570,11 +5713,13 @@ def _aggregate_tree_fingerprint_is_complete(aggregate: dict[str, Any]) -> bool:
 
 
 def _post_rebase_review_need(
+    store: SqliteTaskStore,
     request: LandingPostRebaseReviewRequest,
     *,
+    config: Any | None = None,
     source_head: str | None = None,
     target_head: str | None = None,
-) -> LandingPostRebaseReviewNeed:
+) -> LandingPostRebaseReviewNeed | _LandingReviewVerdictReadFailure:
     outcome_kind = request.rebase_outcome_kind
     if outcome_kind == "provider_resolved" or request.conflict_resolved:
         return "resolution" if request.resolution_provenance_complete else "full"
@@ -5584,14 +5729,295 @@ def _post_rebase_review_need(
         if request.changed_diff is False:
             return "full"
         return "resolution" if request.resolution_provenance_complete else "full"
-    if (
+    carry_forward = (
         request.changed_diff is False
         and source_head is not None
         and target_head is not None
         and _valid_post_rebase_carry_forward_identity(request, source_head=source_head, target_head=target_head)
-    ):
-        return "none"
+    )
+    if carry_forward:
+        assert source_head is not None
+        carry_forward_review = _find_valid_post_rebase_carry_forward_review(
+            store,
+            request,
+            config=config,
+            source_head=source_head,
+        )
+        if isinstance(carry_forward_review, _LandingReviewVerdictReadFailure):
+            return carry_forward_review
+        if carry_forward_review is not None:
+            return "none"
     return "full"
+
+
+def _resolution_review_identity_is_bindable(
+    store: SqliteTaskStore,
+    request: LandingPostRebaseReviewRequest,
+    *,
+    source_head: str,
+    target_head: str,
+) -> bool:
+    if request.impl_task.id is None or request.rebase_task is None or request.rebase_task.id is None:
+        return False
+    return (
+        _exact_resolution_rebase_binding(
+            store,
+            implementation_task_id=request.impl_task.id,
+            rebase_task_id=request.rebase_task.id,
+            resolved_head_sha=source_head,
+            resolved_target_sha=target_head,
+        )
+        is not None
+    )
+
+
+def _persisted_resolution_rebase_is_bindable(
+    store: SqliteTaskStore,
+    *,
+    implementation_task_id: str,
+    rebase_task_id: str,
+    resolved_head_sha: str,
+    resolved_target_sha: str,
+) -> bool:
+    return (
+        _exact_resolution_rebase_binding(
+            store,
+            implementation_task_id=implementation_task_id,
+            rebase_task_id=rebase_task_id,
+            resolved_head_sha=resolved_head_sha,
+            resolved_target_sha=resolved_target_sha,
+        )
+        is not None
+    )
+
+
+def _exact_resolution_rebase_binding(
+    store: SqliteTaskStore,
+    *,
+    implementation_task_id: str,
+    rebase_task_id: str,
+    resolved_head_sha: str,
+    resolved_target_sha: str,
+) -> _ResolutionRebaseBinding | None:
+    rebase_task = store.get(rebase_task_id)
+    if rebase_task is None:
+        return None
+    if rebase_task.status != "completed":
+        return None
+    if rebase_task.task_type != "rebase" or rebase_task.based_on != implementation_task_id:
+        return None
+    provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
+    if provenance is None or not resolution_delta_provenance_is_complete(provenance):
+        return None
+    if (
+        provenance.resolved_head_sha != resolved_head_sha
+        or provenance.resolved_target_sha != resolved_target_sha
+    ):
+        return None
+    return _ResolutionRebaseBinding(rebase_task=rebase_task, provenance=provenance)
+
+
+def _resolution_review_scope_matches_rebase_binding(
+    store: SqliteTaskStore,
+    *,
+    implementation_task_id: str,
+    metadata: Any,
+) -> bool:
+    binding = _exact_resolution_rebase_binding(
+        store,
+        implementation_task_id=implementation_task_id,
+        rebase_task_id=metadata.rebase_task_id,
+        resolved_head_sha=metadata.resolved_head_sha,
+        resolved_target_sha=metadata.resolved_target_sha,
+    )
+    if binding is None:
+        return False
+    provenance = binding.provenance
+    return (
+        metadata.pre_rebase_head_sha == provenance.old_tip
+        and metadata.pre_rebase_target_sha == provenance.target_at_start
+        and metadata.pre_rebase_merge_base_sha == provenance.merge_base_at_start
+    )
+
+
+def _find_valid_post_rebase_carry_forward_review(
+    store: SqliteTaskStore,
+    request: LandingPostRebaseReviewRequest,
+    *,
+    config: Any | None,
+    source_head: str,
+) -> DbTask | None | _LandingReviewVerdictReadFailure:
+    action = _post_rebase_carry_forward_action(request, source_head=source_head)
+    if action is None:
+        return None
+    review = _find_exact_landing_review(store, request.impl_task, action=action)
+    if review is None or review.status != "completed":
+        return None
+    verdict_read = _landing_review_verdict_from_task(config, review)
+    if verdict_read.failure is not None:
+        return verdict_read.failure
+    if verdict_read.verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS", "CHANGES_REQUESTED"}:
+        return review
+    return None
+
+
+def _excluded_historical_carry_forward_review_ids(
+    store: SqliteTaskStore,
+    request: LandingPostRebaseReviewRequest,
+    *,
+    config: Any | None,
+    source_head: str,
+    target_head: str,
+    need: LandingPostRebaseReviewNeed,
+    fallback_epoch_key: dict[str, Any] | None,
+) -> frozenset[str]:
+    if fallback_epoch_key is not None:
+        pre_rebase_source_head = _normalize_optional_identity(request.pre_rebase_source_head)
+        if pre_rebase_source_head is not None and pre_rebase_source_head != source_head:
+            return frozenset()
+        action = _post_rebase_review_action(request, need)
+        if action is None or request.impl_task.id is None:
+            return frozenset()
+        return frozenset(
+            review.id
+            for review in store.get_reviews_for_task(request.impl_task.id)
+            if review.id is not None
+            and review.status in {"completed", "failed", "stopped"}
+            and _landing_review_matches_required_identity(
+                review,
+                subject_task_id=request.impl_task.id,
+                action=action,
+                store=store,
+                completed=review.status == "completed",
+            )
+            and not _landing_full_review_matches_fallback_epoch(
+                store,
+                review=review,
+                fallback_epoch_key=fallback_epoch_key,
+            )
+        )
+    if need != "full" or request.review_budget_used:
+        return frozenset()
+    if not (
+        request.changed_diff is False
+        and _valid_post_rebase_carry_forward_identity(request, source_head=source_head, target_head=target_head)
+    ):
+        return frozenset()
+    action = _post_rebase_carry_forward_action(request, source_head=source_head)
+    if action is None:
+        return frozenset()
+    review = _find_exact_landing_review(store, request.impl_task, action=action)
+    if review is None or review.status != "completed" or review.id is None:
+        return frozenset()
+    verdict_read = _landing_review_verdict_from_task(config, review)
+    if verdict_read.failure is not None:
+        return frozenset()
+    if verdict_read.verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS", "CHANGES_REQUESTED"}:
+        return frozenset()
+    return frozenset({review.id})
+
+
+def _landing_full_review_fallback_epoch_key(
+    request: LandingPostRebaseReviewRequest,
+    *,
+    source_head: str,
+    target_head: str,
+    need: LandingPostRebaseReviewNeed,
+) -> dict[str, Any] | None:
+    if need != "full" or request.impl_task.id is None:
+        return None
+    if request.changed_diff is not False or request.conflict_resolved:
+        return None
+    if request.rebase_outcome_kind in {"provider_resolved", "recovered", "resumed"}:
+        return None
+    identity = request.rebase_outcome_identity
+    return {
+        "schema_version": _LANDING_FULL_REVIEW_FALLBACK_EPOCH_SCHEMA_VERSION,
+        "implementation_task_id": request.impl_task.id,
+        "source_head": source_head,
+        "target_head": target_head,
+        "pre_rebase_source_head": request.pre_rebase_source_head,
+        "request_rebase_outcome_kind": request.rebase_outcome_kind,
+        "request_changed_diff": request.changed_diff,
+        "rebase_outcome_identity": (
+            {
+                "outcome_id": identity.outcome_id,
+                "outcome_kind": identity.outcome_kind,
+                "attempted_source_head": identity.attempted_source_head,
+                "attempted_target_head": identity.attempted_target_head,
+                "live_source_head": identity.live_source_head,
+                "live_target_head": identity.live_target_head,
+                "target_contained": identity.target_contained,
+                "provider_resolution_proof": identity.provider_resolution_proof,
+                "changed_diff": identity.changed_diff,
+                "no_op_subtype": identity.no_op_subtype,
+            }
+            if identity is not None
+            else None
+        ),
+    }
+
+
+def _persist_landing_full_review_fallback_epoch(
+    store: SqliteTaskStore,
+    *,
+    review: DbTask,
+    fallback_epoch_key: dict[str, Any],
+    source_head: str,
+) -> None:
+    if review.id is None:
+        return
+    store.add_artifact(
+        review.id,
+        kind=_LANDING_FULL_REVIEW_FALLBACK_EPOCH_ARTIFACT_KIND,
+        label="landing full review fallback epoch",
+        path=f".gza/artifacts/{review.id}/landing-full-review-fallback-epoch.json",
+        byte_size=0,
+        sha256=_EMPTY_SHA256,
+        producer="gza.landing",
+        status="current",
+        head_sha=source_head,
+        metadata=fallback_epoch_key,
+    )
+
+
+def _landing_full_review_matches_fallback_epoch(
+    store: SqliteTaskStore,
+    *,
+    review: DbTask,
+    fallback_epoch_key: dict[str, Any],
+) -> bool:
+    if review.id is None:
+        return False
+    for artifact in store.list_artifacts(
+        review.id,
+        kind=_LANDING_FULL_REVIEW_FALLBACK_EPOCH_ARTIFACT_KIND,
+    ):
+        if artifact.metadata == fallback_epoch_key:
+            return True
+    return False
+
+
+def _post_rebase_carry_forward_action(
+    request: LandingPostRebaseReviewRequest,
+    *,
+    source_head: str,
+) -> dict[str, Any] | None:
+    if request.impl_task.id is None:
+        return None
+    review_head = source_head
+    if request.rebase_outcome_kind == "mechanical":
+        try:
+            review_head = _normalize_required_ref(
+                request.pre_rebase_source_head,
+                "landing pre-rebase source head",
+            )
+        except ValueError:
+            return None
+    return {
+        "type": "create_review",
+        "review_head_sha": review_head,
+    }
 
 
 def _valid_post_rebase_carry_forward_identity(
@@ -5670,17 +6096,20 @@ def _find_exact_landing_review(
     impl_task: DbTask,
     *,
     action: dict[str, Any],
+    exclude_review_ids: frozenset[str] = frozenset(),
 ) -> DbTask | None:
     if impl_task.id is None:
         return None
     candidates = [
         review
         for review in get_implementation_review_evidence(store, impl_task)
-        if review.status in {"completed", "failed", "stopped"}
+        if review.id not in exclude_review_ids
+        and review.status in {"completed", "failed", "stopped"}
         and _landing_review_matches_required_identity(
             review,
             subject_task_id=impl_task.id,
             action=action,
+            store=store,
             completed=review.status == "completed",
         )
     ]
@@ -5711,6 +6140,7 @@ def _select_active_landing_review(
             review,
             subject_task_id=impl_task.id,
             action=action,
+            store=store,
             completed=False,
         ):
             exact.append(review)
@@ -5731,6 +6161,7 @@ def _landing_review_matches_required_identity(
     *,
     subject_task_id: str,
     action: dict[str, Any],
+    store: SqliteTaskStore,
     completed: bool,
 ) -> bool:
     if not subject_task_id:
@@ -5740,12 +6171,37 @@ def _landing_review_matches_required_identity(
     review_mode = action.get("review_mode")
     if review_mode == "resolution":
         expected_head = action.get("resolution_head_sha")
+        expected_target = action.get("resolution_target_sha")
+        expected_rebase_task_id = action.get("resolution_rebase_task_id")
         if not isinstance(expected_head, str) or not expected_head.strip():
+            return False
+        if not isinstance(expected_target, str) or not expected_target.strip():
+            return False
+        if not isinstance(expected_rebase_task_id, str) or not expected_rebase_task_id.strip():
             return False
         actual_head = review.review_verify_head_sha
         if actual_head is not None and actual_head != expected_head.strip():
             return False
         if completed and actual_head != expected_head.strip():
+            return False
+        try:
+            metadata = parse_resolution_review_scope(review.review_scope)
+        except ValueError:
+            return False
+        if metadata is None:
+            return False
+        if (
+            metadata.implementation_task_id != subject_task_id
+            or metadata.rebase_task_id != expected_rebase_task_id.strip()
+            or metadata.resolved_head_sha != expected_head.strip()
+            or metadata.resolved_target_sha != expected_target.strip()
+        ):
+            return False
+        if not _resolution_review_scope_matches_rebase_binding(
+            store,
+            implementation_task_id=subject_task_id,
+            metadata=metadata,
+        ):
             return False
     else:
         expected_head = action.get("review_head_sha")
@@ -5756,16 +6212,30 @@ def _landing_review_matches_required_identity(
     return True
 
 
-def _landing_review_verdict_from_task(config: Any | None, review: DbTask) -> str | None:
-    if review.output_content:
-        try:
-            return get_review_report(Path(getattr(config, "project_dir", ".")), review).verdict
-        except Exception:
-            return None
+def _landing_review_verdict_from_task(config: Any | None, review: DbTask) -> _LandingReviewVerdictRead:
     try:
-        return get_review_report(Path(getattr(config, "project_dir", ".")), review).verdict
-    except Exception:
-        return None
+        return _LandingReviewVerdictRead(
+            verdict=get_review_report(Path(getattr(config, "project_dir", ".")), review).verdict,
+        )
+    except Exception as exc:
+        return _LandingReviewVerdictRead(
+            failure=_LandingReviewVerdictReadFailure(
+                review_id=review.id,
+                error=f"{type(exc).__name__}: {exc}",
+            ),
+        )
+
+
+def _verdict_read_failure_block(
+    failure: _LandingReviewVerdictReadFailure,
+    impl_task_id: str | None,
+    source_head: str,
+) -> LandBlocked:
+    return LandBlocked(
+        "required-review-unavailable",
+        f"post-rebase review verdict could not be read: {failure.error}",
+        _evidence_refs(failure.review_id, impl_task_id, source_head),
+    )
 
 
 def _landing_review_report_from_task(config: Any | None, review: DbTask) -> Any | None:
@@ -7676,6 +8146,28 @@ def refresh_landing_authorization(
         if isinstance(current_identity, LandBlocked):
             return None
         facts = coordinator._landing_policy_facts(current_identity)
+        if (
+            facts.rebase_status == "completed"
+            or coordinator._first_execution_required_phase(current_identity, facts, policy=policy) == "post_rebase_review"
+        ):
+            try:
+                review_request = coordinator._post_rebase_review_request(current_identity, facts)
+                transition_facts = coordinator._facts_with_preserved_review_if_eligible(facts, review_request)
+                transition = run_landing_post_rebase_review_transition(
+                    coordinator.store,
+                    review_request,
+                    policy=policy,
+                    facts=transition_facts,
+                    config=coordinator.config,
+                    judge=None,
+                    create_full_review=_raise_post_rebase_refresh_review_creation,
+                    create_resolution_review=_raise_post_rebase_refresh_review_creation,
+                )
+            except (TypeError, ValueError):
+                return None
+            if transition.review_result.status not in {"not_required", "reused_completed"}:
+                return None
+            facts = transition.selected_facts
     finally:
         coordinator.inspect_policy_facts = saved
     if decision.allowed_overrides:
@@ -7752,6 +8244,10 @@ def refresh_landing_authorization(
         facts=facts,
         decision=refreshed_decision,
     )
+
+
+def _raise_post_rebase_refresh_review_creation(*_args: Any, **_kwargs: Any) -> DbTask:
+    raise ValueError("landing authorization refresh cannot create post-rebase reviews")
 
 
 def _landing_judge_evidence(

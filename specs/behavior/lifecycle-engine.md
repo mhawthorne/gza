@@ -1228,6 +1228,10 @@ review evidence is carried forward:
 - `no-op:unchanged-target`, `no-op:moot`, or any other unchanged no-op subtype MAY carry
   review evidence forward only with exact source/target identity, target-tip containment,
   `changed_diff == false`, and proof that no provider conflict resolution occurred.
+- A malformed, unknown-verdict, or non-merge-decision-bearing completed review that is
+  found only as historical carry-forward evidence MUST NOT satisfy carry-forward and MUST
+  NOT be reused as the current-head fallback while the invocation's review budget remains;
+  `land` MUST instead spend that budget on one replacement full current-head review.
 - A no-op outcome with missing, mismatched, prose-only, unsupported, or ambiguous proof
   MUST fail closed with a named `LandBlocked` reason if the coordinator cannot safely
   acquire a current review. If current review acquisition is enabled and budget remains,
