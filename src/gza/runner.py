@@ -2649,12 +2649,13 @@ def extract_content_from_log(log_file: "Path") -> str | None:
 
 
 def _persist_run_steps_from_result(
+    config: Config,
     store: SqliteTaskStore,
     run_id: str,
     provider_name: str,
     result: RunResult,
 ) -> bool:
-    """Persist provider-emitted step/substep events into run_steps tables."""
+    """Persist provider-emitted step/substep events into run_steps tables when enabled."""
     accumulated = getattr(result, "_accumulated_data", None)
     if not isinstance(accumulated, dict):
         return False
@@ -2662,6 +2663,8 @@ def _persist_run_steps_from_result(
     if not isinstance(events, list):
         return False
     store.set_log_schema_version(run_id, 2)
+    if getattr(config, "persist_run_steps", False) is not True:
+        return True
 
     has_non_completed = any(
         isinstance(event, dict) and str(event.get("outcome") or "completed") != "completed"
@@ -13511,7 +13514,7 @@ def _run_inner(
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
         assert task.id is not None
-        has_step_events = _persist_run_steps_from_result(store, task.id, provider.name.lower(), result)
+        has_step_events = _persist_run_steps_from_result(task_config, store, task.id, provider.name.lower(), result)
         if has_step_events:
             task.log_schema_version = 2
 
@@ -13968,7 +13971,7 @@ def _run_non_code_task(
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
         assert task.id is not None
-        has_step_events = _persist_run_steps_from_result(store, task.id, provider.name.lower(), result)
+        has_step_events = _persist_run_steps_from_result(config, store, task.id, provider.name.lower(), result)
         if has_step_events:
             task.log_schema_version = 2
 

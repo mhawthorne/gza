@@ -654,6 +654,39 @@ def test_config_load_parses_docker_startup_timeout(tmp_path) -> None:
     assert config.docker_startup_timeout == 60
 
 
+def test_config_load_defaults_run_step_persistence_disabled(tmp_path) -> None:
+    """Runtime step-table persistence should require explicit opt-in."""
+    (tmp_path / "gza.yaml").write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n")
+
+    config = Config.load(tmp_path)
+
+    assert config.persist_run_steps is False
+
+
+def test_config_load_parses_run_step_persistence_opt_in(tmp_path) -> None:
+    """persist_run_steps should round-trip through Config.load."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
+        "persist_run_steps: true\n"
+    )
+
+    config = Config.load(tmp_path)
+
+    assert config.persist_run_steps is True
+
+
+@pytest.mark.parametrize("value", ["1", '"true"', "[]"])
+def test_config_load_rejects_invalid_run_step_persistence_value(tmp_path, value: str) -> None:
+    """persist_run_steps should only accept YAML booleans."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
+        f"persist_run_steps: {value}\n"
+    )
+
+    with pytest.raises(ConfigError, match="'persist_run_steps' must be a boolean"):
+        Config.load(tmp_path)
+
+
 def test_config_load_defaults_watch_slot_settle_seconds(tmp_path) -> None:
     """watch.slot_settle_seconds should default when omitted."""
     (tmp_path / "gza.yaml").write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n")

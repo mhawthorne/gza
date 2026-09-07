@@ -10630,6 +10630,7 @@ class TestMaxStepsHandling:
         config.use_docker = False
         config.timeout_minutes = 10
         config.max_steps = 2
+        config.persist_run_steps = True
 
         mock_provider = Mock()
         mock_provider.name = "MockProvider"
@@ -10693,6 +10694,7 @@ class TestMaxStepsHandling:
         config.use_docker = False
         config.timeout_minutes = 10
         config.max_steps = 20
+        config.persist_run_steps = True
 
         mock_provider = Mock()
         mock_provider.name = "MockProvider"
@@ -11601,6 +11603,7 @@ class TestRunStepPersistenceIntegration:
         config.chat_text_display_length = 80
         config.claude = Mock(args=[])
         config.tmux = Mock(session_name=None)
+        config.persist_run_steps = True
 
         mock_git = Mock()
         mock_git.default_branch.return_value = "main"
@@ -11660,6 +11663,70 @@ class TestRunStepPersistenceIntegration:
             "tool_name": "Bash",
             "tool_input": {"command": "ls -la"},
         }
+
+    def test_non_code_task_skips_step_table_writes_by_default(self, tmp_path: Path):
+        """Provider event parsing should not populate run_steps/run_substeps unless opted in."""
+        import json
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Plan task", task_type="plan")
+        task.slug = "20260226-plan-task"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 20
+        config.model = ""
+        config.chat_text_display_length = 80
+        config.claude = Mock(args=[])
+        config.tmux = Mock(session_name=None)
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git._run.return_value = Mock(returncode=0)
+
+        provider = ClaudeProvider()
+        json_lines = [
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg_1",
+                        "usage": {"input_tokens": 10, "output_tokens": 3},
+                        "content": [
+                            {"type": "text", "text": "I will inspect the code."},
+                            {"type": "tool_use", "id": "tool_1", "name": "Bash", "input": {"command": "ls -la"}},
+                        ],
+                    },
+                }
+            )
+            + "\n",
+            json.dumps({"type": "result", "subtype": "success", "num_turns": 1, "total_cost_usd": 0.001}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen, patch("gza.runner.console"):
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            exit_code = _run_non_code_task(task, config, store, provider, mock_git, resume=False)
+
+        assert exit_code == 0
+        assert store.get_run_steps(task.id) == []
+        updated_task = store.get(task.id)
+        assert updated_task is not None
+        assert updated_task.log_schema_version == 2
+        assert updated_task.log_file is not None
+        assert (tmp_path / updated_task.log_file).read_text(encoding="utf-8")
 
     def test_on_step_count_updates_task_num_steps_computed_in_real_time(self, tmp_path: Path):
         """on_step_count callback should update task.num_steps_computed in DB during streaming."""

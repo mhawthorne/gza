@@ -213,6 +213,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("merge_squash_threshold", "int", 0, "Auto-squash threshold for merge operations."),
     ConfigKeySpec("model", "str", "", "Default model fallback; required unless provider-scoped or task-type models cover created tasks."),
     ConfigKeySpec(
+        "persist_run_steps",
+        "bool",
+        False,
+        "Persist provider step/substep events into `run_steps` and `run_substeps`; disabled by default because provider logs remain the runtime source.",
+    ),
+    ConfigKeySpec(
         "no_color",
         "bool",
         False,

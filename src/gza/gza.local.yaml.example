@@ -517,3 +517,8 @@ provider: codex
 # as a rollback switch.
 # Default: merge_and_defer
 # on_max_cycles: merge_and_defer
+
+# Persist provider step/substep events into `run_steps` and `run_substeps`; disabled by default
+# because provider logs remain the runtime source.
+# Default: false
+# persist_run_steps: false
