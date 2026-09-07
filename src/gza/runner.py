@@ -225,7 +225,7 @@ from .task_slug import (
     strip_derived_implement_prefixes,
 )
 from .verify_fix_outcome import apply_verify_fix_completion_outcome
-from .workers import _read_linux_proc_stat
+from .workers import ProcStatIdentityUnavailableError, _read_linux_proc_stat_for_identity
 from .worktree_roots import managed_worktree_root_paths
 
 logger = logging.getLogger(__name__)
@@ -3091,12 +3091,19 @@ def _docker_verify_snapshot_permission_state_path(tmp_parent: Path) -> Path:
     return tmp_parent / _DOCKER_VERIFY_SNAPSHOT_PERMISSION_STATE_FILENAME
 
 
-def _docker_verify_snapshot_holder() -> tuple[int, str, int | None]:
-    pid = os.getpid()
-    proc_stat = _read_linux_proc_stat(pid)
-    if sys.platform.startswith("linux") and proc_stat is None:
+def _docker_verify_snapshot_holder() -> tuple[int, str, int]:
+    if not sys.platform.startswith("linux"):
         raise RuntimeError("cannot acquire Docker verify snapshot permission lease without strong process identity")
-    pid_start_ticks = proc_stat[1] if proc_stat is not None else None
+    pid = os.getpid()
+    try:
+        proc_stat = _read_linux_proc_stat_for_identity(pid)
+    except ProcStatIdentityUnavailableError as exc:
+        raise RuntimeError(
+            "cannot acquire Docker verify snapshot permission lease without strong process identity"
+        ) from exc
+    if proc_stat is None:
+        raise RuntimeError("cannot acquire Docker verify snapshot permission lease without strong process identity")
+    pid_start_ticks = proc_stat[1]
     return pid, f"{pid}:{time.time_ns()}", pid_start_ticks
 
 
@@ -3106,29 +3113,24 @@ def _docker_verify_snapshot_holder_is_live(holder: object) -> bool:
     pid = holder.get("pid")
     if not isinstance(pid, int) or pid <= 0:
         return False
-    proc_stat = _read_linux_proc_stat(pid)
-    if proc_stat is not None:
-        state, start_ticks = proc_stat
-        if state == "Z":
-            return False
-        holder_start_ticks = holder.get("pid_start_ticks")
-        if not isinstance(holder_start_ticks, int):
-            return False
-        if holder_start_ticks != start_ticks:
-            return False
-        return True
-    if sys.platform.startswith("linux"):
-        return False
-    if "pid_start_ticks" not in holder and holder.get("token") == "legacy":
-        return False
-    if "pid_start_ticks" in holder and not isinstance(holder.get("pid_start_ticks"), int):
+    if not sys.platform.startswith("linux"):
         return False
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        proc_stat = _read_linux_proc_stat_for_identity(pid)
+    except ProcStatIdentityUnavailableError as exc:
+        raise _DockerVerifySnapshotPermissionStateError(
+            f"Docker verify snapshot permission lease holder identity is indeterminate for pid {pid}"
+        ) from exc
+    if proc_stat is None:
         return False
-    except PermissionError:
-        return True
+    state, start_ticks = proc_stat
+    if state == "Z":
+        return False
+    holder_start_ticks = holder.get("pid_start_ticks")
+    if not isinstance(holder_start_ticks, int):
+        return False
+    if holder_start_ticks != start_ticks:
+        return False
     return True
 
 

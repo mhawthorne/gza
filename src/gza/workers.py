@@ -7,26 +7,40 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 
+class ProcStatIdentityUnavailableError(RuntimeError):
+    """Raised when a Linux proc identity lookup cannot be trusted."""
+
+
 def _read_linux_proc_stat(pid: int) -> tuple[str, int] | None:
     """Return Linux proc state and start ticks for a PID when available."""
     try:
-        stat_text = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
+        return _read_linux_proc_stat_for_identity(pid)
+    except ProcStatIdentityUnavailableError:
         return None
+
+
+def _read_linux_proc_stat_for_identity(pid: int) -> tuple[str, int] | None:
+    """Return Linux proc state and start ticks, preserving indeterminate reads."""
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ProcStatIdentityUnavailableError(f"cannot read process identity for pid {pid}") from exc
 
     rparen = stat_text.rfind(")")
     if rparen == -1:
-        return None
+        raise ProcStatIdentityUnavailableError(f"malformed process identity for pid {pid}")
 
     fields = stat_text[rparen + 2 :].split()
     if len(fields) <= 19:
-        return None
+        raise ProcStatIdentityUnavailableError(f"incomplete process identity for pid {pid}")
 
     state = fields[0]
     try:
         start_ticks = int(fields[19])
     except ValueError:
-        return None
+        raise ProcStatIdentityUnavailableError(f"invalid process start identity for pid {pid}") from None
     return state, start_ticks
 
 

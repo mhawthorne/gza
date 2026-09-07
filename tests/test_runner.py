@@ -8182,7 +8182,7 @@ class TestDisposableVerifyDbSnapshotEnv:
                 333: ("S", 3330),
             }.get(pid)
 
-        monkeypatch.setattr(runner, "_read_linux_proc_stat", proc_stat)
+        monkeypatch.setattr(runner, "_read_linux_proc_stat_for_identity", proc_stat)
         live_handle = runner._PathModeLeaseHandle(
             path=verify_cwd.resolve(),
             gid=original_gids[verify_cwd],
@@ -8212,34 +8212,32 @@ class TestDisposableVerifyDbSnapshotEnv:
         assert self._docker_permission_state(verify_cwd).get("leases", {}) == {}
 
     def test_docker_snapshot_holder_liveness_rejects_zombie_pid(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(runner, "_read_linux_proc_stat", lambda _pid: ("Z", 999))
+        monkeypatch.setattr(runner, "_read_linux_proc_stat_for_identity", lambda _pid: ("Z", 999))
 
         assert not runner._docker_verify_snapshot_holder_is_live(
             {"pid": os.getpid(), "token": "old", "pid_start_ticks": 999}
         )
 
     def test_docker_snapshot_holder_liveness_rejects_reused_pid(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(runner, "_read_linux_proc_stat", lambda _pid: ("S", 999))
+        monkeypatch.setattr(runner, "_read_linux_proc_stat_for_identity", lambda _pid: ("S", 999))
 
         assert not runner._docker_verify_snapshot_holder_is_live(
             {"pid": os.getpid(), "token": "old", "pid_start_ticks": 123}
         )
 
-    def test_docker_snapshot_holder_liveness_accepts_non_linux_pid_without_start_tick(
+    def test_docker_snapshot_holder_liveness_rejects_non_linux_pid_without_start_tick(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(runner, "_read_linux_proc_stat", lambda _pid: None)
-
         with patch("gza.runner.sys") as mock_sys:
             mock_sys.platform = "darwin"
-            assert runner._docker_verify_snapshot_holder_is_live({"pid": os.getpid(), "token": "non-linux"})
+            assert not runner._docker_verify_snapshot_holder_is_live({"pid": os.getpid(), "token": "non-linux"})
 
     def test_docker_snapshot_holder_liveness_rejects_legacy_pid_without_start_tick(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(runner, "_read_linux_proc_stat", lambda _pid: ("S", 999))
+        monkeypatch.setattr(runner, "_read_linux_proc_stat_for_identity", lambda _pid: ("S", 999))
 
         assert not runner._docker_verify_snapshot_holder_is_live({"pid": os.getpid(), "token": "legacy"})
 
@@ -8247,19 +8245,17 @@ class TestDisposableVerifyDbSnapshotEnv:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(runner, "_read_linux_proc_stat", lambda _pid: None)
+        monkeypatch.setattr(runner, "_read_linux_proc_stat_for_identity", lambda _pid: None)
 
         assert not runner._docker_verify_snapshot_holder_is_live({"pid": os.getpid(), "token": "legacy"})
 
-    def test_docker_snapshot_holder_liveness_accepts_non_linux_pid_without_start_tick(
+    def test_docker_snapshot_holder_refuses_acquisition_on_non_linux_without_strong_identity(
         self,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(runner, "_read_linux_proc_stat", lambda _pid: None)
-
         with patch("gza.runner.sys") as mock_sys:
             mock_sys.platform = "darwin"
-            assert runner._docker_verify_snapshot_holder_is_live({"pid": os.getpid(), "token": "non-linux"})
+            with pytest.raises(RuntimeError, match="strong process identity"):
+                runner._docker_verify_snapshot_holder()
 
     def test_docker_snapshot_holder_requires_strong_process_identity_on_linux(
         self,
@@ -8267,10 +8263,57 @@ class TestDisposableVerifyDbSnapshotEnv:
     ) -> None:
         if not sys.platform.startswith("linux"):
             pytest.skip("strong process identity is required only on Linux")
-        monkeypatch.setattr(runner, "_read_linux_proc_stat", lambda _pid: None)
+        monkeypatch.setattr(runner, "_read_linux_proc_stat_for_identity", lambda _pid: None)
 
         with pytest.raises(RuntimeError, match="strong process identity"):
             runner._docker_verify_snapshot_holder()
+
+    def test_docker_snapshot_release_retains_holder_when_identity_lookup_is_indeterminate(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        verify_cwd, _, original_modes, original_gids = self._prepare_distinct_docker_snapshot_hierarchy(
+            tmp_path,
+            monkeypatch,
+        )
+        state_path = self._docker_permission_state_path(verify_cwd)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        verify_cwd.chmod(original_modes[verify_cwd] | stat.S_IXGRP)
+        releasing_holder = {"pid": 222, "token": "release", "pid_start_ticks": 2220}
+        indeterminate_holder = {"pid": 333, "token": "indeterminate", "pid_start_ticks": 3330}
+        initial_state = {
+            "leases": {
+                str(verify_cwd.resolve()): {
+                    "path": str(verify_cwd.resolve()),
+                    "gid": original_gids[verify_cwd],
+                    "mode": original_modes[verify_cwd],
+                    "holders": [releasing_holder, indeterminate_holder],
+                }
+            }
+        }
+        state_path.write_text(json.dumps(initial_state), encoding="utf-8")
+
+        def proc_stat(pid: int) -> tuple[str, int] | None:
+            if pid == 333:
+                raise runner.ProcStatIdentityUnavailableError("unreadable")
+            return ("S", 2220)
+
+        monkeypatch.setattr(runner, "_read_linux_proc_stat_for_identity", proc_stat)
+        handle = runner._PathModeLeaseHandle(
+            path=verify_cwd.resolve(),
+            gid=original_gids[verify_cwd],
+            mode=original_modes[verify_cwd],
+            state_path=state_path,
+            holder_pid=222,
+            holder_token="release",
+        )
+
+        with pytest.raises(runner._DockerVerifySnapshotPermissionStateError, match="indeterminate"):
+            runner._release_docker_verify_snapshot_traversal_leases([handle])
+
+        assert json.loads(state_path.read_text(encoding="utf-8")) == initial_state
+        assert stat.S_IMODE(verify_cwd.stat().st_mode) & stat.S_IXGRP
 
     def test_overlapping_docker_snapshot_keeps_traversal_after_second_context_exits_first(
         self,

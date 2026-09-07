@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from gza import runner
 from gza.providers import DockerConfig
 from gza.providers.base import build_docker_cmd
 from gza.runner import disposable_verify_db_snapshot_env
@@ -75,6 +76,18 @@ def _assert_no_active_permission_leases(verify_cwd: Path) -> None:
         return
     state = json.loads(state_path.read_text(encoding="utf-8") or "{}")
     assert state.get("leases", {}) == {}
+
+
+def _wait_for_zombie(pid: int) -> None:
+    if not sys.platform.startswith("linux"):
+        pytest.skip("unreaped zombie process state is Linux-specific")
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        proc_stat = runner._read_linux_proc_stat_for_identity(pid)
+        if proc_stat is not None and proc_stat[0] == "Z":
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"pid {pid} did not become an unreaped zombie")
 
 
 def _drain_process_messages(messages: Any) -> list[tuple[str, str]]:
@@ -411,16 +424,17 @@ def test_docker_snapshot_abrupt_dead_holder_cleanup_keeps_overlapping_live_holde
         assert second_entered.wait(timeout=10)
         _assert_group_traversal_present(tracked_paths)
 
+        assert first_process.pid is not None
         first_process.terminate()
-        first_process.join(timeout=10)
-        assert first_process.exitcode is not None
-        assert first_process.exitcode != 0
+        _wait_for_zombie(first_process.pid)
         _assert_group_traversal_present(tracked_paths)
 
         release_second.set()
         second_process.join(timeout=10)
         assert second_process.exitcode == 0
     finally:
+        if first_process.pid is not None:
+            first_process.join(timeout=10)
         for process in (first_process, second_process):
             if process.is_alive():
                 process.terminate()
