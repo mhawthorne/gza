@@ -15,6 +15,10 @@ from .lineage_query import (
     LineageOwnerRow,
     query_lineage_owner_rows_in_read_session,
 )
+from .main_integration_verify import (
+    MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    MAIN_INTEGRATION_VERIFY_TAG,
+)
 from .pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from .recovery_engine import (
     FailedRecoveryDecision,
@@ -70,6 +74,10 @@ class DispatchPreviewEntry:
     def reason_code(self) -> str | None:
         return None if self.decision is None else self.decision.reason_code
 
+    @property
+    def is_watch_main_verify_remediation(self) -> bool:
+        return is_watch_main_verify_remediation_task(self.task)
+
 
 @dataclass(frozen=True)
 class DispatchPreview:
@@ -103,6 +111,16 @@ class WatchDispatchPlan:
     entries: tuple[DispatchPreviewEntry, ...]
     recovery_worker_slots: int
     pending_slots: int
+    main_verify_remediation_slots: int = 0
+    main_verify_remediation_entry: DispatchPreviewEntry | None = None
+
+
+def is_watch_main_verify_remediation_task(task: DbTask) -> bool:
+    """Return whether a task is watch-owned main-verify remediation work."""
+    return (
+        task.trigger_source == MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE
+        and MAIN_INTEGRATION_VERIFY_TAG in set(task.tags or ())
+    )
 
 
 def build_dispatch_preview(
@@ -174,16 +192,44 @@ def plan_watch_dispatch_entries(
     recovery_slot_cap: int,
     selection_mode: DispatchSelectionMode,
     include_pending: bool = True,
+    main_verify_remediation_task_id: str | None = None,
 ) -> WatchDispatchPlan:
     """Return the watch execution slice for one ordered preview candidate set."""
     _validate_dispatch_preview_policy(
         selection_mode=selection_mode,
         order_policy=DEFAULT_DISPATCH_ORDER_POLICY,
     )
+    runnable_entries = tuple(entry for entry in entries if entry.runnable)
+    if main_verify_remediation_task_id is not None:
+        held_non_worker_recovery_entries = tuple(
+            entry for entry in runnable_entries if entry.lane == "recovery" and not entry.worker_consuming
+        )
+        remediation_entry = next(
+            (
+                entry
+                for entry in runnable_entries
+                if entry.lane == "pending"
+                and entry.worker_consuming
+                and entry.task.id == main_verify_remediation_task_id
+                and entry.is_watch_main_verify_remediation
+            ),
+            None,
+        )
+        return WatchDispatchPlan(
+            entries=(
+                (*held_non_worker_recovery_entries, remediation_entry)
+                if remediation_entry is not None
+                else held_non_worker_recovery_entries
+            ),
+            recovery_worker_slots=0,
+            pending_slots=0,
+            main_verify_remediation_slots=1 if remediation_entry is not None else 0,
+            main_verify_remediation_entry=remediation_entry,
+        )
+
     if slots <= 0:
         return WatchDispatchPlan(entries=(), recovery_worker_slots=0, pending_slots=0)
 
-    runnable_entries = tuple(entry for entry in entries if entry.runnable)
     if selection_mode == "recovery_only":
         recovery_worker_slots = min(
             slots,
@@ -402,10 +448,10 @@ def _build_pending_preview_entries(
     quiet_seconds: int = 0,
 ) -> tuple[DispatchPreviewEntry, ...]:
     pending_tasks = list(get_runnable_pending_tasks(store, tags=tags, any_tag=any_tag, quiet_seconds=quiet_seconds))
-    if selection_mode in {"recovery_first_explicit", "recovery_only"}:
-        # recovery_only still admits explicitly queue-positioned pending tasks (e.g. main-verify
-        # remediation) so a red main can't be starved by unrelated recovery-lane congestion.
+    if selection_mode == "recovery_first_explicit":
         pending_tasks = [task for task in pending_tasks if task.queue_position is not None]
+    elif selection_mode == "recovery_only":
+        pending_tasks = [task for task in pending_tasks if is_watch_main_verify_remediation_task(task)]
     if pending_limit is not None:
         pending_tasks = pending_tasks[:pending_limit]
     return tuple(

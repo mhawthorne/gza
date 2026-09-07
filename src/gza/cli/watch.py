@@ -78,6 +78,7 @@ from ..dispatch_preview import (
     DispatchPreviewEntry,
     DispatchSelectionMode,
     build_dispatch_preview,
+    is_watch_main_verify_remediation_task,
     normalize_dispatch_selection_mode,
     plan_watch_dispatch_entries,
 )
@@ -728,6 +729,110 @@ def _main_verify_remediation_task_is_reusable(
     if task.status in {"completed", "unmerged"}:
         return _main_verify_remediation_is_still_unmerged(store, task)
     return False
+
+
+def _active_main_verify_fix_dispatch_control(
+    *,
+    store: SqliteTaskStore,
+    remediation: MainIntegrationVerifyRemediation | None,
+    config: Config,
+) -> "_MainVerifyDispatchControl":
+    if remediation is None or remediation.kind != "fix":
+        return _MainVerifyDispatchControl()
+    ledger_fingerprint = _main_verify_remediation_ledger_fingerprint(remediation.tree_fingerprint)
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature=remediation.signature,
+        tree_fingerprint=ledger_fingerprint,
+    )
+    attempt_limit = _main_verify_remediation_attempt_limit(config)
+    if _main_verify_remediation_attempt_state_exhausted(attempt_state, attempt_limit=attempt_limit):
+        return _MainVerifyDispatchControl()
+    active_task_id = attempt_state.active_task_id if attempt_state is not None else None
+    if active_task_id is None:
+        return _MainVerifyDispatchControl()
+    task = store.get(active_task_id)
+    if task is None or task.status not in {"pending", "in_progress"}:
+        return _MainVerifyDispatchControl()
+    identity = _main_verify_remediation_identity(remediation)
+    if not _main_verify_remediation_task_matches_identity(task, identity):
+        return _MainVerifyDispatchControl()
+    if _main_verify_remediation_kind_from_prompt(task.prompt) != "fix":
+        return _MainVerifyDispatchControl()
+    if not is_watch_main_verify_remediation_task(task):
+        return _MainVerifyDispatchControl()
+    return _MainVerifyDispatchControl(active_task_id=active_task_id, hold_ordinary_starts=True)
+
+
+def _main_verify_remediation_has_active_nonexhausted_fix_ownership(
+    *,
+    store: SqliteTaskStore,
+    task: DbTask,
+    config: Config,
+) -> bool:
+    if task.id is None or task.status not in {"pending", "in_progress"}:
+        return False
+    if not is_watch_main_verify_remediation_task(task):
+        return False
+    if _main_verify_remediation_kind_from_prompt(task.prompt) != "fix":
+        return False
+    identity = _main_verify_remediation_identity_from_prompt(task.prompt)
+    if identity is None:
+        return False
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature=identity.signature,
+        tree_fingerprint=_main_verify_remediation_ledger_fingerprint(identity.tree_fingerprint),
+    )
+    if attempt_state is None or attempt_state.active_task_id != task.id:
+        return False
+    return not _main_verify_remediation_attempt_state_exhausted(
+        attempt_state,
+        attempt_limit=_main_verify_remediation_attempt_limit(config),
+    )
+
+
+def _greenlit_live_main_verify_fix_dispatch_control(
+    *,
+    store: SqliteTaskStore,
+    config: Config,
+) -> "_MainVerifyDispatchControl":
+    for attempt_state in store.list_main_verify_remediation_attempt_states():
+        active_task_id = attempt_state.active_task_id
+        if active_task_id is None or attempt_state.greenlit_while_in_progress_task_id != active_task_id:
+            continue
+        task = store.get(active_task_id)
+        if task is None or task.status != "in_progress":
+            continue
+        if _main_verify_remediation_has_active_nonexhausted_fix_ownership(
+            store=store,
+            task=task,
+            config=config,
+        ):
+            return _MainVerifyDispatchControl(active_task_id=active_task_id, hold_ordinary_starts=True)
+    return _MainVerifyDispatchControl()
+
+
+def _validate_main_verify_remediation_launch_boundary(
+    *,
+    store: SqliteTaskStore,
+    config: Config,
+    task_id: str,
+) -> tuple[DbTask | None, str | None]:
+    task = store.get(task_id)
+    if task is None:
+        return None, f"task {task_id} is not present in runtime store"
+    if task.status != "pending":
+        return task, f"task is {task.status}, not pending"
+    if not is_watch_main_verify_remediation_task(task):
+        return task, f"task {task_id} is not watch-owned main-verify remediation"
+    if _main_verify_remediation_kind_from_prompt(task.prompt) != "fix":
+        return task, f"task {task_id} is not a main-verify fix remediation"
+    if not _main_verify_remediation_has_active_nonexhausted_fix_ownership(
+        store=store,
+        task=task,
+        config=config,
+    ):
+        return task, f"task {task_id} is not the active non-exhausted main-verify fix remediation"
+    return task, None
 
 
 def _main_verify_remediation_task_is_moot_retirement_candidate(task: DbTask) -> bool:
@@ -8110,6 +8215,21 @@ class _CycleResult:
     active_recovery_subject_ids: frozenset[str] = frozenset()
     project_analysis_invalidated: bool = False
     needs_replan: bool = False
+    main_verify_dispatch_control: "_MainVerifyDispatchControl" = field(
+        default_factory=lambda: _MainVerifyDispatchControl()
+    )
+
+
+@dataclass(frozen=True)
+class _MainVerifyDispatchControl:
+    """Watch-local dispatch hold for one active deterministic-red remediation row."""
+
+    active_task_id: str | None = None
+    hold_ordinary_starts: bool = False
+
+    @property
+    def active(self) -> bool:
+        return self.hold_ordinary_starts and self.active_task_id is not None
 
 
 _DispatchObserver = Callable[
@@ -9713,6 +9833,9 @@ class ProjectDirectResult:
     blocked: bool = False
     detail: str | None = None
     cycle_result: _CycleResult | None = None
+    main_verify_dispatch_control: _MainVerifyDispatchControl = field(
+        default_factory=lambda: _MainVerifyDispatchControl()
+    )
 
 
 @dataclass(frozen=True)
@@ -9721,7 +9844,7 @@ class ProjectDispatchCandidate:
 
     runtime_key: str
     task: DbTask
-    lane: Literal["recovery", "pending", "lifecycle"]
+    lane: Literal["recovery", "pending", "lifecycle", "main_verify_remediation"]
     runtime_identity: WatchRuntimeIdentity | None = None
     selection_mode: DispatchSelectionMode = "pending_only"
     max_recovery_attempts: int | None = None
@@ -9761,10 +9884,11 @@ class WatchSupervisorDispatchLanePlan:
     recovery_candidates: tuple[ProjectDispatchCandidate, ...]
     pending_candidates: tuple[ProjectDispatchCandidate, ...]
     recovery_slot_limit: int
+    main_verify_remediation_candidates: tuple[ProjectDispatchCandidate, ...] = ()
 
     @property
     def candidates(self) -> tuple[ProjectDispatchCandidate, ...]:
-        return self.recovery_candidates + self.pending_candidates
+        return self.main_verify_remediation_candidates + self.recovery_candidates + self.pending_candidates
 
 
 @dataclass(frozen=True)
@@ -9774,10 +9898,11 @@ class WatchSupervisorDispatchResult:
     recovery_results: tuple[ProjectDispatchResult, ...]
     pending_results: tuple[ProjectDispatchResult, ...]
     restart_requested: bool = False
+    main_verify_remediation_results: tuple[ProjectDispatchResult, ...] = ()
 
     @property
     def results(self) -> tuple[ProjectDispatchResult, ...]:
-        return self.recovery_results + self.pending_results
+        return self.main_verify_remediation_results + self.recovery_results + self.pending_results
 
 
 @dataclass(frozen=True)
@@ -9907,7 +10032,7 @@ class SupervisorLaunchReservation:
     reservation_id: str
     runtime_key: str
     task_id: str
-    lane: Literal["recovery", "pending", "lifecycle"]
+    lane: Literal["recovery", "pending", "lifecycle", "main_verify_remediation"]
     release_pending_after_settle: bool = True
     original_task_id: str | None = None
 
@@ -9927,6 +10052,7 @@ class SupervisorLaunchBudget:
     _settled_reservation_ids: set[str] = field(default_factory=set, init=False, repr=False)
     _unresolved_exception_reservation_ids: set[str] = field(default_factory=set, init=False, repr=False)
     _virtual_dispatch_starts: int = field(default=0, init=False, repr=False)
+    _virtual_main_verify_remediation_starts: int = field(default=0, init=False, repr=False)
     _virtual_dispatch_starts_by_runtime_key: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _occupancy: AggregateWatchOccupancy | None = field(default=None, init=False, repr=False)
     _last_reconcile_by_runtime_key: dict[str, ProjectRuntimeReconcileResult] = field(
@@ -10069,6 +10195,72 @@ class SupervisorLaunchBudget:
             self._reservations[reservation.reservation_id] = reservation
             return reservation
 
+    def reserve_main_verify_remediation(
+        self,
+        candidate: ProjectDispatchCandidate,
+    ) -> SupervisorLaunchReservation | None:
+        with self._lock:
+            assert self._occupancy is not None
+            runtime = self.runtime_by_key.get(candidate.runtime_key)
+            if (
+                runtime is None
+                or not runtime.enabled
+                or candidate.task.id is None
+                or candidate.lane != "main_verify_remediation"
+            ):
+                return None
+            if candidate.runtime_identity != runtime.runtime_identity:
+                return None
+            if not _main_verify_remediation_has_active_nonexhausted_fix_ownership(
+                store=runtime.store,
+                task=candidate.task,
+                config=runtime.config,
+            ):
+                return None
+            if self._has_active_main_verify_remediation_claim_locked():
+                return None
+            occupied = self._occupancy.running + self._occupancy.starting
+            if (
+                occupied
+                + len(self._reservations)
+                + self._virtual_dispatch_starts
+                + self._virtual_main_verify_remediation_starts
+                >= self.supervisor_batch + 1
+            ):
+                return None
+            reservation = SupervisorLaunchReservation(
+                reservation_id=uuid.uuid4().hex,
+                runtime_key=candidate.runtime_key,
+                task_id=str(candidate.task.id),
+                lane="main_verify_remediation",
+                original_task_id=str(candidate.task.id),
+            )
+            self._reservations[reservation.reservation_id] = reservation
+            return reservation
+
+    def _has_active_main_verify_remediation_claim_locked(self) -> bool:
+        if (
+            any(reservation.lane == "main_verify_remediation" for reservation in self._reservations.values())
+            or self._virtual_main_verify_remediation_starts > 0
+        ):
+            return True
+        assert self._occupancy is not None
+        for local in self._occupancy.local:
+            runtime = self.runtime_by_key.get(local.runtime_key)
+            if runtime is None or not runtime.enabled:
+                continue
+            for task_id in (*local.running_task_ids, *local.starting_task_ids):
+                task = runtime.store.get(task_id)
+                if task is None:
+                    continue
+                if _main_verify_remediation_has_active_nonexhausted_fix_ownership(
+                    store=runtime.store,
+                    task=task,
+                    config=runtime.config,
+                ):
+                    return True
+        return False
+
     def release(self, reservation: SupervisorLaunchReservation) -> None:
         with self._lock:
             self._pop_reservation_locked(reservation.reservation_id)
@@ -10188,6 +10380,74 @@ class SupervisorLaunchBudget:
                 self.release(reservation)
             return result
 
+    def dispatch_main_verify_remediation_candidate(
+        self,
+        runtime: "WatchProjectRuntime",
+        candidate: ProjectDispatchCandidate,
+        *,
+        max_iterations: int,
+        dry_run: bool = False,
+        quiet: bool = False,
+        analysis: ProjectCycleAnalysis | None = None,
+    ) -> ProjectDispatchResult:
+        """Reserve the one global emergency remediation slot, then run local pending dispatch."""
+        with self._lock:
+            current_runtime = self.runtime_by_key.get(candidate.runtime_key)
+            if (
+                current_runtime is None
+                or current_runtime is not runtime
+                or not current_runtime.enabled
+                or candidate.runtime_identity != current_runtime.runtime_identity
+            ):
+                return ProjectDispatchResult(
+                    runtime_key=runtime.key,
+                    candidate=candidate,
+                    status="not_dispatchable",
+                    slot_consuming=False,
+                    work_done=False,
+                    detail="candidate does not match the current enabled runtime",
+                    task=candidate.task,
+                )
+            reservation = self.reserve_main_verify_remediation(candidate)
+            if reservation is None:
+                return ProjectDispatchResult(
+                    runtime_key=runtime.key,
+                    candidate=candidate,
+                    status="global_capacity_blocked",
+                    slot_consuming=False,
+                    work_done=False,
+                    detail="supervisor emergency main-verify remediation slot is unavailable",
+                    task=candidate.task,
+                )
+            try:
+                result = current_runtime.dispatch_pending_candidate(
+                    candidate,
+                    max_iterations=max_iterations,
+                    dry_run=dry_run,
+                    quiet=quiet,
+                    analysis=analysis,
+                )
+            except Exception as dispatch_exc:
+                reservation = self._mark_dispatch_exception_locked(reservation, dispatch_exc)
+                try:
+                    self.refresh_occupancy()
+                except Exception as refresh_exc:
+                    dispatch_exc.add_note(
+                        f"supervisor occupancy refresh failed while reconciling reservation "
+                        f"{reservation.reservation_id}: {refresh_exc}"
+                    )
+                raise
+            reservation = self._retarget_reservation_locked(
+                reservation,
+                launched_task_id=self._launched_task_id_for_result(result),
+                release_pending_after_settle=not result.slot_consuming,
+            )
+            self._settled_reservation_ids.add(reservation.reservation_id)
+            self.refresh_occupancy()
+            if not result.slot_consuming:
+                self.release(reservation)
+            return result
+
     def dispatch_recovery_candidate(
         self,
         runtime: "WatchProjectRuntime",
@@ -10258,6 +10518,15 @@ class SupervisorLaunchBudget:
             self._virtual_dispatch_starts_by_runtime_key[runtime_key] = (
                 self._virtual_dispatch_starts_by_runtime_key.get(runtime_key, 0) + 1
             )
+
+    def consume_virtual_main_verify_remediation_capacity(self, runtime_key: str) -> None:
+        """Account for a dry-run emergency remediation start without spending ordinary slots."""
+        with self._lock:
+            if self._virtual_main_verify_remediation_starts <= 0:
+                self._virtual_main_verify_remediation_starts = 1
+                self._virtual_dispatch_starts_by_runtime_key[runtime_key] = (
+                    self._virtual_dispatch_starts_by_runtime_key.get(runtime_key, 0) + 1
+                )
 
     @property
     def virtual_dispatch_starts(self) -> int:
@@ -10571,11 +10840,64 @@ def dispatch_watch_supervisor_lanes_incrementally(
     ]
     | None = None,
     analyses: Mapping[str, ProjectCycleAnalysis] | None = None,
+    main_verify_dispatch_controls: Mapping[str, _MainVerifyDispatchControl] | None = None,
     operational_disabled_callback: Callable[[ExecutionProjectDisabled], None] | None = None,
     restart_checkpoint: Callable[[], bool] | None = None,
 ) -> WatchSupervisorDispatchResult:
     """Run recovery then pending with incremental fleet arbitration and settlement refresh."""
     mode = normalize_dispatch_selection_mode(recovery_mode)
+    analyses = analyses or {}
+    main_verify_dispatch_controls = main_verify_dispatch_controls or {}
+    runtime_by_key = {runtime.key: runtime for runtime in runtimes}
+    emergency_results: tuple[ProjectDispatchResult, ...] = ()
+
+    emergency_candidates: dict[str, ProjectDispatchCandidate | None] = {}
+    for runtime in runtimes:
+        control = main_verify_dispatch_controls.get(runtime.key, _MainVerifyDispatchControl())
+        if not control.active or runtime.key in launch_budget.disabled_runtime_keys:
+            emergency_candidates[runtime.key] = None
+            continue
+        try:
+            emergency_candidates[runtime.key] = runtime.main_verify_remediation_dispatch_head(
+                control,
+                max_recovery_attempts=resolve_watch_supervisor_runtime_recovery_attempts(
+                    runtime,
+                    max_recovery_attempts,
+                ),
+                analysis=analyses.get(runtime.key),
+            )
+        except _WATCH_PROJECT_OPERATIONAL_EXCEPTIONS as exc:
+            launch_budget.disable_runtime(runtime, phase="dispatch", exc=exc)
+            emergency_candidates[runtime.key] = None
+    emergency_choice = recovery_strategy.clone().select_next(emergency_candidates)
+    if emergency_choice is not None:
+        selected_runtime = runtime_by_key.get(emergency_choice.project_key)
+        if selected_runtime is not None:
+            emergency_result = launch_budget.dispatch_main_verify_remediation_candidate(
+                selected_runtime,
+                emergency_choice.candidate,
+                max_iterations=max_iterations,
+                dry_run=launch_budget.dry_run,
+                analysis=analyses.get(selected_runtime.key),
+            )
+            if emergency_result.dispatch_budget_consuming and not emergency_result.slot_consuming:
+                launch_budget.consume_virtual_main_verify_remediation_capacity(emergency_choice.project_key)
+            emergency_results = (emergency_result,)
+
+    restart_requested = restart_checkpoint() if restart_checkpoint is not None else False
+    if restart_requested:
+        return WatchSupervisorDispatchResult(
+            recovery_results=(),
+            pending_results=(),
+            restart_requested=True,
+            main_verify_remediation_results=emergency_results,
+        )
+
+    ordinary_runtimes = tuple(
+        runtime
+        for runtime in runtimes
+        if not main_verify_dispatch_controls.get(runtime.key, _MainVerifyDispatchControl()).active
+    )
     recovery_slot_limit = resolve_watch_supervisor_recovery_slot_limit(
         dispatch_slots=launch_budget.occupancy.slots,
         recovery_slots_config=recovery_slots_config,
@@ -10584,7 +10906,7 @@ def dispatch_watch_supervisor_lanes_incrementally(
     recovery_results: tuple[ProjectDispatchResult, ...] = ()
     if mode != "pending_only" and recovery_slot_limit > 0:
         recovery_results = dispatch_watch_supervisor_lane_incrementally(
-            runtimes,
+            ordinary_runtimes,
             lane="recovery",
             limit=recovery_slot_limit,
             recovery_mode=mode,
@@ -10597,13 +10919,20 @@ def dispatch_watch_supervisor_lanes_incrementally(
             operational_disabled_callback=operational_disabled_callback,
             restart_checkpoint=restart_checkpoint,
         )
+        restart_requested = restart_checkpoint() if restart_checkpoint is not None else False
+        if restart_requested:
+            return WatchSupervisorDispatchResult(
+                recovery_results=recovery_results,
+                pending_results=(),
+                restart_requested=True,
+                main_verify_remediation_results=emergency_results,
+            )
 
     pending_results: tuple[ProjectDispatchResult, ...] = ()
     pending_limit = launch_budget.occupancy.slots
-    restart_requested = restart_checkpoint() if restart_checkpoint is not None else False
     if not restart_requested and mode != "recovery_only" and pending_limit > 0:
         pending_results = dispatch_watch_supervisor_lane_incrementally(
-            runtimes,
+            ordinary_runtimes,
             lane="pending",
             limit=pending_limit,
             recovery_mode=mode,
@@ -10621,6 +10950,7 @@ def dispatch_watch_supervisor_lanes_incrementally(
         recovery_results=recovery_results,
         pending_results=pending_results,
         restart_requested=restart_requested,
+        main_verify_remediation_results=emergency_results,
     )
 
 
@@ -11343,6 +11673,9 @@ def run_watch_supervisor_fleet_cycle(
                 operational_disabled_callback=append_disabled,
             )
             runtime_state.restore_launch_budget(launch_budget)
+            main_verify_dispatch_controls = {
+                result.runtime_key: result.main_verify_dispatch_control for result in direct_results
+            }
             dispatch_results = dispatch_watch_supervisor_lanes_incrementally(
                 enabled_runtimes,
                 recovery_slots_config=recovery_slots,
@@ -11353,6 +11686,7 @@ def run_watch_supervisor_fleet_cycle(
                 launch_budget=launch_budget,
                 max_iterations=max_iterations,
                 analyses=analyses,
+                main_verify_dispatch_controls=main_verify_dispatch_controls,
                 operational_disabled_callback=append_disabled,
                 restart_checkpoint=restart_requested_at_checkpoint,
             )
@@ -11601,6 +11935,7 @@ def plan_watch_supervisor_dispatch_lanes(
     pending_strategy: WatchDispatchStrategy[ProjectDispatchCandidate],
     analyses: Mapping[str, ProjectCycleAnalysis] | None = None,
     local_occupancy: Mapping[str, ProjectLocalOccupancy] | None = None,
+    main_verify_dispatch_controls: Mapping[str, _MainVerifyDispatchControl] | None = None,
 ) -> WatchSupervisorDispatchLanePlan:
     """Build fleet recovery and pending lanes from local runtime candidates.
 
@@ -11618,12 +11953,41 @@ def plan_watch_supervisor_dispatch_lanes(
     )
     mode = normalize_dispatch_selection_mode(recovery_mode)
     analyses = analyses or {}
+    main_verify_dispatch_controls = main_verify_dispatch_controls or {}
     attempts_by_runtime_key = {
         runtime.key: resolve_watch_supervisor_runtime_recovery_attempts(runtime, max_recovery_attempts)
         for runtime in runtimes
     }
+    emergency_candidates_by_runtime = {
+        runtime.key: (
+            (candidate,)
+            if (
+                main_verify_dispatch_controls.get(runtime.key, _MainVerifyDispatchControl()).active
+                and (
+                    candidate := runtime.main_verify_remediation_dispatch_head(
+                        main_verify_dispatch_controls[runtime.key],
+                        max_recovery_attempts=attempts_by_runtime_key[runtime.key],
+                        analysis=analyses.get(runtime.key),
+                    )
+                )
+                is not None
+            )
+            else ()
+        )
+        for runtime in runtimes
+    }
+    main_verify_remediation_candidates = _select_watch_supervisor_lane_candidates(
+        strategy=recovery_strategy,
+        candidates_by_runtime_key=emergency_candidates_by_runtime,
+        limit=1,
+        available_by_runtime_key={runtime.key: 1 for runtime in runtimes},
+        used_by_runtime_key={},
+    )
+
     eligible_runtimes: list[WatchProjectRuntime] = []
     for runtime in runtimes:
+        if main_verify_dispatch_controls.get(runtime.key, _MainVerifyDispatchControl()).active:
+            continue
         occupancy = local_occupancy.get(runtime.key) if local_occupancy is not None else None
         if occupancy is None or occupancy.available > 0:
             eligible_runtimes.append(runtime)
@@ -11681,6 +12045,7 @@ def plan_watch_supervisor_dispatch_lanes(
         recovery_candidates=recovery_candidates,
         pending_candidates=pending_candidates,
         recovery_slot_limit=recovery_slot_limit,
+        main_verify_remediation_candidates=main_verify_remediation_candidates,
     )
 
 
@@ -11820,6 +12185,7 @@ def _preflight_pending_dispatch_candidate(
     owner_rows: tuple[LineageOwnerRow, ...] | None = None,
     read_context: RecoveryReadContext | None = None,
     suppression_context: _WatchDispatchSuppressionContext,
+    main_verify_remediation_task_id: str | None = None,
 ) -> _PendingDispatchPreflightResult:
     if task.id is None:
         return _PendingDispatchPreflightResult(
@@ -11865,18 +12231,30 @@ def _preflight_pending_dispatch_candidate(
         step1_handled_child_task_ids=step1_handled_ids,
         excluded_owner_ids=excluded_ids,
     )
-    current_head = next(iter(current_pending_entries), None)
-    if current_head is None or current_head.task.id != refreshed_task.id:
-        detail = (
-            f"task {refreshed_task.id} is not the current eligible pending dispatch head"
-            if current_head is not None
-            else f"task {refreshed_task.id} is no longer eligible for pending dispatch"
-        )
-        return _PendingDispatchPreflightResult(
-            task=refreshed_task,
-            dispatchable=False,
-            detail=detail,
-        )
+    if main_verify_remediation_task_id is not None:
+        if (
+            str(refreshed_task.id) != main_verify_remediation_task_id
+            or not is_watch_main_verify_remediation_task(refreshed_task)
+            or all(entry.task.id != refreshed_task.id for entry in current_pending_entries)
+        ):
+            return _PendingDispatchPreflightResult(
+                task=refreshed_task,
+                dispatchable=False,
+                detail=f"task {refreshed_task.id} is not the active main-verify remediation candidate",
+            )
+    else:
+        current_head = next(iter(current_pending_entries), None)
+        if current_head is None or current_head.task.id != refreshed_task.id:
+            detail = (
+                f"task {refreshed_task.id} is not the current eligible pending dispatch head"
+                if current_head is not None
+                else f"task {refreshed_task.id} is no longer eligible for pending dispatch"
+            )
+            return _PendingDispatchPreflightResult(
+                task=refreshed_task,
+                dispatchable=False,
+                detail=detail,
+            )
     task_type = refreshed_task.task_type or "implement"
     try:
         require_execution_route_for_task(refreshed_task, config)
@@ -12345,6 +12723,44 @@ class WatchProjectRuntime:
             None,
         )
 
+    def main_verify_remediation_dispatch_head(
+        self,
+        control: _MainVerifyDispatchControl,
+        *,
+        max_recovery_attempts: int,
+        analysis: ProjectCycleAnalysis | None = None,
+    ) -> ProjectDispatchCandidate | None:
+        if not control.active:
+            return None
+        preview = self.build_dispatch_preview(
+            recovery_mode="recovery_only",
+            max_recovery_attempts=max_recovery_attempts,
+            analysis=analysis,
+            include_recovery=False,
+            include_pending=True,
+        )
+        plan = plan_watch_dispatch_entries(
+            preview.runnable_entries,
+            slots=0,
+            recovery_slot_cap=0,
+            selection_mode="recovery_only",
+            main_verify_remediation_task_id=control.active_task_id,
+        )
+        entry = plan.main_verify_remediation_entry
+        if entry is None or entry.task.id is None:
+            return None
+        return ProjectDispatchCandidate(
+            runtime_key=self.key,
+            task=entry.task,
+            lane="main_verify_remediation",
+            runtime_identity=self.runtime_identity,
+            selection_mode="recovery_only",
+            max_recovery_attempts=max_recovery_attempts,
+            preview_entry=entry,
+            owner_task=entry.owner_task,
+            detail="main-verify-remediation",
+        )
+
     def _current_recovery_dispatch_head_for_validation(
         self,
         *,
@@ -12551,6 +12967,7 @@ class WatchProjectRuntime:
             project_analysis_invalidated=result.project_analysis_invalidated,
             needs_replan=result.needs_replan,
             cycle_result=result,
+            main_verify_dispatch_control=result.main_verify_dispatch_control,
         )
 
     def build_dispatch_preview(
@@ -13615,7 +14032,7 @@ class WatchProjectRuntime:
             )
         if (
             not self._candidate_belongs_to_runtime(candidate)
-            or candidate.lane != "pending"
+            or candidate.lane not in {"pending", "main_verify_remediation"}
             or candidate.task.id is None
         ):
             return ProjectDispatchResult(
@@ -13684,6 +14101,9 @@ class WatchProjectRuntime:
             owner_rows=analysis.analysis.owner_rows if analysis is not None else None,
             read_context=analysis.analysis.watch_read_context if analysis is not None else None,
             suppression_context=suppression_context,
+            main_verify_remediation_task_id=(
+                str(candidate.task.id) if candidate.lane == "main_verify_remediation" else None
+            ),
         )
         if not preflight.dispatchable:
             self._exclude_pending_dispatch_candidate_for_pass(str(task.id))
@@ -13700,8 +14120,8 @@ class WatchProjectRuntime:
         assert task is not None
         task_type = task.task_type or "implement"
 
-        def reject_if_live_worker_proof() -> ProjectDispatchResult | None:
-            if not self._task_has_current_live_worker_proof(str(task.id)):
+        def reject_if_live_worker_proof(task_obj: DbTask) -> ProjectDispatchResult | None:
+            if not self._task_has_current_live_worker_proof(str(task_obj.id)):
                 return None
             return ProjectDispatchResult(
                 runtime_key=self.key,
@@ -13709,31 +14129,47 @@ class WatchProjectRuntime:
                 status="not_dispatchable",
                 slot_consuming=False,
                 work_done=False,
-                detail=f"task {task.id} already has live worker proof",
-                task=task,
+                detail=f"task {task_obj.id} already has live worker proof",
+                task=task_obj,
             )
 
-        current_head = self._current_pending_dispatch_head_for_validation(
-            suppression_context=suppression_context,
-            selection_mode=candidate.selection_mode,
-            max_recovery_attempts=effective_max_recovery_attempts,
-        )
-        if current_head is None or current_head.task.id != task.id:
-            detail = (
-                f"task {task.id} is not the current eligible pending dispatch head"
-                if current_head is not None
-                else f"task {task.id} is no longer eligible for pending dispatch"
-            )
-            return ProjectDispatchResult(
-                runtime_key=self.key,
-                candidate=candidate,
-                status="not_dispatchable",
-                slot_consuming=False,
-                work_done=False,
-                detail=detail,
+        if candidate.lane == "main_verify_remediation":
+            if not _main_verify_remediation_has_active_nonexhausted_fix_ownership(
+                store=self.store,
                 task=task,
+                config=self.config,
+            ):
+                return ProjectDispatchResult(
+                    runtime_key=self.key,
+                    candidate=candidate,
+                    status="not_dispatchable",
+                    slot_consuming=False,
+                    work_done=False,
+                    detail=f"task {task.id} is not the active non-exhausted main-verify fix remediation",
+                    task=task,
+                )
+        else:
+            current_head = self._current_pending_dispatch_head_for_validation(
+                suppression_context=suppression_context,
+                selection_mode=candidate.selection_mode,
+                max_recovery_attempts=effective_max_recovery_attempts,
             )
-        live_worker_rejection = reject_if_live_worker_proof()
+            if current_head is None or current_head.task.id != task.id:
+                detail = (
+                    f"task {task.id} is not the current eligible pending dispatch head"
+                    if current_head is not None
+                    else f"task {task.id} is no longer eligible for pending dispatch"
+                )
+                return ProjectDispatchResult(
+                    runtime_key=self.key,
+                    candidate=candidate,
+                    status="not_dispatchable",
+                    slot_consuming=False,
+                    work_done=False,
+                    detail=detail,
+                    task=task,
+                )
+        live_worker_rejection = reject_if_live_worker_proof(task)
         if live_worker_rejection is not None:
             return live_worker_rejection
 
@@ -13772,7 +14208,7 @@ class WatchProjectRuntime:
                 detail="active recovery backoff",
                 task=task,
             )
-        live_worker_rejection = reject_if_live_worker_proof()
+        live_worker_rejection = reject_if_live_worker_proof(task)
         if live_worker_rejection is not None:
             return live_worker_rejection
         no_progress_attention = _maybe_park_watch_no_progress(
@@ -13816,12 +14252,16 @@ class WatchProjectRuntime:
                 detail=str(no_progress_attention.get("needs_attention_reason", "watch-no-progress")),
                 task=task,
             )
-        live_worker_rejection = reject_if_live_worker_proof()
+        live_worker_rejection = reject_if_live_worker_proof(task)
         if live_worker_rejection is not None:
             return live_worker_rejection
 
+        permit_config = self.config
+        if candidate.lane == "main_verify_remediation":
+            permit_config = copy.copy(self.config)
+            permit_config.max_concurrent = int(self.config.max_concurrent) + 1
         try:
-            permit = launch_permit(self.config, self.store)
+            permit = launch_permit(permit_config, self.store)
         except MaxConcurrentTasksError as exc:
             self.log.emit(
                 "SKIP",
@@ -13840,7 +14280,28 @@ class WatchProjectRuntime:
         owned_launch_permit: LaunchPermit | None = permit
         reserved_launch_permit_task_id: str | None = None
         try:
-            live_worker_rejection = reject_if_live_worker_proof()
+            if candidate.lane == "main_verify_remediation":
+                boundary_task, boundary_detail = _validate_main_verify_remediation_launch_boundary(
+                    store=self.store,
+                    config=self.config,
+                    task_id=str(task.id),
+                )
+                if boundary_detail is not None:
+                    permit.release()
+                    owned_launch_permit = None
+                    return ProjectDispatchResult(
+                        runtime_key=self.key,
+                        candidate=candidate,
+                        status="not_dispatchable",
+                        slot_consuming=False,
+                        work_done=False,
+                        detail=boundary_detail,
+                        task=boundary_task or task,
+                    )
+                assert boundary_task is not None
+                task = boundary_task
+                task_type = task.task_type or "implement"
+            live_worker_rejection = reject_if_live_worker_proof(task)
             if live_worker_rejection is not None:
                 permit.release()
                 owned_launch_permit = None
@@ -13880,11 +14341,31 @@ class WatchProjectRuntime:
                 owned_launch_permit = None
                 settle_task_before = _snapshot_watch_dispatch_task(prepared_task)
                 pending_recovery_mode = resolve_pending_recovery_execution_mode(task)
-                live_worker_rejection = reject_if_live_worker_proof()
+                live_worker_rejection = reject_if_live_worker_proof(task)
                 if live_worker_rejection is not None:
                     release_task_launch_permit(reserved_launch_permit_task_id)
                     reserved_launch_permit_task_id = None
                     return live_worker_rejection
+                if candidate.lane == "main_verify_remediation":
+                    boundary_task, boundary_detail = _validate_main_verify_remediation_launch_boundary(
+                        store=self.store,
+                        config=self.config,
+                        task_id=prepared_task_id,
+                    )
+                    if boundary_detail is not None:
+                        release_task_launch_permit(reserved_launch_permit_task_id)
+                        reserved_launch_permit_task_id = None
+                        return ProjectDispatchResult(
+                            runtime_key=self.key,
+                            candidate=candidate,
+                            status="not_dispatchable",
+                            slot_consuming=False,
+                            work_done=False,
+                            detail=boundary_detail,
+                            task=boundary_task or task,
+                        )
+                    assert boundary_task is not None
+                    task = boundary_task
                 iterate_args = argparse.Namespace(
                     max_iterations=max_iterations,
                     no_docker=False,
@@ -13892,15 +14373,16 @@ class WatchProjectRuntime:
                     retry=False,
                     auto_iterate=True,
                 )
+                spawn_task = task
                 rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
                     log=self.log,
-                    failure_message=f"{task.id} {task_type}: iterate worker spawn failed",
-                    dedupe_key=f"spawn-iterate-failed:{task.id}",
+                    failure_message=f"{spawn_task.id} {task_type}: iterate worker spawn failed",
+                    dedupe_key=f"spawn-iterate-failed:{spawn_task.id}",
                     spawn_fn=lambda: _spawn_background_iterate(
                         iterate_args,
                         self.config,
-                        task,
+                        spawn_task,
                         prepared_task_id=prepared_task_id,
                         prepared_resume=pending_recovery_mode == "resume",
                         prepared_phase="preloop",
@@ -13914,11 +14396,31 @@ class WatchProjectRuntime:
             else:
                 settle_task_before = _snapshot_watch_dispatch_task(task)
                 worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                live_worker_rejection = reject_if_live_worker_proof()
+                live_worker_rejection = reject_if_live_worker_proof(task)
                 if live_worker_rejection is not None:
                     permit.release()
                     owned_launch_permit = None
                     return live_worker_rejection
+                if candidate.lane == "main_verify_remediation":
+                    boundary_task, boundary_detail = _validate_main_verify_remediation_launch_boundary(
+                        store=self.store,
+                        config=self.config,
+                        task_id=str(task.id),
+                    )
+                    if boundary_detail is not None:
+                        permit.release()
+                        owned_launch_permit = None
+                        return ProjectDispatchResult(
+                            runtime_key=self.key,
+                            candidate=candidate,
+                            status="not_dispatchable",
+                            slot_consuming=False,
+                            work_done=False,
+                            detail=boundary_detail,
+                            task=boundary_task or task,
+                        )
+                    assert boundary_task is not None
+                    task = boundary_task
                 rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
                     log=self.log,
@@ -14197,6 +14699,7 @@ def _map_planned_pending_entries_to_launchable_tasks(
     planned_entries: Sequence[DispatchPreviewEntry],
     *,
     pending_entries: Sequence[DispatchPreviewEntry],
+    include_unplanned_entries: bool = True,
 ) -> tuple[tuple[DbTask, ...], tuple[DispatchPreviewEntry, ...]]:
     pending_by_task_id = {
         str(entry.task.id): entry.task
@@ -14216,13 +14719,14 @@ def _map_planned_pending_entries_to_launchable_tasks(
             continue
         ordered_pending_tasks.append(task)
         planned_task_ids.add(task_id)
-    for entry in pending_entries:
-        if entry.lane != "pending" or entry.task.id is None:
-            continue
-        task_id = str(entry.task.id)
-        if task_id in planned_task_ids:
-            continue
-        ordered_pending_tasks.append(entry.task)
+    if include_unplanned_entries:
+        for entry in pending_entries:
+            if entry.lane != "pending" or entry.task.id is None:
+                continue
+            task_id = str(entry.task.id)
+            if task_id in planned_task_ids:
+                continue
+            ordered_pending_tasks.append(entry.task)
     return tuple(ordered_pending_tasks), tuple(unmapped_entries)
 
 
@@ -16963,6 +17467,51 @@ def _run_cycle(
             )
             return None
 
+    def _reserve_main_verify_remediation_launch(task: DbTask) -> LaunchPermit | None:
+        if task.id is None or not main_verify_dispatch_control.active:
+            return None
+        task_id = str(task.id)
+        if task_id != main_verify_dispatch_control.active_task_id:
+            return None
+        if not is_watch_main_verify_remediation_task(task):
+            return None
+        if task.status != "pending":
+            return None
+        if active_main_verify_remediation is None:
+            return None
+        refreshed_control = _active_main_verify_fix_dispatch_control(
+            store=store,
+            remediation=active_main_verify_remediation,
+            config=config,
+        )
+        if refreshed_control.active_task_id != task_id:
+            return None
+        exception_config = copy.copy(config)
+        exception_config.max_concurrent = int(config.max_concurrent) + 1
+        try:
+            permit = launch_permit(exception_config, store)
+        except MaxConcurrentTasksError as exc:
+            log.emit(
+                "SKIP",
+                f"{task_id}: {exc}",
+                dedupe_key=f"watch-main-verify-remediation-max-concurrent:{task_id}",
+            )
+            return None
+        _boundary_task, boundary_detail = _validate_main_verify_remediation_launch_boundary(
+            store=store,
+            config=config,
+            task_id=task_id,
+        )
+        if boundary_detail is not None:
+            permit.release()
+            log.emit(
+                "SKIP",
+                f"{task_id}: {boundary_detail}",
+                dedupe_key=f"watch-main-verify-remediation-boundary:{task_id}",
+            )
+            return None
+        return permit
+
     def _prepare_watch_reserved_task(
         task: DbTask,
         *,
@@ -17005,10 +17554,19 @@ def _run_cycle(
             remaining_new_worker_starts = max(0, remaining_new_worker_starts - 1)
 
     def _free_worker_start_slots() -> int:
+        if main_verify_dispatch_control.active:
+            return 0
         provisional_starts = len(deferred_lifecycle_starts) + len(deferred_recovery_starts)
         if remaining_new_worker_starts is None:
             return max(0, slots - provisional_starts)
         return max(0, min(slots, remaining_new_worker_starts) - provisional_starts)
+
+    def _normal_dispatch_slots_for_planning() -> int:
+        if main_verify_dispatch_control.active:
+            return 0
+        if remaining_new_worker_starts is None:
+            return slots
+        return min(slots, remaining_new_worker_starts)
 
     def _free_reserved_recovery_slots() -> int:
         return max(0, reserved_recovery_slots - len(deferred_recovery_starts))
@@ -17371,6 +17929,7 @@ def _run_cycle(
     merge_halted_for_cycle = False
     active_main_verify_remediation: MainIntegrationVerifyRemediation | None = None
     active_main_verify_remediation_task_id: str | None = None
+    main_verify_dispatch_control = _MainVerifyDispatchControl()
     merge_verify_git: Git | None = None
     latest_main_verify_state: Any | None = None
     latest_main_verify_git: Git | None = None
@@ -17379,6 +17938,7 @@ def _run_cycle(
         remediation: MainIntegrationVerifyRemediation | None,
     ) -> None:
         nonlocal active_main_verify_remediation, active_main_verify_remediation_task_id
+        nonlocal main_verify_dispatch_control
         if remediation is not None and remediation.kind == "fix":
             active_main_verify_remediation = remediation
             active_state = store.get_main_verify_remediation_attempt_state(
@@ -17386,9 +17946,18 @@ def _run_cycle(
                 tree_fingerprint=_main_verify_remediation_ledger_fingerprint(remediation.tree_fingerprint),
             )
             active_main_verify_remediation_task_id = active_state.active_task_id if active_state is not None else None
+            main_verify_dispatch_control = _active_main_verify_fix_dispatch_control(
+                store=store,
+                remediation=remediation,
+                config=config,
+            )
         else:
             active_main_verify_remediation = None
             active_main_verify_remediation_task_id = None
+            main_verify_dispatch_control = _greenlit_live_main_verify_fix_dispatch_control(
+                store=store,
+                config=config,
+            )
 
     with _watch_cycle_phase(long_phase_reporter, "lifecycle-preflight"):
         _check_canonical_checkout_boundary("watch-pass-start")
@@ -17493,6 +18062,7 @@ def _run_cycle(
         require_candidate_lineage: bool = True,
     ) -> bool:
         nonlocal active_main_verify_remediation, active_main_verify_remediation_task_id
+        nonlocal main_verify_dispatch_control
         nonlocal latest_main_verify_state, work_done, active_main_verify_terminal_attempt_consumed
         if dry_run or active_main_verify_terminal_attempt_consumed:
             return False
@@ -17512,6 +18082,7 @@ def _run_cycle(
             )
             active_main_verify_remediation = None
             active_main_verify_remediation_task_id = None
+            main_verify_dispatch_control = _MainVerifyDispatchControl()
             return False
         active_identity = _main_verify_remediation_identity(active_main_verify_remediation)
         if not _main_verify_remediation_task_matches_identity(active_task, active_identity):
@@ -17525,6 +18096,7 @@ def _run_cycle(
             )
             active_main_verify_remediation = None
             active_main_verify_remediation_task_id = None
+            main_verify_dispatch_control = _MainVerifyDispatchControl()
             return False
         if require_candidate_lineage:
             if candidate is None or candidate.id is None:
@@ -17592,6 +18164,7 @@ def _run_cycle(
         active_main_verify_terminal_attempt_consumed = True
         active_main_verify_remediation = None
         active_main_verify_remediation_task_id = None
+        main_verify_dispatch_control = _MainVerifyDispatchControl()
         work_done = True
         return True
 
@@ -18713,6 +19286,7 @@ def _run_cycle(
                 active_recovery_subject_ids=analysis.active_recovery_subject_ids,
                 project_analysis_invalidated=project_analysis_invalidated,
                 needs_replan=project_analysis_invalidated,
+                main_verify_dispatch_control=main_verify_dispatch_control,
             )
         finally:
             cycle_phase.finish()
@@ -18864,16 +19438,21 @@ def _run_cycle(
         )
         dispatch_plan = plan_watch_dispatch_entries(
             dispatch_launchable_entries,
-            slots=slots,
+            slots=_normal_dispatch_slots_for_planning(),
             recovery_slot_cap=recovery_slots,
             selection_mode=dispatch_selection_mode,
             include_pending=scoped_owner_ids is None,
+            main_verify_remediation_task_id=main_verify_dispatch_control.active_task_id,
         )
         planned_dispatch_entries = tuple(getattr(dispatch_plan, "entries", dispatch_launchable_entries))
         reserved_recovery_slots = dispatch_plan.recovery_worker_slots
         if remaining_new_worker_starts is not None:
             reserved_recovery_slots = min(reserved_recovery_slots, remaining_new_worker_starts)
-        pending_slots = 0 if scoped_owner_ids is not None else dispatch_plan.pending_slots
+        pending_slots = (
+            0
+            if scoped_owner_ids is not None
+            else dispatch_plan.pending_slots + dispatch_plan.main_verify_remediation_slots
+        )
         known_non_actionable_recovery_subject_ids = frozenset(
             str(failed.id)
             for _owner_task, failed, _decision, _action in (
@@ -19872,10 +20451,11 @@ def _run_cycle(
                 )
                 replanned_dispatch_plan = plan_watch_dispatch_entries(
                     remaining_dispatch_entries,
-                    slots=slots,
+                    slots=_normal_dispatch_slots_for_planning(),
                     recovery_slot_cap=recovery_slots,
                     selection_mode=dispatch_selection_mode,
                     include_pending=scoped_owner_ids is None,
+                    main_verify_remediation_task_id=main_verify_dispatch_control.active_task_id,
                 )
                 replanned_dispatch_entries = tuple(
                     getattr(replanned_dispatch_plan, "entries", remaining_dispatch_entries)
@@ -19949,7 +20529,11 @@ def _run_cycle(
     ) -> tuple[list[DbTask], int, bool, tuple[DispatchPreviewEntry, ...]]:
         if scoped_owner_ids is not None:
             return [], 0, False, ()
-        pending_selection_mode = selection_mode_override or _watch_supervisor_pending_selection_mode(recovery_mode)
+        pending_selection_mode = (
+            "recovery_only"
+            if main_verify_dispatch_control.active
+            else selection_mode_override or _watch_supervisor_pending_selection_mode(recovery_mode)
+        )
         pending_preview = build_dispatch_preview(
             store,
             config=config,
@@ -19969,26 +20553,31 @@ def _run_cycle(
             step1_handled_child_task_ids=step1_handled_child_task_ids,
             excluded_owner_ids=excluded_owner_ids,
         )
-        effective_pending_slots = slots
-        if remaining_new_worker_starts is not None:
-            effective_pending_slots = min(effective_pending_slots, remaining_new_worker_starts)
+        effective_pending_slots = _normal_dispatch_slots_for_planning()
         pending_plan = plan_watch_dispatch_entries(
             pending_entries,
             slots=effective_pending_slots,
             recovery_slot_cap=0,
             selection_mode=pending_selection_mode,
             include_pending=True,
+            main_verify_remediation_task_id=main_verify_dispatch_control.active_task_id,
         )
         planned_pending_entries = tuple(getattr(pending_plan, "entries", pending_entries))
         pending_tasks, unmapped_pending_entries = _map_planned_pending_entries_to_launchable_tasks(
             planned_pending_entries,
             pending_entries=pending_entries,
+            include_unplanned_entries=not main_verify_dispatch_control.active,
         )
         if unmapped_pending_entries:
             for entry in unmapped_pending_entries:
                 _fail_closed_for_planned_pending_entry(entry, reason="missing-pending-task")
             return [], 0, True, ()
-        return list(pending_tasks), pending_plan.pending_slots, False, tuple(pending_entries)
+        return (
+            list(pending_tasks),
+            pending_plan.pending_slots + pending_plan.main_verify_remediation_slots,
+            False,
+            tuple(pending_entries),
+        )
 
     pending_restart_requested = False
     with _watch_cycle_phase(long_phase_reporter, "pending-dispatch"):
@@ -20011,21 +20600,19 @@ def _run_cycle(
             pending_entries_for_preflight = ()
             pending_dispatch_failed_closed = False
 
-        if (
-            scoped_owner_ids is None
-            and recovery_mode == "recovery_only"
-            and pending_slots <= 0
-            and not recovery_started_this_cycle
-        ):
-            if not nonparked_recovery_subject_ids:
-                pending_tasks, pending_slots, pending_dispatch_failed_closed, pending_entries_for_preflight = (
-                    _recompute_pending_dispatch()
-                )
-
         # 3) Start new queued tasks (consumes slots)
-        def consume_pending_slot() -> None:
+        main_verify_remediation_pending_slots = 1 if main_verify_dispatch_control.active else 0
+
+        def consume_pending_slot(task_id: str) -> None:
+            nonlocal main_verify_remediation_pending_slots
             nonlocal pending_slots, slots
             pending_slots -= 1
+            if (
+                main_verify_remediation_pending_slots > 0
+                and main_verify_dispatch_control.active_task_id == task_id
+            ):
+                main_verify_remediation_pending_slots -= 1
+                return
             slots = max(0, slots - 1)
 
         def _settle_pending_dispatch_wave(
@@ -20054,7 +20641,7 @@ def _run_cycle(
                         attention_key_prefix="pending-attention",
                     )
                     continue
-                consume_pending_slot()
+                consume_pending_slot(deferred.settle.task_id)
                 work_done = True
                 started_task_ids.add(deferred.settle.task_id)
                 confirmed_start_count += 1
@@ -20093,7 +20680,9 @@ def _run_cycle(
                 nonlocal pending_task_index
                 pending_preflight_rejected_task_ids.add(task_id)
                 pending_tasks, pending_slots, pending_dispatch_failed_closed, pending_entries_for_preflight = (
-                    _recompute_pending_dispatch()
+                    _recompute_pending_dispatch(
+                        selection_mode_override="recovery_only" if main_verify_dispatch_control.active else None
+                    )
                 )
                 pending_task_index = 0
                 return pending_dispatch_failed_closed
@@ -20121,7 +20710,11 @@ def _run_cycle(
                         tags=tags,
                         any_tag=any_tag,
                         max_recovery_attempts=max_recovery_attempts,
-                        selection_mode=_watch_supervisor_pending_selection_mode(recovery_mode),
+                        selection_mode=(
+                            "recovery_only"
+                            if main_verify_dispatch_control.active
+                            else _watch_supervisor_pending_selection_mode(recovery_mode)
+                        ),
                         target_branch=target_branch,
                         owner_rows=analysis.owner_rows,
                         read_context=analysis.watch_read_context,
@@ -20131,6 +20724,7 @@ def _run_cycle(
                             step1_handled_child_task_ids=frozenset(step1_handled_child_task_ids),
                             excluded_owner_ids=excluded_owner_ids,
                         ),
+                        main_verify_remediation_task_id=main_verify_dispatch_control.active_task_id,
                     )
                     if not preflight.dispatchable:
                         if _suppress_pending_candidate_and_recompute(str(task.id)):
@@ -20150,7 +20744,7 @@ def _run_cycle(
                             )
                             log.emit("START", f'{task.id} {task_type} "{dry_run_prompt}" [dry-run]')
                             started_task_ids.add(str(task.id))
-                            consume_pending_slot()
+                            consume_pending_slot(str(task.id))
                             wave_fill_count += 1
                             work_done = True
                             continue
@@ -20202,12 +20796,32 @@ def _run_cycle(
                             auto_iterate=True,
                         )
                         pending_recovery_mode = resolve_pending_recovery_execution_mode(task)
-                        reserved_launch = _reserve_watch_launch("iterate", str(task.id))
+                        reserved_launch = (
+                            _reserve_main_verify_remediation_launch(task)
+                            if str(task.id) == main_verify_dispatch_control.active_task_id
+                            else _reserve_watch_launch("iterate", str(task.id))
+                        )
                         if reserved_launch is None:
                             continue
                         if _watch_task_has_live_registered_worker(config, str(task.id)):
                             reserved_launch.release()
                             continue
+                        if str(task.id) == main_verify_dispatch_control.active_task_id:
+                            boundary_task, boundary_detail = _validate_main_verify_remediation_launch_boundary(
+                                store=store,
+                                config=config,
+                                task_id=str(task.id),
+                            )
+                            if boundary_detail is not None:
+                                reserved_launch.release()
+                                log.emit(
+                                    "SKIP",
+                                    f"{task.id}: {boundary_detail}",
+                                    dedupe_key=f"watch-main-verify-remediation-boundary:{task.id}",
+                                )
+                                continue
+                            assert boundary_task is not None
+                            task = boundary_task
                         prepared_pending_task = _prepare_watch_reserved_task(
                             task,
                             permit=reserved_launch,
@@ -20225,6 +20839,22 @@ def _run_cycle(
                         if _watch_task_has_live_registered_worker(config, str(task.id)):
                             _release_watch_reserved_task(str(prepared_pending_task.id))
                             continue
+                        if str(task.id) == main_verify_dispatch_control.active_task_id:
+                            boundary_task, boundary_detail = _validate_main_verify_remediation_launch_boundary(
+                                store=store,
+                                config=config,
+                                task_id=str(prepared_pending_task.id),
+                            )
+                            if boundary_detail is not None:
+                                _release_watch_reserved_task(str(prepared_pending_task.id))
+                                log.emit(
+                                    "SKIP",
+                                    f"{prepared_pending_task.id}: {boundary_detail}",
+                                    dedupe_key=f"watch-main-verify-remediation-boundary:{prepared_pending_task.id}",
+                                )
+                                continue
+                            assert boundary_task is not None
+                            task = boundary_task
                         rc = _spawn_worker_with_failure_log(
                             quiet=quiet,
                             log=log,
@@ -20273,7 +20903,7 @@ def _run_cycle(
                         )
                         log.emit("START", f'{task.id} {task_type} "{dry_run_prompt}" [dry-run]')
                         started_task_ids.add(str(task.id))
-                        consume_pending_slot()
+                        consume_pending_slot(str(task.id))
                         wave_fill_count += 1
                         work_done = True
                         continue
@@ -20432,6 +21062,7 @@ def _run_cycle(
         expected_starts=expected_starts,
         confirmed_start_count=confirmed_start_count,
         active_recovery_subject_ids=analysis.active_recovery_subject_ids,
+        main_verify_dispatch_control=main_verify_dispatch_control,
     )
 
 

@@ -167,6 +167,13 @@ fleet-wide direct-action-before-dispatch barrier.
   alone. The supervisor MUST compute `aggregate_occupied` as the count of deduplicated
   slot claims across selected runtimes, then compute
   `dispatch_slots = max(0, supervisor_batch - aggregate_occupied)`.
+- A deterministic-red main-verify fix remediation MAY use one supervisor-global
+  emergency slot outside `dispatch_slots`. That slot is authorized only for the exact
+  active non-exhausted `system-main-verify` remediation task recorded in the watch
+  main-verify attempt ledger. While such a claim is reserved or live, no second
+  emergency remediation claim may be issued. Aggregate occupancy MUST therefore remain
+  at or below `supervisor_batch + 1`, and ordinary recovery/pending/lifecycle starts
+  remain capped by `dispatch_slots`.
 - A slot claim is one task-executing live worker, one starting worker, or one unsettled
   global reservation. The same launch MUST produce at most one claim: deduplicate by
   worker PID when available, then by a launch token proven globally unique across the
@@ -219,9 +226,16 @@ then `queue_position ASC`, `urgent DESC`, `urgent_bumped_at DESC`, and `created_
 with dependency-runnable filtering applied locally. The cross-project strategy chooses
 only between eligible project heads. It MUST NOT reorder candidates within one project.
 
-The fleet dispatch loop has two worker-consuming lanes:
+The fleet dispatch loop has three worker-consuming lanes:
 
-1. **Recovery lane.** When recovery pickup is enabled, each runtime exposes at most its
+1. **Main-verify remediation emergency lane.** Before ordinary recovery or pending
+   arbitration, a held runtime may expose only the exact active non-exhausted
+   deterministic-red `system-main-verify` fix remediation task. The supervisor
+   arbitrates these emergency heads deterministically and may start at most one across
+   the fleet, independent of `dispatch_slots` but subject to the `supervisor_batch + 1`
+   aggregate ceiling. Held runtimes expose no ordinary recovery or pending head while
+   the hold is active; healthy runtimes remain eligible for ordinary lanes.
+2. **Recovery lane.** When recovery pickup is enabled, each runtime exposes at most its
    current locally ordered recovery head. The supervisor arbitrates those heads with the
    selected cross-project strategy for at most
    `min(dispatch_slots, effective_recovery_slots)` worker-consuming starts. Recovery
@@ -229,7 +243,7 @@ The fleet dispatch loop has two worker-consuming lanes:
    recovery rules that explicitly bypass pending pickup. Under `--recovery-only`,
    `effective_recovery_slots` equals `dispatch_slots`, so enough eligible recovery heads
    MUST be allowed to fill every free fleet slot.
-2. **Pending lane.** When pending pickup is enabled, each runtime exposes at most its
+3. **Pending lane.** When pending pickup is enabled, each runtime exposes at most its
    current locally ordered pending head. The supervisor offers this lane all remaining
    dispatch capacity after the recovery lane, including any unused recovery allocation
    when fewer recovery heads are available than `effective_recovery_slots`.
@@ -239,7 +253,10 @@ recovery lane still has unused supervisor-global recovery allocation. Unused rec
 allocation is donated immediately to pending in the same cycle; it is not held idle for a
 possible later recovery candidate discovered after pending starts. `--recovery-only`
 sets the fleet recovery allocation to all current dispatch capacity and disables the
-pending lane. `--pending-only` disables the global failed-task recovery lane.
+ordinary pending lane. The only pending carve-out under `--recovery-only` is the active
+watch-owned `system-main-verify` remediation selected by the emergency lane; queue
+position or urgency alone is never authorization. `--pending-only` disables the global
+failed-task recovery lane.
 In a scoped single-project watch, existing scoped recovery and pending suppression rules
 remain the lane gates.
 
@@ -331,8 +348,10 @@ and dispatch stops only when aggregate capacity or eligible heads are exhausted.
     performing observation, required mutating reconciliation, bounded rerun bookkeeping,
     and the `system-main-verify` remediation creation/reuse/queue-bump/dispatch path
     defined by this spec and
-    [main-verify-self-heal.md](main-verify-self-heal.md). It MUST NOT suppress worker
-    dispatch for that remediation lane merely because ordinary merges are held.
+    [main-verify-self-heal.md](main-verify-self-heal.md). While an active non-exhausted
+    deterministic-red fix remediation is pending or in progress, the runtime MUST also
+    suppress new ordinary worker-consuming starts for that affected runtime. The exact
+    active remediation task remains eligible for the one emergency dispatch slot.
   - `verify-environment-unavailable`: config is valid and the lease remains owned, but
     the configured local-target verify gate cannot produce code verdict evidence because
     exact-tree freshness, execution budget, schema-runtime compatibility, or control-plane
@@ -729,9 +748,10 @@ Each watch cycle MUST execute these phases in order:
    Recovery allocation is not a pending leftover: the supervisor MUST offer
    worker-consuming recovery heads the configured supervisor-global recovery allocation
    before pending pickup. Under `--recovery-only`, that allocation MUST be all current
-   fleet dispatch capacity, and pending pickup MUST be gated entirely while any
-   actionable in-scope recovery remains, even if that recovery action is direct and does
-   not consume a worker slot.
+   fleet dispatch capacity, and ordinary pending pickup MUST be disabled
+   unconditionally. The active watch-owned main-verify remediation carve-out is handled
+   by the emergency lane and does not turn an empty recovery lane into pending-only
+   dispatch.
    Before pending pickup begins, the supervisor MUST examine pending work in the same
    priority order the pickup lane would use if quiet-period holds were ignored. If the
    first otherwise-pickable pending task is currently held only by the quiet-period
@@ -898,6 +918,10 @@ The batch limit means "maintain at most N concurrent detached worker processes,"
   project's explicit `max_concurrent` remains a local sub-cap.
 - In legacy single-project mode, `slots` MUST equal
   `max(0, min(batch, max_concurrent) - running)`.
+- In legacy single-project mode, the exact active non-exhausted deterministic-red
+  `system-main-verify` fix remediation MAY use one emergency start evaluated against
+  `max_concurrent + 1`. No ordinary start may use that exception, and normal `slots`
+  MUST NOT be debited by the emergency start.
 - In legacy single-project mode, if the requested `batch` exceeds an explicit
   `max_concurrent`, watch MUST emit one startup warning that the requested batch was
   capped by the configured ceiling.
@@ -1226,12 +1250,12 @@ The existence of these knobs is contract; their values are operator policy.
 
 | Knob | Governs |
 |------|---------|
-| `watch.batch` / supervisor batch | Maximum concurrent detached worker processes the supervisor maintains; in multi-project mode this is one supervisor-global aggregate watch budget enforced by `dispatch_slots = max(0, supervisor_batch - aggregate_occupied)` |
+| `watch.batch` / supervisor batch | Maximum concurrent detached worker processes the supervisor maintains; in multi-project mode this is one supervisor-global aggregate watch budget enforced by `dispatch_slots = max(0, supervisor_batch - aggregate_occupied)`, except for the single exact active main-verify remediation emergency slot capped by `supervisor_batch + 1` |
 | `max_concurrent` | Project-local launch ceiling; legacy single-project watch clamps batch to this when explicit, and multi-project watch treats each selected project's value as a local sub-cap |
 | `watch.poll` / supervisor poll | Delay between completed cycles; in multi-project mode this is one supervisor-global fleet-level sleep boundary |
 | `watch.max_idle` / supervisor max-idle | Consecutive idle loop time before clean exit; in multi-project mode idle is aggregate across selected runtimes |
 | `watch.max_iterations` | Iterate-worker loop cap for implementation chains launched by watch; an explicit CLI override may apply to every selected project, otherwise each project runtime uses its own value |
-| `watch.recovery_slots` / supervisor recovery slots | Worker-consuming failed-task recovery reservation before pending pickup; in legacy single-project mode this comes from that project's watch config when no CLI value is supplied, while in multi-project mode it is one supervisor-global recovery-lane allocation resolved by CLI, then manifest, then anchor/supervisor config, then default, not multiplied per project, and donated to pending when unused in the same cycle; `--recovery-only` overrides the effective recovery allocation to all current dispatch capacity and suppresses pending pickup |
+| `watch.recovery_slots` / supervisor recovery slots | Worker-consuming failed-task recovery reservation before pending pickup; in legacy single-project mode this comes from that project's watch config when no CLI value is supplied, while in multi-project mode it is one supervisor-global recovery-lane allocation resolved by CLI, then manifest, then anchor/supervisor config, then default, not multiplied per project, and donated to ordinary pending when unused in the same cycle; `--recovery-only` overrides the effective recovery allocation to all current dispatch capacity and suppresses ordinary pending pickup, leaving only the exact active watch-owned main-verify remediation emergency carve-out |
 | `watch.failure_backoff_initial` / `watch.failure_backoff_max` | Project-local exponential cooldown after non-auto-resumable failures |
 | `watch.failure_halt_after` | Project-local distinct failing-owner threshold that stops or holds that runtime for human intervention; repeated failures from one owner advance only that owner's backoff streak |
 | `watch.transient_recovery_backoff_max` | Project-local maximum persisted cooldown for transient failed recovery/improve retries |

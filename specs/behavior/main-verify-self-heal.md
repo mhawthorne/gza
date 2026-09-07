@@ -149,11 +149,12 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   Automation MUST halt merges for that failure, and the supervisor MUST create or reuse
   exactly one active remediation attempt for that failure identity, backed by a
   remediation task that aims to fix the failing phase or gate.
-- That deterministic-red hold applies only to ordinary merge actions for the affected
-  local target/merge lane. It MUST NOT suppress creation, reuse, queue-bumping, or
-  worker dispatch of the bounded `system-main-verify` remediation path for the same
-  failure identity, and it MUST NOT block healthy project runtimes in a multi-project
-  watch fleet.
+- That deterministic-red hold applies to ordinary merge actions and, while the active
+  non-exhausted fix remediation is pending or in progress, to new ordinary
+  worker-consuming starts for the affected runtime. It MUST NOT suppress creation,
+  reuse, queue-bumping, or emergency worker dispatch of the exact active
+  `system-main-verify` remediation for the same failure identity, and it MUST NOT block
+  healthy project runtimes in a multi-project watch fleet.
 - The bounded rerun evidence MUST carry the observed environment identity (at minimum
   runner class plus host/container-relevant runtime traits, or an explicit
   `unknown/unavailable` marker when that identity could not be captured) into
@@ -335,6 +336,17 @@ because merges are currently halted.
 - Work whose next meaningful action is blocked by the freeze MAY remain waiting, but it
   MUST stay visible and re-evaluable rather than being converted into a permanent parked
   state solely because the target is red.
+- While an active non-exhausted deterministic-red `system-main-verify` fix remediation
+  owns the pipeline, watch MUST temporarily suppress new ordinary worker starts in the
+  affected runtime. The hold starts when preflight confirms deterministic red and creates
+  or reuses that active fix attempt, survives while that exact remediation is pending or
+  in progress, and ends when it merges and main is reclassified, is retired as moot after
+  green proof, or reaches durable exhaustion. Exhaustion releases the dispatch hold while
+  leaving durable human attention and merge gating intact.
+- The dispatch exception is exact-task scoped: queue position, urgency, prompt prose, or
+  a copied tag cannot authorize the emergency slot without the watch-owned trigger
+  source, `system-main-verify` tag, active ledger pointer, fix identity, and
+  non-exhausted attempt state.
 - The shared no-progress backstop MUST ignore repeated evaluation of a blocked merge lane
   by itself. But once watch has already selected the same downstream subject/action on an
   unchanged subject, both executed no-op repeats and undispatched selected repeats count

@@ -9,7 +9,11 @@ import pytest
 from gza import recovery_engine
 from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.config import Config
-from gza.dispatch_preview import build_dispatch_preview, plan_watch_dispatch_entries
+from gza.dispatch_preview import DispatchPreviewEntry, build_dispatch_preview, plan_watch_dispatch_entries
+from gza.main_integration_verify import (
+    MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    MAIN_INTEGRATION_VERIFY_TAG,
+)
 from gza.pickup import get_runnable_pending_tasks
 from tests.cli.conftest import make_store, setup_config
 
@@ -304,6 +308,69 @@ def test_build_dispatch_preview_orders_recovery_then_pending_and_preserves_pendi
     assert recovery_entries[1].runnable is False
     assert recovery_entries[1].manual_only is True
     assert recovery_entries[1].reason_code == "manual_failure_reason"
+
+
+def test_plan_watch_dispatch_entries_under_main_verify_hold_keeps_only_direct_recovery_and_exact_remediation(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    direct_recovery = store.add("Direct recovery reconcile", task_type="implement")
+    worker_recovery = store.add("Worker recovery retry", task_type="implement")
+    remediation = store.add(
+        "Main verify remediation",
+        task_type="implement",
+        tags=(MAIN_INTEGRATION_VERIFY_TAG,),
+        trigger_source=MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    ordinary_pending = store.add("Ordinary pending", task_type="plan")
+    assert direct_recovery.id is not None
+    assert worker_recovery.id is not None
+    assert remediation.id is not None
+    assert ordinary_pending.id is not None
+    entries = (
+        DispatchPreviewEntry(
+            lane="recovery",
+            task=direct_recovery,
+            runnable=True,
+            worker_consuming=False,
+            advance_action={"type": "reconcile"},
+        ),
+        DispatchPreviewEntry(
+            lane="recovery",
+            task=worker_recovery,
+            runnable=True,
+            worker_consuming=True,
+            advance_action={"type": "retry"},
+        ),
+        DispatchPreviewEntry(
+            lane="pending",
+            task=remediation,
+            runnable=True,
+            worker_consuming=True,
+        ),
+        DispatchPreviewEntry(
+            lane="pending",
+            task=ordinary_pending,
+            runnable=True,
+            worker_consuming=True,
+        ),
+    )
+
+    plan = plan_watch_dispatch_entries(
+        entries,
+        slots=0,
+        recovery_slot_cap=2,
+        selection_mode="recovery_only",
+        main_verify_remediation_task_id=remediation.id,
+    )
+
+    assert [entry.task.id for entry in plan.entries] == [direct_recovery.id, remediation.id]
+    assert plan.recovery_worker_slots == 0
+    assert plan.pending_slots == 0
+    assert plan.main_verify_remediation_slots == 1
+    assert plan.main_verify_remediation_entry is not None
+    assert plan.main_verify_remediation_entry.task.id == remediation.id
 
 
 def test_build_dispatch_preview_keeps_manual_only_recovery_visible_but_non_runnable(
@@ -1999,6 +2066,146 @@ def test_build_dispatch_preview_recovery_first_explicit_filters_pending_to_expli
         ordered_one.id,
         ordered_two.id,
     ]
+
+
+def test_build_dispatch_preview_recovery_only_does_not_admit_ordinary_positioned_pending(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    store._default_merge_target_cache = "main"  # noqa: SLF001 - avoid real git in unit test
+    store._project_root = None  # noqa: SLF001 - avoid real git fallback in unit test
+
+    positioned = store.add("Positioned ordinary pending", task_type="implement")
+    urgent = store.add("Urgent ordinary pending", task_type="implement", urgent=True)
+    assert positioned.id is not None
+    assert urgent.id is not None
+    store.set_queue_position(positioned.id, 1)
+
+    with patch(
+        "gza.recovery_engine._load_merge_context",
+        return_value=recovery_engine._MergeContext(git=None, default_branch=None),
+    ):
+        preview = build_dispatch_preview(
+            store,
+            tags=None,
+            any_tag=False,
+            max_recovery_attempts=1,
+            selection_mode="recovery_only",
+        )
+
+    assert preview.recovery_entries == ()
+    assert preview.pending_entries == ()
+    assert positioned.id not in {entry.task.id for entry in preview.entries}
+    assert urgent.id not in {entry.task.id for entry in preview.entries}
+
+
+def test_build_dispatch_preview_recovery_only_admits_unpositioned_watch_main_verify_remediation_only(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    store._default_merge_target_cache = "main"  # noqa: SLF001 - avoid real git in unit test
+    store._project_root = None  # noqa: SLF001 - avoid real git fallback in unit test
+
+    failed_retry = store.add("Failed recovery", task_type="plan")
+    assert failed_retry.id is not None
+    failed_retry.status = "failed"
+    failed_retry.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_retry.completed_at = datetime(2026, 6, 24, 12, 0, 0, tzinfo=UTC)
+    store.update(failed_retry)
+
+    remediation = store.add(
+        "Watch main verify remediation",
+        task_type="implement",
+        tags=("system", MAIN_INTEGRATION_VERIFY_TAG),
+        trigger_source=MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    ordinary_positioned = store.add("Positioned ordinary pending", task_type="implement")
+    assert remediation.id is not None
+    assert ordinary_positioned.id is not None
+    store.set_queue_position(ordinary_positioned.id, 1)
+
+    with patch(
+        "gza.recovery_engine._load_merge_context",
+        return_value=recovery_engine._MergeContext(git=None, default_branch=None),
+    ):
+        preview = build_dispatch_preview(
+            store,
+            tags=None,
+            any_tag=False,
+            max_recovery_attempts=1,
+            selection_mode="recovery_only",
+        )
+    plan = plan_watch_dispatch_entries(
+        preview.runnable_entries,
+        slots=0,
+        recovery_slot_cap=0,
+        selection_mode="recovery_only",
+        main_verify_remediation_task_id=remediation.id,
+    )
+
+    assert [entry.task.id for entry in preview.recovery_entries] == [failed_retry.id]
+    assert [entry.task.id for entry in preview.pending_entries] == [remediation.id]
+    assert ordinary_positioned.id not in {entry.task.id for entry in preview.pending_entries}
+    assert plan.entries == (preview.pending_entries[0],)
+    assert plan.main_verify_remediation_slots == 1
+    assert plan.pending_slots == 0
+
+
+@pytest.mark.parametrize(
+    ("task_status", "tags", "trigger_source", "selected_id"),
+    [
+        ("completed", ("system", MAIN_INTEGRATION_VERIFY_TAG), MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE, None),
+        ("pending", ("system",), MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE, None),
+        ("pending", ("system", MAIN_INTEGRATION_VERIFY_TAG), "manual", None),
+        ("pending", ("system", MAIN_INTEGRATION_VERIFY_TAG), MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE, "other"),
+    ],
+)
+def test_plan_watch_dispatch_entries_exact_main_verify_remediation_fails_closed_for_stale_rows(
+    tmp_path: Path,
+    task_status: str,
+    tags: tuple[str, ...],
+    trigger_source: str,
+    selected_id: str | None,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    remediation = store.add(
+        "Maybe remediation",
+        task_type="implement",
+        tags=tags,
+        trigger_source=trigger_source,
+    )
+    ordinary = store.add("Ordinary pending", task_type="implement")
+    assert remediation.id is not None
+    assert ordinary.id is not None
+    remediation.status = task_status
+    store.update(remediation)
+    entry = DispatchPreviewEntry(
+        lane="pending",
+        task=remediation,
+        runnable=task_status == "pending",
+        worker_consuming=True,
+    )
+    ordinary_entry = DispatchPreviewEntry(
+        lane="pending",
+        task=ordinary,
+        runnable=True,
+        worker_consuming=True,
+    )
+
+    plan = plan_watch_dispatch_entries(
+        (entry, ordinary_entry),
+        slots=1,
+        recovery_slot_cap=0,
+        selection_mode="recovery_only",
+        main_verify_remediation_task_id=selected_id or remediation.id,
+    )
+
+    assert plan.entries == ()
+    assert plan.main_verify_remediation_slots == 0
+    assert plan.pending_slots == 0
 
 
 def test_build_dispatch_preview_filters_quiet_pending_but_keeps_exempt_tasks(tmp_path: Path) -> None:

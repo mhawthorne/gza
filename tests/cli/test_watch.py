@@ -13652,6 +13652,116 @@ def _runtime_candidate(
     )
 
 
+def _main_verify_remediation_candidate_for_runtime(runtime: WatchProjectRuntime) -> ProjectDispatchCandidate:
+    task = runtime.store.add(
+        _main_verify_remediation_prompt_for_test(),
+        task_type="implement",
+        tags=("system", MAIN_INTEGRATION_VERIFY_TAG),
+        trigger_source=watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    assert task.id is not None
+    return ProjectDispatchCandidate(
+        runtime_key=runtime.key,
+        task=task,
+        lane="main_verify_remediation",
+        runtime_identity=runtime.runtime_identity,
+        selection_mode="recovery_only",
+    )
+
+
+def test_watch_supervisor_lane_plan_holds_red_runtime_ordinary_heads_but_keeps_healthy_pending(
+    tmp_path: Path,
+) -> None:
+    red_runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    healthy_runtime = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    red_recovery = _runtime_candidate(
+        red_runtime,
+        red_runtime.store.add("Red recovery must be held", task_type="implement"),
+        lane="recovery",
+    )
+    red_pending = _runtime_candidate(
+        red_runtime,
+        red_runtime.store.add("Red pending must be held", task_type="plan"),
+        lane="pending",
+    )
+    healthy_pending = _runtime_candidate(
+        healthy_runtime,
+        healthy_runtime.store.add("Healthy pending remains eligible", task_type="plan"),
+        lane="pending",
+    )
+    emergency = _main_verify_remediation_candidate_for_runtime(red_runtime)
+    assert emergency.task.id is not None
+    controls = {
+        red_runtime.key: watch_module._MainVerifyDispatchControl(
+            active_task_id=emergency.task.id,
+            hold_ordinary_starts=True,
+        )
+    }
+
+    with contextlib.ExitStack() as stack:
+        red_dispatch_candidates = stack.enter_context(
+            _patch_runtime_lane_candidates(red_runtime, recovery=(red_recovery,), pending=(red_pending,))
+        )
+        stack.enter_context(_patch_runtime_lane_candidates(healthy_runtime, pending=(healthy_pending,)))
+        stack.enter_context(patch.object(red_runtime, "main_verify_remediation_dispatch_head", return_value=emergency))
+        stack.enter_context(patch.object(healthy_runtime, "main_verify_remediation_dispatch_head", return_value=None))
+        plan = plan_watch_supervisor_dispatch_lanes(
+            [red_runtime, healthy_runtime],
+            dispatch_slots=1,
+            recovery_slots_config=0,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            main_verify_dispatch_controls=controls,
+        )
+
+    red_dispatch_candidates.assert_not_called()
+    assert plan.main_verify_remediation_candidates == (emergency,)
+    assert plan.recovery_candidates == ()
+    assert plan.pending_candidates == (healthy_pending,)
+
+
+def test_watch_supervisor_lane_plan_selects_one_emergency_when_two_projects_are_red(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    emergency_a = _main_verify_remediation_candidate_for_runtime(runtime_a)
+    emergency_b = _main_verify_remediation_candidate_for_runtime(runtime_b)
+    assert emergency_a.task.id is not None
+    assert emergency_b.task.id is not None
+    controls = {
+        runtime_a.key: watch_module._MainVerifyDispatchControl(
+            active_task_id=emergency_a.task.id,
+            hold_ordinary_starts=True,
+        ),
+        runtime_b.key: watch_module._MainVerifyDispatchControl(
+            active_task_id=emergency_b.task.id,
+            hold_ordinary_starts=True,
+        ),
+    }
+
+    with (
+        patch.object(runtime_a, "main_verify_remediation_dispatch_head", return_value=emergency_a),
+        patch.object(runtime_b, "main_verify_remediation_dispatch_head", return_value=emergency_b),
+    ):
+        plan = plan_watch_supervisor_dispatch_lanes(
+            [runtime_a, runtime_b],
+            dispatch_slots=0,
+            recovery_slots_config=0,
+            recovery_mode="recovery_only",
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            main_verify_dispatch_controls=controls,
+        )
+
+    assert plan.main_verify_remediation_candidates == (emergency_a,)
+    assert plan.recovery_candidates == ()
+    assert plan.pending_candidates == ()
+
+
 def _add_failed_resume_row(runtime: WatchProjectRuntime, prompt: str) -> DbTask:
     task = runtime.store.add(prompt, task_type="implement")
     assert task.id is not None
@@ -19044,13 +19154,8 @@ def test_watch_cycle_restart_failed_reuses_existing_deep_recovery_chain_without_
             max_recovery_attempts=3,
         )
 
-    assert result.work_done is True
-    assert spawn_iterate.call_count == 1
-    spawned_args = spawn_iterate.call_args.args[0]
-    spawned_task = spawn_iterate.call_args.args[2]
-    assert spawned_args.resume is False
-    assert spawned_args.retry is False
-    assert spawned_task.id == pending_grandchild.id
+    assert result.work_done is False
+    assert spawn_iterate.call_count == 0
     assert [task.id for task in store.get_based_on_children(root.id)] == [failed_retry.id]
     assert [task.id for task in store.get_based_on_children(failed_retry.id)] == [pending_grandchild.id]
 
@@ -19234,10 +19339,9 @@ def test_watch_cycle_recovery_mode_does_not_resume_test_failure_tasks(tmp_path: 
             max_recovery_attempts=config.max_resume_attempts,
         )
 
-    assert result.work_done is True
+    assert result.work_done is False
     assert spawn_resume.call_count == 0
-    assert spawn_iterate.call_count == 1
-    assert spawn_iterate.call_args.args[2].id == pending_impl.id
+    assert spawn_iterate.call_count == 0
 
 
 def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(tmp_path: Path) -> None:
@@ -20039,6 +20143,7 @@ def test_watch_cycle_executes_only_planned_recovery_entries_and_preserves_pendin
         recovery_slot_cap: int,
         selection_mode: str,
         include_pending: bool = True,
+        main_verify_remediation_task_id: str | None = None,
     ) -> WatchDispatchPlan:
         if selection_mode == "default":
             recovery_entries = [entry for entry in entries if entry.lane == "recovery"]
@@ -20056,6 +20161,7 @@ def test_watch_cycle_executes_only_planned_recovery_entries_and_preserves_pendin
             recovery_slot_cap=recovery_slot_cap,
             selection_mode=selection_mode,
             include_pending=include_pending,
+            main_verify_remediation_task_id=main_verify_remediation_task_id,
         )
 
     with (
@@ -20116,6 +20222,7 @@ def test_watch_cycle_executes_only_planned_recovery_entries_when_no_pending_slot
         recovery_slot_cap: int,
         selection_mode: str,
         include_pending: bool = True,
+        main_verify_remediation_task_id: str | None = None,
     ) -> WatchDispatchPlan:
         if selection_mode == "default":
             recovery_entries = [entry for entry in entries if entry.lane == "recovery"]
@@ -20131,6 +20238,7 @@ def test_watch_cycle_executes_only_planned_recovery_entries_when_no_pending_slot
             recovery_slot_cap=recovery_slot_cap,
             selection_mode=selection_mode,
             include_pending=include_pending,
+            main_verify_remediation_task_id=main_verify_remediation_task_id,
         )
 
     with (
@@ -20203,6 +20311,7 @@ def test_watch_cycle_pending_launch_uses_planned_pending_entry_identities(
         recovery_slot_cap: int,
         selection_mode: str,
         include_pending: bool = True,
+        main_verify_remediation_task_id: str | None = None,
     ) -> WatchDispatchPlan:
         if selection_mode == "pending_only":
             pending_entries = [entry for entry in entries if entry.lane == "pending"]
@@ -20218,6 +20327,7 @@ def test_watch_cycle_pending_launch_uses_planned_pending_entry_identities(
             recovery_slot_cap=recovery_slot_cap,
             selection_mode=selection_mode,
             include_pending=include_pending,
+            main_verify_remediation_task_id=main_verify_remediation_task_id,
         )
 
     def spawn_worker(
@@ -20785,9 +20895,8 @@ def test_watch_cycle_restart_failed_manual_failure_child_does_not_block_pending_
             max_recovery_attempts=config.max_resume_attempts,
         )
 
-    assert result.work_done is True
-    assert spawn_worker.call_count == 1
-    assert spawn_worker.call_args.kwargs["task_id"] == pending_plan.id
+    assert result.work_done is False
+    assert spawn_worker.call_count == 0
 
 
 def test_watch_cycle_plain_mode_starts_manually_queued_pending_recovery_child(tmp_path: Path) -> None:
@@ -20915,12 +21024,11 @@ def test_watch_cycle_restart_failed_starts_manually_queued_child_after_recovery_
 
     assert first_result.work_done is True
     assert second_result.work_done is True
-    assert third_result.work_done is True
+    assert third_result.work_done is False
     assert first_result.confirmed_start_count == 1
     assert second_result.confirmed_start_count == 1
-    assert third_result.confirmed_start_count == 1
-    assert spawn_worker.call_count == 3
-    assert spawn_worker.call_args_list[-1].kwargs["task_id"] == manual_child.id
+    assert third_result.confirmed_start_count == 0
+    assert spawn_worker.call_count == 2
 
 
 @pytest.mark.parametrize(
@@ -21967,8 +22075,9 @@ def test_watch_cycle_replan_settles_only_new_recovery_starts(
         recovery_slot_cap: int | None,
         selection_mode: str,
         include_pending: bool,
+        main_verify_remediation_task_id: str | None = None,
     ) -> WatchDispatchPlan:
-        del entries, slots, recovery_slot_cap, selection_mode, include_pending
+        del entries, slots, recovery_slot_cap, selection_mode, include_pending, main_verify_remediation_task_id
         dispatch_plan_calls["count"] += 1
         if dispatch_plan_calls["count"] == 1:
             return WatchDispatchPlan(
@@ -22383,8 +22492,9 @@ def test_watch_cycle_replan_executes_resume_recovery_entries(
         recovery_slot_cap: int | None,
         selection_mode: str,
         include_pending: bool,
+        main_verify_remediation_task_id: str | None = None,
     ) -> WatchDispatchPlan:
-        del entries, slots, recovery_slot_cap, selection_mode, include_pending
+        del entries, slots, recovery_slot_cap, selection_mode, include_pending, main_verify_remediation_task_id
         dispatch_plan_calls["count"] += 1
         if dispatch_plan_calls["count"] == 1:
             return WatchDispatchPlan(
@@ -22597,8 +22707,9 @@ def test_watch_cycle_replan_executes_fresh_retry_recovery_entries(
         recovery_slot_cap: int | None,
         selection_mode: str,
         include_pending: bool,
+        main_verify_remediation_task_id: str | None = None,
     ) -> WatchDispatchPlan:
-        del entries, slots, recovery_slot_cap, selection_mode, include_pending
+        del entries, slots, recovery_slot_cap, selection_mode, include_pending, main_verify_remediation_task_id
         dispatch_plan_calls["count"] += 1
         if dispatch_plan_calls["count"] == 1:
             return WatchDispatchPlan(
@@ -38676,6 +38787,490 @@ def _main_verify_remediation_state_for_test() -> SimpleNamespace:
     return SimpleNamespace(head_sha="feedfacecafe")
 
 
+def test_active_main_verify_dispatch_control_requires_exact_nonexhausted_fix_owner(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    remediation = _main_verify_remediation_for_test()
+    task = store.add(
+        _main_verify_remediation_prompt_for_test(),
+        task_type="implement",
+        tags=("system", MAIN_INTEGRATION_VERIFY_TAG),
+        trigger_source=watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    assert task.id is not None
+    store.record_main_verify_remediation_active_task(
+        signature=remediation.signature,
+        tree_fingerprint=None,
+        task_id=task.id,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure=remediation.failure,
+    )
+
+    control = watch_module._active_main_verify_fix_dispatch_control(
+        store=store,
+        remediation=remediation,
+        config=config,
+    )
+    assert control.active
+    assert control.active_task_id == task.id
+
+    task.tags = ("system",)
+    store.update(task)
+    stale_control = watch_module._active_main_verify_fix_dispatch_control(
+        store=store,
+        remediation=remediation,
+        config=config,
+    )
+    assert not stale_control.active
+
+
+def test_active_main_verify_dispatch_control_rejects_active_deflake_owner_for_same_signature(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    remediation = _main_verify_remediation_for_test()
+    task = store.add(
+        _main_verify_remediation_prompt_for_test(kind="deflake"),
+        task_type="implement",
+        tags=("system", MAIN_INTEGRATION_VERIFY_TAG),
+        trigger_source=watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    assert task.id is not None
+    store.record_main_verify_remediation_active_task(
+        signature=remediation.signature,
+        tree_fingerprint=None,
+        task_id=task.id,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure=remediation.failure,
+    )
+
+    control = watch_module._active_main_verify_fix_dispatch_control(
+        store=store,
+        remediation=remediation,
+        config=config,
+    )
+
+    assert not control.active
+
+
+def test_supervisor_budget_allows_one_exact_main_verify_emergency_slot_when_full(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "alpha", project_name="alpha", max_concurrent=1)
+    store = runtime.store
+    config = runtime.config
+    remediation = _main_verify_remediation_for_test()
+    task = store.add(
+        _main_verify_remediation_prompt_for_test(),
+        task_type="implement",
+        tags=("system", MAIN_INTEGRATION_VERIFY_TAG),
+        trigger_source=watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    running = store.add("Already running", task_type="implement")
+    assert task.id is not None
+    assert running.id is not None
+    running.status = "in_progress"
+    running.running_pid = 987654
+    running.started_at = datetime.now(UTC)
+    store.update(running)
+    store.record_main_verify_remediation_active_task(
+        signature=remediation.signature,
+        tree_fingerprint=None,
+        task_id=task.id,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure=remediation.failure,
+    )
+    candidate = ProjectDispatchCandidate(
+        runtime_key=runtime.key,
+        task=task,
+        lane="main_verify_remediation",
+        runtime_identity=runtime.runtime_identity,
+        selection_mode="recovery_only",
+    )
+    occupied_state = ProjectRuntimeReconcileResult(
+        runtime_key=runtime.key,
+        live_pids=frozenset({987654}),
+        running_task_ids=(running.id,),
+        running_task_pid_by_task_id={running.id: 987654},
+        anonymous_worker_count=0,
+        starting_worker_count=0,
+        runtime_identity=runtime.runtime_identity,
+    )
+    with patch.object(runtime, "reconcile_runtime_state", return_value=occupied_state):
+        budget = SupervisorLaunchBudget(
+            (runtime,),
+            supervisor_batch=1,
+            read_only_reconcile_states=(occupied_state,),
+        )
+
+    assert budget.occupancy.slots == 0
+    reservation = budget.reserve_main_verify_remediation(candidate)
+    assert reservation is not None
+    assert reservation.task_id == task.id
+    assert budget.reserve_main_verify_remediation(candidate) is None
+
+
+def test_supervisor_budget_reconstructs_live_emergency_claim_across_refresh_and_restore(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a", max_concurrent=1)
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b", max_concurrent=1)
+    task_a = runtime_a.store.add(
+        _main_verify_remediation_prompt_for_test(),
+        task_type="implement",
+        tags=("system", MAIN_INTEGRATION_VERIFY_TAG),
+        trigger_source=watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    task_b = runtime_b.store.add(
+        _main_verify_remediation_prompt_for_test(),
+        task_type="implement",
+        tags=("system", MAIN_INTEGRATION_VERIFY_TAG),
+        trigger_source=watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    assert task_a.id is not None
+    assert task_b.id is not None
+    for runtime, task in ((runtime_a, task_a), (runtime_b, task_b)):
+        runtime.store.record_main_verify_remediation_active_task(
+            signature="phase:functional",
+            tree_fingerprint=None,
+            task_id=str(task.id),
+            last_observed_head_sha="feedfacecafe",
+            last_observed_failure="verify_command failed twice",
+        )
+    candidate_a = ProjectDispatchCandidate(
+        runtime_key=runtime_a.key,
+        task=task_a,
+        lane="main_verify_remediation",
+        runtime_identity=runtime_a.runtime_identity,
+        selection_mode="recovery_only",
+    )
+    candidate_b = ProjectDispatchCandidate(
+        runtime_key=runtime_b.key,
+        task=task_b,
+        lane="main_verify_remediation",
+        runtime_identity=runtime_b.runtime_identity,
+        selection_mode="recovery_only",
+    )
+    empty_a = ProjectRuntimeReconcileResult(
+        runtime_key=runtime_a.key,
+        live_pids=frozenset(),
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        starting_worker_count=0,
+        runtime_identity=runtime_a.runtime_identity,
+    )
+    empty_b = ProjectRuntimeReconcileResult(
+        runtime_key=runtime_b.key,
+        live_pids=frozenset(),
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        starting_worker_count=0,
+        runtime_identity=runtime_b.runtime_identity,
+    )
+    live_a = ProjectRuntimeReconcileResult(
+        runtime_key=runtime_a.key,
+        live_pids=frozenset({424242}),
+        running_task_ids=(task_a.id,),
+        running_task_pid_by_task_id={task_a.id: 424242},
+        anonymous_worker_count=0,
+        starting_worker_count=0,
+        runtime_identity=runtime_a.runtime_identity,
+    )
+
+    with (
+        patch.object(runtime_a, "reconcile_runtime_state", return_value=empty_a),
+        patch.object(runtime_b, "reconcile_runtime_state", return_value=empty_b),
+    ):
+        budget = SupervisorLaunchBudget((runtime_a, runtime_b), supervisor_batch=1)
+        reservation = budget.reserve_main_verify_remediation(candidate_a)
+
+    assert reservation is not None
+    live_task_a = runtime_a.store.get(task_a.id)
+    assert live_task_a is not None
+    live_task_a.status = "in_progress"
+    live_task_a.running_pid = 424242
+    live_task_a.started_at = datetime.now(UTC)
+    runtime_a.store.update(live_task_a)
+
+    with (
+        patch.object(runtime_a, "reconcile_runtime_state", return_value=live_a),
+        patch.object(runtime_b, "reconcile_runtime_state", return_value=empty_b),
+    ):
+        budget.refresh_occupancy()
+        assert budget.reservations == ()
+        assert budget.reserve_main_verify_remediation(candidate_b) is None
+        persisted = budget.persistent_state()
+        restored = SupervisorLaunchBudget((runtime_a, runtime_b), supervisor_batch=1)
+        restored.restore_persistent_state(
+            reservations=persisted[0],
+            settled_reservation_ids=persisted[1],
+            unresolved_exception_reservation_ids=persisted[2],
+        )
+        assert restored.reserve_main_verify_remediation(candidate_b) is None
+
+    completed_task_a = runtime_a.store.get(task_a.id)
+    assert completed_task_a is not None
+    completed_task_a.status = "completed"
+    completed_task_a.completed_at = datetime.now(UTC)
+    runtime_a.store.update(completed_task_a)
+    with (
+        patch.object(runtime_a, "reconcile_runtime_state", return_value=empty_a),
+        patch.object(runtime_b, "reconcile_runtime_state", return_value=empty_b),
+    ):
+        restored.refresh_occupancy()
+        turnover = restored.reserve_main_verify_remediation(candidate_b)
+
+    assert turnover is not None
+    assert turnover.task_id == task_b.id
+
+
+def test_watch_cycle_recovery_only_full_capacity_starts_only_exact_main_verify_remediation(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store)
+    red_check = _main_verify_red_check(main_verify_task)
+    remediation = _main_verify_remediation_for_test()
+    remediation_task = store.add(
+        _main_verify_remediation_prompt_for_test(),
+        task_type="implement",
+        tags=("system", MAIN_INTEGRATION_VERIFY_TAG),
+        trigger_source=watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    ordinary = store.add("Ordinary positioned pending", task_type="implement")
+    running = store.add("Already running", task_type="implement")
+    assert remediation_task.id is not None
+    assert ordinary.id is not None
+    assert running.id is not None
+    store.set_queue_position(ordinary.id, 1)
+    running.status = "in_progress"
+    running.running_pid = 123456
+    running.started_at = datetime.now(UTC)
+    store.update(running)
+    store.record_main_verify_remediation_active_task(
+        signature=remediation.signature,
+        tree_fingerprint=None,
+        task_id=remediation_task.id,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure=remediation.failure,
+    )
+    log_path = tmp_path / ".gza" / "watch.log"
+    occupied_state = ProjectRuntimeReconcileResult(
+        runtime_key=config.project_name,
+        live_pids=frozenset({123456}),
+        running_task_ids=(running.id,),
+        running_task_pid_by_task_id={running.id: 123456},
+        anonymous_worker_count=0,
+        starting_worker_count=0,
+    )
+
+    with (
+        patch("gza.cli.watch._reconcile_watch_runtime_state", return_value=occupied_state),
+        patch("gza.cli.watch._run_watch_main_integration_verify", return_value=red_check),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("dry-run should not spawn")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("dry-run should not spawn")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            recovery_slots=1,
+            recovery_mode="recovery_only",
+            git=_make_watch_git(),
+        )
+
+    log_text = log_path.read_text()
+    assert result.main_verify_dispatch_control.active_task_id == remediation_task.id
+    assert f"START     {remediation_task.id} implement" in log_text
+    assert str(ordinary.id) not in log_text
+
+
+def test_watch_cycle_greenlit_live_main_verify_fix_holds_ordinary_until_retirement(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store)
+    remediation_task = store.add(
+        _main_verify_remediation_prompt_for_test(),
+        task_type="implement",
+        tags=("system", MAIN_INTEGRATION_VERIFY_TAG),
+        trigger_source=watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    ordinary = store.add("Ordinary pending waits for greenlit live retirement", task_type="plan")
+    assert remediation_task.id is not None
+    assert ordinary.id is not None
+    remediation_task.status = "in_progress"
+    remediation_task.running_pid = 424242
+    remediation_task.started_at = datetime.now(UTC)
+    store.update(remediation_task)
+    store.record_main_verify_remediation_active_task(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        task_id=remediation_task.id,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure="verify_command failed twice",
+    )
+    store.mark_main_verify_remediation_greenlit_while_in_progress(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        task_id=remediation_task.id,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure=None,
+    )
+    green_check = SimpleNamespace(
+        merges_halted=False,
+        remediation=None,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            gate_enabled=True,
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            tree_fingerprint="fp-green",
+            head_sha="feedfacecafe",
+            verify_status="passed",
+            verify_exit_status="0",
+            failure_signature=None,
+            failing_phase=None,
+            alert_message=None,
+            pending_retirement_signatures=(),
+            red_since=None,
+            captured_at=datetime.now(UTC),
+        ),
+    )
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli.watch._run_watch_main_integration_verify", return_value=green_check),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("ordinary worker spawned")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("ordinary iterate spawned")),
+    ):
+        held_result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            git=_make_watch_git(),
+        )
+
+    assert held_result.main_verify_dispatch_control.active_task_id == remediation_task.id
+    assert f"START     {ordinary.id}" not in log_path.read_text()
+
+    retired = store.get(remediation_task.id)
+    assert retired is not None
+    retired.status = "completed"
+    retired.completed_at = datetime.now(UTC)
+    store.update(retired)
+
+    with (
+        patch("gza.cli.watch._run_watch_main_integration_verify", return_value=green_check),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("dry-run should not spawn")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("dry-run should not spawn")),
+    ):
+        released_result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            git=_make_watch_git(),
+        )
+
+    assert not released_result.main_verify_dispatch_control.active
+    assert f"START     {ordinary.id} plan" in log_path.read_text()
+
+
+def test_watch_supervisor_greenlit_live_main_verify_fix_holds_fleet_heads_until_retirement(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "project", project_name="project")
+    remediation_task, _candidate = _active_main_verify_runtime_candidate(runtime)
+    ordinary = runtime.store.add("Ordinary pending waits for fleet greenlit retirement", task_type="plan")
+    assert remediation_task.id is not None
+    assert ordinary.id is not None
+    remediation_task.status = "in_progress"
+    remediation_task.started_at = datetime.now(UTC)
+    remediation_task.running_pid = 424242
+    runtime.store.update(remediation_task)
+    runtime.store.mark_main_verify_remediation_greenlit_while_in_progress(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        task_id=remediation_task.id,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure=None,
+    )
+    ordinary_candidate = _runtime_candidate(runtime, ordinary, lane="pending")
+    held_control = watch_module._greenlit_live_main_verify_fix_dispatch_control(
+        store=runtime.store,
+        config=runtime.config,
+    )
+
+    with _patch_runtime_lane_candidates(runtime, pending=(ordinary_candidate,)) as dispatch_candidates:
+        held_plan = plan_watch_supervisor_dispatch_lanes(
+            [runtime],
+            dispatch_slots=1,
+            recovery_slots_config=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("project",)),
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("project",)),
+            main_verify_dispatch_controls={runtime.key: held_control},
+        )
+
+    dispatch_candidates.assert_not_called()
+    assert held_plan.pending_candidates == ()
+
+    retired = runtime.store.get(remediation_task.id)
+    assert retired is not None
+    retired.status = "completed"
+    retired.completed_at = datetime.now(UTC)
+    runtime.store.update(retired)
+    runtime.store.clear_main_verify_remediation_active_task(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure=None,
+    )
+    released_control = watch_module._greenlit_live_main_verify_fix_dispatch_control(
+        store=runtime.store,
+        config=runtime.config,
+    )
+
+    with _patch_runtime_lane_candidates(runtime, pending=(ordinary_candidate,)):
+        released_plan = plan_watch_supervisor_dispatch_lanes(
+            [runtime],
+            dispatch_slots=1,
+            recovery_slots_config=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("project",)),
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("project",)),
+            main_verify_dispatch_controls={runtime.key: released_control},
+        )
+
+    assert not released_control.active
+    assert released_plan.pending_candidates == (ordinary_candidate,)
+
+
 def _main_verify_remediation_store_snapshot(store: SqliteTaskStore) -> dict[str, Any]:
     tasks = {
         str(task.id): {
@@ -53018,6 +53613,378 @@ def test_watch_project_runtime_pending_local_cap_is_runtime_wide_hold_not_candid
     assert runtime.pending_dispatch_head(max_recovery_attempts=1).task.id == first.id
 
 
+def _active_main_verify_runtime_candidate(
+    runtime: WatchProjectRuntime,
+) -> tuple[DbTask, ProjectDispatchCandidate]:
+    task = runtime.store.add(
+        _main_verify_remediation_prompt_for_test(),
+        task_type="implement",
+        tags=("system", MAIN_INTEGRATION_VERIFY_TAG),
+        trigger_source=watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    assert task.id is not None
+    runtime.store.record_main_verify_remediation_active_task(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        task_id=task.id,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure="verify_command failed twice",
+    )
+    return task, ProjectDispatchCandidate(
+        runtime_key=runtime.key,
+        task=task,
+        lane="main_verify_remediation",
+        runtime_identity=runtime.runtime_identity,
+        selection_mode="recovery_only",
+    )
+
+
+def _mutate_main_verify_launch_authorization(
+    store: SqliteTaskStore,
+    config: Config,
+    task_id: str,
+    mutation: str,
+) -> None:
+    task = store.get(task_id)
+    assert task is not None
+    if mutation == "tag":
+        task.tags = ("system",)
+        store.update(task)
+        return
+    if mutation == "trigger_source":
+        task.trigger_source = "watch"
+        store.update(task)
+        return
+    if mutation == "status":
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+        return
+    if mutation == "active_pointer":
+        replacement = store.add(
+            _main_verify_remediation_prompt_for_test(),
+            task_type="implement",
+            tags=("system", MAIN_INTEGRATION_VERIFY_TAG),
+            trigger_source=watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+        )
+        assert replacement.id is not None
+        store.record_main_verify_remediation_active_task(
+            signature="phase:functional",
+            tree_fingerprint=None,
+            task_id=replacement.id,
+            last_observed_head_sha="feedfacecafe",
+            last_observed_failure="verify_command failed twice",
+        )
+        return
+    if mutation == "kind":
+        task.prompt = _main_verify_remediation_prompt_for_test(kind="deflake")
+        store.update(task)
+        return
+    if mutation == "exhausted":
+        store.mark_main_verify_remediation_exhausted(
+            signature="phase:functional",
+            tree_fingerprint=None,
+            consumed_attempt_count=config.watch.main_verify_remediation_max_attempts,
+            last_observed_head_sha="feedfacecafe",
+            last_observed_failure="verify_command failed twice",
+        )
+        return
+    raise AssertionError(f"unexpected mutation {mutation!r}")
+
+
+@pytest.mark.parametrize("mutation", ["tag", "trigger_source", "status", "active_pointer", "kind", "exhausted"])
+def test_watch_project_runtime_main_verify_launch_boundary_refuses_stale_authorization(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    ordinary = store.add("Ordinary fallback must not run", task_type="plan")
+    assert ordinary.id is not None
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store)
+    task, candidate = _active_main_verify_runtime_candidate(runtime)
+    permit = _RuntimeDispatchPermit()
+
+    def acquire_then_stale(_config: Config, _store: SqliteTaskStore) -> _RuntimeDispatchPermit:
+        _mutate_main_verify_launch_authorization(store, runtime.config, str(task.id), mutation)
+        return permit
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.launch_permit", side_effect=acquire_then_stale),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=AssertionError("prepared")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate spawned")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker spawned")),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=AssertionError("settled")),
+    ):
+        result = runtime.dispatch_pending_candidate(candidate, max_iterations=1)
+
+    assert result.status == "not_dispatchable"
+    assert result.slot_consuming is False
+    assert result.dispatch_budget_consuming is False
+    assert permit.released is True
+    assert store.get(ordinary.id).status == "pending"
+
+
+@pytest.mark.parametrize("mutation", ["tag", "trigger_source", "status", "active_pointer", "kind", "exhausted"])
+def test_watch_supervisor_main_verify_launch_boundary_releases_reservation_on_stale_authorization(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "project", project_name="project")
+    ordinary = runtime.store.add("Ordinary fallback must not run", task_type="plan")
+    assert ordinary.id is not None
+    task, candidate = _active_main_verify_runtime_candidate(runtime)
+    budget = SupervisorLaunchBudget((runtime,), supervisor_batch=1)
+    permit = _RuntimeDispatchPermit()
+
+    def acquire_then_stale(_config: Config, _store: SqliteTaskStore) -> _RuntimeDispatchPermit:
+        _mutate_main_verify_launch_authorization(runtime.store, runtime.config, str(task.id), mutation)
+        return permit
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.launch_permit", side_effect=acquire_then_stale),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=AssertionError("prepared")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate spawned")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker spawned")),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=AssertionError("settled")),
+    ):
+        result = budget.dispatch_main_verify_remediation_candidate(runtime, candidate, max_iterations=1)
+
+    assert result.status == "not_dispatchable"
+    assert result.slot_consuming is False
+    assert result.dispatch_budget_consuming is False
+    assert budget.reservations == ()
+    assert budget.occupancy.provisional_reservations == 0
+    assert permit.released is True
+    assert runtime.store.get(ordinary.id).status == "pending"
+
+
+def test_watch_supervisor_restart_after_emergency_remediation_skips_ordinary_dispatch(
+    tmp_path: Path,
+) -> None:
+    red_runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    healthy_runtime = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    remediation_task, emergency = _active_main_verify_runtime_candidate(red_runtime)
+    assert remediation_task.id is not None
+    recovery = _runtime_candidate(
+        healthy_runtime,
+        _add_failed_resume_row(healthy_runtime, "Healthy recovery must wait for restart"),
+        lane="recovery",
+    )
+    pending = _runtime_candidate(
+        healthy_runtime,
+        healthy_runtime.store.add("Healthy pending must wait for restart", task_type="plan"),
+        lane="pending",
+    )
+    budget = SupervisorLaunchBudget((red_runtime, healthy_runtime), supervisor_batch=2, dry_run=True)
+    checkpoint_observations: list[tuple[int, int, int]] = []
+
+    def restart_after_emergency_settlement() -> bool:
+        observation = (
+            budget.virtual_dispatch_starts_for_runtime(red_runtime.key),
+            budget.virtual_dispatch_starts,
+            budget.occupancy.provisional_reservations,
+        )
+        checkpoint_observations.append(observation)
+        return observation[0] == 1
+
+    dispatch_recovery = MagicMock(side_effect=AssertionError("recovery dispatch should not start after restart"))
+    dispatch_pending = MagicMock(side_effect=AssertionError("pending dispatch should not start after restart"))
+
+    with (
+        patch.object(red_runtime, "main_verify_remediation_dispatch_head", return_value=emergency),
+        patch.object(healthy_runtime, "main_verify_remediation_dispatch_head", return_value=None),
+        patch.object(healthy_runtime, "recovery_dispatch_head", return_value=recovery) as recovery_head,
+        patch.object(healthy_runtime, "pending_dispatch_head", return_value=pending) as pending_head,
+    ):
+        result = dispatch_watch_supervisor_lanes_incrementally(
+            [red_runtime, healthy_runtime],
+            recovery_slots_config=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a", "b")),
+            pending_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a", "b")),
+            launch_budget=budget,
+            max_iterations=1,
+            dispatch_recovery_candidate=dispatch_recovery,
+            dispatch_pending_candidate=dispatch_pending,
+            main_verify_dispatch_controls={
+                red_runtime.key: watch_module._MainVerifyDispatchControl(
+                    active_task_id=remediation_task.id,
+                    hold_ordinary_starts=True,
+                )
+            },
+            restart_checkpoint=restart_after_emergency_settlement,
+        )
+
+    assert result.restart_requested is True
+    assert [item.candidate.task.id for item in result.main_verify_remediation_results] == [remediation_task.id]
+    assert [item.status for item in result.main_verify_remediation_results] == ["dry_run"]
+    assert result.recovery_results == ()
+    assert result.pending_results == ()
+    dispatch_recovery.assert_not_called()
+    dispatch_pending.assert_not_called()
+    recovery_head.assert_not_called()
+    pending_head.assert_not_called()
+    assert checkpoint_observations == [(1, 0, 0)]
+    assert budget.virtual_dispatch_starts_for_runtime(red_runtime.key) == 1
+    assert budget.virtual_dispatch_starts == 0
+    assert budget.occupancy.provisional_reservations == 0
+    assert budget.occupancy.slots == 2
+
+
+def test_watch_supervisor_restart_after_recovery_settlement_skips_pending_head(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    recovery = _runtime_candidate(
+        runtime,
+        _add_failed_resume_row(runtime, "Recovery settles before restart"),
+        lane="recovery",
+    )
+    pending = _runtime_candidate(
+        runtime,
+        runtime.store.add("Pending must not be selected after recovery restart", task_type="plan"),
+        lane="pending",
+    )
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=2, dry_run=True)
+    checkpoint_observations: list[int] = []
+
+    def restart_after_recovery_settlement() -> bool:
+        observation = budget.virtual_dispatch_starts_for_runtime(runtime.key)
+        checkpoint_observations.append(observation)
+        return observation == 1
+
+    dispatch_recovery = MagicMock(
+        return_value=ProjectDispatchResult(
+            runtime_key=runtime.key,
+            candidate=recovery,
+            status="dry_run",
+            slot_consuming=False,
+            work_done=True,
+            dispatch_budget_consuming=True,
+            task=recovery.task,
+        )
+    )
+    dispatch_pending = MagicMock(side_effect=AssertionError("pending dispatch should not run after recovery restart"))
+
+    with (
+        patch.object(runtime, "recovery_dispatch_head", return_value=recovery) as recovery_head,
+        patch.object(runtime, "pending_dispatch_head", return_value=pending) as pending_head,
+    ):
+        result = dispatch_watch_supervisor_lanes_incrementally(
+            [runtime],
+            recovery_slots_config=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
+            pending_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
+            launch_budget=budget,
+            max_iterations=1,
+            dispatch_recovery_candidate=dispatch_recovery,
+            dispatch_pending_candidate=dispatch_pending,
+            restart_checkpoint=restart_after_recovery_settlement,
+        )
+
+    assert result.restart_requested is True
+    assert [item.candidate.task.id for item in result.recovery_results] == [recovery.task.id]
+    assert [item.status for item in result.recovery_results] == ["dry_run"]
+    assert result.main_verify_remediation_results == ()
+    assert result.pending_results == ()
+    dispatch_recovery.assert_called_once()
+    dispatch_pending.assert_not_called()
+    recovery_head.assert_called_once()
+    pending_head.assert_not_called()
+    assert checkpoint_observations == [0, 1, 1]
+    assert budget.virtual_dispatch_starts_for_runtime(runtime.key) == 1
+
+
+def test_watch_supervisor_restart_after_recovery_settlement_preserves_preceding_emergency_result(
+    tmp_path: Path,
+) -> None:
+    red_runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    healthy_runtime = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    remediation_task, emergency = _active_main_verify_runtime_candidate(red_runtime)
+    assert remediation_task.id is not None
+    recovery = _runtime_candidate(
+        healthy_runtime,
+        _add_failed_resume_row(healthy_runtime, "Healthy recovery settles before restart"),
+        lane="recovery",
+    )
+    pending = _runtime_candidate(
+        healthy_runtime,
+        healthy_runtime.store.add("Healthy pending must not be selected after recovery restart", task_type="plan"),
+        lane="pending",
+    )
+    budget = SupervisorLaunchBudget((red_runtime, healthy_runtime), supervisor_batch=2, dry_run=True)
+    checkpoint_observations: list[tuple[int, int]] = []
+
+    def restart_after_recovery_settlement() -> bool:
+        observation = (
+            budget.virtual_dispatch_starts_for_runtime(red_runtime.key),
+            budget.virtual_dispatch_starts_for_runtime(healthy_runtime.key),
+        )
+        checkpoint_observations.append(observation)
+        return observation[1] == 1
+
+    dispatch_recovery = MagicMock(
+        return_value=ProjectDispatchResult(
+            runtime_key=healthy_runtime.key,
+            candidate=recovery,
+            status="dry_run",
+            slot_consuming=False,
+            work_done=True,
+            dispatch_budget_consuming=True,
+            task=recovery.task,
+        )
+    )
+    dispatch_pending = MagicMock(side_effect=AssertionError("pending dispatch should not run after recovery restart"))
+
+    with (
+        patch.object(red_runtime, "main_verify_remediation_dispatch_head", return_value=emergency),
+        patch.object(healthy_runtime, "main_verify_remediation_dispatch_head", return_value=None),
+        patch.object(healthy_runtime, "recovery_dispatch_head", return_value=recovery) as recovery_head,
+        patch.object(healthy_runtime, "pending_dispatch_head", return_value=pending) as pending_head,
+    ):
+        result = dispatch_watch_supervisor_lanes_incrementally(
+            [red_runtime, healthy_runtime],
+            recovery_slots_config=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a", "b")),
+            pending_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a", "b")),
+            launch_budget=budget,
+            max_iterations=1,
+            dispatch_recovery_candidate=dispatch_recovery,
+            dispatch_pending_candidate=dispatch_pending,
+            main_verify_dispatch_controls={
+                red_runtime.key: watch_module._MainVerifyDispatchControl(
+                    active_task_id=remediation_task.id,
+                    hold_ordinary_starts=True,
+                )
+            },
+            restart_checkpoint=restart_after_recovery_settlement,
+        )
+
+    assert result.restart_requested is True
+    assert [item.candidate.task.id for item in result.main_verify_remediation_results] == [remediation_task.id]
+    assert [item.status for item in result.main_verify_remediation_results] == ["dry_run"]
+    assert [item.candidate.task.id for item in result.recovery_results] == [recovery.task.id]
+    assert [item.status for item in result.recovery_results] == ["dry_run"]
+    assert result.pending_results == ()
+    dispatch_recovery.assert_called_once()
+    dispatch_pending.assert_not_called()
+    recovery_head.assert_called_once()
+    pending_head.assert_not_called()
+    assert checkpoint_observations == [(1, 0), (1, 1), (1, 1)]
+    assert budget.virtual_dispatch_starts_for_runtime(red_runtime.key) == 1
+    assert budget.virtual_dispatch_starts_for_runtime(healthy_runtime.key) == 1
+
+
 @pytest.mark.parametrize(
     ("settle_status", "expected_status"),
     [
@@ -59228,6 +60195,7 @@ def test_watch_cycle_active_improve_recovery_backoff_does_not_consume_pending_sl
         recovery_slot_cap: int,
         selection_mode: str,
         include_pending: bool = True,
+        main_verify_remediation_task_id: str | None = None,
     ) -> WatchDispatchPlan:
         if selection_mode == "pending_only":
             pending_entries = [entry for entry in entries if entry.lane == "pending"]
@@ -59246,6 +60214,7 @@ def test_watch_cycle_active_improve_recovery_backoff_does_not_consume_pending_sl
             recovery_slot_cap=recovery_slot_cap,
             selection_mode=selection_mode,
             include_pending=include_pending,
+            main_verify_remediation_task_id=main_verify_remediation_task_id,
         )
 
     with (
@@ -76742,7 +77711,8 @@ def test_watch_cycle_quiet_logs_start_failed_when_iterate_spawn_fails(
             dry_run=False,
             log=log,
             quiet=True,
-            restart_failed=True,
+            recovery_slots=0,
+            recovery_mode="pending_only",
             max_recovery_attempts=config.max_resume_attempts,
         )
 
@@ -76868,7 +77838,8 @@ def test_watch_cycle_queue_events_use_queue_label(tmp_path: Path) -> None:
             max_iterations=10,
             dry_run=False,
             log=log,
-            restart_failed=True,
+            recovery_slots=0,
+            recovery_mode="pending_only",
             max_recovery_attempts=config.max_resume_attempts,
         )
 
