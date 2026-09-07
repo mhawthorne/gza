@@ -41,6 +41,7 @@ from gza.branch_publication import BranchPublicationState, persist_branch_public
 from gza.canonical_checkout import CanonicalCheckoutStatus
 from gza.cli._common import reconcile_in_progress_tasks, set_task_queue_position_scoped
 from gza.cli._lifecycle_actions import (
+    LifecycleExecutionDecision,
     plan_lifecycle_execution,
     should_execute_lifecycle_action as real_should_execute_lifecycle_action,
 )
@@ -63468,7 +63469,7 @@ def test_installed_gza_package_fingerprint_changes_only_when_python_source_chang
 
 
 def test_watch_warns_once_per_installed_package_drift(tmp_path: Path) -> None:
-    """Watch should advertise next-cycle-boundary re-exec once per new drift fingerprint."""
+    """Watch should advertise safe-checkpoint re-exec once per new drift fingerprint."""
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     drift_state = _InstalledPackageDriftState(startup_fingerprint="startup")
@@ -63501,12 +63502,275 @@ def test_watch_warns_once_per_installed_package_drift(tmp_path: Path) -> None:
     assert len(warning_lines) == 2
     assert all(
         line.endswith(
-            "WARNING   installed gza changed since watch started -- watch will re-exec at the next cycle boundary to load new code"
+            "WARNING   installed gza changed since watch started -- watch will re-exec at the next safe phase checkpoint to load new code"
         )
         for line in warning_lines
     )
     assert drift_state.warned_fingerprint == "changed-2"
     assert drift_state.pending_restart_fingerprint == "changed-2"
+
+
+def test_watch_cycle_requests_restart_immediately_after_opening_drift_check(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    drift_state = _InstalledPackageDriftState(startup_fingerprint="startup")
+
+    with (
+        patch("gza.cli.watch._installed_gza_package_fingerprint", return_value="changed"),
+        patch("gza.cli.watch._should_reexec_watch", wraps=_should_reexec_watch) as should_reexec,
+        patch(
+            "gza.cli.watch._reconcile_watch_runtime_state",
+            side_effect=AssertionError("runtime reconciliation should not start after drift checkpoint"),
+        ),
+        patch(
+            "gza.cli.watch._build_reported_watch_cycle_plan",
+            side_effect=AssertionError("cycle plan should not start after drift checkpoint"),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=1,
+            dry_run=False,
+            log=log,
+            installed_package_drift=drift_state,
+        )
+
+    assert result.restart_requested is True
+    assert drift_state.pending_restart_fingerprint == "changed"
+    assert should_reexec.call_count == 1
+    log_text = (tmp_path / ".gza" / "watch.log").read_text(encoding="utf-8")
+    assert "START     drift-check cycle" in log_text
+    assert "DONE      drift-check cycle elapsed " in log_text
+    assert "START     runtime-reconcile cycle" not in log_text
+    assert "START     cycle-plan cycle" not in log_text
+
+
+def test_watch_cycle_restart_after_reconcile_keeps_latest_occupancy_without_later_phase(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    reconcile_state = ProjectRuntimeReconcileResult(
+        runtime_key=config.project_name,
+        live_pids=frozenset({111, 222, 333}),
+        running_task_ids=("gza-101", "gza-102"),
+        anonymous_worker_count=3,
+        starting_worker_count=2,
+        running_pids=frozenset({111, 222}),
+        starting_pids=frozenset({333}),
+        starting_worker_ids=("starting-a", "starting-b"),
+    )
+    checkpoint_calls = 0
+
+    def restart_after_reconcile() -> bool:
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        return checkpoint_calls == 2
+
+    with (
+        patch("gza.cli.watch._reconcile_watch_runtime_state", return_value=reconcile_state),
+        patch(
+            "gza.cli.watch._build_reported_watch_cycle_plan",
+            side_effect=AssertionError("plan should not start after post-reconcile restart"),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=5,
+            max_iterations=1,
+            dry_run=False,
+            log=log,
+            restart_checkpoint=restart_after_reconcile,
+        )
+
+    assert result.restart_requested is True
+    assert result.running == 2
+    assert result.anonymous_worker_count == 3
+    assert result.starting_worker_count == 2
+    assert result.pending == 0
+
+
+def test_watch_cycle_restart_after_plan_keeps_latest_counts_and_effective_scope(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    effective_scope = ("gza-201", "gza-202")
+    plan = _empty_scoped_watch_plan_with_effective_scope(effective_scope)
+    plan = replace(
+        plan,
+        running_task_ids=("gza-301", "gza-302"),
+        anonymous_worker_count=4,
+        starting_worker_count=3,
+        pending_count=7,
+        running=2,
+        slots=0,
+    )
+    checkpoint_calls = 0
+
+    def restart_after_plan() -> bool:
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        return checkpoint_calls == 3
+
+    with (
+        patch(
+            "gza.cli.watch._reconcile_watch_runtime_state",
+            return_value=ProjectRuntimeReconcileResult(
+                runtime_key=config.project_name,
+                live_pids=frozenset(),
+                running_task_ids=(),
+                anonymous_worker_count=0,
+                starting_worker_count=0,
+            ),
+        ),
+        patch("gza.cli.watch._build_reported_watch_cycle_plan", return_value=plan),
+        patch(
+            "gza.cli.watch.reconcile_stale_watch_no_progress_parks",
+            side_effect=AssertionError("stale reconcile should not run after post-plan restart"),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=5,
+            max_iterations=1,
+            dry_run=False,
+            log=log,
+            scoped_owner_ids=("gza-201",),
+            restart_checkpoint=restart_after_plan,
+        )
+
+    assert result.restart_requested is True
+    assert result.running == 2
+    assert result.pending == 7
+    assert result.anonymous_worker_count == 4
+    assert result.starting_worker_count == 3
+    assert result.effective_scoped_owner_ids == effective_scope
+
+
+def test_watch_cycle_lifecycle_restart_waits_for_deferred_settle_and_canonical_checkout(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    owner = store.add("Lifecycle owner before drift restart", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = "feature/lifecycle-restart-checkout"
+    owner.has_commits = True
+    owner.merge_status = "unmerged"
+    store.update(owner)
+    row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="reconcile_branch_divergence",
+        unresolved_tasks=(owner,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=owner,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+    review_child = store.add("Review child launched before drift restart", task_type="review", depends_on=owner.id)
+    assert review_child.id is not None
+    events: list[str] = []
+
+    def execute_lifecycle(*, task: DbTask, action: Mapping[str, Any], context: object) -> AdvanceActionExecutionResult:
+        assert task.id == owner.id
+        events.append("lifecycle")
+        return AdvanceActionExecutionResult(
+            action_type=str(action["type"]),
+            status="success",
+            execution_phase="worker_launch",
+            message="lifecycle complete",
+            success_message="lifecycle complete",
+            worker_label="review",
+            worker_consuming=True,
+            attempted_spawn=True,
+            worker_started=True,
+            handled_task_id=review_child.id,
+            created_task=review_child,
+        )
+
+    def settle_lifecycle(*, pending_starts: Sequence[object], store: SqliteTaskStore, **_kwargs: object) -> list[object]:
+        assert len(pending_starts) == 1
+        events.append("settle")
+        return _live_settle_results(list(pending_starts), store=store)
+
+    def canonical_checkout(*_args: object, action: str, **_kwargs: object) -> CanonicalCheckoutStatus:
+        if action == "watch-pass-end":
+            events.append("canonical")
+        return CanonicalCheckoutStatus(
+            state="ok",
+            expected_branch="main",
+            current_branch="main",
+            restored=False,
+            dirty_tracked_paths=(),
+        )
+
+    def restart_after_canonical() -> bool:
+        requested = events[-3:] == ["lifecycle", "settle", "canonical"]
+        if requested:
+            events.append("restart")
+        return requested
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch(
+            "gza.cli.watch.plan_lifecycle_execution",
+            return_value=(
+                LifecycleExecutionDecision(
+                    item=(row, owner, {"type": "create_review", "description": "review before restart"}),
+                    action={"type": "create_review", "description": "review before restart"},
+                    free_worker_slots=1,
+                    selected=True,
+                ),
+            ),
+        ),
+        patch("gza.cli.watch.execute_advance_action", side_effect=execute_lifecycle),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_lifecycle),
+        patch("gza.cli.watch.check_canonical_checkout_invariant", side_effect=canonical_checkout),
+        patch(
+            "gza.cli.watch._evaluate_blind_parked_auto_rearm",
+            side_effect=AssertionError("rearm should not start after lifecycle restart"),
+        ),
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("recovery should not start after lifecycle restart"),
+        ),
+        patch(
+            "gza.cli.watch._spawn_background_worker",
+            side_effect=AssertionError("pending dispatch should not start after lifecycle restart"),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=1,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            restart_checkpoint=restart_after_canonical,
+        )
+
+    assert result.restart_requested is True
+    assert events[-4:] == ["lifecycle", "settle", "canonical", "restart"]
 
 
 def test_watch_warns_for_manual_restart_when_auto_restart_on_drift_is_disabled(tmp_path: Path) -> None:
@@ -63551,7 +63815,7 @@ def test_watch_drift_state_does_not_request_reexec_when_fingerprint_is_unchanged
 
 
 def test_watch_requests_reexec_on_pending_drift_even_with_running_and_pending_work() -> None:
-    """Pending drift should restart watch at the next cycle boundary regardless of queue state."""
+    """Pending drift should restart watch at the next safe checkpoint regardless of queue state."""
     drift_state = _InstalledPackageDriftState(startup_fingerprint="startup")
     drift_state.pending_restart_fingerprint = "changed-1"
 
@@ -63564,6 +63828,372 @@ def test_watch_requests_reexec_on_pending_drift_even_with_running_and_pending_wo
         )
         is True
     )
+
+
+def test_watch_cycle_restart_after_settled_recovery_dispatch_stops_before_pending(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    runtime = WatchProjectRuntime.create(
+        key=config.project_name,
+        config=config,
+        store=store,
+        log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+    )
+    failed = _add_failed_resume_row(runtime, "Failed row restarts after settled recovery")
+    pending = store.add("Pending row must not start after recovery checkpoint", task_type="plan")
+    assert failed.id is not None
+    assert pending.id is not None
+    settled = False
+
+    def restart_checkpoint() -> bool:
+        return settled
+
+    def settle_spy(*, pending_starts: list[object], store: SqliteTaskStore, **_kwargs: object) -> list[object]:
+        nonlocal settled
+        settled = True
+        return _live_settle_results(pending_starts, store=store)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch(
+            "gza.cli.watch._run_watch_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch(
+            "gza.cli.watch._spawn_background_worker",
+            side_effect=AssertionError("pending dispatch should not start after restart checkpoint"),
+        ) as spawn_worker,
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_spy),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=1,
+            dry_run=False,
+            log=runtime.log,
+            recovery_slots=1,
+            recovery_mode="default",
+            max_recovery_attempts=1,
+            git=runtime.git,
+            runtime_context=runtime.runtime_context,
+            restart_checkpoint=restart_checkpoint,
+        )
+
+    assert result.restart_requested is True
+    assert result.confirmed_start_count == 1
+    assert result.expected_starts == {}
+    spawn_iterate.assert_called_once()
+    spawn_worker.assert_not_called()
+    log_text = (tmp_path / ".gza" / "watch.log").read_text(encoding="utf-8")
+    assert "START     pending-dispatch cycle" not in log_text
+
+
+def test_watch_supervisor_fleet_direct_checkpoint_restart_skips_later_runtime_and_dispatch(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    lease_set = MagicMock()
+    construction = WatchSupervisorRuntimeConstruction(runtimes=(runtime_a, runtime_b), lease_set=lease_set)
+    selection = WatchSupervisorSelection(
+        projects=(
+            WatchSupervisorProjectSelector(
+                key="a", ref=str(runtime_a.config.project_dir), path=runtime_a.config.project_dir
+            ),
+            WatchSupervisorProjectSelector(
+                key="b", ref=str(runtime_b.config.project_dir), path=runtime_b.config.project_dir
+            ),
+        )
+    )
+    events: list[str] = []
+
+    def reconcile(runtime: WatchProjectRuntime) -> ProjectRuntimeReconcileResult:
+        events.append(f"reconcile:{runtime.key}")
+        return ProjectRuntimeReconcileResult(
+            runtime_key=runtime.key,
+            live_pids=frozenset(),
+            running_task_ids=(),
+            anonymous_worker_count=0,
+            starting_worker_count=0,
+            runtime_identity=runtime.runtime_identity,
+        )
+
+    def analyze(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectCycleAnalysis:
+        events.append(f"analyze:{runtime.key}")
+        return _runtime_analysis_with_pending_suppression(runtime)
+
+    def direct(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectDirectResult:
+        events.append(f"direct:{runtime.key}")
+        return ProjectDirectResult(
+            runtime_key=runtime.key,
+            work_done=False,
+            restart_requested=runtime.key == "a",
+        )
+
+    with (
+        patch("gza.cli.watch.construct_watch_project_runtimes", return_value=construction),
+        patch.object(runtime_a, "reconcile_runtime_state", side_effect=lambda *, dry_run: reconcile(runtime_a)),
+        patch.object(runtime_b, "reconcile_runtime_state", side_effect=lambda *, dry_run: reconcile(runtime_b)),
+        patch.object(runtime_a, "analyze_cycle", side_effect=lambda **kwargs: analyze(runtime_a, **kwargs)),
+        patch.object(runtime_b, "analyze_cycle", side_effect=lambda **kwargs: analyze(runtime_b, **kwargs)),
+        patch.object(runtime_a, "run_direct_phase", side_effect=lambda **kwargs: direct(runtime_a, **kwargs)),
+        patch.object(
+            runtime_b,
+            "run_direct_phase",
+            side_effect=AssertionError("second runtime direct phase should not start after restart checkpoint"),
+        ),
+        patch(
+            "gza.cli.watch.dispatch_watch_supervisor_lanes_incrementally",
+            side_effect=AssertionError("fleet dispatch should not start after direct checkpoint restart"),
+        ) as dispatch_lanes,
+    ):
+        result, returned_lease_set = run_watch_supervisor_fleet_cycle(
+            anchor_store=runtime_a.store,
+            selection=selection,
+            quiet=True,
+            owner_token="fleet-token",
+            existing_lease_set=None,
+            batch=2,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=False,
+            emit_summary=False,
+        )
+
+    assert returned_lease_set is lease_set
+    assert result.restart_requested is True
+    assert [direct_result.runtime_key for direct_result in result.direct_results] == ["a"]
+    assert "direct:b" not in events
+    dispatch_lanes.assert_not_called()
+    lease_set.release.assert_not_called()
+
+
+@pytest.mark.parametrize("restart_after", ["reconcile", "analyze"])
+def test_watch_supervisor_fleet_phase_checkpoint_restart_skips_later_units_and_keeps_lease(
+    tmp_path: Path,
+    restart_after: str,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    lease_set = MagicMock()
+    construction = WatchSupervisorRuntimeConstruction(runtimes=(runtime_a, runtime_b), lease_set=lease_set)
+    selection = WatchSupervisorSelection(
+        projects=(
+            WatchSupervisorProjectSelector(key="a", ref=str(runtime_a.config.project_dir), path=runtime_a.config.project_dir),
+            WatchSupervisorProjectSelector(key="b", ref=str(runtime_b.config.project_dir), path=runtime_b.config.project_dir),
+        )
+    )
+    events: list[str] = []
+    end_cycle_a = MagicMock(wraps=runtime_a.log.end_cycle)
+    end_cycle_b = MagicMock(wraps=runtime_b.log.end_cycle)
+
+    def checkpoint() -> bool:
+        return f"{restart_after}:a" in events
+
+    def reconcile(runtime: WatchProjectRuntime) -> ProjectRuntimeReconcileResult:
+        events.append(f"reconcile:{runtime.key}")
+        if runtime.key == "b":
+            return ProjectRuntimeReconcileResult(
+                runtime_key=runtime.key,
+                live_pids=frozenset({8001, 8002}),
+                running_task_ids=("b-running",),
+                anonymous_worker_count=3,
+                starting_worker_count=2,
+                running_pids=frozenset({8001}),
+                starting_pids=frozenset({8002}),
+                starting_worker_ids=("b-starting-1", "b-starting-2"),
+                runtime_identity=runtime.runtime_identity,
+            )
+        return ProjectRuntimeReconcileResult(
+            runtime_key=runtime.key,
+            live_pids=frozenset({7001}),
+            running_task_ids=("a-running",),
+            anonymous_worker_count=2,
+            starting_worker_count=1,
+            running_pids=frozenset({7001}),
+            starting_worker_ids=("a-starting",),
+            runtime_identity=runtime.runtime_identity,
+        )
+
+    def analyze(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectCycleAnalysis:
+        events.append(f"analyze:{runtime.key}")
+        return _runtime_analysis_with_pending_suppression(runtime)
+
+    runtime_b_reconcile = (
+        AssertionError("runtime B reconcile should not start after runtime A reconcile restart")
+        if restart_after == "reconcile"
+        else lambda *, dry_run: reconcile(runtime_b)
+    )
+    runtime_b_analyze = AssertionError("runtime B analysis should not start after runtime A analysis restart")
+
+    with (
+        patch("gza.cli.watch.construct_watch_project_runtimes", return_value=construction),
+        patch.object(runtime_a.log, "end_cycle", side_effect=end_cycle_a),
+        patch.object(runtime_b.log, "end_cycle", side_effect=end_cycle_b),
+        patch.object(runtime_a, "reconcile_runtime_state", side_effect=lambda *, dry_run: reconcile(runtime_a)),
+        patch.object(runtime_b, "reconcile_runtime_state", side_effect=runtime_b_reconcile),
+        patch.object(runtime_a, "analyze_cycle", side_effect=lambda **kwargs: analyze(runtime_a, **kwargs)),
+        patch.object(runtime_b, "analyze_cycle", side_effect=runtime_b_analyze),
+        patch.object(
+            runtime_a,
+            "run_direct_phase",
+            side_effect=AssertionError("direct phase should not start after fleet phase restart"),
+        ),
+        patch.object(
+            runtime_b,
+            "run_direct_phase",
+            side_effect=AssertionError("runtime B direct phase should not start after fleet phase restart"),
+        ),
+        patch(
+            "gza.cli.watch.dispatch_watch_supervisor_lanes_incrementally",
+            side_effect=AssertionError("dispatch should not start after fleet phase restart"),
+        ),
+    ):
+        result, returned_lease_set = run_watch_supervisor_fleet_cycle(
+            anchor_store=runtime_a.store,
+            selection=selection,
+            quiet=True,
+            owner_token="fleet-token",
+            existing_lease_set=None,
+            batch=4,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=False,
+            emit_summary=False,
+            restart_checkpoint=checkpoint,
+        )
+
+    assert returned_lease_set is lease_set
+    assert result.restart_requested is True
+    assert result.occupancy is not None
+    if restart_after == "reconcile":
+        assert result.occupancy.running == 1
+        assert result.occupancy.starting == 1
+        assert result.anonymous_worker_count == 2
+        assert events == ["reconcile:a"]
+        assert result.analyses == {}
+    else:
+        assert result.occupancy.running == 2
+        assert result.occupancy.starting == 3
+        assert result.anonymous_worker_count == 5
+        assert result.occupancy.local_by_runtime_key["b"].running_task_ids == ("b-running",)
+        assert result.occupancy.local_by_runtime_key["b"].starting == 2
+        assert result.occupancy.local_by_runtime_key["b"].starting_pids == frozenset({8002})
+        assert events == ["reconcile:a", "reconcile:b", "analyze:a"]
+        assert tuple(result.analyses) == ("a",)
+    end_cycle_a.assert_called_once()
+    end_cycle_b.assert_called_once()
+    lease_set.release.assert_not_called()
+
+
+def test_watch_supervisor_fleet_opening_checkpoint_restart_keeps_cached_runtime_occupancy(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    lease_set = MagicMock()
+    construction = WatchSupervisorRuntimeConstruction(runtimes=(runtime_a, runtime_b), lease_set=lease_set)
+    selection = WatchSupervisorSelection(
+        projects=(
+            WatchSupervisorProjectSelector(key="a", ref=str(runtime_a.config.project_dir), path=runtime_a.config.project_dir),
+            WatchSupervisorProjectSelector(key="b", ref=str(runtime_b.config.project_dir), path=runtime_b.config.project_dir),
+        )
+    )
+    runtime_state = WatchSupervisorRuntimeState()
+    runtime_state.remember_reconcile(
+        ProjectRuntimeReconcileResult(
+            runtime_key="a",
+            live_pids=frozenset({7001}),
+            running_task_ids=("a-running",),
+            anonymous_worker_count=1,
+            starting_worker_count=1,
+            running_pids=frozenset({7001}),
+            starting_worker_ids=("a-starting",),
+            runtime_identity=runtime_a.runtime_identity,
+        ),
+        local_limit=runtime_a.config.max_concurrent,
+    )
+    runtime_state.remember_reconcile(
+        ProjectRuntimeReconcileResult(
+            runtime_key="b",
+            live_pids=frozenset({8001, 8002}),
+            running_task_ids=("b-running",),
+            anonymous_worker_count=2,
+            starting_worker_count=2,
+            running_pids=frozenset({8001}),
+            starting_pids=frozenset({8002}),
+            starting_worker_ids=("b-starting-1", "b-starting-2"),
+            runtime_identity=runtime_b.runtime_identity,
+        ),
+        local_limit=runtime_b.config.max_concurrent,
+    )
+    end_cycle_a = MagicMock(wraps=runtime_a.log.end_cycle)
+    end_cycle_b = MagicMock(wraps=runtime_b.log.end_cycle)
+
+    with (
+        patch("gza.cli.watch.construct_watch_project_runtimes", return_value=construction),
+        patch.object(runtime_a.log, "end_cycle", side_effect=end_cycle_a),
+        patch.object(runtime_b.log, "end_cycle", side_effect=end_cycle_b),
+        patch.object(
+            runtime_a,
+            "reconcile_runtime_state",
+            side_effect=AssertionError("runtime A reconcile should not start after opening checkpoint"),
+        ),
+        patch.object(
+            runtime_b,
+            "reconcile_runtime_state",
+            side_effect=AssertionError("runtime B reconcile should not start after opening checkpoint"),
+        ),
+        patch(
+            "gza.cli.watch.dispatch_watch_supervisor_lanes_incrementally",
+            side_effect=AssertionError("dispatch should not start after opening checkpoint"),
+        ),
+    ):
+        result, returned_lease_set = run_watch_supervisor_fleet_cycle(
+            anchor_store=runtime_a.store,
+            selection=selection,
+            quiet=True,
+            owner_token="fleet-token",
+            existing_lease_set=None,
+            batch=4,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=False,
+            emit_summary=False,
+            runtime_state=runtime_state,
+            restart_checkpoint=lambda: True,
+        )
+
+    assert returned_lease_set is lease_set
+    assert result.restart_requested is True
+    assert result.analyses == {}
+    assert result.direct_results == ()
+    assert result.dispatch_results.restart_requested is True
+    assert result.occupancy is not None
+    assert result.occupancy.running == 2
+    assert result.occupancy.starting == 3
+    assert result.anonymous_worker_count == 3
+    assert result.occupancy.local_by_runtime_key["a"].running_task_ids == ("a-running",)
+    assert result.occupancy.local_by_runtime_key["b"].starting == 2
+    assert result.occupancy.local_by_runtime_key["b"].starting_pids == frozenset({8002})
+    end_cycle_a.assert_called_once()
+    end_cycle_b.assert_called_once()
+    lease_set.release.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -70354,6 +70984,119 @@ def test_cmd_watch_sigterm_during_drift_handoff_argv_suppresses_exec_and_cleans_
         )
         is not None
     )
+
+
+def test_cmd_watch_scoped_checkpoint_uses_live_stop_signal_to_suppress_restart(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    scoped = store.add("Scoped drift restart loses to shutdown", task_type="implement")
+    assert scoped.id is not None
+    args = _watch_args(tmp_path, [scoped.id], max_idle=None)
+    handlers: dict[signal.Signals, object] = {}
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        handlers[sig] = handler
+        return object()
+
+    def run_cycle_with_checkpoint(**kwargs: object) -> _CycleResult:
+        drift_state = kwargs["installed_package_drift"]
+        assert isinstance(drift_state, _InstalledPackageDriftState)
+        drift_state.pending_restart_fingerprint = "updated"
+        restart_checkpoint = kwargs["restart_checkpoint"]
+        assert callable(restart_checkpoint)
+        handler = handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+        assert restart_checkpoint() is False
+        return _CycleResult(False, 0, 0)
+
+    with (
+        patch("gza.cli.watch._resolve_watch_scope_owner_ids", return_value=(scoped.id,)),
+        patch("gza.cli.watch._run_cycle", side_effect=run_cycle_with_checkpoint),
+        patch("gza.cli.watch._task_snapshot", return_value={}),
+        patch("gza.cli.watch._emit_transition_events"),
+        patch("gza.cli.watch._collect_completed_transition_ids", return_value=[]),
+        patch("gza.cli.watch._collect_unhandled_failures", return_value=[]),
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch("gza.cli.watch._installed_gza_package_fingerprint", return_value="startup"),
+        patch("gza.cli.watch.os.execv") as execv,
+        patch("gza.cli.watch.signal.signal", side_effect=fake_signal),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    execv.assert_not_called()
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-scoped-stop-checkpoint",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_multi_project_stop_during_reexec_handoff_suppresses_exec_and_releases_lease(
+    tmp_path: Path,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    _write_watch_runtime_project_config(
+        first_dir,
+        project_name="First",
+        project_id="first",
+        project_prefix="first",
+        db_path=tmp_path / "first.db",
+    )
+    _write_watch_runtime_project_config(
+        second_dir,
+        project_name="Second",
+        project_id="second",
+        project_prefix="second",
+        db_path=tmp_path / "second.db",
+    )
+    lease = SimpleNamespace(owner_token="fleet-token", release=MagicMock())
+    args = _watch_args(
+        first_dir,
+        [],
+        watch_projects=[f"first={first_dir}", f"second={second_dir}"],
+        yes=True,
+        max_idle=None,
+    )
+    handlers: dict[signal.Signals, object] = {}
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        handlers[sig] = handler
+        return object()
+
+    def fleet_cycle_with_restart(**kwargs: object) -> tuple[WatchSupervisorFleetCycleResult, object]:
+        drift_state = kwargs["installed_package_drift"]
+        assert isinstance(drift_state, _InstalledPackageDriftState)
+        drift_state.pending_restart_fingerprint = "updated"
+        return WatchSupervisorFleetCycleResult(False, 0, 0, 0, 0, restart_requested=True), lease
+
+    real_serialize = watch_module._serialize_watch_reexec_strategy_state
+
+    def serialize_and_signal(**kwargs: object) -> str:
+        handler = handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+        return real_serialize(**kwargs)
+
+    with (
+        patch("gza.cli.watch.run_watch_supervisor_fleet_cycle", side_effect=fleet_cycle_with_restart),
+        patch("gza.cli.watch._installed_gza_package_fingerprint", return_value="startup"),
+        patch("gza.cli.watch._serialize_watch_reexec_strategy_state", side_effect=serialize_and_signal),
+        patch("gza.cli.watch.os.execv") as execv,
+        patch("gza.cli.watch.signal.signal", side_effect=fake_signal),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    execv.assert_not_called()
+    lease.release.assert_called_once_with()
 
 
 def test_cmd_watch_scoped_resolution_failure_happens_before_watch_lease_acquire(tmp_path: Path) -> None:

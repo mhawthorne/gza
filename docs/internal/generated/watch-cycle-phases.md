@@ -2,195 +2,206 @@
 
 This describes what `gza watch`'s main loop actually does, derived from
 `src/gza/cli/watch.py`. It's a descriptive account of current behavior, not a
-spec of intended behavior — regenerate/re-verify against source when watch.py
+spec of intended behavior; regenerate/re-verify against source when watch.py
 changes materially, since nothing keeps this in sync automatically.
 
 ## The loop
 
-`_run_cycle` (`watch.py:15466`) is the body of one iteration. It runs phases
-in this order, once per iteration:
+`_run_cycle` (`watch.py:16597`) is the body of one single-project iteration.
+It runs phases in this order, once per iteration:
 
-drift-check → runtime-reconcile → (build/reuse cycle plan) →
-stale-no-progress-reconcile → cycle-header → lifecycle-preflight → lifecycle →
-recovery-plan → recovery-dispatch → pending-dispatch → cycle-finalize
+drift-check -> runtime-reconcile -> cycle-plan -> stale-no-progress-reconcile
+-> cycle-header -> lifecycle-preflight -> lifecycle ->
+blind-parked-auto-rearm -> recovery-plan -> recovery-dispatch ->
+pending-dispatch -> cycle-finalize
 
-A **cycle boundary** is the point after one full iteration returns, inside the
-outer `while` loop (`watch.py:19513` for the fleet loop, `:20245` for
-single-project). Anything that needs to restart the process (like picking up
-newly-installed code) waits for this boundary rather than interrupting a
-phase mid-flight, because several phases mutate DB/git state that assumes
-each phase runs to completion before the next begins.
+A **safe restart checkpoint** is the point after a phase or dispatch unit has
+completed and its durable bookkeeping, launch reservation state, checkout state,
+and lease state are settled, before another mutating unit starts. Installed-code
+drift can request re-exec at those checkpoints instead of waiting for a full
+cycle boundary. The outer command loops (`watch.py:20771` for the fleet loop,
+`:21304` for single-project) still make the final `_should_reexec_watch`
+decision immediately before `execv`, so dry-run/manual mode and stop signals
+remain authoritative.
+
+Fleet watch uses the same project-local direct phases but adds global barriers
+in `run_watch_supervisor_fleet_cycle` (`watch.py:10852`): reconcile/observe all
+selected runtimes, analyze all enabled runtimes, run direct phases in order,
+then dispatch recovery and pending candidates incrementally through the shared
+launch budget. A restart request from one completed direct phase stops later
+direct runtimes and all fleet dispatch; a request after a settled fleet
+candidate stops selection of another candidate while preserving completed
+strategy advancement and the lease set for re-exec.
 
 ## Phases
 
-**drift-check** (`watch.py:15506`) — Compares the installed `gza` package
-against a cached snapshot taken when watch started. Version/hash comparison
-only, no DB or subprocess work. Near-instant; just emits the "will re-exec at
-next cycle boundary" warning when code has changed underneath it.
+**drift-check** (`watch.py:16702`) - Compares the installed `gza` package
+against the cached startup fingerprint and updates the drift state. Disk-only
+package stat/hash work. If drift is already pending and auto-restart is allowed,
+this checkpoint can return immediately before runtime reconciliation, planning,
+verify, lifecycle, recovery, or pending dispatch starts.
 
-**runtime-reconcile** (`watch.py:15517`) — Reconciles persisted runtime state
-against actual running processes: PID liveness checks, clearing orphaned
-worker rows. DB reads/writes plus process-liveness checks. Moderate cost,
-skippable via `skip_runtime_reconcile`.
+**runtime-reconcile** (`watch.py:16713`) - Reconciles persisted runtime state
+against actual running processes: PID liveness checks, clearing orphaned worker
+rows, and runtime occupancy bookkeeping. DB reads/writes plus process-liveness
+checks. Moderate cost, skippable via `skip_runtime_reconcile`. A completed
+reconcile is a restart checkpoint.
 
-**cycle-plan** (`watch.py:15223`, invoked from `_build_reported_watch_cycle_plan`
-at `:15349`) — Builds the scheduling picture for the cycle: pulls a
-concurrency snapshot (running tasks, filtering hidden internal tasks like
-`behavior-monitor`), scans all pending tasks and checks blocking dependencies
-per task, then runs `_analyze_watch_cycle` (`watch.py:14056`) — the expensive
-part. That still does a full task-table scan to build lineage/recovery
-indexes, tag-scope gaps, non-dropped implement sources, owner rows, and
-recovery candidates. Tag-filtered owner-row analysis now prunes ordinary
-out-of-scope owners before lifecycle/recovery action resolution, branch
-priming, and most git probes; the full snapshot remains O(#tasks), while
-expensive owner action work tracks the retained scoped owners plus
-conservative terminal-reroot candidates.
+**cycle-plan** (`watch.py:16474`, phase at `:16500`) - Builds the scheduling
+picture for the cycle: pulls a concurrency snapshot, scans pending tasks and
+blocking dependencies, then runs `_analyze_watch_cycle` (`watch.py:14818`).
+That analysis builds lineage/recovery indexes, tag-scope gaps, owner rows,
+non-dropped implement sources, and recovery candidates. Broad scopes still pay
+O(#tasks) snapshot cost, while expensive owner action work tracks retained
+scoped owners plus conservative terminal-reroot candidates. A completed plan is
+a restart checkpoint.
 
-**stale-no-progress-reconcile** (`watch.py:15567`) — Scans parked tasks
-scoped by owner/task selectors and clears "no progress" parks that have gone
-stale. Pure DB read/update; cost scales with number of parked rows.
+**stale-no-progress-reconcile** (`watch.py:16772`) - Scans parked tasks scoped
+by owner/task selectors and clears stale "no progress" parks. Pure DB
+read/update; cost scales with parked rows. A completed reconcile is a restart
+checkpoint.
 
-**cycle-header** (`watch.py:15628`) — Emits the `WAKE` log line and the
-scope/usage summary. Pure formatting of data already computed by cycle-plan —
-no new queries, effectively free.
+**cycle-header** (`watch.py:16833`) - Emits the `WAKE` line plus scope, usage,
+and unit-accounting summaries from already-computed data. Mostly formatting and
+logging. A completed header is a restart checkpoint.
 
-**lifecycle-preflight** (`watch.py:16094`) — Checks the canonical checkout
-boundary, refreshes the isolated worktree if isolation is enabled, and —
-the actual cost driver — calls `check_main_integration_verify`
-(`watch.py:7022`), which **runs the project's full verify/test suite**
-against main, with up to 2 reruns if the result comes back red. This is a
-real CI run happening inline in the watch loop; multi-minute durations here
-are expected whenever the cached verify checkpoint is stale.
+**lifecycle-preflight** (`watch.py:17306`) - Checks the canonical checkout
+boundary, refreshes the isolated worktree if isolation is enabled, and may call
+the main integration verify gate, which can run the project's full verify/test
+suite with bounded reruns when cached evidence is stale or red. DB/git/disk work
+plus potentially expensive subprocess verification. A completed preflight is a
+restart checkpoint.
 
-**lifecycle** (`watch.py:16291`) — Dispatches the actual lifecycle action
-plan (merge, rebase, advance, needs-attention, skip) per task. Can check out
-and verify branches, run isolated merge batches (git checkout/merge/verify
-subprocess calls, sometimes spawning rebase worker processes), and
-re-evaluate next actions via DB + git status queries. The heaviest and most
-variable phase: near-free when it's only advancing state, slow when it's
-actually merging or verifying branches.
+**lifecycle** (`watch.py:17511`) - Dispatches direct lifecycle actions selected
+by the shared advance engine: merge, merge-with-followups, rebase routing,
+review/improve creation, needs-attention, skips, and direct repairs. It can
+check out branches, run candidate verify, promote isolated merge batches, spawn
+rebase/review/improve workers, and settle deferred lifecycle starts. The
+checkpoint is after deferred lifecycle launches have settled and the canonical
+checkout boundary is safe, not inside merge/promotion/finalization work.
 
-**blind-parked-auto-rearm** (`watch.py:17276`, logic in
-`_evaluate_blind_parked_auto_rearm` at `:14322`) — Resolves the target
-branch's current SHA, discovers parked tasks matching scope/tags, and for
-each candidate runs a `git diff` subprocess to confirm the branch still has
-live, non-empty work before re-arming it for another attempt. If anything
-gets rearmed, it **re-runs the entire `_analyze_watch_cycle` from cycle-plan**
-to refresh state — doubling that cost for the cycle when it fires.
+**blind-parked-auto-rearm** (`watch.py:18502`, logic at `:15462`) - Resolves
+the target branch SHA, discovers parked tasks matching scope/tags, and probes
+each candidate with git diff evidence before re-arming it. If anything rearms,
+it reruns `_analyze_watch_cycle` to refresh state. Cost is one target ref
+resolution plus per-candidate git probes; the completed phase is a restart
+checkpoint.
 
-**recovery-plan** (`watch.py:17422`–`18487`) — No subprocess calls. Iterates
-attention/undispatched/skip rows already computed during cycle-plan's
-analysis and emits log/attention events. Bookkeeping over in-memory data,
-not fresh scans — cheap.
+**recovery-plan** (`watch.py:18633`) - Iterates recovery attention,
+undispatched, skip, and candidate rows already computed during cycle analysis.
+Emits log/attention events and prepares in-memory dispatch plans. Mostly cheap
+bookkeeping over DB-derived in-memory state. A completed recovery plan is a
+restart checkpoint.
 
-**recovery-dispatch** (`watch.py:18487`–`18674`) — Actually launches recovery
-workers for failed tasks: reserves launch permits, marks tasks
-running/reserved in the DB, spawns worker subprocesses. Checks
-`watch-no-progress` attention and backoff state. Mutates task rows; cost is
-dominated by subprocess spawn overhead, though it's launch-only (doesn't
-block on task completion).
+**recovery-dispatch** (`watch.py:19712`) - Launches recovery workers for failed
+tasks selected by the recovery plan. It reserves launch permits, prepares or
+creates recovery tasks, spawns worker/iterate processes, waits for deferred
+starts to settle, records confirmed-start counts, and releases/consumes slots.
+The restart checkpoint is after all deferred recovery starts in that dispatch
+unit have settled.
 
-**pending-dispatch** (`watch.py:18674`–`~19064`) — Recomputes the pending
-runnable-task queue (DB query filtered by tags/owner exclusions) and spawns
-workers for selected tasks, consuming available slots. Also handles
-quiet-period skips via an `available_at` check. Similar cost profile to
-recovery-dispatch: one DB query plus N process spawns.
+**pending-dispatch** (`watch.py:19910`) - Recomputes the pending runnable queue,
+handles quiet-period skips, preflights pending candidates, reserves launch
+permits, spawns worker/iterate processes, and settles each complete dispatch
+wave before selecting more pending work. A restart checkpoint runs after every
+settled pending wave, never between permit reservation, task preparation, spawn,
+and settlement.
 
-**cycle-finalize** (`watch.py:19064`–`19102`; early-exit copy at
-`17370`–`17414` for `direct_phase_only`) — End-of-cycle bookkeeping: final
-pending-count query, canonical-checkout boundary check, main-verify attention
-finalization, deferred-blocker/attention summaries, and a final live-process
-scan to report running/starting worker counts. The outer while-loop then
-diffs this cycle's task snapshot against the previous one to emit transition
-events and adopt "confirmed start" bookkeeping (`expected_starts`) for the
-next iteration — this is what turns "a task appeared as running" into a
-durable fact across cycles.
-
-## Heartbeat fields: "cpu unavailable" / "out unavailable"
-
-`BUSY` lines during a long-running phase report CPU delta and output size
-when available. `cpu unavailable` means the sampler couldn't get a CPU-time
-delta for the tracked process/phase. `out unavailable` means the phase has no
-captured output stream — true for all in-process phases (cycle-plan,
-lifecycle-preflight, lifecycle), since they aren't subprocesses with their
-own stdout. Neither indicates a problem; they're just missing instrumentation
-for that kind of phase.
-
-## Why cycles take minutes
-
-Three phases dominate wall-clock time, and all three share the same
-underlying pattern — cheap DB reads, expensive per-item subprocess calls:
-
-- **cycle-plan**: a full task-table scan every cycle, plus git/status probes
-  for retained owner-action candidates. Untagged or broad queries can still
-  approach one `git` subprocess call per task/branch for merge-status, diff,
-  and branch-existence checks; tag-scoped queries prune ordinary
-  out-of-scope owners before most of that work.
-- **lifecycle-preflight**: runs the actual verify/test suite against main
-  when its cached result is stale — a real CI run, not a status check.
-- **blind-parked-auto-rearm**: one `git diff` subprocess per parked
-  candidate, and re-runs the full cycle-plan analysis if anything rearms.
-
-The remaining full snapshot/index work is still proportional to task/branch
-count and repo size, and it pays that cost fresh every cycle since nothing
-here is memoized across cycles yet. For tag-scoped runs, owner action/git
-resolution now scales with the retained scoped owners plus conservative
-terminal-reroot candidates rather than every ordinary owner in the snapshot.
+**cycle-finalize** (`watch.py:20308`; direct-phase copy at `:18581`) - Final
+bookkeeping: pending-count query, canonical-checkout boundary check,
+main-verify attention finalization, deferred-blocker/attention summaries, log
+cycle close, and a final live-process scan for running/starting worker counts.
+The outer loop then diffs this cycle's task snapshot against the previous one
+to emit transition events and process expected-start boundary observations.
 
 ## Diagram
 
-Phase order plus the external systems each phase touches: the task/runtime
-DB (`.gza/gza.db`, sqlite), `git` (subprocess calls against the working
-repo/worktrees), `disk` (installed-package/config filesystem checks), and
-`proc` (OS process spawn/liveness checks for workers).
+Phase order plus the external systems each phase touches: the task/runtime DB
+(`.gza/gza.db`, sqlite), `git` subprocesses against repos/worktrees, installed
+package/config files on disk, and OS process liveness/spawn state.
 
 ```mermaid
 flowchart TD
     DB[("sqlite DB")]
     GIT[/"git (repo/worktrees)"/]
     DISK[/"disk (installed pkg / config)"/]
+    PROC[/"processes (workers/PIDs)"/]
 
     Start(["cycle start"]) --> Drift["drift-check"]
     Drift -.-> DISK
-    Drift --> Runtime["runtime-reconcile"]
+    Drift --> DriftRestart{"restart requested?"}
+    DriftRestart -- yes --> Reexec(["command-level re-exec guard"])
+    DriftRestart -- no --> Runtime["runtime-reconcile"]
     Runtime -.-> DB
-    Runtime --> Plan["cycle-plan<br/>(full task scan + per-branch git probes)"]
+    Runtime -.-> PROC
+    Runtime --> CheckRuntime{"restart checkpoint"}
+    CheckRuntime -- yes --> Reexec
+    CheckRuntime -- no --> Plan["cycle-plan<br/>(full task scan + owner analysis)"]
     Plan -.-> DB
     Plan -.-> GIT
-    Plan --> Stale["stale-no-progress-reconcile"]
+    Plan --> CheckPlan{"restart checkpoint"}
+    CheckPlan -- yes --> Reexec
+    CheckPlan -- no --> Stale["stale-no-progress-reconcile"]
     Stale -.-> DB
     Stale --> Header["cycle-header (log only)"]
-    Header --> Preflight["lifecycle-preflight<br/>(runs full verify/test suite)"]
+    Header --> Preflight["lifecycle-preflight<br/>(canonical checkout + main verify)"]
+    Preflight -.-> DB
     Preflight -.-> GIT
+    Preflight -.-> DISK
     Preflight --> Lifecycle["lifecycle<br/>(merge/rebase/advance dispatch)"]
-    Lifecycle -.-> GIT
     Lifecycle -.-> DB
-    Lifecycle --> Rearm["blind-parked-auto-rearm<br/>(git diff per parked candidate)"]
-    Rearm -.-> GIT
+    Lifecycle -.-> GIT
+    Lifecycle -.-> PROC
+    Lifecycle --> CheckLifecycle{"settled lifecycle checkpoint"}
+    CheckLifecycle -- yes --> Reexec
+    CheckLifecycle -- no --> Rearm["blind-parked-auto-rearm<br/>(git diff per parked candidate)"]
     Rearm -.-> DB
+    Rearm -.-> GIT
     Rearm -- rearmed something --> Plan
     Rearm -- nothing rearmed --> RecPlan["recovery-plan (in-memory)"]
-    RecPlan --> RecDispatch["recovery-dispatch<br/>(spawn recovery workers)"]
+    RecPlan --> RecDispatch["recovery-dispatch<br/>(settled recovery launches)"]
     RecDispatch -.-> DB
-    RecDispatch --> PendDispatch["pending-dispatch<br/>(spawn pending workers)"]
+    RecDispatch -.-> PROC
+    RecDispatch --> CheckRecovery{"restart checkpoint"}
+    CheckRecovery -- yes --> Reexec
+    CheckRecovery -- no --> PendDispatch["pending-dispatch<br/>(settled waves)"]
     PendDispatch -.-> DB
-    PendDispatch --> Finalize["cycle-finalize<br/>(checkout boundary + live-process scan)"]
+    PendDispatch -.-> PROC
+    PendDispatch --> CheckPending{"restart after wave?"}
+    CheckPending -- yes --> Reexec
+    CheckPending -- no --> Finalize["cycle-finalize<br/>(checkout boundary + live scan)"]
     Finalize -.-> DB
     Finalize -.-> GIT
-    Finalize --> Boundary{"cycle boundary"}
-    Boundary -- "code drift detected" --> Reexec(["re-exec process"])
-    Boundary -- "no drift" --> Start
+    Finalize -.-> PROC
+    Finalize --> Boundary{"cycle boundary fallback"}
+    Boundary -- "pending drift" --> Reexec
+    Boundary -- "continue" --> Start
 
     classDef storage fill:#e6d9b8,stroke:#8a6d1d,color:#3a2e0a
-    class DB,GIT,DISK storage
+    class DB,GIT,DISK,PROC storage
 ```
+
+## Why cycles take minutes
+
+Three phases dominate wall-clock time, and all three share the same underlying
+pattern: cheap DB reads around expensive subprocess or per-item work.
+
+- **cycle-plan**: full task-table snapshot and owner analysis every cycle, plus
+  git/status probes for retained owner-action candidates.
+- **lifecycle-preflight**: can run the actual verify/test suite against main
+  when cached checkpoint evidence is stale or needs bounded red confirmation.
+- **lifecycle** and **blind-parked-auto-rearm**: lifecycle may merge, verify,
+  promote, or spawn workers; auto-rearm can run one git diff per parked
+  candidate and repeat cycle analysis after rearming.
+
+The checkpoint checks reuse the existing installed-package fingerprint cache, so
+unchanged checks normally pay directory/stat traversal cost rather than
+rehashing every Python file. They run only at completed phase or settled
+dispatch boundaries, not from heartbeat ticks.
 
 ## Related
 
-- `specs/behavior/watch-supervisor.md` — prescriptive intent for drift/re-exec
-  and idle behavior (§ "Global idle, re-exec, and observability",
-  § 6 "Installed-code drift triggers re-exec at the next cycle boundary").
-- `docs/configuration.md` — describes the same phases in plainer,
-  externally-facing language ("scan", "lifecycle preflight", "lifecycle",
-  "recovery", "dispatch", "finalization") and the re-exec/heartbeat behavior;
-  doesn't use the internal phase-name strings this doc does.
+- `specs/behavior/watch-supervisor.md` - prescriptive intent for drift/re-exec,
+  safe restart checkpoints, fleet state preservation, and idle behavior.
+- `docs/configuration.md` - operator-facing watch flags, auto-restart wording,
+  and the high-level lifecycle/recovery/dispatch behavior.

@@ -40,8 +40,10 @@ This document answers questions the engine spec intentionally does not:
 - **S2 — Process-level idempotency.** Re-running or restarting `watch` with no external
   state change MUST NOT double-spawn workers, duplicate recovery, or double-merge work.
 - **S3 — Interruptible and restart-safe.** `watch` MUST be safe to stop and restart at any
-  cycle boundary. Detached workers MUST continue independently, and the next `watch`
-  process MUST adopt them instead of respawning equivalent work.
+  safe restart checkpoint: after a phase or dispatch unit has completed and durable
+  bookkeeping, launch reservations, checkout state, and lease state are settled, before
+  another mutating unit starts. Detached workers MUST continue independently, and the
+  next `watch` process MUST adopt them instead of respawning equivalent work.
 - **S4 — Land fresh code first.** Within a cycle, direct landing work MUST execute before
   new worker spawns, so later worker starts evaluate against the freshest landed target.
 - **S5 — Scope is explicit.** When tag filters are active, watch MUST act only on
@@ -144,8 +146,12 @@ project. One multi-project cycle MUST execute these barriers in order:
    exposes the selected runtime's next locally ordered head candidate before invoking the
    strategy again. It MUST repeat until either `dispatch_slots` is zero or no selected
    runtime can expose an eligible head.
-7. Observe transitions per project, emit aggregate and project-prefixed summaries, decide
-   re-exec/idle/stop once for the fleet, and sleep once using the global poll interval.
+7. Observe transitions per project, emit aggregate and project-prefixed summaries, and
+   sleep once using the global poll interval when no earlier safe checkpoint requested
+   re-exec. A restart request raised at a completed direct-phase or settled dispatch
+   checkpoint MUST stop later runtime phases and candidate selection while preserving
+   completed strategy advancement, launch-budget occupancy, manifest identity, selector
+   state, and the owned lease token for the command-level re-exec handoff.
 
 The supervisor MUST NOT run a complete single-project cycle for project A, start workers
 there, and only then evaluate project B's direct landing work. That ordering violates the
@@ -383,10 +389,12 @@ boundaries in this state model:
   runtimes with no known live or reserved work remain visible in summaries but MUST NOT
   keep the process falsely active forever; `max_idle` MAY exit with an unhealthy-project
   summary.
-- Drift detection is process-global. Re-exec happens only at a fleet cycle boundary and
-  MUST preserve the full ordered selectors, keyed tags, tag modes, strategy state,
-  manifest identity when used, and lease token. The restarted supervisor MUST adopt all
-  detached workers and owned leases before new dispatch.
+- Drift detection is process-global. Re-exec happens only at a safe restart checkpoint or
+  the ordinary end-of-cycle fallback, and the command loop remains the final authority:
+  it MUST re-check automatic restart, dry-run, and stop-signal guards immediately before
+  `execv`. Fleet re-exec MUST preserve the full ordered selectors, keyed tags, tag modes,
+  strategy state, manifest identity when used, and lease token. The restarted supervisor
+  MUST adopt all detached workers and owned leases before new dispatch.
 - Detailed project-owned logs belong in each project's configured `.gza` area. Aggregate
   supervisor state and the aggregate supervisor log MUST resolve to one supervisor-owned
   state directory in this order: the explicit CLI `--watch-state-dir` override wins;
@@ -755,8 +763,8 @@ Each watch cycle MUST execute these phases in order:
    operator warning rather than a clean `START`; terminal outcomes observed before then
    stand on their own and MUST NOT also emit a contradictory no-show warning. This is
    required by invariant S6's outcome-over-launch rule.
-7. **Decide the next boundary.** Stop, back off, re-exec, idle-exit, or sleep until the
-   next poll interval.
+7. **Decide the next boundary.** Stop, back off, re-exec if a completed safe checkpoint
+   requested it, idle-exit, or sleep until the next poll interval.
 
 The supervisor MUST NOT reorder these phases in a way that can cause older target-branch
 state to win over already-mergeable fresh code.
@@ -963,17 +971,22 @@ Watch workers are detached on purpose. A restarted supervisor MUST adopt them.
 - Adoption MUST happen before any new worker selection for the cycle.
 - Watch MUST NOT require a "drain everything, then restart" gate to stay correct.
 
-### 6. Installed-code drift triggers re-exec at the next cycle boundary
+### 6. Installed-code drift triggers re-exec at the next safe checkpoint
 
 When the installed `gza` package fingerprint changes while watch is running:
 
 - Watch MUST detect the drift and mark a pending self-restart.
-- With automatic drift restart enabled, watch MUST re-exec at the **next cycle
-  boundary**, regardless of current running-worker count, pending-work count, or whether
-  the queue is idle.
+- With automatic drift restart enabled, watch MUST re-exec at the **next safe restart
+  checkpoint**, regardless of current running-worker count, pending-work count, or
+  whether the queue is idle. The opening `drift-check` checkpoint MUST be able to return
+  before runtime reconciliation, cycle planning, lifecycle work, recovery dispatch, or
+  pending dispatch starts.
 - The contract MUST NOT require a drain-first or "only when no workers are active" gate.
 - Detached workers survive supervisor process re-exec; the restarted watch MUST adopt
   them under invariant 5.
+- A stop signal MUST win over a pending drift restart, and dry-run or
+  `--no-auto-restart-on-drift` MUST keep the warning-only behavior without shortening the
+  cycle.
 - When automatic drift restart is disabled, watch MUST still surface the drift to the
   operator and MUST NOT pretend the old process loaded the new code.
 
@@ -1226,7 +1239,7 @@ The existence of these knobs is contract; their values are operator policy.
 | `watch.slot_settle_seconds` | Project-local bounded wait for selected work to prove live execution; only live proof occupies a slot, while terminal-before-running outcomes release provisional budget and no-live-proof outcomes remain undispatched |
 | `watch.no_activity_timeout` | Project-local reconciliation threshold for deciding a registered worker for a pending or in-progress task has gone silent and must be failed/reconciled |
 | `--tag` / `--all-tags`; keyed selector tags | Unkeyed `--tag` / `--all-tags` are accepted whenever the invocation resolves exactly one execution project (`--tag` matches any requested tag by default; `--all-tags` requires all of them). Invocations that resolve more than one execution project MUST use keyed selector or manifest tags and MUST reject unkeyed global tag flags |
-| `--[no-]auto-restart-on-drift` | Whether installed-code drift triggers automatic re-exec at the next cycle boundary |
+| `--[no-]auto-restart-on-drift` | Whether installed-code drift triggers automatic re-exec at the next safe restart checkpoint |
 
 Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to
 `--recovery-only`, `--restart-failed-batch` maps to `--recovery-slots`, and

@@ -2167,7 +2167,7 @@ need to break out promptly from a long or blocked watch pass.
 | `--dry-run` | Show what watch would do without executing; with `--recovery-only`, print the full failed-recovery report and exit for unscoped runs, while scoped `watch <task_id>... --recovery-only --dry-run` runs one scoped preview pass and exits |
 | `--show-skipped` | With `--recovery-only`, include skipped failed tasks in the dry-run recovery report and live watch logs |
 | `--quiet` | Suppress stdout and write events only to the selected watch log: `.gza/watch.log` for live watch, or `.gza/watch.dry-run.log` for `--dry-run` |
-| `--[no-]auto-restart-on-drift` | When installed `gza` code changes while watch is running, re-exec at the next cycle boundary to load the new code without waiting for running or pending work to drain (default: enabled) |
+| `--[no-]auto-restart-on-drift` | When installed `gza` code changes while watch is running, re-exec at the next safe phase checkpoint to load the new code without waiting for running or pending work to drain (default: enabled) |
 | `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `gza queue --tag TAG --pending` to preview the matching pending pickup order, or plain `gza queue --tag TAG` for the shared recovery+pending preview. Scoped watch reports out-of-scope derived blockers but does not start them |
 | `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
 
@@ -2384,7 +2384,7 @@ Multiline watch log messages are rendered with continuation indentation so wake,
 
 Watch-surfaced ordinary merge and rebase failure blocks include the merge subject task ID and source branch on the non-resolve error, abort, and abort-warning lines so concurrent merge-lane failures can be triaged without reverse-mapping a branch name by hand.
 
-When watch detects that the installed `gza` package fingerprint has changed since startup, it logs the drift immediately and, by default, re-execs itself at the next cycle boundary without waiting for running or pending work to drain. Detached workers keep running, and the replacement watch process reconciles them after it auto-resumes. The re-exec is treated as a continuation of the already-approved watch session, so it skips the first-pass confirmation prompt. Pass `--no-auto-restart-on-drift` to keep the manual-restart warning instead.
+When watch detects that the installed `gza` package fingerprint has changed since startup, it logs the drift immediately and, by default, re-execs itself at the next safe phase checkpoint without waiting for running or pending work to drain. A safe checkpoint is reached only after the current phase or dispatch unit has completed and its bookkeeping is settled, so watch can hand off before starting later reconciliation, planning, lifecycle, recovery, or pending-dispatch work. Detached workers keep running, and the replacement watch process reconciles them after it auto-resumes. The re-exec is treated as a continuation of the already-approved watch session, so it skips the first-pass confirmation prompt. Pass `--no-auto-restart-on-drift` to keep the manual-restart warning instead.
 
 If a watch-time merge attempt fails only because the task branch is already merged into the target branch, watch runs the shared branch-truth reconciliation path, marks the task merged, and logs the repair as informational reconciliation instead of surfacing a misleading merge failure.
 

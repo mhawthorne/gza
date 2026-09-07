@@ -4223,7 +4223,7 @@ def _warn_if_installed_gza_changed(
     if auto_restart_on_drift:
         message = (
             "installed gza changed since watch started -- watch will re-exec "
-            "at the next cycle boundary to load new code"
+            "at the next safe phase checkpoint to load new code"
         )
     else:
         message = "installed gza changed since watch started -- restart watch to pick up new code"
@@ -4245,6 +4245,27 @@ def _should_reexec_watch(
     if drift_state.pending_restart_fingerprint is None:
         return False
     return True
+
+
+def _check_watch_restart_checkpoint(
+    *,
+    log: "_WatchLog",
+    auto_restart_on_drift: bool,
+    dry_run: bool,
+    stop_requested: bool,
+    drift_state: _InstalledPackageDriftState | None,
+) -> bool:
+    _warn_if_installed_gza_changed(
+        log,
+        drift_state,
+        auto_restart_on_drift=auto_restart_on_drift,
+    )
+    return _should_reexec_watch(
+        auto_restart_on_drift=auto_restart_on_drift,
+        dry_run=dry_run,
+        stop_requested=stop_requested,
+        drift_state=drift_state,
+    )
 
 
 def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
@@ -8078,6 +8099,7 @@ class _CycleResult:
     work_done: bool
     running: int
     pending: int
+    restart_requested: bool = False
     scoped_done: bool | None = None
     scoped_active: int = 0
     effective_scoped_owner_ids: tuple[str, ...] | None = None
@@ -9685,6 +9707,7 @@ class ProjectDirectResult:
 
     runtime_key: str
     work_done: bool
+    restart_requested: bool = False
     project_analysis_invalidated: bool = False
     needs_replan: bool = False
     blocked: bool = False
@@ -9750,6 +9773,7 @@ class WatchSupervisorDispatchResult:
 
     recovery_results: tuple[ProjectDispatchResult, ...]
     pending_results: tuple[ProjectDispatchResult, ...]
+    restart_requested: bool = False
 
     @property
     def results(self) -> tuple[ProjectDispatchResult, ...]:
@@ -9765,6 +9789,7 @@ class WatchSupervisorFleetCycleResult:
     pending: int
     anonymous_worker_count: int
     starting_worker_count: int
+    restart_requested: bool = False
     disabled: tuple[ExecutionProjectDisabled, ...] = ()
     analyses: Mapping[str, ProjectCycleAnalysis] = field(default_factory=dict)
     direct_results: tuple[ProjectDirectResult, ...] = ()
@@ -10389,6 +10414,7 @@ def dispatch_watch_supervisor_lane_incrementally(
     | None = None,
     analyses: Mapping[str, ProjectCycleAnalysis] | None = None,
     operational_disabled_callback: Callable[[ExecutionProjectDisabled], None] | None = None,
+    restart_checkpoint: Callable[[], bool] | None = None,
 ) -> tuple[ProjectDispatchResult, ...]:
     """Select, dispatch, settle, and refresh one fleet lane one current head at a time."""
     if limit < 0:
@@ -10519,6 +10545,8 @@ def dispatch_watch_supervisor_lane_incrementally(
                 suppressed_task_ids_by_runtime_key.setdefault(choice.project_key, set()).add(
                     str(choice.candidate.task.id)
                 )
+            if restart_checkpoint is not None and restart_checkpoint():
+                break
     return tuple(results)
 
 
@@ -10544,6 +10572,7 @@ def dispatch_watch_supervisor_lanes_incrementally(
     | None = None,
     analyses: Mapping[str, ProjectCycleAnalysis] | None = None,
     operational_disabled_callback: Callable[[ExecutionProjectDisabled], None] | None = None,
+    restart_checkpoint: Callable[[], bool] | None = None,
 ) -> WatchSupervisorDispatchResult:
     """Run recovery then pending with incremental fleet arbitration and settlement refresh."""
     mode = normalize_dispatch_selection_mode(recovery_mode)
@@ -10566,11 +10595,13 @@ def dispatch_watch_supervisor_lanes_incrementally(
             dispatch_candidate=dispatch_recovery_candidate,
             analyses=analyses,
             operational_disabled_callback=operational_disabled_callback,
+            restart_checkpoint=restart_checkpoint,
         )
 
     pending_results: tuple[ProjectDispatchResult, ...] = ()
     pending_limit = launch_budget.occupancy.slots
-    if mode != "recovery_only" and pending_limit > 0:
+    restart_requested = restart_checkpoint() if restart_checkpoint is not None else False
+    if not restart_requested and mode != "recovery_only" and pending_limit > 0:
         pending_results = dispatch_watch_supervisor_lane_incrementally(
             runtimes,
             lane="pending",
@@ -10583,10 +10614,13 @@ def dispatch_watch_supervisor_lanes_incrementally(
             dispatch_candidate=dispatch_pending_candidate,
             analyses=analyses,
             operational_disabled_callback=operational_disabled_callback,
+            restart_checkpoint=restart_checkpoint,
         )
+        restart_requested = restart_checkpoint() if restart_checkpoint is not None else False
     return WatchSupervisorDispatchResult(
         recovery_results=recovery_results,
         pending_results=pending_results,
+        restart_requested=restart_requested,
     )
 
 
@@ -10835,6 +10869,7 @@ def run_watch_supervisor_fleet_cycle(
     emit_summary: bool = True,
     runtime_state: WatchSupervisorRuntimeState | None = None,
     aggregate_log_path: Path | None = None,
+    restart_checkpoint: Callable[[], bool] | None = None,
 ) -> tuple[WatchSupervisorFleetCycleResult, WatchLeaseSet | None]:
     """Run one multi-project supervisor pass with fleet-wide phase barriers."""
     runtime_state = runtime_state or WatchSupervisorRuntimeState()
@@ -10865,6 +10900,116 @@ def run_watch_supervisor_fleet_cycle(
             ):
                 return
             disabled.append(disabled_project)
+
+        def restart_requested_at_checkpoint(log: _WatchLog | None = None) -> bool:
+            if restart_checkpoint is not None:
+                return restart_checkpoint()
+            checkpoint_log = log or (runtimes[0].log if runtimes else None)
+            if checkpoint_log is None:
+                return False
+            return _check_watch_restart_checkpoint(
+                log=checkpoint_log,
+                auto_restart_on_drift=auto_restart_on_drift,
+                dry_run=dry_run,
+                stop_requested=False,
+                drift_state=installed_package_drift,
+            )
+
+        def latest_reconciled_occupancy(relevant_runtime_keys: AbstractSet[str]) -> AggregateWatchOccupancy:
+            disabled_reconcile_states = runtime_state.disabled_reconcile_states(
+                disabled,
+                active_runtime_keys=relevant_runtime_keys,
+            )
+            states = tuple(
+                state
+                for key, state in runtime_state.last_reconcile_by_runtime_key.items()
+                if key in relevant_runtime_keys
+            )
+            limit_by_runtime_key = dict(runtime_state.local_limit_by_runtime_key)
+            occupancy = aggregate_reconciled_watch_occupancy(
+                (*states, *disabled_reconcile_states),
+                supervisor_batch=batch,
+                limit_by_runtime_key=limit_by_runtime_key,
+            )
+            return runtime_state.apply_launch_reservations_to_occupancy(occupancy)
+
+        def finish_fleet_cycle_result(
+            *,
+            direct_results: Sequence[ProjectDirectResult],
+            dispatch_results: WatchSupervisorDispatchResult,
+            occupancy: AggregateWatchOccupancy,
+            analyses: Mapping[str, ProjectCycleAnalysis],
+            enabled_runtimes: Sequence["WatchProjectRuntime"],
+            restart_requested: bool,
+            pending: int = 0,
+            runnable_candidate_count: int = 0,
+            confirmed_start_count: int = 0,
+            halted_by_failure_boundary: bool = False,
+        ) -> WatchSupervisorFleetCycleResult:
+            anonymous_worker_count = sum(local.anonymous_worker_count for local in occupancy.local)
+            work_done = (
+                any(result.work_done for result in direct_results)
+                or any(result.work_done for result in dispatch_results.results)
+                or confirmed_start_count > 0
+                or halted_by_failure_boundary
+            )
+            result = WatchSupervisorFleetCycleResult(
+                work_done=work_done,
+                running=occupancy.running,
+                pending=pending,
+                anonymous_worker_count=anonymous_worker_count,
+                starting_worker_count=occupancy.starting,
+                restart_requested=restart_requested,
+                disabled=tuple(disabled),
+                analyses=dict(analyses),
+                direct_results=tuple(direct_results),
+                dispatch_results=dispatch_results,
+                occupancy=occupancy,
+                runnable_candidate_count=runnable_candidate_count,
+            )
+            if emit_summary:
+                _watch_supervisor_emit_aggregate_summary(
+                    disabled=disabled,
+                    direct_results=direct_results,
+                    dispatch_results=dispatch_results,
+                    occupancy=occupancy,
+                    aggregate_log_path=aggregate_log_path,
+                    quiet=quiet,
+                )
+            for runtime in runtimes:
+                _emit_deferred_blocker_debt_summary(
+                    runtime.log,
+                    runtime.store,
+                    tags=runtime.tags,
+                    any_tag=runtime.any_tag,
+                )
+                _emit_cycle_attention_summary(runtime.log)
+                runtime.log.end_cycle()
+            return result
+
+        def finish_fleet_restart(
+            *,
+            direct_results: Sequence[ProjectDirectResult] = (),
+            dispatch_results: WatchSupervisorDispatchResult | None = None,
+            analyses: Mapping[str, ProjectCycleAnalysis] | None = None,
+            enabled_runtimes: Sequence[WatchProjectRuntime] = (),
+            occupancy: AggregateWatchOccupancy | None = None,
+        ) -> tuple[WatchSupervisorFleetCycleResult, WatchLeaseSet | None]:
+            if occupancy is None:
+                occupancy = latest_reconciled_occupancy(frozenset(runtime.key for runtime in runtimes))
+            return (
+                finish_fleet_cycle_result(
+                    direct_results=direct_results,
+                    dispatch_results=dispatch_results
+                    if dispatch_results is not None
+                    else WatchSupervisorDispatchResult((), (), restart_requested=True),
+                    occupancy=occupancy,
+                    analyses=analyses or {},
+                    enabled_runtimes=enabled_runtimes,
+                    restart_requested=True,
+                ),
+                construction.lease_set,
+            )
 
         if not runtimes:
             disabled_reconcile_states = runtime_state.disabled_reconcile_states(
@@ -10901,6 +11046,11 @@ def run_watch_supervisor_fleet_cycle(
         for runtime in runtimes:
             runtime_state.remember_runtime(runtime)
             runtime.log.begin_cycle()
+
+        if restart_requested_at_checkpoint():
+            return finish_fleet_restart()
+
+        for runtime in runtimes:
             if not runtime.enabled:
                 if runtime.disabled is not None:
                     append_disabled(runtime.disabled)
@@ -10913,6 +11063,8 @@ def run_watch_supervisor_fleet_cycle(
                     append_disabled(read_only_disabled)
                 elif read_only_state is not None:
                     runtime_state.remember_reconcile(read_only_state, local_limit=runtime.config.max_concurrent)
+                if restart_requested_at_checkpoint():
+                    return finish_fleet_restart()
                 continue
             if not runtime.previous_snapshot:
                 _baseline_result, disabled_project = _watch_supervisor_try_project_phase(
@@ -10923,8 +11075,15 @@ def run_watch_supervisor_fleet_cycle(
                 if disabled_project is not None:
                     append_disabled(disabled_project)
                     baseline_disabled_keys.add(runtime.key)
+                    if restart_requested_at_checkpoint():
+                        return finish_fleet_restart()
                     continue
+                if restart_requested_at_checkpoint():
+                    return finish_fleet_restart()
             runtime.begin_dispatch_pass()
+
+        if restart_requested_at_checkpoint():
+            return finish_fleet_restart()
 
         enabled_runtimes: list[WatchProjectRuntime] = []
         for runtime in runtimes:
@@ -10954,8 +11113,12 @@ def run_watch_supervisor_fleet_cycle(
                     append_disabled(read_only_disabled)
                 elif read_only_state is not None:
                     runtime_state.remember_reconcile(read_only_state, local_limit=runtime.config.max_concurrent)
+                if restart_requested_at_checkpoint():
+                    return finish_fleet_restart(enabled_runtimes=enabled_runtimes)
             if enabled:
                 enabled_runtimes.append(runtime)
+            if restart_requested_at_checkpoint():
+                return finish_fleet_restart(enabled_runtimes=enabled_runtimes)
 
         reconciled_states: list[ProjectRuntimeReconcileResult] = []
         still_enabled_runtimes: list[WatchProjectRuntime] = []
@@ -10968,7 +11131,11 @@ def run_watch_supervisor_fleet_cycle(
                 )
                 if disabled_project is not None:
                     append_disabled(disabled_project)
+                    if restart_requested_at_checkpoint():
+                        return finish_fleet_restart(enabled_runtimes=still_enabled_runtimes)
                     continue
+                if restart_requested_at_checkpoint():
+                    return finish_fleet_restart(enabled_runtimes=still_enabled_runtimes)
             reconcile_state, disabled_project = _watch_supervisor_try_project_phase(
                 runtime,
                 phase="reconcile",
@@ -10976,11 +11143,15 @@ def run_watch_supervisor_fleet_cycle(
             )
             if disabled_project is not None:
                 append_disabled(disabled_project)
+                if restart_requested_at_checkpoint():
+                    return finish_fleet_restart(enabled_runtimes=still_enabled_runtimes)
                 continue
             assert reconcile_state is not None
             reconciled_states.append(reconcile_state)
             runtime_state.remember_reconcile(reconcile_state, local_limit=runtime.config.max_concurrent)
             still_enabled_runtimes.append(runtime)
+            if restart_requested_at_checkpoint():
+                return finish_fleet_restart(enabled_runtimes=still_enabled_runtimes)
         enabled_runtimes = still_enabled_runtimes
         pre_boundary_enabled_runtimes: list[WatchProjectRuntime] = []
         for runtime in enabled_runtimes:
@@ -10996,6 +11167,8 @@ def run_watch_supervisor_fleet_cycle(
             )
             if disabled_project is not None:
                 append_disabled(disabled_project)
+                if restart_requested_at_checkpoint():
+                    return finish_fleet_restart(enabled_runtimes=pre_boundary_enabled_runtimes)
                 continue
             assert observed is not None
             if observed[1]:
@@ -11007,8 +11180,12 @@ def run_watch_supervisor_fleet_cycle(
                         message="Failure halt threshold reached; project runtime held for human intervention.",
                     )
                 )
+                if restart_requested_at_checkpoint():
+                    return finish_fleet_restart(enabled_runtimes=pre_boundary_enabled_runtimes)
                 continue
             pre_boundary_enabled_runtimes.append(runtime)
+            if restart_requested_at_checkpoint():
+                return finish_fleet_restart(enabled_runtimes=pre_boundary_enabled_runtimes)
         enabled_runtimes = pre_boundary_enabled_runtimes
         analyses: dict[str, ProjectCycleAnalysis] = {}
         for runtime in enabled_runtimes:
@@ -11027,9 +11204,15 @@ def run_watch_supervisor_fleet_cycle(
             )
             if disabled_project is not None:
                 append_disabled(disabled_project)
+                if restart_requested_at_checkpoint():
+                    analyzed_runtimes = [candidate for candidate in enabled_runtimes if candidate.key in analyses]
+                    return finish_fleet_restart(analyses=analyses, enabled_runtimes=analyzed_runtimes)
                 continue
             assert analysis is not None
             analyses[runtime.key] = analysis
+            if restart_requested_at_checkpoint():
+                analyzed_runtimes = [candidate for candidate in enabled_runtimes if candidate.key in analyses]
+                return finish_fleet_restart(analyses=analyses, enabled_runtimes=analyzed_runtimes)
         enabled_runtimes = [runtime for runtime in enabled_runtimes if runtime.key in analyses]
 
         direct_results: list[ProjectDirectResult] = []
@@ -11051,6 +11234,7 @@ def run_watch_supervisor_fleet_cycle(
                     show_skipped=show_skipped,
                     auto_restart_on_drift=auto_restart_on_drift,
                     installed_package_drift=installed_package_drift,
+                    restart_checkpoint=functools.partial(restart_requested_at_checkpoint, runtime.log),
                     begin_cycle=False,
                     end_cycle=False,
                     emit_cycle_header=True,
@@ -11064,6 +11248,8 @@ def run_watch_supervisor_fleet_cycle(
                 continue
             assert direct_result is not None
             direct_results.append(direct_result)
+            if direct_result.restart_requested:
+                break
             if direct_result.needs_replan:
                 analysis, disabled_project = _watch_supervisor_try_project_phase(
                     runtime,
@@ -11080,9 +11266,22 @@ def run_watch_supervisor_fleet_cycle(
                 if disabled_project is not None:
                     append_disabled(disabled_project)
                     analyses.pop(runtime.key, None)
+                    if restart_requested_at_checkpoint():
+                        return finish_fleet_restart(
+                            direct_results=direct_results,
+                            analyses=analyses,
+                            enabled_runtimes=[candidate for candidate in enabled_runtimes if candidate.key in analyses],
+                        )
                     continue
                 assert analysis is not None
                 analyses[runtime.key] = analysis
+                if restart_requested_at_checkpoint():
+                    return finish_fleet_restart(
+                        direct_results=direct_results,
+                        analyses=analyses,
+                        enabled_runtimes=[candidate for candidate in enabled_runtimes if candidate.key in analyses],
+                    )
+        restart_requested = any(result.restart_requested for result in direct_results)
         enabled_runtimes = [runtime for runtime in enabled_runtimes if runtime.key in analyses]
         active_runtime_keys = frozenset(runtime.key for runtime in enabled_runtimes)
         disabled_reconcile_states = runtime_state.disabled_reconcile_states(
@@ -11099,6 +11298,19 @@ def run_watch_supervisor_fleet_cycle(
             supervisor_batch=batch,
             limit_by_runtime_key=limit_by_runtime_key,
         )
+        if restart_requested:
+            occupancy = runtime_state.apply_launch_reservations_to_occupancy(pre_dispatch_occupancy)
+            return (
+                finish_fleet_cycle_result(
+                    direct_results=direct_results,
+                    dispatch_results=WatchSupervisorDispatchResult((), (), restart_requested=True),
+                    occupancy=occupancy,
+                    analyses=analyses,
+                    enabled_runtimes=enabled_runtimes,
+                    restart_requested=True,
+                ),
+                construction.lease_set,
+            )
 
         project_order = tuple(runtime.key for runtime in enabled_runtimes)
         strategy_name = selection.strategy or "round-robin"
@@ -11142,6 +11354,7 @@ def run_watch_supervisor_fleet_cycle(
                 max_iterations=max_iterations,
                 analyses=analyses,
                 operational_disabled_callback=append_disabled,
+                restart_checkpoint=restart_requested_at_checkpoint,
             )
             for state in launch_budget.reconciled_states:
                 local_limit = runtime_state.local_limit_by_runtime_key.get(
@@ -11155,6 +11368,19 @@ def run_watch_supervisor_fleet_cycle(
             runtime_state.remember_launch_budget(launch_budget)
         else:
             occupancy = runtime_state.apply_launch_reservations_to_occupancy(pre_dispatch_occupancy)
+
+        if dispatch_results.restart_requested:
+            return (
+                finish_fleet_cycle_result(
+                    direct_results=direct_results,
+                    dispatch_results=dispatch_results,
+                    occupancy=occupancy,
+                    analyses=analyses,
+                    enabled_runtimes=enabled_runtimes,
+                    restart_requested=True,
+                ),
+                construction.lease_set,
+            )
 
         pending = 0
         runnable_candidate_count = 0
@@ -12321,6 +12547,7 @@ class WatchProjectRuntime:
         return ProjectDirectResult(
             runtime_key=self.key,
             work_done=result.work_done,
+            restart_requested=result.restart_requested,
             project_analysis_invalidated=result.project_analysis_invalidated,
             needs_replan=result.needs_replan,
             cycle_result=result,
@@ -16395,6 +16622,7 @@ def _dispatch_scoped_watch_once(
     skip_runtime_reconcile: bool = False,
     skip_stale_no_progress_reconcile: bool = False,
     worker_heartbeat: Callable[[], None] | None = None,
+    restart_checkpoint: Callable[[], bool] | None = None,
 ) -> _CycleResult:
     """Run one scoped watch dispatch pass through the shared watch execution path."""
     return _run_cycle(
@@ -16432,6 +16660,7 @@ def _dispatch_scoped_watch_once(
         skip_runtime_reconcile=skip_runtime_reconcile,
         skip_stale_no_progress_reconcile=skip_stale_no_progress_reconcile,
         worker_heartbeat=worker_heartbeat,
+        restart_checkpoint=restart_checkpoint,
     )
 
 
@@ -16473,10 +16702,24 @@ def _run_cycle(
     skip_runtime_reconcile: bool = False,
     skip_stale_no_progress_reconcile: bool = False,
     worker_heartbeat: Callable[[], None] | None = None,
+    restart_checkpoint: Callable[[], bool] | None = None,
 ) -> _CycleResult:
     runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     tags = normalize_tag_filters(tags)
     scoped_mode = scoped_owner_ids is not None
+    effective_scoped_owner_ids = scoped_owner_ids
+    running_task_ids: list[str] = []
+    anonymous_worker_count = 0
+    starting_worker_count = 0
+    pending_count = 0
+    running = 0
+    work_done = False
+    confirmed_start_count = 0
+    recovery_started_this_cycle = False
+    expected_starts: dict[str, _ExpectedStart] = {}
+    project_analysis_invalidated = False
+    current_analysis: _WatchCycleAnalysis | None = None
+    canonical_checkout_end_checked = False
     if restart_failed:
         recovery_slots = batch if restart_failed_batch is None else restart_failed_batch
         recovery_mode = "recovery_only"
@@ -16493,17 +16736,67 @@ def _run_cycle(
         interval_seconds=config.watch.heartbeat_interval_seconds,
     )
 
+    def _restart_requested_at_checkpoint() -> bool:
+        if restart_checkpoint is not None:
+            return restart_checkpoint()
+        return _check_watch_restart_checkpoint(
+            log=log,
+            auto_restart_on_drift=auto_restart_on_drift,
+            dry_run=dry_run,
+            stop_requested=False,
+            drift_state=installed_package_drift,
+        )
+
+    def _abbreviated_cycle_result(*, restart_requested: bool) -> _CycleResult:
+        active_recovery_subject_ids = (
+            current_analysis.active_recovery_subject_ids if current_analysis is not None else frozenset()
+        )
+        return _CycleResult(
+            work_done=work_done,
+            running=running,
+            pending=pending_count,
+            restart_requested=restart_requested,
+            scoped_done=None,
+            scoped_active=0,
+            effective_scoped_owner_ids=effective_scoped_owner_ids,
+            anonymous_worker_count=anonymous_worker_count,
+            starting_worker_count=starting_worker_count,
+            expected_starts=expected_starts,
+            confirmed_start_count=confirmed_start_count,
+            active_recovery_subject_ids=active_recovery_subject_ids,
+            project_analysis_invalidated=project_analysis_invalidated,
+            needs_replan=project_analysis_invalidated,
+        )
+
+    def _remember_reconciled_runtime_state(state: ProjectRuntimeReconcileResult) -> None:
+        nonlocal running_task_ids, anonymous_worker_count, starting_worker_count, running
+        running_task_ids = list(state.running_task_ids)
+        anonymous_worker_count = state.anonymous_worker_count
+        starting_worker_count = state.starting_worker_count
+        running = state.running
+
+    def _remember_cycle_plan(plan: _WatchCyclePlan) -> None:
+        nonlocal running_task_ids, anonymous_worker_count, starting_worker_count, pending_count
+        nonlocal running, effective_scoped_owner_ids, current_analysis
+        current_analysis = plan.analysis
+        running_task_ids = list(plan.running_task_ids)
+        anonymous_worker_count = plan.anonymous_worker_count
+        starting_worker_count = getattr(plan, "starting_worker_count", 0)
+        pending_count = plan.pending_count
+        running = plan.running
+        effective_scoped_owner_ids = getattr(plan.analysis, "effective_scoped_owner_ids", None) or scoped_owner_ids
+
     if begin_cycle:
         log.begin_cycle()
     cycle_phase = _start_watch_cycle_phase(long_phase_reporter, "drift-check")
     try:
-        _warn_if_installed_gza_changed(
-            log,
-            installed_package_drift,
-            auto_restart_on_drift=auto_restart_on_drift,
-        )
+        restart_requested = _restart_requested_at_checkpoint()
     finally:
         cycle_phase.finish()
+    if restart_requested:
+        if end_cycle:
+            log.end_cycle()
+        return _abbreviated_cycle_result(restart_requested=True)
     reconciled_runtime_state: ProjectRuntimeReconcileResult | None = None
     if not skip_runtime_reconcile:
         cycle_phase = _start_watch_cycle_phase(long_phase_reporter, "runtime-reconcile")
@@ -16517,6 +16810,11 @@ def _run_cycle(
             )
         finally:
             cycle_phase.finish()
+        _remember_reconciled_runtime_state(reconciled_runtime_state)
+        if _restart_requested_at_checkpoint():
+            if end_cycle:
+                log.end_cycle()
+            return _abbreviated_cycle_result(restart_requested=True)
 
     if precomputed_plan is not None:
         if excluded_owner_ids:
@@ -16546,15 +16844,14 @@ def _run_cycle(
             runtime_context=runtime_context,
             reconciled_runtime_state=reconciled_runtime_state,
         )
-    running_task_ids = list(plan.running_task_ids)
-    anonymous_worker_count = plan.anonymous_worker_count
-    starting_worker_count = getattr(plan, "starting_worker_count", 0)
+    _remember_cycle_plan(plan)
+    if _restart_requested_at_checkpoint():
+        if end_cycle:
+            log.end_cycle()
+        return _abbreviated_cycle_result(restart_requested=True)
     running_task_id_set = set(running_task_ids)
-    pending_count = plan.pending_count
     blocked_pending_count = plan.blocked_pending_count
-    running = plan.running
     slots = plan.slots
-    effective_scoped_owner_ids = getattr(plan.analysis, "effective_scoped_owner_ids", None) or scoped_owner_ids
     if not dry_run and not skip_stale_no_progress_reconcile:
         cycle_phase = _start_watch_cycle_phase(long_phase_reporter, "stale-no-progress-reconcile")
         try:
@@ -16569,12 +16866,12 @@ def _run_cycle(
             )
         finally:
             cycle_phase.finish()
-    work_done = False
-    confirmed_start_count = 0
-    recovery_started_this_cycle = False
+        if _restart_requested_at_checkpoint():
+            if end_cycle:
+                log.end_cycle()
+            return _abbreviated_cycle_result(restart_requested=True)
     started_task_ids: set[str] = set()
     pending_preflight_rejected_task_ids: set[str] = set()
-    expected_starts: dict[str, _ExpectedStart] = {}
     deferred_lifecycle_starts: list[_DeferredWatchDispatchStart] = []
     deferred_recovery_starts: list[_DeferredWatchDispatchStart] = []
     step1_handled_child_task_ids: set[str] = set()
@@ -16591,8 +16888,13 @@ def _run_cycle(
             worker_heartbeat()
 
     def _check_canonical_checkout_boundary(action: str) -> None:
+        nonlocal canonical_checkout_end_checked
         if dry_run:
             return
+        if action == "watch-pass-end":
+            if canonical_checkout_end_checked:
+                return
+            canonical_checkout_end_checked = True
         watch_ops_log = config.project_dir / ".gza" / "watch.ops.jsonl"
         status = check_canonical_checkout_invariant(
             config,
@@ -16645,6 +16947,10 @@ def _run_cycle(
             _emit_worker_heartbeat()
     finally:
         cycle_phase.finish()
+    if _restart_requested_at_checkpoint():
+        if end_cycle:
+            log.end_cycle()
+        return _abbreviated_cycle_result(restart_requested=True)
 
     def _reserve_watch_launch(worker_label: str, subject_task_id: str) -> LaunchPermit | None:
         try:
@@ -16807,6 +17113,7 @@ def _run_cycle(
     isolation_enabled = bool(getattr(config, "main_checkout_isolate", False))
     git = git if git is not None else Git(config.project_dir, env=runtime_context.env)
     analysis = plan.analysis
+    current_analysis = analysis
     target_branch = analysis.target_branch
     lifecycle_rows = list(analysis.lifecycle_rows)
     recovery_lane_entry_by_failed_id = analysis.recovery_lane_entry_by_failed_id
@@ -17172,6 +17479,10 @@ def _run_cycle(
                 merge_halted_for_cycle = False
                 _set_active_main_verify_remediation(None)
                 _clear_main_verify_attention(log=log, state=main_verify_state)
+    if _restart_requested_at_checkpoint():
+        if end_cycle:
+            log.end_cycle()
+        return _abbreviated_cycle_result(restart_requested=True)
 
     active_main_verify_terminal_attempt_consumed = False
 
@@ -18269,6 +18580,11 @@ def _run_cycle(
             count_confirmed_start=False,
             count_recovery_start=False,
         )
+        _check_canonical_checkout_boundary("watch-pass-end")
+    if _restart_requested_at_checkpoint():
+        if end_cycle:
+            log.end_cycle()
+        return _abbreviated_cycle_result(restart_requested=True)
 
     if not dry_run:
         cycle_phase = _start_watch_cycle_phase(long_phase_reporter, "blind-parked-auto-rearm")
@@ -18318,8 +18634,13 @@ def _run_cycle(
                     known_effective_scoped_owner_ids=effective_scoped_owner_ids,
                     excluded_owner_ids=excluded_owner_ids,
                 )
+                current_analysis = analysis
         finally:
             cycle_phase.finish()
+        if _restart_requested_at_checkpoint():
+            if end_cycle:
+                log.end_cycle()
+            return _abbreviated_cycle_result(restart_requested=True)
 
     def _finish_direct_phase_result() -> _CycleResult:
         nonlocal effective_scoped_owner_ids, project_analysis_invalidated
@@ -18591,6 +18912,10 @@ def _run_cycle(
                     subject_task=failed,
                     action=recovery_action,
                 )
+    if _restart_requested_at_checkpoint():
+        if end_cycle:
+            log.end_cycle()
+        return _abbreviated_cycle_result(restart_requested=True)
 
     def _fail_closed_for_planned_recovery_entry(
         entry: DispatchPreviewEntry,
@@ -18757,12 +19082,13 @@ def _run_cycle(
                     assert exec_result.handled_task_id is not None
                     recovered_task_id = str(exec_result.handled_task_id)
                     recovered_start_task = exec_result.created_task or store.get(recovered_task_id)
+                    expected_start = _ExpectedStart(
+                        recovery_action=recovery_action_type,
+                        parent_failed_id=str(failed.id),
+                        launch_mode=exec_result.worker_label or "worker",
+                    )
                     recovery_annotation = _format_expected_start_annotation(
-                        _ExpectedStart(
-                            recovery_action=recovery_action_type,
-                            parent_failed_id=str(failed.id),
-                            launch_mode=exec_result.worker_label or "worker",
-                        )
+                        expected_start
                     )
                     deferred_recovery_starts.append(
                         _DeferredWatchDispatchStart(
@@ -18909,12 +19235,13 @@ def _run_cycle(
                     assert exec_result.handled_task_id is not None
                     recovered_task_id = str(exec_result.handled_task_id)
                     recovered_start_task = exec_result.created_task or store.get(recovered_task_id)
+                    expected_start = _ExpectedStart(
+                        recovery_action=recovery_action_type,
+                        parent_failed_id=str(failed.id),
+                        launch_mode=exec_result.worker_label or "worker",
+                    )
                     recovery_annotation = _format_expected_start_annotation(
-                        _ExpectedStart(
-                            recovery_action=recovery_action_type,
-                            parent_failed_id=str(failed.id),
-                            launch_mode=exec_result.worker_label or "worker",
-                        )
+                        expected_start
                     )
                     deferred_recovery_starts.append(
                         _DeferredWatchDispatchStart(
@@ -19073,13 +19400,12 @@ def _run_cycle(
                     continue
                 recovered_task_id = str(exec_result.created_task.id)
                 recovered_start_task = exec_result.created_task
-                recovery_annotation = _format_expected_start_annotation(
-                    _ExpectedStart(
-                        recovery_action="needs_rebase",
-                        parent_failed_id=str(failed.id),
-                        launch_mode="worker",
-                    )
+                expected_start = _ExpectedStart(
+                    recovery_action="needs_rebase",
+                    parent_failed_id=str(failed.id),
+                    launch_mode="worker",
                 )
+                recovery_annotation = _format_expected_start_annotation(expected_start)
                 deferred_recovery_starts.append(
                     _DeferredWatchDispatchStart(
                         settle=_PendingWatchDispatchSettle(
@@ -19433,6 +19759,11 @@ def _run_cycle(
                     launch_mode=decision.launch_mode,
                 )
             )
+            expected_start = _ExpectedStart(
+                recovery_action=recovery_action_type,
+                parent_failed_id=str(failed.id),
+                launch_mode=decision.launch_mode,
+            )
             deferred_recovery_starts.append(
                 _DeferredWatchDispatchStart(
                     settle=_PendingWatchDispatchSettle(
@@ -19585,8 +19916,18 @@ def _run_cycle(
                         allow_replan=False,
                     )
 
+    if _restart_requested_at_checkpoint():
+        if end_cycle:
+            log.end_cycle()
+        return _abbreviated_cycle_result(restart_requested=True)
+
     if direct_phase_only:
-        return _finish_direct_phase_result()
+        result = _finish_direct_phase_result()
+        if result.restart_requested:
+            return result
+        if _restart_requested_at_checkpoint():
+            return replace(result, restart_requested=True)
+        return result
 
     def _fail_closed_for_planned_pending_entry(
         entry: DispatchPreviewEntry,
@@ -19649,6 +19990,7 @@ def _run_cycle(
             return [], 0, True, ()
         return list(pending_tasks), pending_plan.pending_slots, False, tuple(pending_entries)
 
+    pending_restart_requested = False
     with _watch_cycle_phase(long_phase_reporter, "pending-dispatch"):
         if planned_recovery_dispatch_failed_closed:
             pending_slots = 0
@@ -20015,6 +20357,14 @@ def _run_cycle(
                     started_task_ids.add(str(task.id))
                     wave_fill_count += 1
                 _settle_pending_dispatch_wave(deferred_pending_starts)
+                if _restart_requested_at_checkpoint():
+                    pending_restart_requested = True
+                    break
+
+    if pending_restart_requested:
+        if end_cycle:
+            log.end_cycle()
+        return _abbreviated_cycle_result(restart_requested=True)
 
     scoped_activity = (
         _reported_scoped_watch_activity(
@@ -20437,6 +20787,18 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     aggregate_log_path=aggregate_log_path,
                     quiet=quiet,
                 )
+            aggregate_restart_log_path = aggregate_log_path or _watch_log_path(anchor_config, dry_run=dry_run)
+            restart_checkpoint_log = _WatchLog(aggregate_restart_log_path, quiet=quiet)
+
+            def _multi_project_restart_checkpoint() -> bool:
+                return _check_watch_restart_checkpoint(
+                    log=restart_checkpoint_log,
+                    auto_restart_on_drift=auto_restart_on_drift,
+                    dry_run=dry_run,
+                    stop_requested=multi_project_stop_signal is not None,
+                    drift_state=installed_package_drift,
+                )
+
             idle_seconds = 0
             watch_lease_token = getattr(args, "watch_lease_token", None)
             if not isinstance(watch_lease_token, str) or not watch_lease_token:
@@ -20513,18 +20875,25 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     pending_strategy=pending_strategy,
                     runtime_state=runtime_state,
                     aggregate_log_path=aggregate_log_path,
+                    restart_checkpoint=_multi_project_restart_checkpoint,
                 )
                 if supervisor_lease_set is not None:
                     watch_lease_token = supervisor_lease_set.owner_token
                     args.watch_lease_token = watch_lease_token
-                if _should_reexec_watch(
+                if fleet_cycle_result.restart_requested or _should_reexec_watch(
                     auto_restart_on_drift=auto_restart_on_drift,
                     dry_run=dry_run,
                     stop_requested=multi_project_stop_signal is not None,
                     drift_state=installed_package_drift,
                 ):
-                    multi_project_reexec_fingerprint = installed_package_drift.pending_restart_fingerprint
-                    break
+                    if _should_reexec_watch(
+                        auto_restart_on_drift=auto_restart_on_drift,
+                        dry_run=dry_run,
+                        stop_requested=multi_project_stop_signal is not None,
+                        drift_state=installed_package_drift,
+                    ):
+                        multi_project_reexec_fingerprint = installed_package_drift.pending_restart_fingerprint
+                        break
                 if dry_run:
                     multi_project_result_code = 0
                     break
@@ -20546,8 +20915,18 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     pending_strategy=pending_strategy,
                 )
                 exec_argv = _watch_reexec_argv(args)
-                os.execv(sys.executable, exec_argv)
-                multi_project_result_code = 1
+                if _should_reexec_watch(
+                    auto_restart_on_drift=auto_restart_on_drift,
+                    dry_run=dry_run,
+                    stop_requested=multi_project_stop_signal is not None,
+                    drift_state=installed_package_drift,
+                ):
+                    os.execv(sys.executable, exec_argv)
+                    multi_project_result_code = 1
+                elif multi_project_stop_signal is not None:
+                    multi_project_result_code = 128 + multi_project_stop_signal
+                else:
+                    multi_project_result_code = 0
         except WatchLeaseConflict as exc:
             for disabled in _watch_lease_conflict_disabled_projects(exc):
                 print(_format_disabled_watch_project(disabled))
@@ -20836,6 +21215,15 @@ def cmd_watch(args: argparse.Namespace) -> int:
         def _watch_sleep_stop_requested() -> bool:
             worker_heartbeat()
             return stop_requested
+
+        def _single_project_restart_checkpoint() -> bool:
+            return _check_watch_restart_checkpoint(
+                log=runtime.log,
+                auto_restart_on_drift=auto_restart_on_drift,
+                dry_run=dry_run,
+                stop_requested=stop_requested,
+                drift_state=installed_package_drift,
+            )
 
         def _active_failure_owner_ids() -> frozenset[str]:
             return runtime.active_failure_owner_ids()
@@ -21180,6 +21568,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     git=runtime.git,
                     runtime_context=runtime.runtime_context,
                     worker_heartbeat=worker_heartbeat,
+                    restart_checkpoint=_single_project_restart_checkpoint,
                 )
             else:
                 cycle_result = runtime.run_cycle(
@@ -21205,6 +21594,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     excluded_owner_ids=excluded_owner_ids,
                     seen_active_recovery_subject_ids=runtime.seen_active_recovery_subject_ids,
                     worker_heartbeat=worker_heartbeat,
+                    restart_checkpoint=_single_project_restart_checkpoint,
                 )
             pending_first_cycle_plan = None
             preview_cycle_open = False
