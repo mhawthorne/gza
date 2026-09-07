@@ -9863,6 +9863,27 @@ class TestSharedDbIsolationAndImportGating:
         assert fetched is not None
         assert fetched.prompt == "readonly open"
 
+    def test_read_only_db_open_skips_legacy_group_tag_backfill(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "readonly-legacy-group.db"
+        store = SqliteTaskStore(db_path, prefix="gza", project_id="projreadonly1")
+        created = store.add("readonly legacy group", group="legacy")
+        assert created.id is not None
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DELETE FROM task_tags WHERE task_id = ?", (created.id,))
+
+        db_path.chmod(0o444)
+        try:
+            reopened = SqliteTaskStore(db_path, prefix="gza", project_id="projreadonly1")
+            fetched = reopened.get(created.id)
+        finally:
+            db_path.chmod(0o644)
+
+        assert fetched is not None
+        assert fetched.prompt == "readonly legacy group"
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute("SELECT tag FROM task_tags WHERE task_id = ?", (created.id,)).fetchall()
+        assert rows == []
+
     def test_convenience_helpers_surface_config_error_without_silent_local_fallback(
         self,
         tmp_path: Path,

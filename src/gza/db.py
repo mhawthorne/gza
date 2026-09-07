@@ -1819,10 +1819,14 @@ def _backfill_task_tags_from_group(conn: sqlite3.Connection) -> None:
         project_id = str(row["project_id"]) if "project_id" in row.keys() and row["project_id"] else "default"
         pairs.append((project_id, str(row["id"]), normalized))
     if pairs:
-        conn.executemany(
-            "INSERT OR IGNORE INTO task_tags(project_id, task_id, tag) VALUES (?, ?, ?)",
-            pairs,
-        )
+        try:
+            conn.executemany(
+                "INSERT OR IGNORE INTO task_tags(project_id, task_id, tag) VALUES (?, ?, ?)",
+                pairs,
+            )
+        except sqlite3.OperationalError as exc:
+            if not _is_readonly_snapshot_operational_error(exc):
+                raise
 
 
 def _next_monotonic_iso_timestamp(now: datetime, floor_iso: str | None) -> str:
