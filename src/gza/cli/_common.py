@@ -4612,6 +4612,7 @@ def _extract_failure_log_context(log_path: Path, verify_command: str | None) -> 
     tool_calls: dict[str, str] = {}
     last_verify_failure: str | None = None
     last_result_context: str | None = None
+    last_provider_error: str | None = None
 
     def _result_snippet(value: Any, limit: int = 160) -> str:
         if isinstance(value, str):
@@ -4722,6 +4723,13 @@ def _extract_failure_log_context(log_path: Path, verify_command: str | None) -> 
                 last_result_context = f"{subtype}: {detail}"
             else:
                 last_result_context = subtype
+        elif entry_type == "gza" and entry.get("source") == "provider" and entry.get("subtype") == "process_output":
+            message = entry.get("message")
+            if isinstance(message, str) and message.strip().lower().startswith(("error", "fatal")):
+                last_provider_error = truncate(message.strip(), 220)
+
+    if last_result_context is None and last_provider_error is not None:
+        last_result_context = last_provider_error
 
     if last_result_context is None and log_data:
         subtype = str(log_data.get("subtype") or "")
@@ -4932,13 +4940,14 @@ def _build_failure_diagnostics(
     verify_context: str | None = None
     result_context: str | None = None
 
-    if log_path is not None and _existing_log_source_path(log_path) is not None:
-        marker_reason = _extract_agent_failure_marker_reason(log_path)
-        interrupt_source = _extract_interrupt_source(log_path)
-        explanation = _extract_last_agent_message_for_failure(log_path)
-        verify_context, result_context = _extract_failure_log_context(log_path, verify_command)
+    resolved_log_path = _existing_log_source_path(log_path)
+    if resolved_log_path is not None:
+        marker_reason = _extract_agent_failure_marker_reason(resolved_log_path)
+        interrupt_source = _extract_interrupt_source(resolved_log_path)
+        explanation = _extract_last_agent_message_for_failure(resolved_log_path)
+        verify_context, result_context = _extract_failure_log_context(resolved_log_path, verify_command)
         if reason == "WORKER_DIED":
-            worker_diagnostics = _extract_worker_death_diagnostics(log_path)
+            worker_diagnostics = _extract_worker_death_diagnostics(resolved_log_path)
 
     return FailureDiagnostics(
         reason=reason,

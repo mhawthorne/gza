@@ -796,6 +796,61 @@ def test_build_failure_diagnostics_extracts_worker_death_details(tmp_path: Path)
     assert diagnostics.worker_os_hint == "darwin log hint (best effort): jetsam around death window"
 
 
+def test_build_failure_diagnostics_surfaces_provider_error_from_ops_log(tmp_path: Path) -> None:
+    """A provider-level error (e.g. codex input-size rejection) must surface, not UNKNOWN.
+
+    Regression for gza-10809: the base .log file only had a thread.started
+    line; the actual failure was a process_output entry in the .ops.jsonl
+    sibling that neither _extract_last_agent_message_for_failure nor
+    _extract_failure_log_context ever looked at, since both were called
+    with the raw (near-empty) base log path instead of the resolved ops
+    sibling. `gza show --full` rendered "Agent Explanation: (not found in
+    log)" with no "Last Result Context" line at all.
+    """
+    log_path = tmp_path / "review.log"
+    log_path.write_text('{"type": "thread.started", "thread_id": "abc123", "timestamp": "2026-09-07T04:07:08Z"}\n')
+    ops_path = tmp_path / "review.ops.jsonl"
+    ops_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "gza",
+                        "stream": "ops",
+                        "source": "provider",
+                        "subtype": "process_output",
+                        "message": (
+                            "Error: turn/start: turn/start failed: Input exceeds the maximum length of "
+                            '1048576 characters. (code -32602), data: {"input_error_code":"input_too_large"}'
+                        ),
+                        "output_stream": "stdout",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "gza",
+                        "subtype": "outcome",
+                        "message": "Outcome: failed (exit_code=1)",
+                        "exit_code": 1,
+                        "failure_reason": "UNKNOWN",
+                    }
+                ),
+            ]
+        )
+    )
+
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = store.add("Review task with oversized diff", task_type="review")
+    task.status = "failed"
+    task.failure_reason = "UNKNOWN"
+    store.update(task)
+
+    diagnostics = _build_failure_diagnostics(task, log_path, verify_command=None)
+
+    assert diagnostics.result_context is not None
+    assert "Input exceeds the maximum length" in diagnostics.result_context
+
+
 def test_build_failure_diagnostics_extracts_worker_death_details_from_ops_without_base_log(tmp_path: Path) -> None:
     """Ops-only worker-death breadcrumbs should render even when the base log file is absent."""
     log_path = tmp_path / "worker-died.startup.log"
