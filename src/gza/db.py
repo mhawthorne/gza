@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, get_args
 
 import yaml
 
@@ -65,8 +65,10 @@ __all__ = [
     "TASK_COMMENT_KINDS",
     "TASK_COMMENT_KIND_FEEDBACK",
     "TASK_COMMENT_KIND_REVIEW_SCOPE",
+    "ForwardSchemaMigrationDeferred",
     "InvalidTaskIdError",
     "ManualMigrationRequired",
+    "MigrationPolicy",
     "MergeTargetResolutionError",
     "NewTaskParams",
     "ProjectRegistryEntry",
@@ -111,6 +113,8 @@ StoreOpenMode = Literal[
     "watch_lease_acquisition",
     "watch_lease_activation",
 ]
+MigrationPolicy = Literal["auto_private", "auto_canonical_shared", "defer_shared"]
+_MIGRATION_POLICY_VALUES: frozenset[str] = frozenset(get_args(MigrationPolicy))
 SqliteIsolationLevel = Literal["DEFERRED", "EXCLUSIVE", "IMMEDIATE"] | None
 _DbFileIdentity = tuple[int, int]
 ExecutionProjectSelectorKind = Literal["path", "registry_id"]
@@ -147,6 +151,22 @@ TASK_COMMENT_KINDS: frozenset[str] = frozenset(
 
 _SCHEMA_BOOTSTRAP_LOCKS: dict[Path, RLockType] = {}
 _SCHEMA_BOOTSTRAP_LOCKS_GUARD = threading.Lock()
+
+_DEFERABLE_SHARED_MIGRATION_VERSIONS: frozenset[int] = frozenset({71})
+
+
+@dataclass(frozen=True)
+class _SchemaInspection:
+    exists: bool
+    has_schema_version_table: bool
+    row: sqlite3.Row | None
+    current_version: int | None
+    error: str | None
+    has_user_objects_without_schema_version: bool = False
+
+    @property
+    def is_fresh_database(self) -> bool:
+        return self.exists and not self.has_schema_version_table and not self.has_user_objects_without_schema_version
 
 
 # Known failure reason categories
@@ -260,6 +280,31 @@ class ExecutionProjectActivationError(SchemaIntegrityError):
         super().__init__(message)
 
 
+class ForwardSchemaMigrationDeferred(SchemaIntegrityError):
+    """Raised when a shared DB needs migration but the opener lacks migration authority."""
+
+    def __init__(
+        self,
+        *,
+        current_version: int,
+        target_version: int,
+        pending_versions: Sequence[int],
+        capability: str | None = None,
+    ) -> None:
+        self.current_version = current_version
+        self.target_version = target_version
+        self.pending_versions = tuple(pending_versions)
+        self.capability = capability
+        pending = ", ".join(str(version) for version in self.pending_versions) or str(target_version)
+        detail = f" for capability {capability!r}" if capability else ""
+        super().__init__(
+            "Forward schema migration deferred"
+            f"{detail}: shared database is at v{current_version}, "
+            f"running code supports v{target_version}, pending migration(s): {pending}. "
+            "Run from the canonical default-branch checkout after the migration code has landed."
+        )
+
+
 def _newer_schema_error(
     *,
     observed_db_version: int,
@@ -333,7 +378,11 @@ class ExecutionProjectResolved:
 
     def open_lease_store(self) -> "SqliteTaskStore":
         """Open a non-mutating store handle used only to acquire the watch lease."""
-        return SqliteTaskStore.from_config(self.config, open_mode="watch_lease_acquisition")
+        return SqliteTaskStore.from_config(
+            self.config,
+            open_mode="watch_lease_acquisition",
+            migration_policy="auto_canonical_shared",
+        )
 
     def open_runtime_store(self) -> ExecutionProjectRuntime:
         """Open the read-write runtime store after the caller owns the project lease."""
@@ -5853,6 +5902,24 @@ def _legacy_local_db_path(project_dir: Path) -> Path:
     return project_dir / ".gza" / "gza.db"
 
 
+def _migration_policy_from_config(config: "Config") -> MigrationPolicy:
+    """Infer private-vs-shared intent from config without granting canonical authority."""
+    project_dir = getattr(config, "project_dir", None)
+    if not isinstance(project_dir, Path):
+        return "auto_private"
+    try:
+        if config.db_path.resolve() == _legacy_local_db_path(project_dir).resolve():
+            return "auto_private"
+    except (OSError, RuntimeError, ValueError):
+        return "defer_shared"
+    source_map = getattr(config, "source_map", {})
+    if not config.db_path.exists() and (
+        source_map.get("db_path") == "env" or source_map.get("worktree_dir") in {"base", "explicit"}
+    ):
+        return "auto_private"
+    return "defer_shared"
+
+
 def _shared_import_marker_path(project_dir: Path) -> Path:
     return project_dir / ".gza" / _SHARED_DB_IMPORT_MARKER
 
@@ -5954,6 +6021,7 @@ class SqliteTaskStore:
         project_name: str | None = None,
         registration_db_path_override: Path | None = None,
         open_mode: StoreOpenMode = "readwrite",
+        migration_policy: MigrationPolicy = "auto_private",
     ):
         self.db_path = db_path
         self._prefix = prefix
@@ -5963,6 +6031,11 @@ class SqliteTaskStore:
         self._project_name = project_name
         self._registration_db_path_override = registration_db_path_override
         self._open_mode = open_mode
+        self._migration_policy = migration_policy
+        if self._migration_policy not in _MIGRATION_POLICY_VALUES:
+            allowed = ", ".join(sorted(_MIGRATION_POLICY_VALUES))
+            raise ValueError(f"Unsupported migration_policy {self._migration_policy!r}; expected one of: {allowed}")
+        self._shared_migration_deferred: ForwardSchemaMigrationDeferred | None = None
         self._startup_warnings: list[str] = []
         self._query_only_empty_db = False
         self._existing_db_uri_mode: Literal["ro", "rw"] | None = None
@@ -5991,13 +6064,15 @@ class SqliteTaskStore:
             pass
         elif self._open_mode == "watch_lease_activation":
             self._ensure_db()
-            self._ensure_project_row()
+            if self._startup_mutations_allowed():
+                self._ensure_project_row()
         else:
             self._ensure_db()
-            if not self._created_empty_db:
+            if not self._created_empty_db and self._startup_mutations_allowed():
                 self.repair_inconsistent_unmerged_merge_units()
                 self.repair_stale_unmerged_merge_unit_owners()
-            self._ensure_project_row()
+            if self._startup_mutations_allowed():
+                self._ensure_project_row()
 
     @classmethod
     def default(cls, project_dir: Path | None = None) -> "SqliteTaskStore":
@@ -6009,7 +6084,7 @@ class SqliteTaskStore:
         from .config import Config
 
         config = Config.load(project_dir or Path.cwd(), discover=True)
-        return cls.from_config(config)
+        return cls.from_config(config, migration_policy="auto_canonical_shared")
 
     @classmethod
     def from_config(
@@ -6018,6 +6093,7 @@ class SqliteTaskStore:
         *,
         allow_legacy_local_db: bool = False,
         open_mode: StoreOpenMode = "readwrite",
+        migration_policy: MigrationPolicy | None = None,
     ) -> "SqliteTaskStore":
         """Create a store from a loaded Config instance."""
         project_id, project_prefix = _project_identity_from_config(config)
@@ -6049,6 +6125,7 @@ class SqliteTaskStore:
         registration_db_path_override = None
         if getattr(config, "source_map", {}).get("db_path") in {"env", "explicit"}:
             registration_db_path_override = config.db_path
+        resolved_migration_policy = migration_policy or _migration_policy_from_config(config)
         return cls(
             config.db_path,
             prefix=project_prefix,
@@ -6058,6 +6135,7 @@ class SqliteTaskStore:
             project_name=project_name,
             registration_db_path_override=registration_db_path_override,
             open_mode=open_mode,
+            migration_policy=resolved_migration_policy,
         )
 
     def startup_warnings(self) -> tuple[str, ...]:
@@ -6521,138 +6599,259 @@ class SqliteTaskStore:
         return "main"
 
     def _ensure_db(self, *, allow_bootstrap: bool = True) -> None:
-        """Ensure database exists and schema is current.
-
-        Raises:
-            ManualMigrationRequired: When the DB needs a manual migration (e.g. v25/v26).
-                The caller should run ``uv run gza migrate`` then re-open the store.
-        """
+        """Ensure database exists and apply the selected migration policy."""
         with _schema_bootstrap_lock(self.db_path):
             if not allow_bootstrap and not self.db_path.exists():
                 raise SchemaIntegrityError(f"Registry DB disappeared before mutation: {self.db_path}")
+            if self._migration_policy == "defer_shared":
+                self._ensure_db_without_shared_migration_authority(allow_bootstrap=allow_bootstrap)
+                return
+
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             with self._connect() as conn:
-                artifacts_verified_at_current_schema = False
-                cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
-                if cur.fetchone() is None:
-                    existing_objects = conn.execute(
-                        """
-                        SELECT name FROM sqlite_master
-                        WHERE name NOT LIKE 'sqlite_%'
-                        LIMIT 1
-                        """
-                    ).fetchone()
-                    if existing_objects is not None:
-                        raise SchemaIntegrityError(
-                            "Database is missing schema_version; existing databases are not initialized implicitly."
-                        )
-                    # Fresh database - create full current schema directly.
-                    conn.executescript(SCHEMA)
-                    conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
-                    # SCHEMA defines the current schema in full, so the artifact repair
-                    # below -- which exists to recreate objects lost to external damage --
-                    # has nothing to find in a database created microseconds ago.
+                inspection = self._inspect_schema(conn, db_exists=True)
+                artifacts_verified_at_current_schema = self._validate_schema_compatibility(inspection)
+                if inspection.is_fresh_database:
+                    self._bootstrap_current_schema(conn)
                     artifacts_verified_at_current_schema = True
-                    self._created_empty_db = True
                 else:
-                    cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
-                    row = cur.fetchone()
-                    current_version, schema_version_error = _parse_schema_version_value(
-                        self.db_path,
-                        row["version"] if row else None,
-                    )
-                    if schema_version_error is not None or current_version is None:
-                        raise SchemaIntegrityError(
-                            schema_version_error or f"Database {self.db_path} has no schema_version row."
-                        )
-                    if current_version > SCHEMA_VERSION:
-                        raise _newer_schema_error(
-                            observed_db_version=current_version,
-                            supported_db_version=SCHEMA_VERSION,
-                            db_role="live_shared",
-                        )
-                    _ensure_required_auto_migration_artifacts(conn, target_version=current_version)
-                    # Remember whether that call already covered the current schema so the
-                    # closing repair below can be skipped when no migration ran afterwards.
-                    artifacts_verified_at_current_schema = current_version == SCHEMA_VERSION
-
-                    pending_manual: list[int] = []
-                    for target_version, migration_sql in _MIGRATIONS:
-                        if current_version < target_version:
-                            if target_version in _MANUAL_MIGRATION_VERSIONS:
-                                pending_manual.append(target_version)
-                                break
-                            if target_version == 36:
-                                try:
-                                    _run_v35_to_v36_migration(conn, self._project_id, self._prefix)
-                                except sqlite3.OperationalError as exc:
-                                    if _is_readonly_operational_error(exc):
-                                        raise SchemaIntegrityError(
-                                            "Cannot auto-migrate schema v35->v36 on a read-only database. "
-                                            "Use a writable database to complete migration, then retry."
-                                        ) from exc
-                                    raise
-                            elif target_version == 44:
-                                _run_v43_to_v44_migration(conn)
-                            elif migration_sql is not None:
-                                for stmt in _split_sql_statements(migration_sql):
-                                    stmt = stmt.strip()
-                                    if stmt:
-                                        try:
-                                            conn.execute(stmt)
-                                        except sqlite3.OperationalError as exc:
-                                            if _is_ignorable_migration_operational_error(exc):
-                                                # Duplicate artifact from partially-applied/idempotent migration.
-                                                continue
-                                            raise
-                            _validate_auto_migration_target(conn, target_version)
-                            conn.execute("UPDATE schema_version SET version = ?", (target_version,))
-                            current_version = target_version
-                            artifacts_verified_at_current_schema = False
-
-                    if pending_manual:
-                        raise ManualMigrationRequired(pending_manual)
-
-                    if row is None:
+                    current_version = self._inspection_current_version(inspection)
+                    self._run_startup_repairs(conn, current_version=current_version)
+                    current_version, migrated = self._apply_pending_migrations(conn, current_version=current_version)
+                    artifacts_verified_at_current_schema = artifacts_verified_at_current_schema and not migrated
+                    if current_version != SCHEMA_VERSION:
                         conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
 
-                _backfill_task_tags_from_group(conn)
+                self._run_current_schema_startup_repairs(
+                    conn,
+                    artifacts_verified_at_current_schema=artifacts_verified_at_current_schema,
+                )
 
-                def _safe_project_backfill(sql: str) -> None:
-                    try:
-                        conn.execute(sql, (self._project_id,))
-                    except sqlite3.OperationalError as exc:
-                        if "readonly" not in str(exc).lower():
-                            raise
+    def _startup_mutations_allowed(self) -> bool:
+        """Return whether constructor startup may repair/register durable shared state."""
+        return self._migration_policy != "defer_shared" and self._shared_migration_deferred is None
 
-                if _table_has_column(conn, "tasks", "project_id"):
-                    _safe_project_backfill(
-                        "UPDATE tasks SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
-                    )
-                if _table_has_column(conn, "run_steps", "project_id"):
-                    _safe_project_backfill(
-                        "UPDATE run_steps SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
-                    )
-                if _table_has_column(conn, "run_substeps", "project_id"):
-                    _safe_project_backfill(
-                        "UPDATE run_substeps SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
-                    )
-                if _table_has_column(conn, "task_comments", "project_id"):
-                    _safe_project_backfill(
-                        "UPDATE task_comments SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
-                    )
-                if _table_has_column(conn, "task_tags", "project_id"):
-                    _safe_project_backfill(
-                        "UPDATE task_tags SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
-                    )
+    def _ensure_db_without_shared_migration_authority(self, *, allow_bootstrap: bool) -> None:
+        """Inspect and validate a shared DB without schema repair or migration writes."""
+        if not self.db_path.exists():
+            if not allow_bootstrap:
+                raise SchemaIntegrityError(f"Registry DB disappeared before mutation: {self.db_path}")
+            raise ForwardSchemaMigrationDeferred(
+                current_version=0,
+                target_version=SCHEMA_VERSION,
+                pending_versions=[version for version, _migration_sql in _MIGRATIONS],
+            )
 
-                # Repair required artifacts for current schemas when external damage
-                # or partial migrations removed them. Skipped when the pre-migration
-                # check above already verified them at SCHEMA_VERSION and no migration
-                # ran since; that call is a byte-for-byte repeat of this one and costs
-                # ~175 PRAGMA probes per store open.
-                if not artifacts_verified_at_current_schema:
-                    _ensure_required_auto_migration_artifacts(conn, target_version=SCHEMA_VERSION)
+        self._existing_db_uri_mode = "rw"
+        uri = self.db_path.resolve().as_uri() + "?mode=ro"
+        with sqlite3.connect(
+            uri,
+            uri=True,
+            isolation_level=None,
+            timeout=30,
+            factory=_ClosingSqliteConnection,
+        ) as conn:
+            conn.row_factory = sqlite3.Row
+            inspection = self._inspect_schema(conn, db_exists=True)
+            self._validate_schema_compatibility(inspection, allow_deferred_shared=True)
+
+    def _inspect_schema(self, conn: sqlite3.Connection, *, db_exists: bool) -> _SchemaInspection:
+        has_schema_version = _table_exists(conn, "schema_version")
+        if not has_schema_version:
+            existing_objects = conn.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE name NOT LIKE 'sqlite_%'
+                LIMIT 1
+                """
+            ).fetchone()
+            return _SchemaInspection(
+                exists=db_exists,
+                has_schema_version_table=False,
+                row=None,
+                current_version=None,
+                error=None,
+                has_user_objects_without_schema_version=existing_objects is not None,
+            )
+        row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+        current_version, schema_version_error = _parse_schema_version_value(
+            self.db_path,
+            row["version"] if row else None,
+        )
+        return _SchemaInspection(
+            exists=db_exists,
+            has_schema_version_table=True,
+            row=row,
+            current_version=current_version,
+            error=schema_version_error,
+        )
+
+    def _inspection_current_version(self, inspection: _SchemaInspection) -> int:
+        if inspection.error is not None or inspection.current_version is None:
+            raise SchemaIntegrityError(inspection.error or f"Database {self.db_path} has no schema_version row.")
+        return inspection.current_version
+
+    def _validate_schema_compatibility(
+        self,
+        inspection: _SchemaInspection,
+        *,
+        allow_deferred_shared: bool = False,
+    ) -> bool:
+        if not inspection.has_schema_version_table:
+            if inspection.has_user_objects_without_schema_version:
+                raise SchemaIntegrityError(
+                    "Database is missing schema_version; existing databases are not initialized implicitly."
+                )
+            if allow_deferred_shared:
+                raise ForwardSchemaMigrationDeferred(
+                    current_version=0,
+                    target_version=SCHEMA_VERSION,
+                    pending_versions=[version for version, _migration_sql in _MIGRATIONS],
+                )
+            return False
+
+        current_version = self._inspection_current_version(inspection)
+        if current_version > SCHEMA_VERSION:
+            raise _newer_schema_error(
+                observed_db_version=current_version,
+                supported_db_version=SCHEMA_VERSION,
+                db_role="live_shared",
+            )
+        if allow_deferred_shared and current_version < SCHEMA_VERSION:
+            pending_manual = self._pending_manual_migration_versions_after(current_version)
+            if pending_manual:
+                raise ManualMigrationRequired(pending_manual)
+            pending_auto = self._pending_auto_migration_versions_after(current_version)
+            nondeferable = [version for version in pending_auto if version not in _DEFERABLE_SHARED_MIGRATION_VERSIONS]
+            if nondeferable:
+                raise ForwardSchemaMigrationDeferred(
+                    current_version=current_version,
+                    target_version=SCHEMA_VERSION,
+                    pending_versions=nondeferable,
+                )
+            self._shared_migration_deferred = ForwardSchemaMigrationDeferred(
+                current_version=current_version,
+                target_version=SCHEMA_VERSION,
+                pending_versions=pending_auto,
+            )
+        return current_version == SCHEMA_VERSION
+
+    def _pending_manual_migration_versions_after(self, current_version: int) -> list[int]:
+        pending_manual: list[int] = []
+        for target_version, _migration_sql in _MIGRATIONS:
+            if current_version < target_version and target_version in _MANUAL_MIGRATION_VERSIONS:
+                pending_manual.append(target_version)
+                break
+        return pending_manual
+
+    def _pending_auto_migration_versions_after(self, current_version: int) -> list[int]:
+        return [
+            target_version
+            for target_version, _migration_sql in _MIGRATIONS
+            if current_version < target_version and target_version not in _MANUAL_MIGRATION_VERSIONS
+        ]
+
+    def _bootstrap_current_schema(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(SCHEMA)
+        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+        self._created_empty_db = True
+
+    def _run_startup_repairs(self, conn: sqlite3.Connection, *, current_version: int) -> None:
+        _ensure_required_auto_migration_artifacts(conn, target_version=current_version)
+
+    def _apply_pending_migrations(self, conn: sqlite3.Connection, *, current_version: int) -> tuple[int, bool]:
+        migrated = False
+        for target_version, migration_sql in _MIGRATIONS:
+            if current_version >= target_version:
+                continue
+            if target_version in _MANUAL_MIGRATION_VERSIONS:
+                raise ManualMigrationRequired([target_version])
+            self._apply_single_auto_migration(conn, target_version=target_version, migration_sql=migration_sql)
+            _validate_auto_migration_target(conn, target_version)
+            conn.execute("UPDATE schema_version SET version = ?", (target_version,))
+            current_version = target_version
+            migrated = True
+        return current_version, migrated
+
+    def _apply_single_auto_migration(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        target_version: int,
+        migration_sql: str | None,
+    ) -> None:
+        if target_version == 36:
+            try:
+                _run_v35_to_v36_migration(conn, self._project_id, self._prefix)
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        "Cannot auto-migrate schema v35->v36 on a read-only database. "
+                        "Use a writable database to complete migration, then retry."
+                    ) from exc
+                raise
+        elif target_version == 44:
+            _run_v43_to_v44_migration(conn)
+        elif migration_sql is not None:
+            for stmt in _split_sql_statements(migration_sql):
+                stmt = stmt.strip()
+                if not stmt:
+                    continue
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError as exc:
+                    if _is_ignorable_migration_operational_error(exc):
+                        continue
+                    raise
+
+    def _run_current_schema_startup_repairs(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        artifacts_verified_at_current_schema: bool,
+    ) -> None:
+        _backfill_task_tags_from_group(conn)
+
+        def _safe_project_backfill(sql: str) -> None:
+            try:
+                conn.execute(sql, (self._project_id,))
+            except sqlite3.OperationalError as exc:
+                if "readonly" not in str(exc).lower():
+                    raise
+
+        if _table_has_column(conn, "tasks", "project_id"):
+            _safe_project_backfill(
+                "UPDATE tasks SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
+            )
+        if _table_has_column(conn, "run_steps", "project_id"):
+            _safe_project_backfill(
+                "UPDATE run_steps SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
+            )
+        if _table_has_column(conn, "run_substeps", "project_id"):
+            _safe_project_backfill(
+                "UPDATE run_substeps SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
+            )
+        if _table_has_column(conn, "task_comments", "project_id"):
+            _safe_project_backfill(
+                "UPDATE task_comments SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
+            )
+        if _table_has_column(conn, "task_tags", "project_id"):
+            _safe_project_backfill(
+                "UPDATE task_tags SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
+            )
+
+        if not artifacts_verified_at_current_schema:
+            _ensure_required_auto_migration_artifacts(conn, target_version=SCHEMA_VERSION)
+
+    def require_schema_capability(self, capability: str) -> None:
+        """Fail before writes when a caller needs schema that was deferred."""
+        if self._shared_migration_deferred is not None:
+            raise ForwardSchemaMigrationDeferred(
+                current_version=self._shared_migration_deferred.current_version,
+                target_version=self._shared_migration_deferred.target_version,
+                pending_versions=self._shared_migration_deferred.pending_versions,
+                capability=capability,
+            )
 
     def _db_file_identity(self) -> _DbFileIdentity:
         stat_result = self.db_path.stat()
@@ -6725,9 +6924,14 @@ class SqliteTaskStore:
             temp_path = Path(temp_name)
             try:
                 self.db_path = temp_path
+                original_migration_policy = self._migration_policy
+                self._migration_policy = "auto_private"
                 created_identity = self._db_file_identity()
                 self._registry_mutation_validated_identity = created_identity
-                self._ensure_db(allow_bootstrap=False)
+                try:
+                    self._ensure_db(allow_bootstrap=False)
+                finally:
+                    self._migration_policy = original_migration_policy
 
                 self._checkpoint_private_registry_bootstrap(temp_path)
                 self._registry_mutation_validated_identity = None
@@ -17059,7 +17263,11 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                 "shared_existing_task_count": existing_count,
             }
 
-        store = SqliteTaskStore.from_config(config, allow_legacy_local_db=True)
+        store = SqliteTaskStore.from_config(
+            config,
+            allow_legacy_local_db=True,
+            migration_policy="auto_canonical_shared",
+        )
         with store._connect() as shared_conn:
             shared_conn.execute("ATTACH DATABASE ? AS legacy_local", (str(local_db),))
             task_conflicts = _find_task_conflicts(shared_conn, local_task_rows)

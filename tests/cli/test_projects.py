@@ -39,6 +39,7 @@ def _write_project_config(
                 f"project_id: {project_id}",
                 f"project_prefix: {project_prefix}",
                 f"db_path: {db_path}",
+                f"worktree_dir: {project_dir / '.gza-test-worktrees'}",
                 f"provider: {provider}",
                 f"model: {model}",
             ]

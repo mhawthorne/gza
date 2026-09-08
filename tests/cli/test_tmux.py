@@ -1453,8 +1453,8 @@ class TestSpawnBackgroundWorkerTmux:
 
         config_a = self._make_same_identity_config(tmp_path / "a", tmp_path / "a.db")
         config_b = self._make_same_identity_config(tmp_path / "b", tmp_path / "b.db")
-        store_a = SqliteTaskStore.from_config(config_a)
-        store_b = SqliteTaskStore.from_config(config_b)
+        store_a = SqliteTaskStore.from_config(config_a, migration_policy="auto_canonical_shared")
+        store_b = SqliteTaskStore.from_config(config_b, migration_policy="auto_canonical_shared")
         task_a = store_a.add("test task")
         task_b = store_b.add("test task")
         assert task_a.id == task_b.id
@@ -1506,7 +1506,7 @@ class TestSpawnBackgroundWorkerTmux:
         from gza.db import SqliteTaskStore
 
         config = self._make_same_identity_config(tmp_path / "project", tmp_path / "project.db")
-        store = SqliteTaskStore.from_config(config)
+        store = SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
         task = store.add("test task")
         task.provider = "codex"
         task.provider_is_explicit = True

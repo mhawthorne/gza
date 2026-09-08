@@ -981,14 +981,14 @@ class TestSkillContentValidation:
         setup_shared_db_config(tmp_path)
         config = Config.load(tmp_path)
 
-        shared_store = SqliteTaskStore.from_config(config)
+        shared_store = SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
         created = shared_store.add("Shared DB task for skill bootstrap")
         assert created.id is not None
 
         unscoped_store = SqliteTaskStore(config.db_path)
         assert unscoped_store.get(created.id) is None
 
-        scoped_store = SqliteTaskStore.from_config(config)
+        scoped_store = SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
         resolved = scoped_store.get(created.id)
         assert resolved is not None
         assert resolved.id == created.id

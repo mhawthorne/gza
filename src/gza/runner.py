@@ -7475,6 +7475,24 @@ def _resolve_cross_project_owning_runtime(
             f"canonical project_id {owner_config.project_id!r} does not match evaluated project_id {project.config.project_id!r}",
         )
 
+    if root_store is not None:
+        try:
+            owner_db_path = owner_config.db_path.resolve()
+            shared_db_path = root_store.db_path.resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return None, f"canonical project DB path for {project.config.project_id!r} is unavailable: {exc}"
+        if not owner_db_path.exists() and shared_db_path != owner_db_path and shared_db_path.exists():
+            try:
+                owner_config = Config.load_execution(owner_project_dir, db_path_override=shared_db_path)
+            except (ConfigError, OSError, RuntimeError, ValueError, UnicodeError) as exc:
+                return None, f"canonical project config at {owner_project_dir} is unavailable: {exc}"
+            if owner_config.project_id != project.config.project_id:
+                return (
+                    None,
+                    f"canonical project_id {owner_config.project_id!r} does not match evaluated project_id "
+                    f"{project.config.project_id!r}",
+                )
+
     owner_runtime_context = RuntimeExecutionContext.from_config(owner_config)
     if not owner_runtime_context.db_path.exists():
         return None, f"runtime DB does not exist: {owner_runtime_context.db_path}"

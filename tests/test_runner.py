@@ -28067,7 +28067,7 @@ class TestRunnerStoreMetadata:
         )
 
         config = Config.load(project_dir)
-        SqliteTaskStore.from_config(config)
+        SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
 
         conn = sqlite3.connect(db_path)
         before = conn.execute(

@@ -48,6 +48,7 @@ from ..db import (
     TASK_COMMENT_KIND_FEEDBACK,
     DuplicateActiveChildError,
     ManualMigrationRequired,
+    MigrationPolicy,
     SqliteTaskStore,
     StoreOpenMode,
     Task as DbTask,
@@ -260,7 +261,8 @@ def get_store(config: Config, *, open_mode: StoreOpenMode = "readwrite") -> Sqli
         ManualMigrationRequired: If the DB needs a manual schema upgrade.
             Callers should run ``gza migrate`` to fix this.
     """
-    store = SqliteTaskStore.from_config(config, open_mode=open_mode)
+    migration_policy: MigrationPolicy | None = "auto_canonical_shared" if open_mode == "readwrite" else None
+    store = SqliteTaskStore.from_config(config, open_mode=open_mode, migration_policy=migration_policy)
     for warning in store.startup_warnings():
         print(f"Warning: {warning}", file=sys.stderr)
     return store
