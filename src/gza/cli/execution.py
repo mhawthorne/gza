@@ -88,6 +88,7 @@ from ..query import (
     get_base_task_slug as _get_base_task_slug,
     get_code_changing_descendants_for_root,
     get_implementation_review_cycle_accounting_evidence,
+    get_reviews_for_root,
     resolve_lineage_owner_task,
 )
 from ..recovery_engine import (
@@ -6568,7 +6569,7 @@ def _cmd_iterate_impl(
         return max(matching, key=_task_sort_key)
 
     def _latest_completed_review() -> DbTask | None:
-        reviews = [r for r in store.get_reviews_for_task(impl_task_key) if r.status == "completed"]
+        reviews = [r for r in get_reviews_for_root(store, _current_impl_task()) if r.status == "completed"]
         if not reviews:
             return None
         return max(
@@ -6670,7 +6671,7 @@ def _cmd_iterate_impl(
         current_impl_task = _current_impl_task()
         return resolve_closing_review_action(
             task=current_impl_task,
-            reviews=store.get_reviews_for_task(impl_task_key),
+            reviews=get_reviews_for_root(store, current_impl_task),
             latest_completed_review=_latest_completed_review(),
             latest_completed_code_change=_latest_completed_code_change(),
         )

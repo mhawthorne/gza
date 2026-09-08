@@ -60,6 +60,7 @@ Gza reads configuration from three YAML layers:
 | `review_diff_small_threshold` | Integer | `500` | Total changed-line cutoff (`added + removed`) below which review prompts include full inline diff |
 | `review_diff_medium_threshold` | Integer | `2000` | Total changed-line cutoff above `review_diff_small_threshold`; larger diffs use targeted excerpts instead of full inline diff |
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
+| `review_diff_char_limit` | Integer | `400000` | Max characters of diff/excerpt content inlined in a review prompt before falling back to targeted excerpts, regardless of line count |
 | `autonomous_verify_timeout_seconds` | Integer | `120` | Configured floor for lifecycle/automation-initiated `verify_command` runs; recent full-suite observations may derive a larger effective timeout |
 | `autonomous_verify_min_margin_seconds` | Integer | `60` | Minimum required margin between a recent successful `./bin/tests` runtime observation and `autonomous_verify_timeout_seconds` |
 | `autonomous_verify_observation_max_age_hours` | Integer | `168` | Maximum age for a successful full-suite runtime observation used by lifecycle verify budget preflight |

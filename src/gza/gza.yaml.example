@@ -582,6 +582,11 @@ provider: codex
 # Default: false
 # persist_run_steps: false
 
+# Max characters of diff/excerpt content inlined in a review prompt before falling back to
+# targeted excerpts, regardless of line count.
+# Default: 400000
+# review_diff_char_limit: 400000
+
 # Port the local gza server listens on. 0 picks any free port, at the cost of a URL that changes
 # on every restart.
 # Default: 8765
