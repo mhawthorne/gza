@@ -5696,6 +5696,50 @@ class TestReviewContextFromChain:
         assert "Targeted diff excerpts" in context
         assert "Additional changed files not expanded inline" not in context
 
+    def test_review_context_falls_back_to_excerpts_when_few_lines_but_oversized_chars(self, tmp_path: Path):
+        """A diff with few lines but very long lines must not exceed the char cap.
+
+        Regression for gza-10759: a diff with a small line count but 1.2M+
+        characters (e.g. a long generated/minified line) sailed past the
+        line-count thresholds and got inlined verbatim, exceeding the codex
+        provider's ~1M character input limit and failing every review retry.
+        """
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement generated content", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "test/oversized-chars-branch"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review generated content implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            review_diff_char_limit=1000,
+        )
+
+        oversized_diff = "diff --git a/src/generated.json b/src/generated.json\n+" + ("x" * 5000)
+
+        mock_git = Mock(spec=Git)
+        mock_git.default_branch.return_value = "main"
+        # Only 2 changed lines - well under the line-count thresholds.
+        mock_git.get_diff_numstat.return_value = "1\t1\tsrc/generated.json\n"
+        mock_git.get_diff_stat.return_value = " src/generated.json | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)"
+        mock_git.get_diff.return_value = oversized_diff
+        mock_git._run.return_value = Mock(stdout=oversized_diff, returncode=0)
+
+        context = _build_context_from_chain(review_task, store, tmp_path, mock_git, config=config)
+
+        assert "Targeted diff excerpts" in context
+        assert "Full diff:" not in context
+        assert len(context) < len(oversized_diff) + 2000
+
     def test_review_context_uses_configurable_thresholds_and_file_limit(self, tmp_path: Path):
         """Review context should honor config-driven diff thresholds and excerpt file cap."""
         db_path = tmp_path / "test.db"

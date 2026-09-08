@@ -134,6 +134,7 @@ DEFAULT_QUIET_PERIOD_SECONDS = 300
 DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD = 500
 DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD = 2000
 DEFAULT_REVIEW_CONTEXT_FILE_LIMIT = 12
+DEFAULT_REVIEW_DIFF_CHAR_LIMIT = 400_000
 DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS = 120
 DEFAULT_AUTONOMOUS_VERIFY_MIN_MARGIN_SECONDS = 60
 DEFAULT_AUTONOMOUS_VERIFY_OBSERVATION_MAX_AGE_HOURS = 168
@@ -1658,6 +1659,7 @@ class Config:
     review_diff_small_threshold: int = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
     review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
     review_context_file_limit: int = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
+    review_diff_char_limit: int = DEFAULT_REVIEW_DIFF_CHAR_LIMIT
     autonomous_verify_timeout_seconds: int = DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS
     autonomous_verify_min_margin_seconds: int = DEFAULT_AUTONOMOUS_VERIFY_MIN_MARGIN_SECONDS
     autonomous_verify_observation_max_age_hours: int = DEFAULT_AUTONOMOUS_VERIFY_OBSERVATION_MAX_AGE_HOURS
@@ -3072,6 +3074,13 @@ class Config:
         if review_context_file_limit < 1:
             raise ConfigError("review_context_file_limit must be a positive integer")
 
+        try:
+            review_diff_char_limit = int(data.get("review_diff_char_limit", DEFAULT_REVIEW_DIFF_CHAR_LIMIT))
+        except (TypeError, ValueError):
+            raise ConfigError("review_diff_char_limit must be a positive integer")
+        if review_diff_char_limit < 1:
+            raise ConfigError("review_diff_char_limit must be a positive integer")
+
         autonomous_verify_timeout_seconds = _load_strict_int_field(
             data,
             "autonomous_verify_timeout_seconds",
@@ -3393,6 +3402,7 @@ class Config:
             review_diff_small_threshold=review_diff_small_threshold,
             review_diff_medium_threshold=review_diff_medium_threshold,
             review_context_file_limit=review_context_file_limit,
+            review_diff_char_limit=review_diff_char_limit,
             autonomous_verify_timeout_seconds=autonomous_verify_timeout_seconds,
             autonomous_verify_min_margin_seconds=autonomous_verify_min_margin_seconds,
             autonomous_verify_observation_max_age_hours=autonomous_verify_observation_max_age_hours,

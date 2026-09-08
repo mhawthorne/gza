@@ -248,6 +248,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("code_task_diff_timeout_cap_minutes", "int", 45, "Hard maximum runtime budget for code tasks after base timeout resolution and diff-size scaling."),
     ConfigKeySpec("review_context_file_limit", "int", 12, "Max changed files included in large review context excerpts."),
     ConfigKeySpec(
+        "review_diff_char_limit",
+        "int",
+        400_000,
+        "Max characters of diff/excerpt content inlined in a review prompt before falling back to targeted excerpts, regardless of line count.",
+    ),
+    ConfigKeySpec(
         "autonomous_verify_timeout_seconds",
         "int",
         120,

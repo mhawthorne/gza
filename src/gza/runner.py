@@ -46,6 +46,7 @@ from .config import (
     DEFAULT_AUTONOMOUS_VERIFY_OBSERVATION_MAX_AGE_HOURS,
     DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS,
     DEFAULT_REVIEW_CONTEXT_FILE_LIMIT,
+    DEFAULT_REVIEW_DIFF_CHAR_LIMIT,
     DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD,
     DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD,
     DEFAULT_REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
@@ -2936,6 +2937,7 @@ def get_task_output_paths(
 DIFF_SMALL_THRESHOLD = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
 DIFF_MEDIUM_THRESHOLD = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
 REVIEW_CONTEXT_FILE_LIMIT = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
+REVIEW_DIFF_CHAR_LIMIT = DEFAULT_REVIEW_DIFF_CHAR_LIMIT
 REVIEW_IMPROVE_LINEAGE_LIMIT = 5
 REVIEW_IMPROVE_LINEAGE_CITATION_LIMIT = 6
 REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
@@ -8456,6 +8458,7 @@ def _build_review_diff_context(
     diff_small_threshold: int = DIFF_SMALL_THRESHOLD,
     diff_medium_threshold: int = DIFF_MEDIUM_THRESHOLD,
     review_context_file_limit: int = REVIEW_CONTEXT_FILE_LIMIT,
+    review_diff_char_limit: int = REVIEW_DIFF_CHAR_LIMIT,
 ) -> str:
     """Build self-contained review diff context for prompts."""
     numstat_output = git.get_diff_numstat(revision_range)
@@ -8493,27 +8496,21 @@ def _build_review_diff_context(
         parts.append("Diff summary:")
         parts.append(stat_summary)
 
-    if total_lines < diff_small_threshold:
-        diff_content = git.get_diff(revision_range)
-        if not isinstance(diff_content, str):
-            diff_content = ""
-        if diff_content:
-            parts.append("")
-            parts.append("Full diff:")
-            parts.append(diff_content)
-        return "\n".join(parts)
-
     if total_lines < diff_medium_threshold:
         diff_content = git.get_diff(revision_range)
         if not isinstance(diff_content, str):
             diff_content = ""
-        if diff_content:
+        if diff_content and len(diff_content) <= review_diff_char_limit:
             parts.append("")
             parts.append("Full diff:")
             parts.append(diff_content)
-        return "\n".join(parts)
+            return "\n".join(parts)
+        # Diff has few lines but is oversized in characters (e.g. long lines,
+        # generated/minified content) - fall through to targeted excerpts
+        # instead of risking a provider input-size rejection.
 
-    # Large diff: include targeted per-file diff excerpts for the most relevant files.
+    # Large diff (by line count or by character count): include targeted
+    # per-file diff excerpts for the most relevant files.
     selected_files = changed_files[:review_context_file_limit]
     if selected_files:
         excerpt_result = git._run(
@@ -8526,12 +8523,18 @@ def _build_review_diff_context(
         )
         excerpt_stdout = excerpt_result.stdout if isinstance(excerpt_result.stdout, str) else ""
         excerpt_content = excerpt_stdout.strip()
+        excerpt_truncated = False
+        if len(excerpt_content) > review_diff_char_limit:
+            excerpt_content = excerpt_content[:review_diff_char_limit]
+            excerpt_truncated = True
         if excerpt_content:
             parts.append("")
             parts.append(
                 f"Targeted diff excerpts (first {len(selected_files)} changed files; total changed lines: {total_lines}):"
             )
             parts.append(excerpt_content)
+            if excerpt_truncated:
+                parts.append(f"... [excerpt truncated at {review_diff_char_limit} characters]")
         if len(changed_files) > len(selected_files):
             parts.append("")
             parts.append(
@@ -8991,6 +8994,10 @@ def _build_context_from_chain(
                                 review_context_file_limit=_int_or_default(
                                     getattr(config, "review_context_file_limit", None),
                                     REVIEW_CONTEXT_FILE_LIMIT,
+                                ),
+                                review_diff_char_limit=_int_or_default(
+                                    getattr(config, "review_diff_char_limit", None),
+                                    REVIEW_DIFF_CHAR_LIMIT,
                                 ),
                             )
                         )
