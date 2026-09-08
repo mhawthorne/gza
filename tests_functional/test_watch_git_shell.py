@@ -249,7 +249,7 @@ def test_watch_cycle_real_git_dedupes_attention_and_emits_single_task_scoped_rep
     assert len(inline_attention_lines) == 1
     assert len(roundup_attention_lines) == 0
     assert "Needs attention (" in text
-    assert "Needs attention (2 tasks): advance-attention=2" in text
+    assert "Needs attention (2 units): advance-attention=2" in text
     assert "Could not resolve freshest merge source" not in text
 
 
