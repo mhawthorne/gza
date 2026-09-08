@@ -16038,6 +16038,25 @@ def _watch_failed_recovery_scan_target_moved_units(
                 for unit in unchanged_candidates:
                     present = content_presence.get(str(unit.head_sha))
                     if present is None:
+                        proof_refs = [str(unit.head_sha), target_sha] if unit.head_sha is not None else [target_sha]
+                        try:
+                            resolved_proof_refs = git.resolve_refs(proof_refs)
+                        except GitError as exc:
+                            incomplete_reasons.append(
+                                f"branch '{unit.source_branch}' content-equivalence proof unavailable "
+                                f"against '{target_branch}': {exc}"
+                            )
+                            continue
+                        if any(resolved_proof_refs.get(ref) is None for ref in proof_refs):
+                            logger.debug(
+                                "watch failed-recovery scan treating branch %s as unchanged for target %s: "
+                                "content-equivalence source head %s or target %s no longer resolves",
+                                unit.source_branch,
+                                target_branch,
+                                unit.head_sha,
+                                target_sha,
+                            )
+                            continue
                         incomplete_reasons.append(
                             f"branch '{unit.source_branch}' content-equivalence proof unavailable "
                             f"against '{target_branch}'"

@@ -2227,6 +2227,148 @@ def test_watch_failed_recovery_scan_moved_target_dead_head_does_not_poison_live_
     git.content_equivalent_refs_on_target.assert_called_once_with(["live-head"], "target-new")
 
 
+def test_watch_failed_recovery_scan_moved_target_stale_equivalence_none_is_terminal(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_watch_scan_task(store, "feature/watch-stale-equivalence-head")
+    assert task.id is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, head_sha="source-head", base_sha="target-old")
+    store.set_merge_unit_state(unit.id, "empty")
+    _record_current_watch_failed_recovery_scan(store, target_branch="main", target_sha="target-old")
+
+    git = _make_watch_git()
+    resolve_calls = {"count": 0}
+
+    def resolve_refs(refs: object, **_kwargs: object) -> dict[str, str | None]:
+        resolve_calls["count"] += 1
+        ref_tuple = tuple(str(ref) for ref in refs)  # type: ignore[arg-type]
+        if resolve_calls["count"] <= 2:
+            values = {
+                "feature/watch-stale-equivalence-head": "source-head",
+                "source-head": "source-head",
+                "target-new": "target-new",
+            }
+        else:
+            values = {"source-head": None, "target-new": "target-new"}
+        return {ref: values.get(ref) for ref in ref_tuple}
+
+    git.resolve_refs = MagicMock(side_effect=resolve_refs)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: (
+            "source-head"
+            if ref == "feature/watch-stale-equivalence-head"
+            else "target-new"
+            if ref == "main"
+            else None
+        )
+    )
+    git.content_equivalent_refs_on_target = MagicMock(return_value={"source-head": None})  # type: ignore[method-assign]
+
+    with caplog.at_level("DEBUG", logger="gza.cli.watch"):
+        assert _watch_failed_recovery_scan_is_current(
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="target-new",
+        )
+        assert _watch_failed_recovery_scan_is_current(
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="target-new",
+        )
+
+    marker = store.get_watch_failed_recovery_scan_state(target_branch="main")
+    assert marker is not None and marker.target_sha == "target-new"
+    refreshed = store.get_merge_unit(unit.id)
+    assert refreshed is not None
+    assert refreshed.state == "empty"
+    assert refreshed.base_sha == "target-new"
+    git.content_equivalent_refs_on_target.assert_called_once_with(["source-head"], "target-new")
+    assert "content-equivalence source head source-head or target target-new no longer resolves" in caplog.text
+    assert "incomplete; keeping previous marker" not in caplog.text
+
+
+def test_watch_failed_recovery_scan_moved_target_stale_equivalence_dead_head_preserves_live_peer(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    dead = _completed_watch_scan_task(store, "feature/watch-stale-equivalence-dead-peer")
+    live = _completed_watch_scan_task(store, "feature/watch-stale-equivalence-live-peer")
+    assert dead.id is not None and live.id is not None
+    dead_unit = store.resolve_merge_unit_for_task(dead.id)
+    live_unit = store.resolve_merge_unit_for_task(live.id)
+    assert dead_unit is not None and live_unit is not None
+    store.refresh_merge_unit_head(dead_unit.id, head_sha="dead-head", base_sha="target-old")
+    store.refresh_merge_unit_head(live_unit.id, head_sha="live-head", base_sha="stable-base")
+    store.set_merge_unit_state(dead_unit.id, "empty")
+    store.set_merge_unit_state(live_unit.id, "unmerged")
+    _record_current_watch_failed_recovery_scan(store, target_branch="main", target_sha="target-old")
+
+    git = _make_watch_git()
+    resolve_calls = {"count": 0}
+
+    def resolve_refs(refs: object, **_kwargs: object) -> dict[str, str | None]:
+        resolve_calls["count"] += 1
+        ref_tuple = tuple(str(ref) for ref in refs)  # type: ignore[arg-type]
+        values = {
+            "feature/watch-stale-equivalence-dead-peer": "dead-head",
+            "feature/watch-stale-equivalence-live-peer": "live-head",
+            "dead-head": "dead-head",
+            "live-head": "live-head",
+            "target-new": "target-new",
+        }
+        if resolve_calls["count"] > 2:
+            values["dead-head"] = None
+        return {ref: values.get(ref) for ref in ref_tuple}
+
+    git.resolve_refs = MagicMock(side_effect=resolve_refs)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: (
+            "dead-head"
+            if ref == "feature/watch-stale-equivalence-dead-peer"
+            else "live-head"
+            if ref == "feature/watch-stale-equivalence-live-peer"
+            else "target-new"
+            if ref == "main"
+            else None
+        )
+    )
+    git.content_equivalent_refs_on_target = MagicMock(  # type: ignore[method-assign]
+        return_value={"dead-head": None, "live-head": True}
+    )
+    git.patch_equivalent_commits_present_on_target = MagicMock(return_value={})  # type: ignore[method-assign]
+    git.is_merged = MagicMock(return_value=False)  # type: ignore[method-assign]
+
+    with caplog.at_level("DEBUG", logger="gza.cli.watch"):
+        assert _watch_failed_recovery_scan_is_current(
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="target-new",
+        )
+
+    refreshed_dead = store.get_merge_unit(dead_unit.id)
+    refreshed_live = store.get_merge_unit(live_unit.id)
+    assert refreshed_dead is not None and refreshed_dead.state == "empty"
+    assert refreshed_dead.base_sha == "target-new"
+    assert refreshed_live is not None and refreshed_live.state == "merged"
+    assert refreshed_live.merge_source == "external"
+    assert refreshed_live.base_sha == "target-new"
+    marker = store.get_watch_failed_recovery_scan_state(target_branch="main")
+    assert marker is not None and marker.target_sha == "target-new"
+    git.content_equivalent_refs_on_target.assert_called_once_with(["dead-head", "live-head"], "target-new")
+    assert "content-equivalence source head dead-head or target target-new no longer resolves" in caplog.text
+    assert "incomplete; keeping previous marker" not in caplog.text
+
+
 def test_watch_failed_recovery_scan_moved_target_missing_source_with_recorded_head_keeps_marker(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
