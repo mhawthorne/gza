@@ -18555,7 +18555,7 @@ def test_watch_cycle_unknown_manual_empty_branch_matches_incomplete_owner_surfac
         failed_leaf.id in line and 'implement "Failed empty-branch descendant"' in line for line in attention_lines
     )
     text = log_path.read_text()
-    assert "Needs attention (1 task):" in text
+    assert "Needs attention (1 unit):" in text
 
 
 def test_watch_cycle_default_watch_false_positives_stay_silent(
@@ -18664,10 +18664,10 @@ def test_watch_cycle_manual_failed_recovery_emits_one_steady_attention_per_cycle
     text = log_path.read_text()
     stdout = capsys.readouterr().out
     assert text.count("ATTENTION") == 1
-    assert text.count("Needs attention (1 task):") == 1
-    assert text.count("1 task still need attention (unchanged)") == 1
-    assert stdout.count("Needs attention (1 task):") == 1
-    assert stdout.count("1 task still need attention (unchanged)") == 1
+    assert text.count("Needs attention (1 unit):") == 1
+    assert text.count("1 unit still need attention (unchanged)") == 1
+    assert stdout.count("Needs attention (1 unit):") == 1
+    assert stdout.count("1 unit still need attention (unchanged)") == 1
     # The message now appears once (via the one-time ATTENTION line); the
     # roundup is counts-only and no longer repeats it.
     assert text.count(f"{failed_leaf.id} implement") == 1
@@ -34765,7 +34765,7 @@ def test_watch_cycle_red_main_after_merge_halts_later_merges_and_emits_single_at
     skipped_task_id = second.id if merge_calls[0] == first.id else first.id
     log_text = log_path.read_text()
     assert "main verify RED at `deadbeefcafe` - merges halted; phase `unit` failing (red for 2h13m)" in log_text
-    assert "Needs attention (1 task):" in log_text
+    assert "Needs attention (1 unit):" in log_text
     assert f"SKIP      {skipped_task_id}: merges halted while local main verify is red" in log_text
 
 
@@ -41423,7 +41423,7 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
         "main verify remediation exhausted for phase:functional after 2/2 attempts; human intervention required"
     )
     assert log_text.count("ATTENTION") == 1
-    assert log_text.count("Needs attention (1 task):") == 1
+    assert log_text.count("Needs attention (1 unit):") == 1
     # The message now appears once (via the one-time ATTENTION line); the
     # roundup is counts-only and no longer repeats it.
     assert log_text.count(expected_attention) == 1
@@ -42264,7 +42264,7 @@ def test_watch_cycle_emits_attention_for_main_verify_launch_issue_without_freezi
     assert remediation_tasks == []
     log_text = log_path.read_text()
     assert sum(1 for line in log_text.splitlines() if " ATTENTION " in line) == 1
-    assert log_text.count("Needs attention (1 task):") == 1
+    assert log_text.count("Needs attention (1 unit):") == 1
     # The roundup is counts-only now; the message itself lives on the one-time
     # ATTENTION line, captured in the log's current attention state.
     messages = log.visible_attention_messages()
@@ -42354,8 +42354,8 @@ def test_watch_cycle_keeps_unchanged_main_verify_launch_issue_sticky_across_cycl
     attention_lines = [line for line in log_text.splitlines() if " ATTENTION " in line]
     assert len(attention_lines) == 1
     assert "could not launch `ruff`" in attention_lines[0]
-    assert log_text.count("Needs attention (1 task):") == 1
-    assert log_text.count("1 task still need attention (unchanged)") == 1
+    assert log_text.count("Needs attention (1 unit):") == 1
+    assert log_text.count("1 unit still need attention (unchanged)") == 1
     assert "main verify RED" not in log_text
     assert "merges halted" not in log_text
 
@@ -42440,7 +42440,7 @@ def test_watch_cycle_clears_main_verify_launch_issue_after_green_check(
 
     log_text = log_path.read_text()
     assert sum(1 for line in log_text.splitlines() if " ATTENTION " in line) == 1
-    assert log_text.count("Needs attention (1 task):") == 1
+    assert log_text.count("Needs attention (1 unit):") == 1
     second_cycle_text = log_text.split("\n\n", maxsplit=1)[1]
     assert "Needs attention" not in second_cycle_text
     assert "could not launch `ruff`" not in second_cycle_text
@@ -42652,7 +42652,7 @@ def test_watch_cycle_replaces_buffered_main_verify_red_with_exhausted_after_reme
         )
 
     assert merge_calls == [remediation_task.id]
-    assert "INFO      Needs attention (1 task):" in log_path.read_text()
+    assert "INFO      Needs attention (1 unit):" in log_path.read_text()
     # The roundup is counts-only now; the currently-active message lives on
     # the log's current attention state (the one-time ATTENTION line).
     messages = log.visible_attention_messages()
@@ -49355,8 +49355,8 @@ def test_watch_cycle_logs_attention_events_for_manual_advance_outcomes(
 
     text = log_path.read_text()
     assert text.count("ATTENTION") == 1
-    assert text.count("Needs attention (1 task):") == 1
-    assert text.count("1 task still need attention (unchanged)") == 1
+    assert text.count("Needs attention (1 unit):") == 1
+    assert text.count("1 unit still need attention (unchanged)") == 1
     assert str(impl.id) in text
     assert "SKIP" not in text
 
@@ -49908,8 +49908,8 @@ def test_watch_cycle_surfaces_verify_noop_branch_tip_attention_once_without_resp
 
     text = log_path.read_text()
     assert text.count("ATTENTION") == 1
-    assert text.count("Needs attention (1 task):") == 1
-    assert text.count("1 task still need attention (unchanged)") == 1
+    assert text.count("Needs attention (1 unit):") == 1
+    assert text.count("1 unit still need attention (unchanged)") == 1
     assert f"reason={PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE}" in text
     assert str(impl.id) in text
     assert _non_cycle_start_lines(text) == []
@@ -50093,7 +50093,7 @@ def test_watch_cycle_does_not_rerun_verify_only_noop_recovery_after_parked_atten
     assert execute_action.call_count == 1
     text = log_path.read_text()
     assert text.count("ATTENTION") == 1
-    assert "1 task still need attention (unchanged)" in text
+    assert "1 unit still need attention (unchanged)" in text
 
 
 def test_watch_cycle_logs_attention_for_rebase_did_not_unblock_merge_without_spawning_rebase(
@@ -50835,7 +50835,7 @@ def test_watch_cycle_undispatched_unmaterialized_create_review_does_not_no_progr
     assert observations == []
     text = log_path.read_text()
     assert "ATTENTION" not in text
-    assert "Needs attention (1 task):" not in text
+    assert "Needs attention (1 unit):" not in text
     assert f"{impl.id} create_review: dispatch did not reach live slot occupancy" in text
     assert "watch selected the same create review action without durable progress" not in text
 
@@ -51992,7 +51992,7 @@ def test_watch_cycle_pending_no_live_proof_emits_attention_at_no_progress_backst
     assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
     text = log_path.read_text()
     assert "ATTENTION" in text
-    assert "Needs attention (1 task):" in text
+    assert "Needs attention (1 unit):" in text
     assert f"START_UNDISPATCHED {pending.id} implement: dispatch did not reach live slot occupancy" in text
     assert "watch selected the same iterate action without durable progress for 2 cycles" in text
 
@@ -61782,8 +61782,8 @@ def test_watch_cycle_dedupes_attempt_cap_skip_across_cycles(tmp_path: Path) -> N
     text = log_path.read_text()
     assert text.count("ATTENTION") == 1
     assert text.count("SKIP") == 0
-    assert text.count("Needs attention (1 task):") == 1
-    assert text.count("1 task still need attention (unchanged)") == 1
+    assert text.count("Needs attention (1 unit):") == 1
+    assert text.count("1 unit still need attention (unchanged)") == 1
     assert (
         f'{failed.id} implement "Failed resume attempt" reason=automatic-recovery-disabled '
         "automatic recovery is disabled"
@@ -61873,7 +61873,7 @@ def test_watch_cycle_surfaces_guarded_pending_skip_as_attention_then_roundup_onl
         _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
         first_pass = log_path.read_text()
         assert "ATTENTION" in first_pass
-        assert "Needs attention (1 task):" in first_pass
+        assert "Needs attention (1 unit):" in first_pass
         assert "SKIP" in first_pass
 
         _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
@@ -61886,8 +61886,8 @@ def test_watch_cycle_surfaces_guarded_pending_skip_as_attention_then_roundup_onl
         f'{pending_review.id} review "Pending review" reason=guarded-pending-skip '
         f"{exec_result.message}; will not run automatically"
     ) in attention_lines[0]
-    assert text.count("Needs attention (1 task):") == 1
-    assert text.count("1 task still need attention (unchanged)") == 1
+    assert text.count("Needs attention (1 unit):") == 1
+    assert text.count("1 unit still need attention (unchanged)") == 1
     assert "Summary:" not in text
     # The message now appears once (via the one-time ATTENTION line); the
     # roundup is counts-only and no longer repeats it.
@@ -61898,8 +61898,8 @@ def test_watch_cycle_surfaces_guarded_pending_skip_as_attention_then_roundup_onl
         )
         == 1
     )
-    assert stdout.count("Needs attention (1 task):") == 1
-    assert stdout.count("1 task still need attention (unchanged)") == 1
+    assert stdout.count("Needs attention (1 unit):") == 1
+    assert stdout.count("1 unit still need attention (unchanged)") == 1
     assert text.count("SKIP") == 1
 
 
@@ -63154,6 +63154,7 @@ def test_watch_log_suppresses_unchanged_attention_inline_across_cycles_but_keeps
 ) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
 
     with patch(
         "gza.cli.watch._format_hms",
@@ -63167,17 +63168,17 @@ def test_watch_log_suppresses_unchanged_attention_inline_across_cycles_but_keeps
     ):
         log.begin_cycle()
         log.emit_attention(attention_key="task-1", message="gza-1 review needs manual attention")
-        _emit_cycle_attention_summary(log)
+        _emit_cycle_attention_summary(log, store)
         log.end_cycle()
 
         log.begin_cycle()
         log.emit_attention(attention_key="task-1", message="gza-1 review needs manual attention")
-        _emit_cycle_attention_summary(log)
+        _emit_cycle_attention_summary(log, store)
         log.end_cycle()
 
         log.begin_cycle()
         log.emit_attention(attention_key="task-1", message="gza-1 review still needs manual attention")
-        _emit_cycle_attention_summary(log)
+        _emit_cycle_attention_summary(log, store)
         log.end_cycle()
 
     text = log_path.read_text()
@@ -63185,8 +63186,8 @@ def test_watch_log_suppresses_unchanged_attention_inline_across_cycles_but_keeps
     assert len(attention_lines) == 2
     assert attention_lines[0].startswith("18:08:47 ATTENTION")
     assert attention_lines[1].startswith("18:18:47 ATTENTION")
-    assert text.count("INFO      Needs attention (1 task): task-1=1") == 2
-    assert text.count("INFO      1 task still need attention (unchanged)") == 1
+    assert text.count("INFO      Needs attention (1 unit): task-1=1") == 2
+    assert text.count("INFO      1 unit still need attention (unchanged)") == 1
     # The roundup is counts-only now; each distinct message still appears once,
     # via its one-time (unindented) ATTENTION line.
     assert text.count("gza-1 review needs manual attention") == 1
@@ -63196,6 +63197,7 @@ def test_watch_log_suppresses_unchanged_attention_inline_across_cycles_but_keeps
 def test_main_verify_attention_summary_keeps_red_line_when_head_is_unchanged(tmp_path: Path) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.rev_parse_if_exists = MagicMock(
         side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main"} else None
@@ -63217,16 +63219,17 @@ def test_main_verify_attention_summary_keeps_red_line_when_head_is_unchanged(tmp
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     text = log_path.read_text()
-    assert "Needs attention (1 task):" in text
+    assert "Needs attention (1 unit):" in text
     assert "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing (red for 8m)" in text
 
 
 def test_main_verify_attention_summary_suppresses_red_line_when_head_advanced(tmp_path: Path) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.rev_parse_if_exists = MagicMock(side_effect=["feedfacecafe", "cafebabecafe", "cafebabecafe"])  # type: ignore[method-assign]
     state = SimpleNamespace(
@@ -63246,7 +63249,7 @@ def test_main_verify_attention_summary_suppresses_red_line_when_head_advanced(tm
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     text = log_path.read_text()
     summary_text = text.split("INFO      ", maxsplit=1)[1] if "INFO      " in text else ""
@@ -63259,6 +63262,7 @@ def test_main_verify_attention_summary_replaces_matching_emission_when_render_he
 ) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.rev_parse_if_exists = MagicMock(side_effect=["feedfacecafe", None, None])  # type: ignore[method-assign]
     state = SimpleNamespace(
@@ -63279,7 +63283,7 @@ def test_main_verify_attention_summary_replaces_matching_emission_when_render_he
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     # The roundup is counts-only now; the message lives on the one-time
     # ATTENTION line, captured in the log's current attention state.
@@ -63297,6 +63301,7 @@ def test_main_verify_attention_summary_replaces_unproven_emission_when_render_he
 ) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.rev_parse_if_exists = MagicMock(side_effect=[None, "feedfacecafe"])  # type: ignore[method-assign]
     state = SimpleNamespace(
@@ -63317,7 +63322,7 @@ def test_main_verify_attention_summary_replaces_unproven_emission_when_render_he
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     # The roundup is counts-only now; the message lives on the one-time
     # ATTENTION line, captured in the log's current attention state.
@@ -63334,6 +63339,7 @@ def test_main_verify_attention_summary_uses_real_target_ref_for_isolated_checkou
 ) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     detached_git = _make_watch_git()
     detached_git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
     repo_git = _make_watch_git()
@@ -63365,7 +63371,7 @@ def test_main_verify_attention_summary_uses_real_target_ref_for_isolated_checkou
         git=repo_git,
         target_branch="main",
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     text = log_path.read_text()
     summary_text = text.split("INFO      ", maxsplit=1)[1] if "INFO      " in text else ""
@@ -63460,6 +63466,7 @@ def test_main_verify_attention_summary_ignores_ambiguous_short_target_ref(
 ) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.current_branch = MagicMock(return_value="topic")  # type: ignore[method-assign]
     git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
@@ -63490,7 +63497,7 @@ def test_main_verify_attention_summary_ignores_ambiguous_short_target_ref(
         git=git,
         target_branch="main",
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     # The roundup is counts-only now; the message lives on the one-time
     # ATTENTION line, captured in the log's current attention state.
@@ -63517,6 +63524,7 @@ def test_main_verify_attention_summary_marks_red_claim_unproven_without_head_pro
 ) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     if isinstance(head_side_effect, BaseException):
         git.rev_parse_if_exists = MagicMock(side_effect=head_side_effect)  # type: ignore[method-assign]
@@ -63540,7 +63548,7 @@ def test_main_verify_attention_summary_marks_red_claim_unproven_without_head_pro
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     text = log_path.read_text()
     assert expected in text
@@ -63564,6 +63572,7 @@ def test_main_verify_attention_summary_fails_closed_for_malformed_unclassified_s
 ) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.rev_parse_if_exists = MagicMock(return_value=live_main_sha)  # type: ignore[method-assign]
     state = SimpleNamespace(
@@ -63585,7 +63594,7 @@ def test_main_verify_attention_summary_fails_closed_for_malformed_unclassified_s
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     # The roundup is counts-only now; the message lives on the one-time
     # ATTENTION line, captured in the log's current attention state.
@@ -63601,6 +63610,7 @@ def test_main_verify_attention_summary_fails_closed_for_malformed_unclassified_s
 def test_main_verify_attention_summary_keeps_missing_evidence_attention_visible(tmp_path: Path) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
     state = SimpleNamespace(
@@ -63622,12 +63632,12 @@ def test_main_verify_attention_summary_keeps_missing_evidence_attention_visible(
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     # The roundup is counts-only now; the message lives on the one-time
     # ATTENTION line, captured in the log's current attention state.
     messages = log.visible_attention_messages()
-    assert "Needs attention (1 task):" in log_path.read_text()
+    assert "Needs attention (1 unit):" in log_path.read_text()
     assert any(
         "main verify evidence unknown for current HEAD; verify status unavailable" in message for message in messages
     )
@@ -63641,6 +63651,7 @@ def test_main_verify_attention_summary_renders_current_unknown_status_as_unknown
 ) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
     state = SimpleNamespace(
@@ -63662,7 +63673,7 @@ def test_main_verify_attention_summary_renders_current_unknown_status_as_unknown
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     # The roundup is counts-only now; the message lives on the one-time
     # ATTENTION line, captured in the log's current attention state.
@@ -63691,6 +63702,7 @@ def test_main_verify_attention_summary_suppresses_legacy_exhaustion_for_non_atte
 ) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
     state = SimpleNamespace(
@@ -63715,7 +63727,7 @@ def test_main_verify_attention_summary_suppresses_legacy_exhaustion_for_non_atte
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     text = log_path.read_text() if log_path.exists() else ""
     assert "Needs attention" not in text
@@ -63731,6 +63743,7 @@ def test_main_verify_attention_summary_suppresses_disabled_conflicting_failed_fr
 ) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
     state = SimpleNamespace(
@@ -63757,7 +63770,7 @@ def test_main_verify_attention_summary_suppresses_disabled_conflicting_failed_fr
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     text = log_path.read_text() if log_path.exists() else ""
     assert "Needs attention" not in text
@@ -63774,6 +63787,7 @@ def test_main_verify_attention_summary_surfaces_launch_failure_without_alert_mes
 ) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.rev_parse_if_exists = MagicMock(return_value=None)  # type: ignore[method-assign]
     state = SimpleNamespace(
@@ -63795,7 +63809,7 @@ def test_main_verify_attention_summary_surfaces_launch_failure_without_alert_mes
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     # The roundup is counts-only now; the message lives on the one-time
     # ATTENTION line, captured in the log's current attention state.
@@ -63818,6 +63832,7 @@ def test_main_verify_attention_summary_sanitizes_launch_failure_with_legacy_red_
 ) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.rev_parse_if_exists = MagicMock(return_value=live_main_sha)  # type: ignore[method-assign]
     state = SimpleNamespace(
@@ -63839,7 +63854,7 @@ def test_main_verify_attention_summary_sanitizes_launch_failure_with_legacy_red_
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     # The roundup is counts-only now; the message lives on the one-time
     # ATTENTION line, captured in the log's current attention state.
@@ -63873,6 +63888,7 @@ def test_main_verify_attention_summary_prefers_structured_special_status_over_le
 ) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
     state = SimpleNamespace(
@@ -63906,7 +63922,7 @@ def test_main_verify_attention_summary_prefers_structured_special_status_over_le
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     # The roundup is counts-only now; the message lives on the one-time
     # ATTENTION line, captured in the log's current attention state.
@@ -63926,6 +63942,7 @@ def test_main_verify_attention_summary_rejects_legacy_exhaustion_for_unknown_inv
 ) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
     state = SimpleNamespace(
@@ -63952,7 +63969,7 @@ def test_main_verify_attention_summary_rejects_legacy_exhaustion_for_unknown_inv
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     # The roundup is counts-only now; the message lives on the one-time
     # ATTENTION line, captured in the log's current attention state.
@@ -63984,6 +64001,7 @@ def test_main_verify_attention_summary_weakens_stale_freshness_unavailable_claim
 ) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.rev_parse_if_exists = MagicMock(return_value=head_side_effect)  # type: ignore[method-assign]
     state = SimpleNamespace(
@@ -64004,7 +64022,7 @@ def test_main_verify_attention_summary_weakens_stale_freshness_unavailable_claim
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     # The roundup is counts-only now; the message lives on the one-time
     # ATTENTION line, captured in the log's current attention state.
@@ -64017,6 +64035,7 @@ def test_main_verify_attention_summary_weakens_stale_freshness_unavailable_claim
 def test_main_verify_attention_summary_keeps_freshness_halt_when_head_matches(tmp_path: Path) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
     state = SimpleNamespace(
@@ -64037,7 +64056,7 @@ def test_main_verify_attention_summary_keeps_freshness_halt_when_head_matches(tm
         now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
         git=git,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     # The roundup is counts-only now; the message lives on the one-time
     # ATTENTION line, captured in the log's current attention state.
@@ -64062,6 +64081,7 @@ def test_main_verify_attention_summary_limits_exhausted_duration_to_current_prov
 ) -> None:
     log_path = tmp_path / ".gza" / f"watch-exhausted-{target_head or 'unavailable'}.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.current_branch = MagicMock(return_value="topic")  # type: ignore[method-assign]
     git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
@@ -64091,7 +64111,7 @@ def test_main_verify_attention_summary_limits_exhausted_duration_to_current_prov
         git=git,
         target_branch="main",
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     # The roundup is counts-only now; the message lives on the one-time
     # ATTENTION line, captured in the log's current attention state.
@@ -64152,6 +64172,7 @@ def test_main_verify_missing_alert_exhaustion_finalizes_as_proof_free_human_atte
 
     log_path = tmp_path / ".gza" / f"watch-{target_head or 'unavailable'}.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     git = _make_watch_git()
     git.current_branch = MagicMock(return_value="topic")  # type: ignore[method-assign]
     git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
@@ -64166,7 +64187,7 @@ def test_main_verify_missing_alert_exhaustion_finalizes_as_proof_free_human_atte
         git=git,
         target_branch="main",
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     # The roundup is counts-only now; the message lives on the one-time
     # ATTENTION line, captured in the log's current attention state.
@@ -64209,6 +64230,7 @@ def test_main_verify_legacy_exhaustion_message_uses_shared_classifier_and_render
 def test_main_verify_attention_summary_clears_exhausted_key_after_green_resolution(tmp_path: Path) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    store = SqliteTaskStore(tmp_path / ".gza" / "attn.db", prefix="attn", project_id="attn")
     exhausted_state = SimpleNamespace(
         task=SimpleNamespace(id="gza-main"),
         head_sha="feedfacecafe",
@@ -64240,7 +64262,7 @@ def test_main_verify_attention_summary_clears_exhausted_key_after_green_resoluti
         now=datetime(2026, 6, 24, 12, 14, tzinfo=UTC),
         git=None,
     )
-    _emit_cycle_attention_summary(log)
+    _emit_cycle_attention_summary(log, store)
 
     summary_text = (
         log_path.read_text().split("INFO      ", maxsplit=1)[1] if "INFO      " in log_path.read_text() else ""
