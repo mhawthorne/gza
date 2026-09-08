@@ -5259,33 +5259,31 @@ def resolve_closing_review_action(
             }
         # A completed follow-on review satisfies the invariant (verdict acted on elsewhere).
         # A failed closing review must NOT silently allow merge when code changed after an
-        # established review baseline (latest_completed_review is not None). Only apply
-        # bounded retry in that case: when latest_completed_review is None there may be
-        # a completed resume that is invisible via get_reviews_for_task (its based_on
-        # points to the original review, not the impl), so preserve the old behaviour
-        # to avoid false retries.
-        if latest_completed_review is not None:
-            failed_count = sum(1 for r in follow_on_reviews if r.status == "failed")
-            if failed_count > 0 and not any(r.status == "completed" for r in follow_on_reviews):
-                assert task.id is not None
-                if failed_count >= max_failed_closing_review_retries:
-                    return with_needs_attention(
-                        {
-                            "type": "needs_discussion",
-                            "description": (
-                                f"SKIP: closing review failed {failed_count} time(s), needs manual intervention"
-                            ),
-                        },
-                        reason="closing-review-failed-max-retries",
-                        subject_task_id=task.id,
-                    )
-                action = {
-                    "type": "create_review",
-                    "description": "Create closing review (previous attempt failed)",
-                }
-                if current_review_head_sha:
-                    action["review_head_sha"] = current_review_head_sha
-                return action
+        # established review baseline. Bounded retry applies whenever every visible
+        # follow-on review has failed and none completed: resume/retry descendants of an
+        # already-linked review are discoverable via get_implementation_review_evidence's
+        # recovery-descendant walk, so a hidden completed resume is not a concern here.
+        failed_count = sum(1 for r in follow_on_reviews if r.status == "failed")
+        if failed_count > 0 and not any(r.status == "completed" for r in follow_on_reviews):
+            assert task.id is not None
+            if failed_count >= max_failed_closing_review_retries:
+                return with_needs_attention(
+                    {
+                        "type": "needs_discussion",
+                        "description": (
+                            f"SKIP: closing review failed {failed_count} time(s), needs manual intervention"
+                        ),
+                    },
+                    reason="closing-review-failed-max-retries",
+                    subject_task_id=task.id,
+                )
+            action = {
+                "type": "create_review",
+                "description": "Create closing review (previous attempt failed)",
+            }
+            if current_review_head_sha:
+                action["review_head_sha"] = current_review_head_sha
+            return action
         return None
 
     if latest_completed_code_change.id == task.id:

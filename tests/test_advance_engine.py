@@ -24498,6 +24498,64 @@ def test_failed_closing_review_recovery_chain_counts_toward_retry_cap(
     assert str(max_retries) in action["description"]
 
 
+def test_repeated_failed_reviews_with_no_completed_review_ever_escalate_to_needs_attention(
+    tmp_path: Path,
+) -> None:
+    """A lineage that has never had a completed review must still hit the retry cap.
+
+    Regression for gza-10759: every review attempt failed outright (provider error)
+    before a first review ever completed, so latest_completed_review stayed None and
+    the bounded-retry cap never engaged, letting watch recreate a fresh review task
+    every cycle indefinitely.
+    """
+    store = _make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    impl.branch = "feat/no-review-ever-completed"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    max_retries = 2
+    first_failed = store.add("Review attempt 1", task_type="review", based_on=impl.id, depends_on=impl.id)
+    assert first_failed.id is not None
+    first_failed.status = "failed"
+    first_failed.failure_reason = "UNKNOWN"
+    first_failed.created_at = datetime(2026, 1, 2, tzinfo=UTC)
+    first_failed.completed_at = datetime(2026, 1, 2, 1, tzinfo=UTC)
+    store.update(first_failed)
+
+    second_failed = store.add(
+        "Review attempt 2",
+        task_type="review",
+        based_on=impl.id,
+        depends_on=impl.id,
+    )
+    assert second_failed.id is not None
+    second_failed.status = "failed"
+    second_failed.failure_reason = "UNKNOWN"
+    second_failed.created_at = datetime(2026, 1, 3, tzinfo=UTC)
+    second_failed.completed_at = datetime(2026, 1, 3, 1, tzinfo=UTC)
+    store.update(second_failed)
+
+    action = resolve_closing_review_action(
+        task=impl,
+        reviews=get_implementation_review_evidence(store, impl),
+        latest_completed_review=None,
+        latest_completed_code_change=impl,
+        max_failed_closing_review_retries=max_retries,
+    )
+
+    assert action is not None
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "closing-review-failed-max-retries"
+    assert action["subject_task_id"] == impl.id
+    assert str(max_retries) in action["description"]
+
+
 def test_single_failed_closing_review_below_retry_bound_retries(
     tmp_path: Path,
 ) -> None:
