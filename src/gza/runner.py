@@ -6214,6 +6214,9 @@ class _LongPhaseHeartbeatState:
     def note_output(self, chunk: bytes) -> None:
         self.output_bytes_since_last += len(chunk)
         self.output_lines_since_last += chunk.count(b"\n")
+        note_raw_output = getattr(self.on_heartbeat, "note_raw_output", None)
+        if callable(note_raw_output):
+            note_raw_output(chunk)
 
     def seconds_until_next(self) -> float | None:
         if self.on_heartbeat is None:

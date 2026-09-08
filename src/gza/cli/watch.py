@@ -151,6 +151,7 @@ from ..recovery_transients import (
 )
 from ..review_tasks import CappedReviewBlockerMaterializationError, FollowupMaterializationError
 from ..review_verify_state import (
+    KNOWN_FULL_VERIFY_PHASES,
     VERIFY_GATE_ARTIFACT_KIND,
     VERIFY_GATE_ARTIFACT_SCHEMA_VERSION,
     normalized_verify_command,
@@ -7112,6 +7113,12 @@ def _format_watch_cpu_delta(seconds: float) -> str:
     return _format_watch_duration(seconds)
 
 
+_VERIFY_PHASE_RESULT_LINE_RE = re.compile(
+    r"^gza-verify phase=(?P<status>passed|failed) name=(?P<name>[A-Za-z0-9_.-]+) "
+    r"duration_seconds=(?P<duration>[0-9.]+)"
+)
+
+
 class _WatchLongPhaseReporter:
     _duration_history_by_log: dict[Path, dict[tuple[str, str], float]] = {}
 
@@ -7192,9 +7199,30 @@ class _WatchLongPhaseHeartbeat:
         self._finish_lock = threading.Lock()
         self._ticker_stop: threading.Event | None = None
         self._ticker_thread: threading.Thread | None = None
+        self._phase_line_buffer = ""
+        self._verify_phases_passed = 0
 
     def __call__(self, progress: LongPhaseProgress) -> None:
         self._emit_busy(progress)
+
+    def note_raw_output(self, chunk: bytes) -> None:
+        with self._finish_lock:
+            if self._finished:
+                return
+        self._phase_line_buffer += chunk.decode("utf-8", errors="replace")
+        *complete_lines, self._phase_line_buffer = self._phase_line_buffer.split("\n")
+        for line in complete_lines:
+            match = _VERIFY_PHASE_RESULT_LINE_RE.match(line.strip())
+            if match is None:
+                continue
+            if match.group("status") == "passed":
+                self._verify_phases_passed += 1
+            self._reporter.log.emit(
+                "HEARTBEAT",
+                f"{self._subject_id} {match.group('name')} {match.group('status')} "
+                f"({float(match.group('duration')):.1f}s), "
+                f"{self._verify_phases_passed}/{len(KNOWN_FULL_VERIFY_PHASES)} phases done",
+            )
 
     def _emit_busy(self, progress: LongPhaseProgress, *, output_available: bool = True) -> None:
         with self._finish_lock:
@@ -7298,6 +7326,11 @@ class _CompositeLongPhaseHeartbeat:
     def __call__(self, progress: LongPhaseProgress) -> None:
         self._foreground(progress)
         self.service_due()
+
+    def note_raw_output(self, chunk: bytes) -> None:
+        note_raw_output = getattr(self._foreground, "note_raw_output", None)
+        if callable(note_raw_output):
+            note_raw_output(chunk)
 
     def service_due(self) -> None:
         if self._worker_heartbeat is not None:
