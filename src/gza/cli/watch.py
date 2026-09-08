@@ -6957,6 +6957,13 @@ def _bucket_unit_live_task(
             if classify_advance_action(owner_row.next_action) == "needs_attention":
                 return "parked"
         return "blocked" if unit is not None and unit.state == "blocked" else "pending"
+    if task.status == "dropped":
+        # A dropped task means its unit's state should already be tombstoned
+        # (see drop_active_merge_units_owned_by), which removes it from the
+        # actionable query entirely. If we still see one here, the tombstone
+        # is stale/missing - exclude it rather than count it as "other": we
+        # are never going to work on it, so it has no accounting signal.
+        return None
     return "other"
 
 
@@ -11346,7 +11353,7 @@ def run_watch_supervisor_fleet_cycle(
                     tags=runtime.tags,
                     any_tag=runtime.any_tag,
                 )
-                _emit_cycle_attention_summary(runtime.log)
+                _emit_cycle_attention_summary(runtime.log, runtime.store)
                 runtime.log.end_cycle()
             return result
 
@@ -11874,7 +11881,7 @@ def run_watch_supervisor_fleet_cycle(
                 tags=runtime.tags,
                 any_tag=runtime.any_tag,
             )
-            _emit_cycle_attention_summary(runtime.log)
+            _emit_cycle_attention_summary(runtime.log, runtime.store)
             runtime.log.end_cycle()
         return result, construction.lease_set
     except BaseException as primary_error:
@@ -14933,31 +14940,59 @@ def _attention_category(attention_key: str) -> str:
     return attention_key.split(":", 1)[0]
 
 
-def _emit_cycle_attention_summary(log: _WatchLog) -> None:
+def _attention_dedupe_identity(attention_key: str, *, store: SqliteTaskStore) -> str:
+    """The unit (or task, if unit-less) an attention key is really "about".
+
+    Attention keys are emitted per task (``category:task_id:...``), but two
+    failed attempts on the same merge unit are one unit needing attention, not
+    two. Resolve to the owning merge unit id so the roundup counts merge
+    units — the same granularity as ``unit accounting:`` — not raw tasks.
+    Keys that aren't task-shaped (e.g. a main-verify failure signature, which
+    isn't scoped to any single merge unit) are already one identity per
+    condition and are used as-is.
+    """
+    parts = attention_key.split(":")
+    if len(parts) < 2:
+        return attention_key
+    task_id = parts[1]
+    task = store.get(task_id)
+    if task is None:
+        return attention_key
+    unit = store.resolve_merge_unit_for_task(task_id)
+    return unit.id if unit is not None else task_id
+
+
+def _emit_cycle_attention_summary(log: _WatchLog, store: SqliteTaskStore) -> None:
     """Log a per-cycle roundup of attention counts, grouped by category.
 
-    This is a repeating summary, not the place to act on individual tasks — use
-    ``gza incomplete --tag <tag>`` to list and copy the actual task IDs. Keeping
-    the roundup to counts (rather than one line per task, repeated every cycle)
-    keeps the log legible; the one-time ATTENTION line emitted when a task first
-    needs attention still carries the full per-task message.
+    Counts distinct merge units (see ``_attention_dedupe_identity``), matching
+    the granularity of ``unit accounting:``. This is a repeating summary, not
+    the place to act on individual units — use ``gza incomplete --tag <tag>``
+    to list and copy the actual task IDs. Keeping the roundup to counts
+    (rather than one line per unit, repeated every cycle) keeps the log
+    legible; the one-time ATTENTION line emitted when a task first needs
+    attention still carries the full per-task message.
     """
     items = log.visible_attention_items()
     if not items:
         return
     with log._lock:
         unchanged = dict(items) == log._sticky_attention_prev_cycle
-    if unchanged:
-        plural = "s" if len(items) != 1 else ""
-        log.emit("INFO", f"{len(items)} task{plural} still need attention (unchanged)")
-        return
-    counts: dict[str, int] = {}
+    identities_by_category: dict[str, set[str]] = {}
     for attention_key, _message in items:
         category = _attention_category(attention_key)
-        counts[category] = counts.get(category, 0) + 1
-    plural = "s" if len(items) != 1 else ""
-    breakdown = ", ".join(f"{category}={count}" for category, count in sorted(counts.items()))
-    log.emit("INFO", f"{NEEDS_ATTENTION_LABEL} ({len(items)} task{plural}): {breakdown}")
+        identities_by_category.setdefault(category, set()).add(
+            _attention_dedupe_identity(attention_key, store=store)
+        )
+    total = len({identity for identities in identities_by_category.values() for identity in identities})
+    plural = "s" if total != 1 else ""
+    if unchanged:
+        log.emit("INFO", f"{total} unit{plural} still need attention (unchanged)")
+        return
+    breakdown = ", ".join(
+        f"{category}={len(identities)}" for category, identities in sorted(identities_by_category.items())
+    )
+    log.emit("INFO", f"{NEEDS_ATTENTION_LABEL} ({total} unit{plural}): {breakdown}")
 
 
 def _process_expected_start_boundary(
@@ -15797,7 +15832,7 @@ def _watch_failed_recovery_scan_is_current(
         current_fingerprint = _watch_failed_recovery_scan_unit_fingerprint(units)
     if incomplete_reasons:
         reasons_block = "\n".join(f"  - {reason}" for reason in incomplete_reasons)
-        logger.warning(
+        logger.debug(
             "watch failed-recovery scan for target %s at %s incomplete; keeping previous marker:\n%s",
             target_branch,
             target_sha,
@@ -19285,7 +19320,7 @@ def _run_cycle(
             )
             if end_cycle:
                 _emit_deferred_blocker_debt_summary(log, store, tags=tags, any_tag=any_tag)
-            _emit_cycle_attention_summary(log)
+            _emit_cycle_attention_summary(log, store)
             if end_cycle:
                 log.end_cycle()
             _live_pids, end_running_task_ids, end_anonymous_worker_count, end_starting_worker_count = (
@@ -21077,7 +21112,7 @@ def _run_cycle(
         )
         if end_cycle:
             _emit_deferred_blocker_debt_summary(log, store, tags=tags, any_tag=any_tag)
-        _emit_cycle_attention_summary(log)
+        _emit_cycle_attention_summary(log, store)
         if end_cycle:
             log.end_cycle()
         _live_pids, end_running_task_ids, end_anonymous_worker_count, end_starting_worker_count = (
