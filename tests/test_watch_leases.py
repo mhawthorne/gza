@@ -1,8 +1,10 @@
 """Tests for watch-supervisor project lease helpers."""
 
 import os
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -62,6 +64,33 @@ class RaisingAcquireStore:
 
     def release_project_lease(self, **kwargs) -> bool:
         raise AssertionError("unacquired store should not be released")
+
+
+class FlakyLockedAcquireStore:
+    """Raises sqlite3.OperationalError('database is locked') a fixed number of times, then succeeds."""
+
+    def __init__(self, key: str, store: SqliteTaskStore, *, fail_times: int) -> None:
+        self.key = key
+        self.store = store
+        self.fail_times = fail_times
+        self.attempts = 0
+
+    @property
+    def db_path(self) -> Path:
+        return self.store.db_path
+
+    @property
+    def project_id(self) -> str:
+        return self.store.project_id
+
+    def try_acquire_project_lease(self, **kwargs):
+        self.attempts += 1
+        if self.attempts <= self.fail_times:
+            raise sqlite3.OperationalError("database is locked")
+        return self.store.try_acquire_project_lease(**kwargs)
+
+    def release_project_lease(self, **kwargs) -> bool:
+        return self.store.release_project_lease(**kwargs)
 
 
 class RaisingReleaseStore(RecordingStore):
@@ -642,3 +671,33 @@ def test_watch_lease_incremental_rollback_releases_only_new_in_reverse_order_wit
         is None
     )
     assert [result.target_key for result in existing.release()] == ["retained"]
+
+
+def test_watch_lease_acquisition_retries_transient_database_lock(tmp_path: Path) -> None:
+    store = _store(tmp_path, "core")
+    flaky = FlakyLockedAcquireStore("core", store, fail_times=2)
+
+    with patch("gza.watch_leases._LEASE_ACQUIRE_RETRY_DELAY_SECONDS", 0.0):
+        leases = acquire_watch_project_leases(
+            [WatchLeaseTarget("core", flaky)],
+            owner_token="run-token",
+        )
+
+    assert flaky.attempts == 3
+    assert [held.target.key for held in leases.held] == ["core"]
+
+
+def test_watch_lease_acquisition_gives_up_after_exhausting_lock_retries(tmp_path: Path) -> None:
+    store = _store(tmp_path, "core")
+    flaky = FlakyLockedAcquireStore("core", store, fail_times=99)
+
+    with (
+        patch("gza.watch_leases._LEASE_ACQUIRE_RETRY_DELAY_SECONDS", 0.0),
+        pytest.raises(sqlite3.OperationalError, match="database is locked"),
+    ):
+        acquire_watch_project_leases(
+            [WatchLeaseTarget("core", flaky)],
+            owner_token="run-token",
+        )
+
+    assert flaky.attempts == 3

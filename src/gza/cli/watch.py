@@ -2202,11 +2202,10 @@ def _apply_main_verify_green_cleanup(
     remaining_pending_signatures: list[str] = []
     dispatch_state_changed = False
     for signature in sorted(signatures_to_retire):
-        store.clear_main_verify_remediation_active_task(
+        store.reset_main_verify_remediation_ledger_on_green(
             signature=signature,
             tree_fingerprint=None,
             last_observed_head_sha=getattr(state, "head_sha", None),
-            last_observed_failure=None,
         )
         reason = (
             f"main verify green for signature {signature}"

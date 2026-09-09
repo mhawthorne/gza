@@ -42347,9 +42347,12 @@ def test_watch_cycle_green_skips_stale_final_main_verify_remediation_merge_witho
         tree_fingerprint=None,
     )
     assert attempt_state is not None
-    assert attempt_state.consumed_attempt_count == 1
+    # Verify is confirmed green, so the ledger is fully reset (not merely left
+    # unexhausted) - an old incident's spent budget must not carry forward and
+    # block remediation of a later, unrelated failure under the same signature.
+    assert attempt_state.consumed_attempt_count == 0
     assert attempt_state.active_task_id is None
-    assert attempt_state.last_consumed_task_id == "gza-100"
+    assert attempt_state.last_consumed_task_id is None
     assert attempt_state.exhausted_at is None
 
     assert "retired moot main-verify remediation rows for phase:functional" in log_path.read_text()

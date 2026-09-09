@@ -1,6 +1,8 @@
 """Watch-supervisor project lease helpers."""
 
 import os
+import sqlite3
+import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -11,6 +13,38 @@ from typing import Protocol
 from gza.db import ProjectLease
 
 WATCH_SUPERVISOR_LEASE_NAME = "watch-supervisor"
+
+# The store's own sqlite connections already retry internally for up to 15s
+# (PRAGMA busy_timeout) before raising "database is locked". These retries
+# are for the rare case a single acquisition attempt still loses that race
+# (e.g. a writer holds the lock across two consecutive busy_timeout windows) -
+# without them, a transient lock crashes the whole watch process.
+_LEASE_ACQUIRE_RETRY_ATTEMPTS = 3
+_LEASE_ACQUIRE_RETRY_DELAY_SECONDS = 2.0
+
+
+def _try_acquire_project_lease_with_retry(
+    store: "WatchLeaseStore",
+    *,
+    lease_name: str,
+    owner_pid: int,
+    owner_token: str,
+    acquired_at: datetime | None,
+) -> ProjectLease | None:
+    """Retry lease acquisition a few times on a transient sqlite lock."""
+    for attempt in range(1, _LEASE_ACQUIRE_RETRY_ATTEMPTS + 1):
+        try:
+            return store.try_acquire_project_lease(
+                lease_name=lease_name,
+                owner_pid=owner_pid,
+                owner_token=owner_token,
+                acquired_at=acquired_at,
+            )
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == _LEASE_ACQUIRE_RETRY_ATTEMPTS:
+                raise
+            time.sleep(_LEASE_ACQUIRE_RETRY_DELAY_SECONDS)
+    raise AssertionError("unreachable: retry loop always returns or raises")
 
 
 class WatchLeaseStore(Protocol):
@@ -225,7 +259,8 @@ def acquire_watch_project_leases(
         desired_identities.add(identity)
         already_owned = existing_by_identity.get(identity)
         try:
-            lease = target.store.try_acquire_project_lease(
+            lease = _try_acquire_project_lease_with_retry(
+                target.store,
                 lease_name=WATCH_SUPERVISOR_LEASE_NAME,
                 owner_pid=resolved_owner_pid,
                 owner_token=resolved_owner_token,

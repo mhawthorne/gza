@@ -12155,6 +12155,46 @@ class SqliteTaskStore:
             clear_exhausted=False,
         )
 
+    def reset_main_verify_remediation_ledger_on_green(
+        self,
+        *,
+        signature: str,
+        tree_fingerprint: str | None,
+        last_observed_head_sha: str | None = None,
+    ) -> None:
+        """Fully clear one identity's attempt/exhaustion ledger once verify is confirmed green.
+
+        Unlike ``clear_main_verify_remediation_active_task``, this always clears
+        ``exhausted_at``/``consumed_attempt_count`` (not gated on an active task
+        being present), so an incident's exhausted budget cannot outlive it and
+        silently block remediation of a later, unrelated failure under the same
+        signature.
+        """
+        if not self.supports_main_verify_remediation_attempts():
+            return
+        normalized_fingerprint = _normalize_main_verify_tree_fingerprint(tree_fingerprint)
+        updated_at = _format_db_timestamp(datetime.now(UTC))
+        assert updated_at is not None
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE main_verify_remediation_attempts
+                SET consumed_attempt_count = 0,
+                    active_task_id = NULL,
+                    exhausted_at = NULL,
+                    last_consumed_task_id = NULL,
+                    greenlit_while_in_progress_task_id = NULL,
+                    greenlit_while_in_progress_at = NULL,
+                    last_observed_head_sha = COALESCE(?, main_verify_remediation_attempts.last_observed_head_sha),
+                    last_observed_failure = NULL,
+                    updated_at = ?
+                WHERE project_id = ?
+                  AND signature = ?
+                  AND tree_fingerprint = ?
+                """,
+                (last_observed_head_sha, updated_at, self._project_id, signature, normalized_fingerprint),
+            )
+
     def record_main_verify_remediation_consumed_attempt(
         self,
         *,

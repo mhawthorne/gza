@@ -15902,6 +15902,57 @@ class TestExecutionProjectResolver:
         assert cleared.last_observed_head_sha == "abc123"
         assert cleared.last_observed_failure == "verify green after rerun"
 
+    def test_main_verify_remediation_reset_ledger_on_green_clears_exhausted_state(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:unit",
+            tree_fingerprint=None,
+            task_id="gza-100",
+        )
+        store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:unit",
+            tree_fingerprint=None,
+            task_id="gza-101",
+        )
+        exhausted = store.mark_main_verify_remediation_exhausted(
+            signature="phase:unit",
+            tree_fingerprint=None,
+        )
+        assert exhausted is not None
+        assert exhausted.exhausted_at is not None
+        assert exhausted.consumed_attempt_count == 2
+
+        store.reset_main_verify_remediation_ledger_on_green(
+            signature="phase:unit",
+            tree_fingerprint=None,
+            last_observed_head_sha="deadbeef",
+        )
+
+        reset_state = store.get_main_verify_remediation_attempt_state(
+            signature="phase:unit",
+            tree_fingerprint=None,
+        )
+        assert reset_state is not None
+        assert reset_state.exhausted_at is None
+        assert reset_state.consumed_attempt_count == 0
+        assert reset_state.active_task_id is None
+        assert reset_state.last_consumed_task_id is None
+        assert reset_state.last_observed_head_sha == "deadbeef"
+
+        # A later, unrelated phase:unit failure must not inherit the old exhaustion.
+        reconsumed = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:unit",
+            tree_fingerprint=None,
+            task_id="gza-200",
+        )
+        assert reconsumed is not None
+        assert reconsumed.consumed_attempt_count == 1
+        assert reconsumed.exhausted_at is None
+
     def test_main_verify_remediation_consumed_attempt_is_idempotent_for_same_task(
         self, tmp_path: Path
     ) -> None:
