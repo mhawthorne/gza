@@ -22254,65 +22254,75 @@ def cmd_watch(args: argparse.Namespace) -> int:
             if excluded_owner_ids != excluded_owner_ids_before_boundary:
                 pending_first_cycle_plan = None
 
-            if scoped_owner_ids is not None:
-                cycle_result = _dispatch_scoped_watch_once(
-                    config=runtime.config,
-                    store=runtime.store,
-                    batch=batch,
-                    max_iterations=max_iterations,
-                    dry_run=dry_run,
-                    quiet=quiet,
-                    suppress_main_verify_stdout=suppress_main_verify_stdout,
-                    log=runtime.log,
-                    tags=runtime.tags,
-                    any_tag=runtime.any_tag,
-                    recovery_slots=recovery_slots,
-                    recovery_mode=dispatch_mode,
-                    max_recovery_attempts=max_recovery_attempts,
-                    show_skipped=show_skipped,
-                    auto_restart_on_drift=auto_restart_on_drift,
-                    installed_package_drift=installed_package_drift,
-                    precomputed_plan=pending_first_cycle_plan,
-                    begin_cycle=not preview_cycle_open,
-                    end_cycle=True,
-                    emit_cycle_header=not preview_cycle_open,
-                    emit_lifecycle_summary=not preview_cycle_open,
-                    scoped_owner_ids=scoped_owner_ids,
-                    scoped_task_ids=raw_task_ids,
-                    known_effective_scoped_owner_ids=effective_scoped_owner_ids,
-                    excluded_owner_ids=excluded_owner_ids,
-                    seen_active_recovery_subject_ids=runtime.seen_active_recovery_subject_ids,
-                    git=runtime.git,
-                    runtime_context=runtime.runtime_context,
-                    worker_heartbeat=worker_heartbeat,
-                    restart_checkpoint=_single_project_restart_checkpoint,
-                )
-            else:
-                cycle_result = runtime.run_cycle(
-                    batch=batch,
-                    max_iterations=max_iterations,
-                    dry_run=dry_run,
-                    quiet=quiet,
-                    suppress_main_verify_stdout=suppress_main_verify_stdout,
-                    recovery_slots=recovery_slots,
-                    recovery_mode=dispatch_mode,
-                    max_recovery_attempts=max_recovery_attempts,
-                    show_skipped=show_skipped,
-                    auto_restart_on_drift=auto_restart_on_drift,
-                    installed_package_drift=installed_package_drift,
-                    precomputed_plan=pending_first_cycle_plan,
-                    begin_cycle=not preview_cycle_open,
-                    end_cycle=True,
-                    emit_cycle_header=not preview_cycle_open,
-                    emit_lifecycle_summary=not preview_cycle_open,
-                    scoped_owner_ids=scoped_owner_ids,
-                    scoped_task_ids=raw_task_ids if scoped_owner_ids is not None else None,
-                    known_effective_scoped_owner_ids=effective_scoped_owner_ids,
-                    excluded_owner_ids=excluded_owner_ids,
-                    seen_active_recovery_subject_ids=runtime.seen_active_recovery_subject_ids,
-                    worker_heartbeat=worker_heartbeat,
-                    restart_checkpoint=_single_project_restart_checkpoint,
-                )
+            try:
+                if scoped_owner_ids is not None:
+                    cycle_result = _dispatch_scoped_watch_once(
+                        config=runtime.config,
+                        store=runtime.store,
+                        batch=batch,
+                        max_iterations=max_iterations,
+                        dry_run=dry_run,
+                        quiet=quiet,
+                        suppress_main_verify_stdout=suppress_main_verify_stdout,
+                        log=runtime.log,
+                        tags=runtime.tags,
+                        any_tag=runtime.any_tag,
+                        recovery_slots=recovery_slots,
+                        recovery_mode=dispatch_mode,
+                        max_recovery_attempts=max_recovery_attempts,
+                        show_skipped=show_skipped,
+                        auto_restart_on_drift=auto_restart_on_drift,
+                        installed_package_drift=installed_package_drift,
+                        precomputed_plan=pending_first_cycle_plan,
+                        begin_cycle=not preview_cycle_open,
+                        end_cycle=True,
+                        emit_cycle_header=not preview_cycle_open,
+                        emit_lifecycle_summary=not preview_cycle_open,
+                        scoped_owner_ids=scoped_owner_ids,
+                        scoped_task_ids=raw_task_ids,
+                        known_effective_scoped_owner_ids=effective_scoped_owner_ids,
+                        excluded_owner_ids=excluded_owner_ids,
+                        seen_active_recovery_subject_ids=runtime.seen_active_recovery_subject_ids,
+                        git=runtime.git,
+                        runtime_context=runtime.runtime_context,
+                        worker_heartbeat=worker_heartbeat,
+                        restart_checkpoint=_single_project_restart_checkpoint,
+                    )
+                else:
+                    cycle_result = runtime.run_cycle(
+                        batch=batch,
+                        max_iterations=max_iterations,
+                        dry_run=dry_run,
+                        quiet=quiet,
+                        suppress_main_verify_stdout=suppress_main_verify_stdout,
+                        recovery_slots=recovery_slots,
+                        recovery_mode=dispatch_mode,
+                        max_recovery_attempts=max_recovery_attempts,
+                        show_skipped=show_skipped,
+                        auto_restart_on_drift=auto_restart_on_drift,
+                        installed_package_drift=installed_package_drift,
+                        precomputed_plan=pending_first_cycle_plan,
+                        begin_cycle=not preview_cycle_open,
+                        end_cycle=True,
+                        emit_cycle_header=not preview_cycle_open,
+                        emit_lifecycle_summary=not preview_cycle_open,
+                        scoped_owner_ids=scoped_owner_ids,
+                        scoped_task_ids=raw_task_ids if scoped_owner_ids is not None else None,
+                        known_effective_scoped_owner_ids=effective_scoped_owner_ids,
+                        excluded_owner_ids=excluded_owner_ids,
+                        seen_active_recovery_subject_ids=runtime.seen_active_recovery_subject_ids,
+                        worker_heartbeat=worker_heartbeat,
+                        restart_checkpoint=_single_project_restart_checkpoint,
+                    )
+            except Exception as exc:
+                for message in _watch_exception_messages("watch cycle failed", exc):
+                    cleanup_errors.extend(_emit_watch_error_safely(runtime.log, quiet, message))
+                pending_first_cycle_plan = None
+                preview_cycle_open = False
+                if stop_requested:
+                    break
+                _sleep_interruptibly(poll, _watch_sleep_stop_requested)
+                continue
             pending_first_cycle_plan = None
             preview_cycle_open = False
             effective_scoped_owner_ids = cycle_result.effective_scoped_owner_ids or scoped_owner_ids
