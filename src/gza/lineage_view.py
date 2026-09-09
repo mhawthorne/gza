@@ -82,7 +82,13 @@ class LineageView:
             return [self._task]
         unit = self._store.resolve_merge_unit_for_task(self._task.id)
         if unit is None:
-            unit = self._store.get_or_create_merge_unit_for_task(self._task)
+            try:
+                unit = self._store.get_or_create_merge_unit_for_task(self._task)
+            except ValueError:
+                # Read-only lineage lookup: a merge unit whose only implement was
+                # dropped (e.g. superseded by a new implement) has no resolvable
+                # tip yet. Fall back to the bare task rather than propagating.
+                unit = self._store.resolve_merge_unit_for_task(self._task.id)
         if unit is None:
             return [self._task]
         self._merge_unit = unit
@@ -93,7 +99,10 @@ class LineageView:
         if unit is None and self._task is not None and self._task.id is not None:
             unit = self._store.resolve_merge_unit_for_task(self._task.id)
             if unit is None:
-                unit = self._store.get_or_create_merge_unit_for_task(self._task)
+                try:
+                    unit = self._store.get_or_create_merge_unit_for_task(self._task)
+                except ValueError:
+                    unit = self._store.resolve_merge_unit_for_task(self._task.id)
             self._merge_unit = unit
         if unit is None:
             return self._task if self._task is not None and self._task.task_type == "implement" else None
