@@ -349,9 +349,13 @@ def build_watch_progress_candidate(
     )
 
 
-def build_watch_no_progress_attention_action(*, subject_task_id: str, action_type: str, streak: int) -> dict[str, Any]:
+def build_watch_no_progress_attention_action(
+    *, subject_task_id: str, action_type: str, streak: int, action_reason: str | None = None
+) -> dict[str, Any]:
     """Build the shared parked attention action for repeated watch no-progress loops."""
     label = action_type.replace("_", " ") if action_type else "action"
+    if action_reason:
+        label = f"{label} ({action_reason})"
     return {
         "type": "skip",
         "description": (
@@ -395,6 +399,7 @@ def get_active_watch_no_progress_attention(
         subject_task_id=candidate.subject_task_id,
         action_type=candidate.action_type,
         streak=observation.streak,
+        action_reason=candidate.action_reason,
     )
 
 
@@ -768,6 +773,7 @@ def observe_watch_progress_and_maybe_park(
         subject_task_id=candidate.subject_task_id,
         action_type=candidate.action_type,
         streak=streak,
+        action_reason=candidate.action_reason,
     )
 
 
@@ -918,6 +924,7 @@ def finalize_background_watch_execution(
         subject_task_id=candidate.subject_task_id,
         action_type=candidate.action_type,
         streak=streak,
+        action_reason=candidate.action_reason,
     )
 
 

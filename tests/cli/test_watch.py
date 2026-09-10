@@ -52165,7 +52165,7 @@ def test_watch_cycle_pending_no_live_proof_emits_attention_at_no_progress_backst
     assert "ATTENTION" in text
     assert "Needs attention (1 unit):" in text
     assert f"START_UNDISPATCHED {pending.id} implement: dispatch did not reach live slot occupancy" in text
-    assert "watch selected the same iterate action without durable progress for 2 cycles" in text
+    assert "watch selected the same iterate (pending queue iterate) action without durable progress for 2 cycles" in text
 
 
 def test_watch_cycle_pending_live_implement_emits_single_start_line(tmp_path: Path) -> None:
