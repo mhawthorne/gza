@@ -32,6 +32,7 @@ from ..concurrency import (
 from ..config import Config, ConfigError
 from ..cross_project import task_is_cross_project
 from ..db import DuplicateActiveChildError, SqliteTaskStore, Task as DbTask
+from ..lifecycle_completion import RetryTargetLineageResolvedError
 from ..flaky_investigations import create_or_reuse_flaky_investigations
 from ..git import Git, GitError
 from ..plan_review_verdict import PlanReviewManifest
@@ -1029,6 +1030,24 @@ def _task_creation_config_error_result(
         status="error",
         execution_phase="worker_launch",
         message=str(exc),
+        worker_consuming=False,
+        work_done=False,
+    )
+
+
+def _skip_retry_target_lineage_resolved(
+    *,
+    action_type: str,
+    permit: LaunchPermit | None,
+    exc: RetryTargetLineageResolvedError,
+) -> AdvanceActionExecutionResult:
+    if permit is not None:
+        permit.release()
+    return AdvanceActionExecutionResult(
+        action_type=action_type,
+        status="skip",
+        execution_phase="worker_launch",
+        message=f"SKIP: {exc}",
         worker_consuming=False,
         work_done=False,
     )
@@ -3277,6 +3296,12 @@ def execute_advance_action(
                     exc=exc,
                     task=failed_improve,
                 )
+            except RetryTargetLineageResolvedError as exc:
+                return _skip_retry_target_lineage_resolved(
+                    action_type=action_type,
+                    permit=permit,
+                    exc=exc,
+                )
             except ConfigError as exc:
                 return _task_creation_config_error_result(
                     action_type=action_type,
@@ -3581,6 +3606,12 @@ def execute_advance_action(
                     permit=permit,
                     exc=exc,
                     task=task_to_retry,
+                )
+            except RetryTargetLineageResolvedError as exc:
+                return _skip_retry_target_lineage_resolved(
+                    action_type=action_type,
+                    permit=permit,
+                    exc=exc,
                 )
             except ConfigError as exc:
                 return _task_creation_config_error_result(

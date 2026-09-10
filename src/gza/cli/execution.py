@@ -77,7 +77,10 @@ from ..extractions import (
 )
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git
-from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle
+from ..lifecycle_completion import (
+    RetryTargetLineageResolvedError,
+    merge_state_is_terminal_for_lifecycle,
+)
 from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
 from ..merge_state import effective_no_work_merge_state, resolve_task_merge_state_for_target
@@ -3453,6 +3456,10 @@ def cmd_retry(args: argparse.Namespace) -> int:
             args,
             format_duplicate_active_child_message(exc, parent_task_id=task_id, task=task),
         )
+    except RetryTargetLineageResolvedError as exc:
+        if isinstance(reserved_launch, LaunchPermit):
+            reserved_launch.release()
+        return phase1_error(args, str(exc))
     except ConfigError as exc:
         if isinstance(reserved_launch, LaunchPermit):
             reserved_launch.release()

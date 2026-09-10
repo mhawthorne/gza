@@ -7,6 +7,10 @@ from .db import Task
 TERMINAL_MERGE_STATES = frozenset({"merged", "empty", "redundant"})
 
 
+class RetryTargetLineageResolvedError(ValueError):
+    """Raised when a retry/resume clone is requested for an already-resolved lineage."""
+
+
 def merge_state_is_terminal_for_lifecycle(merge_state: str | None) -> bool:
     """Return whether merge state means no more merge work remains."""
     return merge_state in TERMINAL_MERGE_STATES

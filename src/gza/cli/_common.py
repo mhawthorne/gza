@@ -52,6 +52,7 @@ from ..db import (
     SqliteTaskStore,
     StoreOpenMode,
     Task as DbTask,
+    merge_unit_is_active,
     merge_unit_membership_role,
     resolve_task_id,
     task_id_numeric_key,
@@ -60,7 +61,12 @@ from ..db import (
 from ..derived_tags import resolve_derived_task_tags
 from ..failure_policy import is_resumable_failure_reason
 from ..failure_reasons import mark_task_failed_from_cause
+from ..lifecycle_completion import (
+    RetryTargetLineageResolvedError,
+    merge_state_is_terminal_for_lifecycle,
+)
 from ..lineage import resolve_impl_task
+from ..merge_state import effective_no_work_merge_state
 from ..log_paths import ops_log_path_for
 from ..operator_state import blocked_dependency_error_message, inspect_empty_merge_unit
 from ..plan_review_materialization import (
@@ -4198,6 +4204,16 @@ def _create_retry_task(
     and automatic recovery.
     """
     assert original_task.id is not None
+    if store.supports_merge_units():
+        original_unit = _resolve_retry_merge_unit_read_only(store, original_task)
+        if original_unit is not None and merge_unit_is_active(original_unit):
+            unit_state = effective_no_work_merge_state(original_task, original_unit.state)
+            if merge_state_is_terminal_for_lifecycle(unit_state):
+                raise RetryTargetLineageResolvedError(
+                    f"retry for {original_task.id} refused: owner merge unit {original_unit.id} "
+                    f"is already resolved (state={unit_state}); the lineage has moved on "
+                    "and a retry would clone a dead prompt against a stale epoch."
+                )
     retry_same_branch = original_task.same_branch
     retry_base_branch: str | None = None
     retry_branch = original_task.branch
@@ -4304,6 +4320,25 @@ def format_duplicate_active_child_message(
     if active_child.id:
         return f"{label} already pending/in progress: {active_child.id}"
     return f"{label} already pending/in progress"
+
+
+def _resolve_retry_merge_unit_read_only(store: SqliteTaskStore, original_task: DbTask):
+    """Resolve an already-existing owner merge unit without creating one.
+
+    Used to pre-flight whether a retry target's lineage has already resolved
+    (merged/empty/redundant). Deliberately avoids the get-or-create fallbacks
+    in ``_resolve_retry_merge_unit`` so this check has no side effects on
+    tasks that don't yet have a merge unit at all.
+    """
+    assert original_task.id is not None
+    attached_unit = store.resolve_merge_unit_for_task(original_task.id)
+    if attached_unit is not None:
+        return attached_unit
+    if original_task.task_type in {"improve", "fix", "review"}:
+        impl_task, err = resolve_impl_task(store, original_task.id)
+        if err is None and impl_task is not None and impl_task.id is not None:
+            return store.resolve_merge_unit_for_task(impl_task.id)
+    return None
 
 
 def _resolve_retry_merge_unit(store: SqliteTaskStore, original_task: DbTask):
