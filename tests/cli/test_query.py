@@ -9424,7 +9424,8 @@ class TestShowCommand:
 
         output = capsys.readouterr().out
         assert exit_code == 0
-        assert "Lifecycle: needs rebase" in output
+        normalized = " ".join(output.split())
+        assert "Lifecycle: rebase before run_review" in normalized
 
     def test_show_lifecycle_labels_capped_merge_and_defer(self, tmp_path: Path) -> None:
         setup_config(tmp_path)

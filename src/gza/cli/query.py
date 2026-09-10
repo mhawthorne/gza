@@ -634,7 +634,11 @@ def _summarize_lifecycle(
             detail = "completed, ready to merge"
         return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="completed")
     if action_type == "needs_rebase":
-        detail = "needs rebase"
+        description = str(action.get("description", "")).strip()
+        if description:
+            detail = description[0].lower() + description[1:]
+        else:
+            detail = "needs rebase"
         return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="default")
     if action_type == "wait_improve":
         improve_task = action.get("improve_task")
