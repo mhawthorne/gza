@@ -66,6 +66,7 @@ _REBASE_INFRA_LOG_MARKERS = (
     "invalid path '/gza-git'",
     "/gza-git/",
     "worktree metadata became unavailable",
+    "- not a valid ref",
 )
 RETRY_LIMIT_REACHED_ATTENTION_REASON = "retry-limit-reached"
 

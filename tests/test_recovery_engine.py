@@ -2899,6 +2899,33 @@ def test_recovery_engine_historical_rebase_readonly_db_failure_retries(tmp_path:
     )
 
 
+def test_recovery_engine_rebase_missing_local_default_branch_ref_retries(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, task_type="rebase", reason="GIT_ERROR", session_id=None)
+    task.log_file = "logs/rebase-missing-main-ref.log"
+    store.update(task)
+
+    log_path = tmp_path / task.log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "git -C /workspace show-ref --verify refs/heads/main\n"
+        "fatal: 'refs/heads/main' - not a valid ref\n"
+    )
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "retry"
+    assert decision.reason_code == "INFRASTRUCTURE_ERROR"
+    assert decision.reason_text == "INFRASTRUCTURE_ERROR restart with fresh attempt"
+    assert (
+        get_failed_recovery_needs_attention_reason(
+            store,
+            task,
+            decision=decision,
+            max_recovery_attempts=1,
+        )
+        is None
+    )
+
+
 def test_recovery_engine_historical_rebase_success_log_records_completed_success(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, task_type="rebase", reason="GIT_ERROR", session_id=None)
     task.log_file = "logs/rebase-success.log"
