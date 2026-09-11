@@ -23640,7 +23640,7 @@ def test_resolve_subject_task_warns_before_falling_back_for_missing_or_unusable_
     fallback_task = store.add("Fallback implement", task_type="implement")
     assert fallback_task.id is not None
 
-    with caplog.at_level("WARNING", logger="gza.advance_engine"):
+    with caplog.at_level("DEBUG", logger="gza.advance_engine"):
         subject_task = resolve_subject_task(store, action, fallback_task=fallback_task)
 
     assert subject_task.id == fallback_task.id

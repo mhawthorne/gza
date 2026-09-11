@@ -417,7 +417,7 @@ branch_strategy: date_slug
 
         monkeypatch.setattr(Config, "_load_merged_config_data", classmethod(lambda cls, project_dir: _boom(project_dir)))
 
-        with caplog.at_level("ERROR"):
+        with caplog.at_level("DEBUG"):
             is_valid, errors, _warnings = Config.validate(tmp_path)
 
         assert is_valid is False

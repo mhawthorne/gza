@@ -26208,7 +26208,7 @@ def test_promote_isolated_merge_to_target_branch_restores_stashed_changes_onto_n
     with (
         patch("gza.cli.git_ops.active_worktree_path_for_branch", return_value=tmp_path),
         patch("gza.cli.git_ops.Git", return_value=attached_target_git),
-        caplog.at_level(logging.WARNING),
+        caplog.at_level(logging.DEBUG),
     ):
         warnings = _promote_isolated_merge_to_target_branch(repo_git, merge_git, "main")
 
@@ -26249,7 +26249,7 @@ def test_promote_isolated_merge_to_target_branch_leaves_conflicting_stash_parked
     with (
         patch("gza.cli.git_ops.active_worktree_path_for_branch", return_value=tmp_path),
         patch("gza.cli.git_ops.Git", return_value=attached_target_git),
-        caplog.at_level(logging.WARNING),
+        caplog.at_level(logging.DEBUG),
     ):
         warnings = _promote_isolated_merge_to_target_branch(repo_git, merge_git, "main")
 

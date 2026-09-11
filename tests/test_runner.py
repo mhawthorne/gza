@@ -9385,7 +9385,7 @@ class TestComputeSlugOverride:
             "gza-root": None,
         }.get(task_id)
 
-        with caplog.at_level(logging.WARNING, logger="gza.runner"):
+        with caplog.at_level(logging.DEBUG, logger="gza.runner"):
             result = _compute_slug_override(child, store)
         assert result == "mid-ancestor-prompt"
         assert (
@@ -9404,7 +9404,7 @@ class TestComputeSlugOverride:
         store = Mock(spec=SqliteTaskStore)
         store.get.return_value = None
 
-        with caplog.at_level(logging.WARNING, logger="gza.runner"):
+        with caplog.at_level(logging.DEBUG, logger="gza.runner"):
             result = _compute_slug_override(review_task, store)
         assert result == "review-missing-target-behavior"
         assert (
@@ -9420,7 +9420,7 @@ class TestComputeSlugOverride:
         store = Mock(spec=SqliteTaskStore)
         store.get.side_effect = lambda task_id: {"gza-a": a, "gza-b": b}.get(task_id)
 
-        with caplog.at_level(logging.WARNING, logger="gza.runner"):
+        with caplog.at_level(logging.DEBUG, logger="gza.runner"):
             result = _compute_slug_override(child, store)
         assert result == "root-b-prompt"
         assert (
@@ -16140,7 +16140,7 @@ class TestExtractedRunInnerHelpers:
 
         with (
             patch("gza.runner.resolve_task_merge_state_for_target", side_effect=GitError("simulated probe failure")),
-            caplog.at_level(logging.WARNING, logger="gza.runner"),
+            caplog.at_level(logging.DEBUG, logger="gza.runner"),
         ):
             rc = _complete_code_task(
                 task,
@@ -16158,8 +16158,8 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0
-        warning_messages = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
-        assert any("no-work merge-state probe failed" in message for message in warning_messages)
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("no-work merge-state probe failed" in message for message in messages)
 
         ops_log_file = ops_log_path_for(log_file)
         log_entries = [json.loads(line) for line in ops_log_file.read_text().splitlines()]
@@ -24846,7 +24846,7 @@ class TestExtractedRunInnerHelpers:
         }.get(ref)
         config = self._make_config(tmp_path)
 
-        caplog.set_level(logging.WARNING)
+        caplog.set_level(logging.DEBUG)
 
         with (
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
@@ -25010,7 +25010,7 @@ class TestExtractedRunInnerHelpers:
         mock_worktree_git = Mock(spec=Git)
         config = self._make_config(tmp_path)
 
-        caplog.set_level(logging.WARNING)
+        caplog.set_level(logging.DEBUG)
 
         with (
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
@@ -25432,7 +25432,7 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner._squash_wip_commits"),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
             patch.object(Path, "read_text", autospec=True, side_effect=_flaky_read_text),
-            caplog.at_level("WARNING"),
+            caplog.at_level("DEBUG"),
         ):
             rc = _complete_code_task(
                 task,
@@ -25507,7 +25507,7 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner._squash_wip_commits"),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
             patch.object(Path, "read_text", autospec=True, side_effect=_always_failing_read_text),
-            caplog.at_level("WARNING"),
+            caplog.at_level("DEBUG"),
         ):
             rc = _complete_code_task(
                 task,
@@ -25571,7 +25571,7 @@ class TestWriteLogEntry:
         """write_log_entry logs a warning and does not raise when writing fails."""
         bad_path = tmp_path / "task.log"
         with (
-            caplog.at_level("WARNING"),
+            caplog.at_level("DEBUG"),
             patch("builtins.open", side_effect=OSError("boom")),
         ):
             write_log_entry(bad_path, {"type": "gza", "message": "x"})

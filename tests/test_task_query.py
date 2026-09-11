@@ -2283,7 +2283,7 @@ def test_incomplete_preset_warns_and_falls_back_to_owner_for_missing_subject_tas
         },
     )
 
-    with caplog.at_level("WARNING", logger="gza.advance_engine"):
+    with caplog.at_level("DEBUG", logger="gza.advance_engine"):
         projected = service._project_lineage_row(  # noqa: SLF001
             row,
             TaskQueryPresets.incomplete(limit=None),

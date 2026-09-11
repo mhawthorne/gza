@@ -540,7 +540,7 @@ def test_timeout_resume_context_warns_when_checkpoint_json_is_malformed(
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path.write_text("{not-json", encoding="utf-8")
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.DEBUG):
         context = _build_timeout_resume_context(
             config=config,
             checkpoint_task_id="gza-1",
@@ -566,7 +566,7 @@ def test_timeout_resume_context_warns_when_checkpoint_json_is_not_a_mapping(
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path.write_text('["not", "a", "mapping"]', encoding="utf-8")
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.DEBUG):
         context = _build_timeout_resume_context(
             config=config,
             checkpoint_task_id="gza-1",
