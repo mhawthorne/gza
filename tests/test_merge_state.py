@@ -209,7 +209,7 @@ def test_resolve_task_merge_state_keeps_merged_when_empty_probe_is_indeterminate
     refreshed = store.get(task.id)
     assert refreshed is not None
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("DEBUG"):
         result = resolve_task_merge_state_for_target(
             store=store,
             task=refreshed,
@@ -336,7 +336,7 @@ def test_classify_zero_unique_commits_with_task_commits_fails_closed_without_tre
     warning_text: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("DEBUG"):
         result = classify_branch_merge_state_for_target(
             git=git,
             source_branch="feature/redundant",
@@ -635,7 +635,7 @@ def test_classify_proven_merged_state_keeps_merged_without_tree_proof(
     warning_text: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("DEBUG"):
         result = classify_proven_merged_state(
             git=git,
             source_ref="feature/merged",
@@ -652,7 +652,7 @@ def test_classify_proven_merged_state_keeps_merged_without_tree_proof(
 def test_classify_proven_merged_state_returns_redundant_for_task_commits_when_side_branch_probe_fails(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("DEBUG"):
         result = classify_proven_merged_state(
             git=_FakeGit(
                 ref_shas={"feature/merged": "branch-tip-sha", "main": "merge-commit-sha"},
@@ -673,7 +673,7 @@ def test_classify_proven_merged_state_returns_redundant_for_task_commits_when_si
 def test_classify_proven_merged_state_returns_empty_for_no_commit_branch_when_probe_fails(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("DEBUG"):
         result = classify_proven_merged_state(
             git=_FakeGit(
                 ref_shas={"feature/empty": "branch-tip-sha", "main": "merge-commit-sha"},
@@ -707,7 +707,7 @@ def test_classify_proven_merged_state_returns_empty_for_no_commit_branch_when_pr
                 raise AttributeError(name)
             return getattr(self._delegate, name)
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("DEBUG"):
         result = classify_proven_merged_state(
             git=_GitWithoutFirstParentProbe(),
             source_ref="feature/empty",
@@ -736,7 +736,7 @@ def test_classify_proven_merged_state_returns_redundant_for_task_commits_when_pr
                 raise AttributeError(name)
             return getattr(self._delegate, name)
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("DEBUG"):
         result = classify_proven_merged_state(
             git=_GitWithoutFirstParentProbe(),
             source_ref="feature/redundant",
@@ -837,7 +837,7 @@ def test_classify_content_equivalent_terminal_states_respect_recorded_head_guard
 def test_classify_zero_unique_commits_returns_redundant_when_side_branch_probe_fails(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("DEBUG"):
         result = classify_branch_merge_state_for_target(
             git=_FakeGit(
                 source_ref="feature/redundant",
@@ -861,7 +861,7 @@ def test_classify_zero_unique_commits_returns_redundant_when_side_branch_probe_f
 def test_classify_zero_unique_commits_returns_empty_for_no_commit_branch_when_probe_fails(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("DEBUG"):
         result = classify_branch_merge_state_for_target(
             git=_FakeGit(
                 source_ref="feature/empty",
@@ -900,7 +900,7 @@ def test_classify_zero_unique_commits_returns_empty_for_no_commit_branch_when_pr
                 raise AttributeError(name)
             return getattr(self._delegate, name)
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("DEBUG"):
         result = classify_branch_merge_state_for_target(
             git=_GitWithoutFirstParentProbe(),
             source_branch="feature/empty",
@@ -932,7 +932,7 @@ def test_classify_zero_unique_commits_returns_redundant_when_side_branch_probe_m
                 raise AttributeError(name)
             return getattr(self._delegate, name)
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("DEBUG"):
         result = classify_branch_merge_state_for_target(
             git=_GitWithoutFirstParentProbe(),
             source_branch="feature/redundant",
@@ -1338,7 +1338,7 @@ def test_resolve_task_merge_state_does_not_log_merge_source_warning_side_effect(
 
     warning = "Could not resolve freshest merge source for branch 'feature/diverged' against 'main': local/origin diverged"
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("DEBUG"):
         state = resolve_task_merge_state_for_target(
             store=store,
             task=task,
@@ -1448,7 +1448,7 @@ def test_classify_branch_merge_state_returns_unknown_without_persisted_state_for
 def test_classify_branch_merge_state_uses_persisted_merged_when_source_is_unresolvable_locally(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("DEBUG"):
         result = classify_branch_merge_state_for_target(
             git=_MergeSourceResolverGit(
                 local_branches=set(),

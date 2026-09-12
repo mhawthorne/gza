@@ -2269,7 +2269,7 @@ def test_revalidate_terminal_no_work_merge_units_leaves_unresolvable_recorded_he
     git.cached.return_value = nullcontext()
     git.rev_parse_if_exists.return_value = None
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("DEBUG"):
         results = revalidate_terminal_no_work_merge_units(store, git)
 
     assert len(results) == 1

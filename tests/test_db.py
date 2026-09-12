@@ -5376,7 +5376,7 @@ class TestMergeStatus:
         store.mark_completed(task, has_commits=True, branch="feature/test")
         store.set_merge_status(task.id, None)
 
-        with caplog.at_level("WARNING"):
+        with caplog.at_level("DEBUG"):
             migrate_merge_status(store, FakeGit())
 
         updated = store.get(task.id)

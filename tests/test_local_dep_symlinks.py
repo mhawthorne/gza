@@ -170,7 +170,7 @@ class TestIdempotency:
         link.symlink_to(wrong_target)
 
         config = make_config(project_dir)
-        with caplog.at_level(logging.WARNING, logger="gza.runner"):
+        with caplog.at_level(logging.DEBUG, logger="gza.runner"):
             _create_local_dep_symlinks(config, worktree)
 
         # Still points to wrong target (not overwritten)
@@ -194,7 +194,7 @@ class TestIdempotency:
         real_dir.mkdir()
 
         config = make_config(project_dir)
-        with caplog.at_level(logging.WARNING, logger="gza.runner"):
+        with caplog.at_level(logging.DEBUG, logger="gza.runner"):
             _create_local_dep_symlinks(config, worktree)
 
         assert real_dir.is_dir() and not real_dir.is_symlink()
