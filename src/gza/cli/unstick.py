@@ -236,7 +236,11 @@ def cmd_unstick(args: argparse.Namespace) -> int:
         select_all=select_all,
     )
 
-    print(f"Selected {len(result.selected)} parked owner(s)")
+    # ``selected`` also carries explicitly named owners with no current park. Those are
+    # not no-ops -- unstick can still rearm and re-verify them -- so they belong in the
+    # count. Only the "parked" claim needs qualifying.
+    parked_selected = sum(1 for entry in result.selected if entry.current_candidate is not None)
+    print(f"Selected {len(result.selected)} owner(s) ({parked_selected} currently parked)")
     if result.stale_backstop_cleared:
         print(f"Cleared {result.stale_backstop_cleared} stale backstop park(s) before selection")
 
