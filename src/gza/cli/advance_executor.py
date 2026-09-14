@@ -32,9 +32,9 @@ from ..concurrency import (
 from ..config import Config, ConfigError
 from ..cross_project import task_is_cross_project
 from ..db import DuplicateActiveChildError, SqliteTaskStore, Task as DbTask
-from ..lifecycle_completion import RetryTargetLineageResolvedError
 from ..flaky_investigations import create_or_reuse_flaky_investigations
 from ..git import Git, GitError
+from ..lifecycle_completion import RetryTargetLineageResolvedError
 from ..plan_review_verdict import PlanReviewManifest
 from ..query import resolve_lineage_owner_task
 from ..recovery_engine import FailedRecoveryDecision, get_failed_recovery_needs_attention_reason

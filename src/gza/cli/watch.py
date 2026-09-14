@@ -86,6 +86,7 @@ from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git, Git as ProductionGit, GitError, resolve_ref_if_possible
 from ..git_health import GIT_HEALTH_PROMPT, GIT_HEALTH_REASON, check_git_health
 from ..lifecycle_completion import (
+    RetryTargetLineageResolvedError,
     merge_state_is_terminal_for_lifecycle,
     task_is_complete_for_lifecycle,
 )
@@ -20326,6 +20327,16 @@ def _run_cycle(
                             "SKIP",
                             f"{failed.id}: {detail}",
                             dedupe_key=f"recovery-retry-config:{failed.id}",
+                        )
+                        continue
+                    except RetryTargetLineageResolvedError as exc:
+                        reserved_launch.release()
+                        detail = str(exc)
+                        _observe_dispatch(row.owner_task.id, "launch_blocked", recovery_action_type, detail)
+                        log.emit(
+                            "SKIP",
+                            f"{failed.id}: {detail}",
+                            dedupe_key=f"recovery-retry-lineage-resolved:{failed.id}",
                         )
                         continue
                     except Exception:

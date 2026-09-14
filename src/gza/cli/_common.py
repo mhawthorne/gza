@@ -66,8 +66,8 @@ from ..lifecycle_completion import (
     merge_state_is_terminal_for_lifecycle,
 )
 from ..lineage import resolve_impl_task
-from ..merge_state import effective_no_work_merge_state
 from ..log_paths import ops_log_path_for
+from ..merge_state import effective_no_work_merge_state
 from ..operator_state import blocked_dependency_error_message, inspect_empty_merge_unit
 from ..plan_review_materialization import (
     PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
@@ -4208,7 +4208,7 @@ def _create_retry_task(
         original_unit = _resolve_retry_merge_unit_read_only(store, original_task)
         if original_unit is not None and merge_unit_is_active(original_unit):
             unit_state = effective_no_work_merge_state(original_task, original_unit.state)
-            if merge_state_is_terminal_for_lifecycle(unit_state):
+            if original_task.has_commits and merge_state_is_terminal_for_lifecycle(unit_state):
                 raise RetryTargetLineageResolvedError(
                     f"retry for {original_task.id} refused: owner merge unit {original_unit.id} "
                     f"is already resolved (state={unit_state}); the lineage has moved on "
