@@ -4205,10 +4205,14 @@ def _create_retry_task(
     """
     assert original_task.id is not None
     if store.supports_merge_units():
-        original_unit = _resolve_retry_merge_unit_read_only(store, original_task)
+        original_unit = _resolve_retry_merge_unit_read_only(
+            store,
+            original_task,
+            include_attached_terminal=automatic_recovery,
+        )
         if original_unit is not None and merge_unit_is_active(original_unit):
             unit_state = effective_no_work_merge_state(original_task, original_unit.state)
-            if original_task.has_commits and merge_state_is_terminal_for_lifecycle(unit_state):
+            if merge_state_is_terminal_for_lifecycle(unit_state):
                 raise RetryTargetLineageResolvedError(
                     f"retry for {original_task.id} refused: owner merge unit {original_unit.id} "
                     f"is already resolved (state={unit_state}); the lineage has moved on "
@@ -4322,7 +4326,12 @@ def format_duplicate_active_child_message(
     return f"{label} already pending/in progress"
 
 
-def _resolve_retry_merge_unit_read_only(store: SqliteTaskStore, original_task: DbTask):
+def _resolve_retry_merge_unit_read_only(
+    store: SqliteTaskStore,
+    original_task: DbTask,
+    *,
+    include_attached_terminal: bool = False,
+):
     """Resolve an already-existing owner merge unit without creating one.
 
     Used to pre-flight whether a retry target's lineage has already resolved
@@ -4332,8 +4341,13 @@ def _resolve_retry_merge_unit_read_only(store: SqliteTaskStore, original_task: D
     """
     assert original_task.id is not None
     attached_unit = store.resolve_merge_unit_for_task(original_task.id)
-    if attached_unit is not None and attached_unit.owner_task_id == original_task.id:
-        return attached_unit
+    if attached_unit is not None:
+        if attached_unit.owner_task_id == original_task.id:
+            return attached_unit
+        # A failed same-branch leaf can remain attached to a terminal unit owned
+        # by a different task. That attachment is not proof that the leaf's own
+        # retry target has resolved.
+        _ = include_attached_terminal
     if original_task.task_type in {"improve", "fix", "review"}:
         impl_task, err = resolve_impl_task(store, original_task.id)
         if err is None and impl_task is not None and impl_task.id is not None:

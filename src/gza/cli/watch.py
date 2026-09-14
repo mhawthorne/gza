@@ -20319,16 +20319,6 @@ def _run_cycle(
                             dedupe_key=f"recovery-retry-duplicate:{failed.id}:{exc.active_child.id}",
                         )
                         continue
-                    except ConfigError as exc:
-                        reserved_launch.release()
-                        detail = str(exc)
-                        _observe_dispatch(row.owner_task.id, "launch_blocked", recovery_action_type, detail)
-                        log.emit(
-                            "SKIP",
-                            f"{failed.id}: {detail}",
-                            dedupe_key=f"recovery-retry-config:{failed.id}",
-                        )
-                        continue
                     except RetryTargetLineageResolvedError as exc:
                         reserved_launch.release()
                         detail = str(exc)
@@ -20337,6 +20327,16 @@ def _run_cycle(
                             "SKIP",
                             f"{failed.id}: {detail}",
                             dedupe_key=f"recovery-retry-lineage-resolved:{failed.id}",
+                        )
+                        continue
+                    except ConfigError as exc:
+                        reserved_launch.release()
+                        detail = str(exc)
+                        _observe_dispatch(row.owner_task.id, "launch_blocked", recovery_action_type, detail)
+                        log.emit(
+                            "SKIP",
+                            f"{failed.id}: {detail}",
+                            dedupe_key=f"recovery-retry-config:{failed.id}",
                         )
                         continue
                     except Exception:

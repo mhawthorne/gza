@@ -27,6 +27,7 @@ from gza.config import Config, ConfigError
 from gza.db import DuplicateActiveChildError, SqliteTaskStore, task_id_numeric_key
 from gza.extractions import ExtractionDraft, SourceSelection
 from gza.git import Git
+from gza.lifecycle_completion import RetryTargetLineageResolvedError
 from gza.log_paths import ops_log_path_for
 from gza.query import build_lineage_tree
 from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance
@@ -3437,7 +3438,10 @@ class TestRetryCommand:
         assert retry_unit is not None
         assert retry_unit.id == impl_unit.id
 
-    def test_create_retry_task_same_branch_failed_leaf_ignores_resolved_owner_unit(self, tmp_path: Path):
+    @pytest.mark.parametrize("automatic_recovery", [False, True])
+    def test_create_retry_task_same_branch_failed_leaf_ignores_resolved_owner_unit(
+        self, tmp_path: Path, automatic_recovery: bool
+    ):
         """Retrying a failed same-branch leaf should not treat its landed owner unit as its own resolution."""
         from gza.cli._common import _create_retry_task
 
@@ -3472,12 +3476,50 @@ class TestRetryCommand:
         store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
         store.attach_task_to_merge_unit(leaf.id, owner_unit.id, "same_branch")
 
-        retry_task = _create_retry_task(store, leaf, trigger_source="watch")
+        retry_task = _create_retry_task(
+            store,
+            leaf,
+            trigger_source="watch",
+            automatic_recovery=automatic_recovery,
+        )
 
         assert retry_task.based_on == leaf.id
         assert retry_task.same_branch is False
         assert retry_task.base_branch == "feature/leaf"
         assert retry_task.branch is None
+
+    def test_create_retry_task_refuses_target_with_own_terminal_owner_unit(self, tmp_path: Path):
+        """Automatic recovery should still refuse a target whose own active merge unit is terminal."""
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed owner already landed", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "MAX_TURNS"
+        failed.completed_at = datetime.now(UTC)
+        failed.branch = "feature/failed-owner"
+        failed.has_commits = True
+        store.update(failed)
+
+        owner_unit = store.create_merge_unit(
+            source_branch=str(failed.branch),
+            target_branch="main",
+            owner_task_id=failed.id,
+            state="merged",
+            merged_at=datetime.now(UTC),
+        )
+        store.attach_task_to_merge_unit(failed.id, owner_unit.id, "owner")
+
+        with pytest.raises(RetryTargetLineageResolvedError, match=f"retry for {failed.id} refused"):
+            _create_retry_task(
+                store,
+                failed,
+                trigger_source="watch",
+                automatic_recovery=True,
+            )
 
     @pytest.mark.parametrize("creation_mode", ["automatic", "manual"])
     def test_same_branch_improve_retry_execution_prefers_canonical_branch(self, tmp_path: Path, creation_mode: str):

@@ -20143,6 +20143,154 @@ def test_watch_cycle_executes_only_planned_recovery_ids_and_preserves_pending_sl
     assert any(line.split(maxsplit=2)[1] == "START" and pending_plan.id in line for line in log_text.splitlines())
 
 
+def test_watch_cycle_retry_lineage_resolved_releases_reservation_and_skips_dispatch(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    failed = store.add("Failed retry target whose own unit landed", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PROVIDER_ERROR"
+    failed.completed_at = datetime.now(UTC)
+    failed.branch = "feature/failed-own-unit"
+    failed.has_commits = True
+    store.update(failed)
+    own_unit = store.create_merge_unit(
+        source_branch=str(failed.branch),
+        target_branch="main",
+        owner_task_id=failed.id,
+        state="merged",
+        merged_at=datetime.now(UTC),
+    )
+    store.attach_task_to_merge_unit(failed.id, own_unit.id, "owner")
+
+    row = LineageOwnerRow(
+        owner_task=failed,
+        members=(failed,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="recovery",
+        unresolved_tasks=(failed,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=failed,
+        recovery_leaf_task=failed,
+    )
+    decision = FailedRecoveryDecision(
+        task_id=failed.id,
+        action="retry",
+        reason_code="retry_provider_error",
+        reason_text="Retry failed implementation",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+        recovery_task_id=None,
+        reuse_existing=False,
+    )
+    precomputed_plan = _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=1,
+        slots=1,
+        analysis=_WatchCycleAnalysis(
+            target_branch="main",
+            scope_gaps=(),
+            owner_rows=(row,),
+            watch_read_context=RecoveryReadContext(),
+            lifecycle_rows=(),
+            recovery_rows=(row,),
+            recovery_lane_entry_by_failed_id={},
+            action_plan=(),
+            recovery_attention_rows=(),
+            recovery_visible_skips=(),
+            actionable_failed=(
+                (
+                    row,
+                    failed,
+                    decision,
+                    {"type": "retry", "description": "Retry failed implementation"},
+                    True,
+                    failed,
+                ),
+            ),
+            active_recovery_subject_ids=(),
+        ),
+    )
+    permit = MagicMock()
+    observations: list[tuple[Any, ...]] = []
+
+    def build_preview(*_args: object, **_kwargs: object) -> DispatchPreview:
+        return DispatchPreview(
+            entries=(
+                DispatchPreviewEntry(
+                    lane="recovery",
+                    task=failed,
+                    owner_task=failed,
+                    runnable=True,
+                    worker_consuming=True,
+                    decision=decision,
+                    advance_action={"type": "retry"},
+                    lineage_row=row,
+                ),
+            )
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.build_dispatch_preview", side_effect=build_preview),
+        patch("gza.cli.watch.launch_permit", return_value=permit),
+        patch("gza.cli.watch._create_retry_task", wraps=watch_module._create_retry_task) as create_retry_task,
+        patch(
+            "gza.cli.watch._prepare_task_for_immediate_execution",
+            side_effect=AssertionError("retry worker should not be prepared"),
+        ) as prepare_task,
+        patch(
+            "gza.cli.watch._spawn_background_worker",
+            side_effect=AssertionError("retry worker should not be dispatched"),
+        ) as spawn_worker,
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("retry iterate worker should not be dispatched"),
+        ) as spawn_iterate,
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=AssertionError("settle should not run")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            recovery_slots=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            max_recovery_attempts=config.max_resume_attempts,
+            precomputed_plan=precomputed_plan,
+            dispatch_observer=lambda *args: observations.append(args),
+        )
+
+    assert result.work_done is False
+    create_retry_task.assert_called_once()
+    permit.release.assert_called_once_with()
+    assert len(observations) == 1
+    assert observations[0][:3] == (failed.id, "launch_blocked", "retry")
+    assert f"retry for {failed.id} refused" in str(observations[0][3])
+    skip_lines = [line for line in log_path.read_text().splitlines() if "SKIP" in line]
+    assert len(skip_lines) == 1
+    assert f"retry for {failed.id} refused" in skip_lines[0]
+    assert f"recovery-retry-lineage-resolved:{failed.id}" not in log_path.read_text()
+    prepare_task.assert_not_called()
+    spawn_worker.assert_not_called()
+    spawn_iterate.assert_not_called()
+
+
 def test_watch_dispatch_preview_recovery_preflight_rebase_is_runnable_and_consumes_only_recovery_slot(
     tmp_path: Path,
 ) -> None:
@@ -39031,7 +39179,6 @@ def test_supervisor_budget_allows_one_exact_main_verify_emergency_slot_when_full
 ) -> None:
     runtime = _make_aggregate_runtime(tmp_path / "alpha", project_name="alpha", max_concurrent=1)
     store = runtime.store
-    config = runtime.config
     remediation = _main_verify_remediation_for_test()
     task = store.add(
         _main_verify_remediation_prompt_for_test(),
@@ -68150,13 +68297,14 @@ def test_watch_scoped_canonical_owner_launches_each_failed_leaf_once_with_two_sl
             recovery_slots=2,
         )
 
-    launched_recovery_parents = [
-        store.get(task_id).based_on
-        for task_id in launched_task_ids
-        if store.get(task_id) is not None and store.get(task_id).based_on in {selected.id, sibling.id}
+    recovery_children = [
+        task for task in store.get_all() if task.based_on in {selected.id, sibling.id} and task.id in launched_task_ids
     ]
-    assert launched_recovery_parents.count(selected.id) == 1
-    assert launched_recovery_parents.count(sibling.id) == 1
+    assert {task.based_on for task in recovery_children} == {selected.id, sibling.id}
+    assert len(recovery_children) == 2
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert f"retry for {selected.id} refused" not in log_text
+    assert f"retry for {sibling.id} refused" not in log_text
     assert result.work_done is True
 
 
@@ -68614,12 +68762,12 @@ def test_watch_cycle_refilters_stale_recovery_plan_until_boundary_backoff_expire
         )
 
     assert backed_off.work_done is False
-    assert launched_task_ids
     assert fresh.work_done is True
     recovery_children = [
         task for task in store.get_all() if task.based_on == selected.id and task.id in launched_task_ids
     ]
     assert len(recovery_children) == 1
+    assert f"retry for {selected.id} refused" not in log_path.read_text()
 
 
 def test_watch_scoped_recovery_row_uses_selected_leaf_when_sibling_sorts_first(tmp_path: Path) -> None:
