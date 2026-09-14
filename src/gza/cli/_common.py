@@ -4332,7 +4332,7 @@ def _resolve_retry_merge_unit_read_only(store: SqliteTaskStore, original_task: D
     """
     assert original_task.id is not None
     attached_unit = store.resolve_merge_unit_for_task(original_task.id)
-    if attached_unit is not None:
+    if attached_unit is not None and attached_unit.owner_task_id == original_task.id:
         return attached_unit
     if original_task.task_type in {"improve", "fix", "review"}:
         impl_task, err = resolve_impl_task(store, original_task.id)

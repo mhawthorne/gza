@@ -47,6 +47,36 @@ def test_main_integration_verify_unit_test_passes_ruff_gate(tmp_path: Path) -> N
 
 
 @pytest.mark.timeout(30, method="signal")
+def test_common_cli_module_passes_ruff_gate(tmp_path: Path) -> None:
+    del tmp_path
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [str(_venv_tool(repo_root, "ruff")), "check", "src/gza/cli/_common.py"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.timeout(30, method="signal")
+def test_advance_executor_module_passes_ruff_gate(tmp_path: Path) -> None:
+    del tmp_path
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [str(_venv_tool(repo_root, "ruff")), "check", "src/gza/cli/advance_executor.py"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.timeout(30, method="signal")
 def test_watch_cli_module_passes_mypy_gate(tmp_path: Path) -> None:
     del tmp_path
     repo_root = Path(__file__).resolve().parents[1]

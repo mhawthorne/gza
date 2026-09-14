@@ -3437,6 +3437,48 @@ class TestRetryCommand:
         assert retry_unit is not None
         assert retry_unit.id == impl_unit.id
 
+    def test_create_retry_task_same_branch_failed_leaf_ignores_resolved_owner_unit(self, tmp_path: Path):
+        """Retrying a failed same-branch leaf should not treat its landed owner unit as its own resolution."""
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        owner = store.add("Landed owner", task_type="implement")
+        assert owner.id is not None
+        owner.status = "completed"
+        owner.completed_at = datetime.now(UTC)
+        owner.branch = "feature/owner"
+        owner.has_commits = True
+        store.update(owner)
+
+        leaf = store.add("Failed same-branch leaf", task_type="implement", based_on=owner.id, same_branch=True)
+        assert leaf.id is not None
+        leaf.status = "failed"
+        leaf.failure_reason = "MAX_TURNS"
+        leaf.completed_at = datetime.now(UTC)
+        leaf.branch = "feature/leaf"
+        leaf.has_commits = False
+        leaf.merge_status = "merged"
+        store.update(leaf)
+
+        owner_unit = store.create_merge_unit(
+            source_branch=str(owner.branch),
+            target_branch="main",
+            owner_task_id=owner.id,
+            state="merged",
+            merged_at=datetime.now(UTC),
+        )
+        store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+        store.attach_task_to_merge_unit(leaf.id, owner_unit.id, "same_branch")
+
+        retry_task = _create_retry_task(store, leaf, trigger_source="watch")
+
+        assert retry_task.based_on == leaf.id
+        assert retry_task.same_branch is False
+        assert retry_task.base_branch == "feature/leaf"
+        assert retry_task.branch is None
+
     @pytest.mark.parametrize("creation_mode", ["automatic", "manual"])
     def test_same_branch_improve_retry_execution_prefers_canonical_branch(self, tmp_path: Path, creation_mode: str):
         """Execution should honor the retry's canonical branch instead of a drifted failed-parent branch."""
