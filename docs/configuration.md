@@ -2474,6 +2474,10 @@ uv run gza migrate [--status] [--dry-run] [--yes/-y] [--import-local-db]
 
 When run without flags, `uv run gza migrate` prompts for confirmation before applying migrations. Each migration is atomic (wrapped in BEGIN/COMMIT/ROLLBACK) and creates a pre-migration backup (for example, `<db_path>.backup.pre-v25.db` and `<db_path>.backup.pre-v26.db`). It is safe to re-run: calling it on an already-migrated database is a no-op.
 
+Shared databases have an additional authority gate. A write-capable shared-DB migration must be run from the primary canonical checkout on the configured default branch, with `HEAD` equal to the current local tip of `refs/heads/<default-branch>`, after the migration code has landed there. Running `uv run gza migrate --yes` from a linked worktree, feature branch, detached checkout, or stale default-branch checkout is refused before write-capable database inspection or mutation; the refusal does not create backups or SQLite companion files. Recover by switching to the primary checkout, updating it to the landed default-branch tip, and rerunning the selected-project command shown in the error, for example `uv run gza migrate --project PATH`.
+
+Local project databases (`db_path: .gza/gza.db`) and isolated private snapshots are not shared durable control-plane databases, so they remain independently migratable from their owning checkout. `--status` and `--dry-run` are read-only inspection modes for both local and shared databases.
+
 On successful migration, the backup path is printed to stdout so you can locate it for rollback if needed.
 
 Task IDs start at `{prefix}-1` for new databases (there is no `{prefix}-0`) and are variable-length decimal (`{prefix}-{n}`).

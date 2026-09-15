@@ -7,6 +7,7 @@ import re
 import signal
 import sqlite3
 import sys
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,7 +19,16 @@ import pytest
 from gza.cli._common import get_store
 from gza.cli.advance_executor import AdvanceActionExecutionResult
 from gza.config import Config
-from gza.db import MigrationAuthorityProof, SqliteTaskStore
+from gza.db import (
+    ManualMigrationRequired,
+    MigrationAuthorityProof,
+    SchemaIntegrityError,
+    SqliteTaskStore,
+    _pending_manual_migration_versions,
+    check_migration_status,
+    preview_v25_migration,
+    preview_v26_migration,
+)
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
@@ -64,6 +74,152 @@ def _test_migration_authority(root: Path) -> MigrationAuthorityProof:
         head_sha="1" * 40,
         revalidate=lambda: None,
     )
+
+
+def _make_v24_migration_db(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (21)")
+    conn.execute("""
+        CREATE TABLE tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prompt TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            task_type TEXT NOT NULL DEFAULT 'implement',
+            task_id TEXT,
+            branch TEXT,
+            log_file TEXT,
+            report_file TEXT,
+            based_on INTEGER,
+            has_commits INTEGER,
+            duration_seconds REAL,
+            num_steps_reported INTEGER,
+            num_steps_computed INTEGER,
+            num_turns_reported INTEGER,
+            num_turns_computed INTEGER,
+            cost_usd REAL,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            created_at TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            "group" TEXT,
+            depends_on INTEGER,
+            spec TEXT,
+            create_review INTEGER NOT NULL DEFAULT 0,
+            same_branch INTEGER NOT NULL DEFAULT 0,
+            task_type_hint TEXT,
+            output_content TEXT,
+            session_id TEXT,
+            pr_number INTEGER,
+            model TEXT,
+            provider TEXT,
+            provider_is_explicit INTEGER NOT NULL DEFAULT 0,
+            merge_status TEXT,
+            failure_reason TEXT,
+            skip_learnings INTEGER NOT NULL DEFAULT 0,
+            diff_files_changed INTEGER,
+            diff_lines_added INTEGER,
+            diff_lines_removed INTEGER,
+            review_cleared_at TEXT,
+            log_schema_version INTEGER NOT NULL DEFAULT 1,
+            cycle_id INTEGER,
+            cycle_iteration_index INTEGER,
+            cycle_role TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+    with pytest.raises(ManualMigrationRequired):
+        SqliteTaskStore(db_path)
+
+
+def _schema_version(db_path: Path) -> int:
+    uri = db_path.resolve().as_uri() + "?mode=ro"
+    with sqlite3.connect(uri, uri=True, isolation_level=None) as conn:
+        return int(conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()[0])
+
+
+def _main_file_schema_version_without_wal(db_path: Path) -> int:
+    uri = db_path.resolve().as_uri() + "?mode=ro&immutable=1"
+    with sqlite3.connect(uri, uri=True, isolation_level=None) as conn:
+        return int(conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()[0])
+
+
+def _task_count(db_path: Path) -> int:
+    uri = db_path.resolve().as_uri() + "?mode=ro"
+    with sqlite3.connect(uri, uri=True, isolation_level=None) as conn:
+        return int(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
+
+
+def _sqlite_file_snapshot(db_path: Path) -> dict[str, tuple[bool, int | None, int | None, bytes | None]]:
+    snapshot = {}
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        path = Path(f"{db_path}{suffix}")
+        if path.exists():
+            stat_result = path.stat()
+            snapshot[suffix] = (True, stat_result.st_size, stat_result.st_mtime_ns, path.read_bytes())
+        else:
+            snapshot[suffix] = (False, None, None, None)
+    return snapshot
+
+
+def _make_wal_companions(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute("CREATE TABLE IF NOT EXISTS wal_marker (id INTEGER PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO wal_marker (value) VALUES ('keep-wal-open')")
+    conn.commit()
+    assert db_path.with_name(db_path.name + "-wal").exists()
+    assert db_path.with_name(db_path.name + "-shm").exists()
+    return conn
+
+
+def _make_wal_resident_v25_inspection_db(db_path: Path, *, prefix: str = "gza") -> sqlite3.Connection:
+    _make_v25_migration_db(db_path, prefix=prefix)
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute("UPDATE schema_version SET version = 24")
+    checkpoint_row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    assert checkpoint_row == (0, 0, 0)
+
+    conn.execute("UPDATE schema_version SET version = 25")
+    conn.execute(
+        """
+        INSERT INTO tasks (id, prompt, status, task_type, created_at)
+        VALUES
+            (?, 'wal-resident task one', 'pending', 'implement', ?),
+            (?, 'wal-resident task two', 'pending', 'implement', ?)
+        """,
+        (
+            f"{prefix}-a",
+            "2026-09-15T00:00:00+00:00",
+            f"{prefix}-z",
+            "2026-09-15T00:00:01+00:00",
+        ),
+    )
+    assert db_path.with_name(db_path.name + "-wal").exists()
+    assert db_path.with_name(db_path.name + "-shm").exists()
+    return conn
+
+
+def _make_v25_migration_db(db_path: Path, *, prefix: str = "gza") -> None:
+    from gza.db import run_v25_migration
+
+    _make_v24_migration_db(db_path)
+    run_v25_migration(db_path, prefix)
+    db_path.with_suffix(".backup.pre-v25.db").unlink(missing_ok=True)
+
+
+def _make_v26_migration_db(db_path: Path, *, prefix: str = "gza") -> None:
+    from gza.db import run_v26_migration
+
+    _make_v25_migration_db(db_path, prefix=prefix)
+    run_v26_migration(db_path)
+    db_path.with_suffix(".backup.pre-v26.db").unlink(missing_ok=True)
 
 
 class _RecordingLifecycleGit:
@@ -398,6 +554,196 @@ def test_get_store_warns_for_canonical_registry_conflict_with_shell_quoted_path(
 
 class TestHelpOutput:
     """Tests for CLI help output."""
+
+    def test_migrate_refuses_shared_db_without_canonical_authority_before_mutation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        project_dir = tmp_path / "feature"
+        shared_db = tmp_path / "shared" / "gza.db"
+        _write_project_config(project_dir, project_name="Feature", project_id="feature", db_path=shared_db)
+        _make_v24_migration_db(shared_db)
+        before_version = _schema_version(shared_db)
+
+        with (
+            patch("gza.cli.main.resolve_canonical_migration_authority", return_value=None),
+            patch("gza.cli.main.check_migration_status", side_effect=AssertionError("status opened DB")),
+            patch("gza.cli.main.SqliteTaskStore.from_config", side_effect=AssertionError("store opened DB")),
+            patch("gza.cli.main.run_v25_migration", side_effect=AssertionError("v25 opened DB")),
+            patch("gza.cli.main.run_v26_migration", side_effect=AssertionError("v26 opened DB")),
+            patch("gza.cli.main.run_v27_migration", side_effect=AssertionError("v27 opened DB")),
+        ):
+            result = invoke_gza("migrate", "--yes", "--project", str(project_dir))
+
+        assert result.returncode == 1
+        assert "shared database migration requires the canonical default-branch checkout" in result.stderr
+        assert "primary checkout on the configured default branch" in result.stderr
+        assert _schema_version(shared_db) == before_version
+        assert not shared_db.with_suffix(".backup.pre-v25.db").exists()
+
+    def test_migrate_refusal_does_not_create_or_change_wal_companion_files(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        project_dir = tmp_path / "feature"
+        shared_db = tmp_path / "shared" / "gza.db"
+        _write_project_config(project_dir, project_name="Feature", project_id="feature", db_path=shared_db)
+        _make_v24_migration_db(shared_db)
+        wal_conn = _make_wal_companions(shared_db)
+        try:
+            before = _sqlite_file_snapshot(shared_db)
+
+            with patch("gza.cli.main.resolve_canonical_migration_authority", return_value=None):
+                result = invoke_gza("migrate", "--yes", "--project", str(project_dir))
+
+            assert result.returncode == 1
+            assert before == _sqlite_file_snapshot(shared_db)
+        finally:
+            wal_conn.close()
+
+    def test_migrate_shared_db_dry_run_uses_read_only_inspection(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        project_dir = tmp_path / "feature"
+        shared_db = tmp_path / "shared" / "gza.db"
+        _write_project_config(project_dir, project_name="Feature", project_id="feature", db_path=shared_db)
+        _make_v24_migration_db(shared_db)
+        wal_conn = _make_wal_companions(shared_db)
+        try:
+            before_version = _schema_version(shared_db)
+
+            with patch("gza.cli.main.resolve_canonical_migration_authority", return_value=None):
+                result = invoke_gza("migrate", "--dry-run", "--project", str(project_dir))
+
+            assert result.returncode == 0
+            assert "Dry-run: would apply migration(s): v25, v26, v27" in result.stdout
+            assert _schema_version(shared_db) == before_version
+            assert not shared_db.with_suffix(".backup.pre-v25.db").exists()
+            assert not shared_db.with_suffix(".backup.pre-v26.db").exists()
+            assert not shared_db.with_suffix(".backup.pre-v27.db").exists()
+        finally:
+            wal_conn.close()
+
+    def test_migrate_inspection_reads_committed_wal_state_without_migrating(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        project_dir = tmp_path / "feature"
+        shared_db = tmp_path / "shared" / "gza.db"
+        _write_project_config(project_dir, project_name="Feature", project_id="feature", db_path=shared_db)
+        wal_conn = _make_wal_resident_v25_inspection_db(shared_db)
+        try:
+            assert _main_file_schema_version_without_wal(shared_db) == 24
+            assert _schema_version(shared_db) == 25
+
+            status = check_migration_status(shared_db)
+            assert status["current_version"] == 25
+            assert status["pending_manual"] == [26, 27]
+            assert _pending_manual_migration_versions(shared_db) == [26, 27]
+
+            v25_preview = preview_v25_migration(shared_db, "gza")
+            assert v25_preview["task_count"] == 2
+            assert v25_preview["samples"] == []
+            assert v25_preview["first_post_migration_id"] == ""
+
+            v26_preview = preview_v26_migration(shared_db)
+            assert v26_preview["task_count"] == 2
+            assert v26_preview["samples"] == [("gza-a", "gza-10"), ("gza-z", "gza-35")]
+
+            status_result = invoke_gza("migrate", "--status", "--project", str(project_dir))
+            assert status_result.returncode == 0
+            assert "Schema version: 25 / " in status_result.stdout
+            assert "Pending manual migrations: v26, v27" in status_result.stdout
+            assert "v25" not in status_result.stdout
+
+            dry_run_result = invoke_gza("migrate", "--dry-run", "--project", str(project_dir))
+            assert dry_run_result.returncode == 0
+            assert "Dry-run: would apply migration(s): v26, v27" in dry_run_result.stdout
+            assert "Tasks to convert: 2" in dry_run_result.stdout
+            assert "gza-a" in dry_run_result.stdout
+            assert "gza-10" in dry_run_result.stdout
+
+            assert _main_file_schema_version_without_wal(shared_db) == 24
+            assert _schema_version(shared_db) == 25
+            assert _task_count(shared_db) == 2
+            assert not shared_db.with_suffix(".backup.pre-v25.db").exists()
+            assert not shared_db.with_suffix(".backup.pre-v26.db").exists()
+            assert not shared_db.with_suffix(".backup.pre-v27.db").exists()
+        finally:
+            wal_conn.close()
+
+    @pytest.mark.parametrize(
+        ("version", "factory"),
+        [
+            (25, _make_v24_migration_db),
+            (26, _make_v25_migration_db),
+            (27, _make_v26_migration_db),
+        ],
+    )
+    def test_migrate_shared_db_revalidates_authority_at_manual_migration_boundary(
+        self,
+        tmp_path: Path,
+        version: int,
+        factory: Callable[[Path], None],
+    ) -> None:
+        project_dir = tmp_path / f"canonical-v{version}"
+        shared_db = tmp_path / "shared" / f"gza-v{version}.db"
+        _write_project_config(project_dir, project_name="Canonical", project_id="canonical", db_path=shared_db)
+        factory(shared_db)
+        before_version = _schema_version(shared_db)
+        before_task_count = _task_count(shared_db)
+
+        revalidate_calls = 0
+
+        def revalidate() -> None:
+            nonlocal revalidate_calls
+            revalidate_calls += 1
+            if revalidate_calls > 1:
+                raise SchemaIntegrityError("stale authority")
+
+        authority = MigrationAuthorityProof(
+            canonical_root=project_dir.resolve(),
+            default_branch="main",
+            head_sha="1" * 40,
+            revalidate=revalidate,
+        )
+
+        with (
+            patch("gza.cli.main.resolve_canonical_migration_authority", return_value=authority),
+            patch("gza.cli.main.SqliteTaskStore.from_config", return_value=object()),
+        ):
+            result = invoke_gza("migrate", "--yes", "--project", str(project_dir))
+
+        assert result.returncode == 1
+        assert f"Migration v{version} failed: stale authority" in result.stderr
+        assert _schema_version(shared_db) == before_version
+        assert _task_count(shared_db) == before_task_count
+        assert not shared_db.with_suffix(f".backup.pre-v{version}.db").exists()
+
+    def test_migrate_shared_db_with_canonical_authority_runs_manual_migration_chain(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        project_dir = tmp_path / "canonical"
+        shared_db = tmp_path / "shared" / "gza.db"
+        _write_project_config(project_dir, project_name="Canonical", project_id="canonical", db_path=shared_db)
+        _make_v24_migration_db(shared_db)
+
+        with patch(
+            "gza.cli.main.resolve_canonical_migration_authority",
+            return_value=_test_migration_authority(project_dir),
+        ):
+            result = invoke_gza("migrate", "--yes", "--project", str(project_dir))
+
+        assert result.returncode == 0
+        assert "Migration v25 complete" in result.stdout
+        assert "Migration v26 complete" in result.stdout
+        assert "Migration v27 complete" in result.stdout
+        assert _schema_version(shared_db) == 27
+        assert shared_db.with_suffix(".backup.pre-v25.db").exists()
+        assert shared_db.with_suffix(".backup.pre-v26.db").exists()
+        assert shared_db.with_suffix(".backup.pre-v27.db").exists()
 
     def test_migrate_import_local_db_dry_run_bootstraps_missing_shared_project_id_from_user_config(
         self, tmp_path: Path

@@ -91,10 +91,12 @@ __all__ = [
     "SqliteTaskStore",
     "extract_failure_reason",
     "classify_existing_execution_db",
+    "configured_db_is_shared",
     "is_canonical_project_checkout",
     "run_v25_migration",
     "run_v26_migration",
     "run_v27_migration",
+    "run_manual_migration_with_authority",
     "preview_v25_migration",
     "preview_v26_migration",
     "check_migration_status",
@@ -840,7 +842,7 @@ def classify_existing_execution_db(
 def _pending_manual_migration_versions(db_path: Path) -> list[int]:
     if not db_path.exists():
         return []
-    uri = db_path.resolve().as_uri() + "?mode=ro"
+    uri = _readonly_sqlite_uri(db_path)
     with sqlite3.connect(
         uri,
         uri=True,
@@ -868,6 +870,10 @@ def _schema_bootstrap_lock(db_path: Path) -> RLockType:
             lock = threading.RLock()
             _SCHEMA_BOOTSTRAP_LOCKS[resolved] = lock
         return lock
+
+
+def _readonly_sqlite_uri(db_path: Path) -> str:
+    return db_path.resolve().as_uri() + "?mode=ro"
 
 
 def _is_execution_db_availability_sqlite_error(exc: sqlite3.Error) -> bool:
@@ -5954,6 +5960,11 @@ def _migration_policy_from_config(config: "Config") -> MigrationPolicy:
     if not isinstance(project_dir, Path):
         return "auto_private"
     return "auto_private" if _is_project_local_db_path(config.db_path, project_dir) else "defer_shared"
+
+
+def configured_db_is_shared(config: "Config") -> bool:
+    """Return whether a loaded config targets a shared DB path."""
+    return _migration_policy_from_config(config) != "auto_private"
 
 
 def _shared_import_marker_path(project_dir: Path) -> Path:
@@ -18294,9 +18305,15 @@ def check_migration_status(db_path: Path) -> dict:
             "pending_auto": [],
             "pending_manual": [],
         }
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    uri = _readonly_sqlite_uri(db_path)
+    with sqlite3.connect(
+        uri,
+        uri=True,
+        isolation_level=None,
+        timeout=30,
+        factory=_ClosingSqliteConnection,
+    ) as conn:
+        conn.row_factory = sqlite3.Row
         cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
         if cur.fetchone() is None:
             current = 0
@@ -18304,8 +18321,6 @@ def check_migration_status(db_path: Path) -> dict:
             cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
             row = cur.fetchone()
             current = row["version"] if row else 0
-    finally:
-        conn.close()
 
     pending_auto = [v for v, sql in _MIGRATIONS if v > current and v not in _MANUAL_MIGRATION_VERSIONS]
     pending_manual = [v for v, sql in _MIGRATIONS if v > current and v in _MANUAL_MIGRATION_VERSIONS]
@@ -19163,6 +19178,26 @@ CREATE INDEX IF NOT EXISTS idx_tasks_type_based_on ON tasks(task_type, based_on)
         conn.close()
 
 
+def run_manual_migration_with_authority(
+    db_path: Path,
+    *,
+    version: int,
+    prefix: str,
+    migration_authority: MigrationAuthorityProof,
+) -> None:
+    """Run one shared manual migration after lock-held authority revalidation."""
+    with _schema_bootstrap_lock(db_path):
+        migration_authority.revalidate()
+        if version == 25:
+            run_v25_migration(db_path, prefix)
+        elif version == 26:
+            run_v26_migration(db_path)
+        elif version == 27:
+            run_v27_migration(db_path)
+        else:
+            raise RuntimeError(f"Unknown manual migration v{version}")
+
+
 def resolve_task_id(arg: str, project_prefix: str) -> str:
     """Resolve a user-supplied task ID argument to a canonical string ID.
 
@@ -19213,9 +19248,15 @@ def preview_v25_migration(
     Use :func:`check_migration_status` to determine whether v25 migration is pending
     before calling this function.
     """
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    uri = _readonly_sqlite_uri(db_path)
+    with sqlite3.connect(
+        uri,
+        uri=True,
+        isolation_level=None,
+        timeout=30,
+        factory=_ClosingSqliteConnection,
+    ) as conn:
+        conn.row_factory = sqlite3.Row
         # Determine the current schema version so we can short-circuit on already-migrated DBs.
         try:
             cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
@@ -19274,8 +19315,6 @@ def preview_v25_migration(
             random_samples_raw = []
             task_count = 0
             max_id = 0
-    finally:
-        conn.close()
 
     first_post = f"{prefix}-{_encode_v25_base36(max_id + 1)}" if max_id else f"{prefix}-{_encode_v25_base36(1)}"
     return {
@@ -19298,9 +19337,15 @@ def preview_v26_migration(
     random_sample_limit: int = 10,
 ) -> _MigrationV26Preview:
     """Return a preview of v26 ID rewrites (base36 text IDs -> decimal IDs)."""
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
+    uri = _readonly_sqlite_uri(db_path)
+    with sqlite3.connect(
+        uri,
+        uri=True,
+        isolation_level=None,
+        timeout=30,
+        factory=_ClosingSqliteConnection,
+    ) as conn:
+        conn.row_factory = sqlite3.Row
         try:
             cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
             if cur.fetchone() is not None:
@@ -19351,5 +19396,3 @@ def preview_v26_migration(
             "samples": samples,
             "random_samples": random_samples,
         }
-    finally:
-        conn.close()

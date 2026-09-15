@@ -28,15 +28,18 @@ from ..db import (
     SchemaIntegrityError,
     SqliteTaskStore,
     check_migration_status,
+    configured_db_is_shared,
     import_legacy_local_db,
     preview_v25_migration,
     preview_v26_migration,
+    run_manual_migration_with_authority,
     run_v25_migration,
     run_v26_migration,
     run_v27_migration,
 )
 from ..learnings import DEFAULT_LEARNINGS_WINDOW
 from ..metrics import enabled as metrics_enabled, render_cli_summary, snapshot
+from ..migration_authority import resolve_canonical_migration_authority
 from ..task_types import CLI_ADD_TASK_TYPES
 from ..watch_strategies import WATCH_DISPATCH_STRATEGY_REGISTRY
 from ._common import (
@@ -154,6 +157,20 @@ def _selected_project_migrate_command(args: argparse.Namespace) -> str:
     if isinstance(project_dir, Path):
         return selected_project_migrate_command(project_dir)
     return "uv run gza migrate"
+
+
+def _refuse_shared_migration_without_authority(args: argparse.Namespace) -> None:
+    command = _selected_project_migrate_command(args)
+    print(
+        "Error: shared database migration requires the canonical default-branch checkout.",
+        file=sys.stderr,
+    )
+    print(
+        "Run "
+        f"'{command}' from the primary checkout on the configured default branch "
+        "after this migration code has landed.",
+        file=sys.stderr,
+    )
 
 
 def _parse_non_negative_int(value: str) -> int:
@@ -3446,6 +3463,11 @@ def main() -> int:
     migrate_parser = subparsers.add_parser(
         "migrate",
         help="Run pending manual database migrations (e.g. v25/v26/v27)",
+        description=(
+            "Run pending manual database migrations. Shared databases can be migrated only "
+            "from the primary checkout on the configured default branch after the migration "
+            "code has landed; local/private databases migrate independently."
+        ),
     )
     migrate_parser.add_argument(
         "--status",
@@ -3745,6 +3767,21 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
         print(f"Error loading config: {e}", file=sys.stderr)
         return 1
 
+    shared_db = configured_db_is_shared(config)
+    write_capable_migration = not args.status and not args.dry_run and not args.import_local_db
+    migration_authority = None
+    if shared_db and write_capable_migration:
+        migration_authority = resolve_canonical_migration_authority(config)
+        if migration_authority is None:
+            _refuse_shared_migration_without_authority(args)
+            return 1
+        try:
+            migration_authority.revalidate()
+        except SchemaIntegrityError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            _refuse_shared_migration_without_authority(args)
+            return 1
+
     status = check_migration_status(config.db_path)
 
     if args.import_local_db:
@@ -3880,7 +3917,12 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
     # will run the auto-migrations and then raise ManualMigrationRequired.
     # We swallow that exception here since we are about to run the manual migration.
     try:
-        SqliteTaskStore.from_config(config)
+        SqliteTaskStore.from_config(
+            config,
+            migration_policy="auto_canonical_shared" if shared_db else None,
+            migration_authority=migration_authority,
+            require_migration_authority=shared_db,
+        )
     except ManualMigrationRequired:
         pass  # Expected — auto-migrations ran, now proceed with the manual migration
 
@@ -3888,7 +3930,16 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
         if version == 25:
             print("Running migration v25 (INTEGER PK → TEXT base36 IDs)...")
             try:
-                run_v25_migration(config.db_path, config.project_prefix)
+                if shared_db:
+                    assert migration_authority is not None
+                    run_manual_migration_with_authority(
+                        config.db_path,
+                        version=25,
+                        prefix=config.project_prefix,
+                        migration_authority=migration_authority,
+                    )
+                else:
+                    run_v25_migration(config.db_path, config.project_prefix)
                 backup_path = config.db_path.with_suffix(".backup.pre-v25.db")
                 print(f"Migration v25 complete. Backup at: {backup_path}")
             except Exception as e:
@@ -3897,7 +3948,16 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
         elif version == 26:
             print("Running migration v26 (TEXT base36 IDs → TEXT decimal IDs)...")
             try:
-                run_v26_migration(config.db_path)
+                if shared_db:
+                    assert migration_authority is not None
+                    run_manual_migration_with_authority(
+                        config.db_path,
+                        version=26,
+                        prefix=config.project_prefix,
+                        migration_authority=migration_authority,
+                    )
+                else:
+                    run_v26_migration(config.db_path)
                 backup_path = config.db_path.with_suffix(".backup.pre-v26.db")
                 print(f"Migration v26 complete. Backup at: {backup_path}")
             except Exception as e:
@@ -3906,7 +3966,16 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
         elif version == 27:
             print("Running migration v27 (drop TaskCycle bookkeeping)...")
             try:
-                run_v27_migration(config.db_path)
+                if shared_db:
+                    assert migration_authority is not None
+                    run_manual_migration_with_authority(
+                        config.db_path,
+                        version=27,
+                        prefix=config.project_prefix,
+                        migration_authority=migration_authority,
+                    )
+                else:
+                    run_v27_migration(config.db_path)
                 backup_path = config.db_path.with_suffix(".backup.pre-v27.db")
                 print(f"Migration v27 complete. Backup at: {backup_path}")
             except Exception as e:
