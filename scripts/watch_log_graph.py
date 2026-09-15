@@ -5,7 +5,7 @@
 # ///
 """Graph gza ``watch`` queue depth over time from ``.gza/watch.log`` archives.
 
-Parses the selected watch log family and plots six disjoint series — units
+Parses the selected watch log family and plots seven disjoint series — units
 **running**, **pending**, **blocked**, **parked** (needs a human), **recovery**
 (failed, awaiting automatic retry/resume), and **other** (classification
 residual; should stay at zero) — against time, saving a PNG and printing a text
@@ -91,20 +91,20 @@ _ATTN_UNCHANGED_RE = re.compile(r"(\d+) tasks? still need attention")
 _ATTN_HEADER_RE = re.compile(r"Needs attention \((\d+) tasks?\)")
 # Newest accounting line (emitted once per cycle after the WAKE line): a disjoint,
 # exhaustive classification of in-scope non-terminal tasks. When present it is the
-# source of truth for all six series; older logs fall back to the WAKE counts plus
+# source of truth for all seven series; older logs fall back to the WAKE counts plus
 # the attention lines (mapped onto "parked").
 _ACCOUNTING_RE = re.compile(
     r"cycle accounting: running=(\d+) pending=(\d+) blocked=(\d+) "
     r"parked=(\d+) recovery=(\d+) other=(\d+)"
 )
 # Merge-unit-level accounting (emitted right after the task-level line, same
-# cycle): the six buckets count merge units / plan-only lineages, not tasks.
+# cycle): the seven buckets count merge units / plan-only lineages, not tasks.
 # This is the primary view now - see UnitPoint and _UNIT_ACCOUNTING_RE usage
 # in parse_log. Older logs never emit this line; those cycles simply have no
 # unit data (unit=None on the Point), there is no legacy fallback to compute
 # it from.
 _UNIT_ACCOUNTING_RE = re.compile(
-    r"unit accounting: running=(\d+) pending=(\d+) blocked=(\d+) "
+    r"unit accounting: running=(\d+) pending=(\d+) blocked=(\d+) advancing=(\d+) "
     r"parked=(\d+) recovery=(\d+) other=(\d+)"
 )
 # Real merge events: "MERGE     gza-7957 -> main" (dry-run variants excluded below).
@@ -127,18 +127,19 @@ class WatchLogFile:
 
 
 class UnitPoint:
-    """One cycle's merge-unit-level counts: same six disjoint buckets as Point,
+    """One cycle's merge-unit-level counts: same seven disjoint buckets as Point,
     but counting merge units (and plan-only lineages that never produce one)
     instead of tasks. Only present on cycles that emitted a
     ``unit accounting:`` line; older cycles simply have no UnitPoint.
     """
 
-    __slots__ = ("running", "pending", "blocked", "parked", "recovery", "other")
+    __slots__ = ("running", "pending", "blocked", "advancing", "parked", "recovery", "other")
 
-    def __init__(self, running, pending, blocked, parked, recovery, other):
+    def __init__(self, running, pending, blocked, advancing, parked, recovery, other):
         self.running = running
         self.pending = pending
         self.blocked = blocked
+        self.advancing = advancing
         self.parked = parked
         self.recovery = recovery
         self.other = other
@@ -151,13 +152,19 @@ class Point:
     cycle emitted a ``unit accounting:`` line, else None - see UnitPoint.
     """
 
-    __slots__ = ("when", "running", "pending", "blocked", "parked", "recovery", "other", "unit")
+    __slots__ = (
+        "when", "running", "pending", "blocked", "advancing", "parked", "recovery", "other", "unit",
+    )
 
-    def __init__(self, when, running, pending, blocked, parked, recovery=None, other=None, unit=None):
+    def __init__(
+        self, when, running, pending, blocked, parked, recovery=None, other=None, unit=None,
+        advancing=None,
+    ):
         self.when = when
         self.running = running  # int
         self.pending = pending  # int | None (None for old-format WAKE)
         self.blocked = blocked  # int | None
+        self.advancing = advancing  # int | None (unit-level view only; no task-level counterpart)
         self.parked = parked  # int | None
         self.recovery = recovery  # int | None (only from accounting lines)
         self.other = other  # int | None (only from accounting lines)
@@ -267,7 +274,7 @@ def parse_log(path, base_date, *, use_anchor_time=False, legacy_attention=False)
     # attention at all, so older logs that never emit attention lines keep
     # parked=None as before. Newer logs emit a "cycle accounting" line per cycle
     # with the full disjoint breakdown (running/pending/blocked/parked/recovery/
-    # other); when a cycle has one it is the source of truth for all six series.
+    # other); when a cycle has one it is the source of truth for all seven series.
     first_attn_idx = next((i for i, r in enumerate(raw) if r[2] == "attn"), None)
     points = []
     merges = []  # (datetime, task_id)
@@ -365,6 +372,7 @@ _SERIES = [
     ("running", "running"),
     ("pending", "pending"),
     ("blocked", "blocked"),
+    ("advancing", "advancing"),
     ("parked", "parked"),
     ("recovery", "recovery"),
     ("other", "other"),
@@ -375,6 +383,7 @@ _SERIES_COLORS = {
     "running": "GREEN",
     "pending": "BLUE",
     "blocked": "ORANGE",
+    "advancing": "CYAN",
     "parked": "RED",
     "recovery": "YELLOW",
     "other": "PURPLE",
@@ -721,10 +730,10 @@ def print_table(points, max_rows, tail=False, unit="cycles"):
         sampled = points
         note = f"({len(points)} {unit})"
 
-    header = ("datetime", "running", "pending", "blocked", "parked", "recovery", "other")
+    header = ("datetime", "running", "pending", "blocked", "advancing", "parked", "recovery", "other")
     rows = [
         (p.when.strftime("%Y-%m-%d %H:%M:%S"),
-         _fmt(p.running), _fmt(p.pending), _fmt(p.blocked), _fmt(p.parked),
+         _fmt(p.running), _fmt(p.pending), _fmt(p.blocked), _fmt(p.advancing), _fmt(p.parked),
          _fmt(p.recovery), _fmt(p.other))
         for p in sampled
     ]
@@ -743,7 +752,7 @@ def print_current(points):
     now = datetime.now().strftime("%H:%M:%S")
     print(f"[{now}]  latest cycle {p.when:%Y-%m-%d %H:%M:%S}  |  "
           f"running={_fmt(p.running)}  pending={_fmt(p.pending)}  "
-          f"blocked={_fmt(p.blocked)}  parked={_fmt(p.parked)}  "
+          f"blocked={_fmt(p.blocked)}  advancing={_fmt(p.advancing)}  parked={_fmt(p.parked)}  "
           f"recovery={_fmt(p.recovery)}  other={_fmt(p.other)}")
 
 
@@ -1043,6 +1052,7 @@ def _select_view(points, *, task_level):
             p.unit.parked if p.unit is not None else None,
             p.unit.recovery if p.unit is not None else None,
             p.unit.other if p.unit is not None else None,
+            advancing=p.unit.advancing if p.unit is not None else None,
         )
         for p in points
     ]
@@ -1073,6 +1083,7 @@ def rollup(points, resolution, agg):
             _aggregate(col["parked"], agg),
             _aggregate(col["recovery"], agg),
             _aggregate(col["other"], agg),
+            advancing=_aggregate(col["advancing"], agg),
         ))
     return out
 
