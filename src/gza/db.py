@@ -152,7 +152,13 @@ TASK_COMMENT_KINDS: frozenset[str] = frozenset(
 _SCHEMA_BOOTSTRAP_LOCKS: dict[Path, RLockType] = {}
 _SCHEMA_BOOTSTRAP_LOCKS_GUARD = threading.Lock()
 
-_DEFERABLE_SHARED_MIGRATION_VERSIONS: frozenset[int] = frozenset({71})
+_DEFERABLE_SHARED_MIGRATIONS: Mapping[int, str] = {
+    71: "v71 only adds unit-granular failed-recovery scan proof; v70 callers can still use core task state.",
+}
+_DEFERABLE_SHARED_MIGRATION_VERSIONS: frozenset[int] = frozenset(_DEFERABLE_SHARED_MIGRATIONS)
+_SCHEMA_CAPABILITY_MIN_VERSION: Mapping[str, int] = {
+    "watch_failed_recovery_scan_unit_fingerprint": 71,
+}
 
 
 @dataclass(frozen=True)
@@ -6845,13 +6851,23 @@ class SqliteTaskStore:
 
     def require_schema_capability(self, capability: str) -> None:
         """Fail before writes when a caller needs schema that was deferred."""
-        if self._shared_migration_deferred is not None:
-            raise ForwardSchemaMigrationDeferred(
-                current_version=self._shared_migration_deferred.current_version,
-                target_version=self._shared_migration_deferred.target_version,
-                pending_versions=self._shared_migration_deferred.pending_versions,
-                capability=capability,
-            )
+        required_version = _SCHEMA_CAPABILITY_MIN_VERSION.get(capability)
+        if required_version is None:
+            known = ", ".join(sorted(_SCHEMA_CAPABILITY_MIN_VERSION))
+            raise ValueError(f"Unknown schema capability {capability!r}; expected one of: {known}")
+        if self._shared_migration_deferred is None:
+            return
+        if required_version <= self._shared_migration_deferred.current_version:
+            return
+        pending_versions = tuple(
+            version for version in self._shared_migration_deferred.pending_versions if version >= required_version
+        )
+        raise ForwardSchemaMigrationDeferred(
+            current_version=self._shared_migration_deferred.current_version,
+            target_version=self._shared_migration_deferred.target_version,
+            pending_versions=pending_versions or self._shared_migration_deferred.pending_versions,
+            capability=capability,
+        )
 
     def _db_file_identity(self) -> _DbFileIdentity:
         stat_result = self.db_path.stat()
@@ -11929,6 +11945,7 @@ class SqliteTaskStore:
         scanned_at: datetime | None = None,
     ) -> WatchFailedRecoveryScanState | None:
         """Persist the completed failed-recovery scan marker for a target branch."""
+        self.require_schema_capability("watch_failed_recovery_scan_unit_fingerprint")
         if not self.supports_watch_failed_recovery_scans():
             return None
         completed_at = _format_db_timestamp(scanned_at or datetime.now(UTC))

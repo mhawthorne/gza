@@ -11819,6 +11819,159 @@ class TestExecutionProjectResolver:
         assert exc_info.value.pending_versions == (SCHEMA_VERSION,)
         assert exc_info.value.capability == "watch_failed_recovery_scan_unit_fingerprint"
 
+    def test_configured_shared_open_fails_closed_for_nondeferable_pending_migration(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_db = tmp_path / "shared-v69.db"
+        _write_project_config(project_dir, project_name="Shared", project_id="shared", db_path=project_db)
+        SqliteTaskStore(project_db, prefix="shared", project_id="shared")
+        with sqlite3.connect(project_db) as conn:
+            conn.execute("DROP TABLE IF EXISTS watch_failed_recovery_scans")
+            conn.execute("UPDATE schema_version SET version = 69")
+        before = self._sqlite_user_schema_and_rows(project_db)
+
+        with pytest.raises(ForwardSchemaMigrationDeferred) as exc_info:
+            SqliteTaskStore.from_config(Config.load(project_dir))
+
+        assert exc_info.value.current_version == 69
+        assert exc_info.value.target_version == SCHEMA_VERSION
+        assert exc_info.value.pending_versions == (70,)
+        assert self._sqlite_user_schema_and_rows(project_db) == before
+
+    def test_v70_shared_deferred_open_allows_compatible_writes_and_blocks_v71_capability(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        project_db = tmp_path / "shared-v70.db"
+        _write_project_config(project_dir, project_name="Shared", project_id="shared", db_path=project_db)
+        seeded = SqliteTaskStore(project_db, prefix="shared", project_id="shared")
+        with sqlite3.connect(project_db) as conn:
+            conn.execute("ALTER TABLE watch_failed_recovery_scans DROP COLUMN unit_fingerprint")
+            conn.execute("UPDATE schema_version SET version = 70")
+        before_scan_rows: list[tuple[str, str, str, str]]
+        with sqlite3.connect(project_db) as conn:
+            before_scan_rows = conn.execute(
+                """
+                SELECT project_id, target_branch, target_sha, scanned_at
+                FROM watch_failed_recovery_scans
+                ORDER BY project_id, target_branch
+                """
+            ).fetchall()
+
+        store = SqliteTaskStore.from_config(Config.load(project_dir))
+        task = store.add("compatible old-schema write")
+
+        assert task.id is not None
+        with sqlite3.connect(project_db) as conn:
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 70
+            assert conn.execute("SELECT prompt FROM tasks WHERE id = ?", (task.id,)).fetchone()[0] == (
+                "compatible old-schema write"
+            )
+
+        with pytest.raises(ForwardSchemaMigrationDeferred) as exc_info:
+            store.record_watch_failed_recovery_scan(
+                target_branch="main",
+                target_sha="abc123",
+                unit_fingerprint="unit-fp",
+                scanned_at=datetime(2026, 9, 15, tzinfo=UTC),
+            )
+
+        assert exc_info.value.current_version == 70
+        assert exc_info.value.target_version == SCHEMA_VERSION
+        assert exc_info.value.pending_versions == (71,)
+        assert exc_info.value.capability == "watch_failed_recovery_scan_unit_fingerprint"
+        with sqlite3.connect(project_db) as conn:
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 70
+            assert conn.execute(
+                """
+                SELECT project_id, target_branch, target_sha, scanned_at
+                FROM watch_failed_recovery_scans
+                ORDER BY project_id, target_branch
+                """
+            ).fetchall() == before_scan_rows
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(watch_failed_recovery_scans)")}
+        assert "unit_fingerprint" not in columns
+
+    def test_v70_shared_deferred_scan_first_operation_fails_without_partial_write(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza.config import Config
+
+        def db_sidecars(db_path: Path) -> tuple[Path, Path, Path]:
+            return (Path(f"{db_path}-wal"), Path(f"{db_path}-shm"), Path(f"{db_path}-journal"))
+
+        project_dir = tmp_path / "project"
+        project_db = tmp_path / "shared-v70-delete.db"
+        _write_project_config(project_dir, project_name="Shared", project_id="shared", db_path=project_db)
+        SqliteTaskStore(project_db, prefix="shared", project_id="shared")
+        with sqlite3.connect(project_db) as conn:
+            conn.execute("ALTER TABLE watch_failed_recovery_scans DROP COLUMN unit_fingerprint")
+            conn.execute("UPDATE schema_version SET version = 70")
+            conn.commit()
+            assert conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0].lower() == "delete"
+
+        sidecars = db_sidecars(project_db)
+        assert [path.exists() for path in sidecars] == [False, False, False]
+        before_schema_and_rows = self._sqlite_user_schema_and_rows(project_db)
+        with sqlite3.connect(project_db) as conn:
+            before_journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0].lower()
+            before_version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            before_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(watch_failed_recovery_scans)")
+            }
+            before_scan_rows = conn.execute(
+                """
+                SELECT project_id, target_branch, target_sha, scanned_at
+                FROM watch_failed_recovery_scans
+                ORDER BY project_id, target_branch
+                """
+            ).fetchall()
+
+        assert before_journal_mode == "delete"
+        assert before_version == 70
+        assert "unit_fingerprint" not in before_columns
+
+        store = SqliteTaskStore.from_config(Config.load(project_dir))
+
+        with pytest.raises(ForwardSchemaMigrationDeferred) as exc_info:
+            store.record_watch_failed_recovery_scan(
+                target_branch="main",
+                target_sha="abc123",
+                unit_fingerprint="unit-fp",
+                scanned_at=datetime(2026, 9, 15, tzinfo=UTC),
+            )
+
+        assert exc_info.value.current_version == 70
+        assert exc_info.value.target_version == SCHEMA_VERSION
+        assert exc_info.value.pending_versions == (71,)
+        assert exc_info.value.capability == "watch_failed_recovery_scan_unit_fingerprint"
+        assert [path.exists() for path in sidecars] == [False, False, False]
+        assert self._sqlite_user_schema_and_rows(project_db) == before_schema_and_rows
+        with sqlite3.connect(project_db) as conn:
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == before_version
+            assert {
+                row[1] for row in conn.execute("PRAGMA table_info(watch_failed_recovery_scans)")
+            } == before_columns
+            assert (
+                conn.execute(
+                    """
+                    SELECT project_id, target_branch, target_sha, scanned_at
+                    FROM watch_failed_recovery_scans
+                    ORDER BY project_id, target_branch
+                    """
+                ).fetchall()
+                == before_scan_rows
+            )
+
     def test_configured_shared_absent_db_defers_without_creating_database(
         self,
         tmp_path: Path,
