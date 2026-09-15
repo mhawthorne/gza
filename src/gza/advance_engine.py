@@ -5477,10 +5477,22 @@ def _resolve_review_state(
         and not (t.task_type == "improve" and t.changed_diff is False)
         and not (t.task_type == "verify_fix" and t.changed_diff is False)
     ]
-    if completed_descendant_code_changes:
-        latest_completed_code_change = max(completed_descendant_code_changes, key=_task_event_time)
-    elif task.status == "completed" and latest_completed_review is None:
-        latest_completed_code_change = task
+    completed_code_changes = list(completed_descendant_code_changes)
+    if (
+        task.task_type == "implement"
+        and task.status == "completed"
+        and task.has_commits is not False
+        and (
+            latest_completed_review is None
+            or (
+                latest_completed_review.based_on != task.id
+                and latest_completed_review.depends_on != task.id
+            )
+        )
+    ):
+        completed_code_changes.append(task)
+    if completed_code_changes:
+        latest_completed_code_change = max(completed_code_changes, key=_task_event_time)
 
     if latest_completed_review is not None:
         latest_review_snapshot = _resolve_review_content_snapshot(config, latest_completed_review)

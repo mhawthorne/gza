@@ -30517,6 +30517,73 @@ def test_changed_rebase_counts_as_latest_code_change_for_stale_review_refresh(
     assert action["verify_gate_phase"] == "pre_review"
 
 
+def test_same_branch_implement_after_manual_attention_review_stales_old_verdict(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    earlier_impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/shared-branch-stale-review",
+        when=datetime(2026, 9, 8, 9, 0, tzinfo=UTC),
+    )
+    store.get_or_create_merge_unit_for_task(earlier_impl)
+    old_review = _add_completed_review(store, earlier_impl, when=datetime(2026, 9, 8, 10, 0, tzinfo=UTC))
+    old_review.review_verify_head_sha = "old-reviewed-head"
+    old_review.output_content = "## Verdict\n\nVerdict: NEEDS_DISCUSSION\n"
+    store.update(old_review)
+
+    assert earlier_impl.id is not None
+    later_impl = store.add(
+        "Later same-branch slice",
+        task_type="implement",
+        depends_on=earlier_impl.id,
+        same_branch=True,
+    )
+    assert later_impl.id is not None
+    later_impl.status = "completed"
+    later_impl.completed_at = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    later_impl.branch = earlier_impl.branch
+    later_impl.merge_status = "unmerged"
+    later_impl.has_commits = True
+    store.update(later_impl)
+    store.get_or_create_merge_unit_for_task(later_impl)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="NEEDS_DISCUSSION",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={later_impl.branch},
+        ref_shas={later_impl.branch: "later-head", "main": "base-head"},
+        ancestor_pairs={("main", later_impl.branch): True},
+    )
+
+    ctx = resolve_advance_context(config, store, git, later_impl, "main")
+    action = evaluate_advance_rules(config, store, git, later_impl, "main")
+
+    assert ctx.latest_completed_review is not None
+    assert ctx.latest_completed_review.id == old_review.id
+    assert ctx.latest_completed_code_change is not None
+    assert ctx.latest_completed_code_change.id == later_impl.id
+    assert ctx.review_invalidated_by_progress is True
+    assert ctx.review_invalidation_reason == "branch_head_advanced"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action.get("needs_attention_reason") is None
+    assert action.get("review_task") is None
+
+
 def test_non_spec_branch_with_head_probe_warning_bypasses_spec_coherence_gate(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
