@@ -274,9 +274,11 @@ def test_sqlite_connect_context_records_connect_execute_and_close_once(monkeypat
     assert _latency_count(metrics, after_open, operation="connect") == _latency_count(
         metrics, before, operation="connect"
     ) + 1
+    # Opening a connection runs two pragmas: busy_timeout, and synchronous,
+    # which is connection-scoped and so must be set on every connection.
     assert _latency_count(metrics, after_open, operation="execute") == _latency_count(
         metrics, before, operation="execute"
-    ) + 1
+    ) + 2
     assert _latency_count(metrics, after_execute, operation="execute") == _latency_count(
         metrics, after_open, operation="execute"
     ) + 1

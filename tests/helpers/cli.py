@@ -62,7 +62,10 @@ def invoke_gza(
         os.chdir(old_cwd)
 
     return subprocess.CompletedProcess(
-        args=["uv", "run", "gza", *args],
+        # The CLI ran in this process; naming uv here would advertise a
+        # subprocess that was never spawned, which is misleading in failure
+        # output.
+        args=["gza", *args],
         returncode=returncode,
         stdout=stdout.getvalue(),
         stderr=stderr.getvalue(),

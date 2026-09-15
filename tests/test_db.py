@@ -2514,7 +2514,10 @@ class TestConnectionLifecycle:
             with pytest.raises(sqlite3.ProgrammingError):
                 conn.execute("SELECT 1")
 
-    def test_write_pragmas_are_only_applied_once_per_store(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def test_journal_mode_is_set_once_but_synchronous_is_set_per_connection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """journal_mode persists in the file; synchronous belongs to each connection."""
         db_path = tmp_path / "test.db"
         seen_pragmas: list[str] = []
 
@@ -2531,7 +2534,15 @@ class TestConnectionLifecycle:
         store.add("Task 2")
         store.get_all()
 
-        assert seen_pragmas == ["PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"]
+        # Persisted in the database file, so setting it again on later
+        # connections would be wasted work.
+        assert seen_pragmas.count("PRAGMA journal_mode=WAL") == 1
+        # Connection-scoped, so every connection has to set it or it silently
+        # falls back to the FULL default.
+        assert seen_pragmas.count("PRAGMA synchronous=NORMAL") > 1
+
+        with store._connect() as conn:
+            assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
 
     def test_read_session_reuses_one_underlying_connection_for_many_reads(
         self,

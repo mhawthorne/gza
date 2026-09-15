@@ -7991,14 +7991,21 @@ class SqliteTaskStore:
                 return conn
             if self._open_mode in {"registry_mutation", "registry_mutation_existing"}:
                 self._validate_registry_mutation_identity()
+            # journal_mode is persisted in the database file, so it only needs
+            # setting once per store. synchronous is a property of each
+            # connection: gating it behind the same flag left every connection
+            # after the store's first one at the FULL default, so the intended
+            # NORMAL never reached any operational connection.
+            write_pragmas = ["PRAGMA synchronous=NORMAL"]
             if not self._write_pragmas_applied:
-                for pragma in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"):
-                    try:
-                        conn.execute(pragma)
-                    except sqlite3.OperationalError as exc:
-                        if "readonly" not in str(exc).lower() and "read-only" not in str(exc).lower():
-                            raise
-                self._write_pragmas_applied = True
+                write_pragmas.insert(0, "PRAGMA journal_mode=WAL")
+            for pragma in write_pragmas:
+                try:
+                    conn.execute(pragma)
+                except sqlite3.OperationalError as exc:
+                    if "readonly" not in str(exc).lower() and "read-only" not in str(exc).lower():
+                        raise
+            self._write_pragmas_applied = True
             return conn
         except Exception:
             conn.close()

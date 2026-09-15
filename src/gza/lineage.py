@@ -22,23 +22,27 @@ def walk_based_on_descendants(
         return
 
     visited: set[str] = {task.id}
-    queue: list[Task] = (
-        list(store.get_based_on_children_by_type(task.id, task_type))
-        if task_type is not None
-        else list(store.get_based_on_children(task.id))
-    )
-
-    while queue:
-        child = queue.pop(0)
-        if child.id is None or child.id in visited:
-            continue
-        visited.add(child.id)
-        yield child
-        queue.extend(
-            store.get_based_on_children_by_type(child.id, task_type)
+    # One child lookup per node, each of which would otherwise open its own
+    # connection -- and the first statement on a fresh connection pays for
+    # parsing the schema. Hold a single read connection across the walk.
+    with store.read_session():
+        queue: list[Task] = (
+            list(store.get_based_on_children_by_type(task.id, task_type))
             if task_type is not None
-            else store.get_based_on_children(child.id)
+            else list(store.get_based_on_children(task.id))
         )
+
+        while queue:
+            child = queue.pop(0)
+            if child.id is None or child.id in visited:
+                continue
+            visited.add(child.id)
+            yield child
+            queue.extend(
+                store.get_based_on_children_by_type(child.id, task_type)
+                if task_type is not None
+                else store.get_based_on_children(child.id)
+            )
 
 
 def walk_lineage_descendants(store: SqliteTaskStore, task: Task) -> Iterator[Task]:

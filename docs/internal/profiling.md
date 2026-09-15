@@ -175,3 +175,35 @@ tmp/flamegraph-20260519113123.svg
 
 This matches the pattern used by `src/gza/test_latency.py` and keeps profile
 output out of git history.
+
+## Test-suite latency
+
+Three tools cover the suite itself, in increasing order of what they answer:
+
+| tool | question |
+| --- | --- |
+| `bin/test-latency` | which tests are slow? |
+| `bin/test-redundancy` | how much of the suite is redundant? |
+| `bin/test-cull-candidates` | which specific tests should go first? |
+
+`test-cull-candidates` needs two inputs. Collect branch coverage with one
+context per test, then let the tool produce its own timing run:
+
+```
+pytest tests/ --cov=gza --cov-branch --cov-context=test --cov-report= -q
+bin/test-cull-candidates --run --tsv tmp/cull-candidates.tsv -- tests/ -q
+```
+
+The timing run is deliberately single-process: under xdist each worker loads
+its own copy of the plugin and would overwrite the others' results.
+
+It ranks candidates most-expensive-first and holds back two classes that
+coverage cannot judge — parametrised variants whose siblings survive, and tests
+carrying a `specs/behavior/` term no surviving test carries. The output is a
+review list, not a delete script; see
+`docs/internal/sessions/2026-09-04-test-suite-latency.md` for what the numbers
+mean and which optimisations have already been tried and failed.
+
+Note that on a machine running concurrent `gza` verify gates, wall-clock A/B
+comparisons of the suite are unreliable — identical runs have drifted by 80%.
+Prefer load-independent counters when comparing.

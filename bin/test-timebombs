@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Report tests that pass today but will fail on a future date.
+
+Runs the suite twice per file -- once normally, once with gza's clock shifted
+forward -- and reports the difference. Tests failing only in the shifted arm are
+pinned to a literal fixture date that production compares against a moving
+staleness window.
+
+    bin/test-timebombs                 # default +365d over tests/
+    bin/test-timebombs --days 30
+    bin/test-timebombs --days 365 tests/cli/test_query.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+# The agent shell exports FORCE_COLOR, which makes pytest wrap summary lines in
+# ANSI codes and quietly breaks an anchored match. Strip it and ask for no colour.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+FAILED = re.compile(r"^FAILED (\S+)")
+
+
+def run_file(path: str, days: int, venv_python: str) -> set[str]:
+    env = {**os.environ, "GZA_TIMESHIFT_DAYS": str(days)}
+    env.pop("FORCE_COLOR", None)
+    cmd = [
+        venv_python, "-m", "pytest", path,
+        "-q", "-p", "no:randomly", "-p", "no:xdist",
+        "--color=no", "--maxfail=9999",
+    ]
+    if days:
+        cmd += ["-p", "gza.test_timeshift"]
+    # The summary reaches stderr in some configurations; merge so neither is lost.
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    found = set()
+    for line in _ANSI.sub("", proc.stdout + proc.stderr).splitlines():
+        match = FAILED.match(line)
+        if match:
+            found.add(match.group(1))
+    return found
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--days", type=int, default=365)
+    parser.add_argument("targets", nargs="*", default=["tests"])
+    args = parser.parse_args(argv)
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    venv_python = str(root / ".venv" / "bin" / "python")
+    if not pathlib.Path(venv_python).exists():
+        venv_python = sys.executable
+
+    files: list[str] = []
+    for target in args.targets:
+        path = pathlib.Path(target)
+        files.extend(sorted(str(p) for p in path.rglob("test_*.py")) if path.is_dir() else [str(path)])
+
+    print(f"probing {len(files)} files at +{args.days}d\n", flush=True)
+    bombs: dict[str, list[str]] = {}
+    for index, path in enumerate(files, 1):
+        base = run_file(path, 0, venv_python)
+        shifted = run_file(path, args.days, venv_python)
+        new = sorted(shifted - base)
+        if new:
+            bombs[path] = new
+            print(f"[{index}/{len(files)}] {path}: {len(new)} will expire", flush=True)
+
+    total = sum(len(v) for v in bombs.values())
+    print(f"\n=== {total} tests pass today and fail at +{args.days}d ===")
+    for path, ids in sorted(bombs.items(), key=lambda kv: -len(kv[1])):
+        print(f"\n{path}  ({len(ids)})")
+        for node_id in ids:
+            print(f"  {node_id.split('::', 1)[-1]}")
+    if total:
+        print(
+            "\nFix by making fixture timestamps relative to now "
+            "(datetime.now(UTC) - timedelta(...)), not literal dates. "
+            "Bumping the literal only re-arms it."
+        )
+    return 1 if total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
