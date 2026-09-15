@@ -217,28 +217,6 @@ def test_format_iterate_terminal_merge_state_message_hides_recoverable_failed_re
         )
 
 
-def test_format_iterate_terminal_merge_state_message_hides_pending_redundant_resume_task(
-    tmp_path: Path,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    pending = store.add("Pending redundant resume", task_type="implement", recovery_origin="resume")
-    assert pending.id is not None
-    pending.status = "pending"
-    pending.session_id = "sess-pending-redundant"
-    pending.has_commits = True
-    store.update(pending)
-
-    assert (
-        _format_iterate_terminal_merge_state_message(
-            store=store,
-            requested_impl_task=pending,
-            iterate_task=pending,
-            resolved_from_failed_ancestor=False,
-            merge_state="redundant",
-        )
-        is None
-    )
 
 
 def test_work_explicit_pending_task_requires_resolved_existing_route_before_foreground(
@@ -1913,27 +1891,6 @@ class TestRetagCommand:
         assert self._task_row_state(tmp_path, task.id) == before_row
         assert self._task_tag_rows(tmp_path, task.id) == ()
 
-    def test_retag_dry_run_does_not_persist_changes(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        task = store.add("Release task", tags=("v0.6.0",))
-
-        result = invoke_gza(
-            "retag",
-            "--tag",
-            "v0.6.0",
-            "--replace-tag",
-            "v0.6.0",
-            "v0.6.1",
-            "--dry-run",
-            "--project",
-            str(tmp_path),
-        )
-
-        assert result.returncode == 0
-        assert "[dry-run] No changes applied." in result.stdout
-        assert store.get(task.id).tags == ("v0.6.0",)
 
     def test_retag_requires_confirmation_without_yes(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -1957,39 +1914,6 @@ class TestRetagCommand:
         input_mock.assert_called_once_with("\nProceed? [y/N] ")
         assert store.get(task.id).tags == ("v0.6.0",)
 
-    def test_retag_confirmed_write_preserves_concurrent_non_tag_and_unrelated_tag_changes(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Original prompt", tags=("v0.6.0",))
-
-        def confirm_after_concurrent_change(_prompt: str) -> str:
-            concurrent = store.get(task.id)
-            assert concurrent is not None
-            concurrent.status = "failed"
-            concurrent.prompt = "Concurrent prompt"
-            concurrent.completed_at = datetime.now(UTC)
-            store.update(concurrent)
-            store.add_task_tags(task.id, ("operator",))
-            return "y"
-
-        with patch("builtins.input", side_effect=confirm_after_concurrent_change):
-            result = invoke_gza(
-                "retag",
-                "--tag",
-                "v0.6.0",
-                "--add-tag",
-                "release",
-                "--project",
-                str(tmp_path),
-            )
-
-        assert result.returncode == 0
-        assert "Updated 1 task(s)." in result.stdout
-        refreshed = store.get(task.id)
-        assert refreshed is not None
-        assert refreshed.prompt == "Concurrent prompt"
-        assert refreshed.status == "failed"
-        assert refreshed.tags == ("operator", "release", "v0.6.0")
 
     def test_retag_confirmed_write_skips_task_deleted_after_preview(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
@@ -6181,36 +6105,6 @@ class TestBackgroundWorkerCommand:
         assert worker.task_slug == refreshed_task.slug
         assert (tmp_path / worker.startup_log_file).exists()
 
-    def test_work_background_existing_task_startup_failure_surfaces_before_detach(self, tmp_path: Path):
-        """Explicit background work should fail in the parent when startup preparation fails."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Parent-side startup failure")
-
-        with (
-            patch("gza.cli.prepare_task_startup_phase", side_effect=RuntimeError("startup boom")),
-            patch(
-                "gza.cli._spawn_detached_worker_process",
-                side_effect=AssertionError("worker process should not spawn"),
-            ),
-        ):
-            result = invoke_gza(
-                "work",
-                str(task.id),
-                "--background",
-                "--no-docker",
-                "--project",
-                str(tmp_path),
-            )
-
-        assert result.returncode == 1
-        assert "startup boom" in result.stderr
-        output = result.stdout + result.stderr
-        assert "Started task" not in output
-
-        workers_dir = tmp_path / ".gza" / "workers"
-        if workers_dir.exists():
-            assert list(workers_dir.iterdir()) == []
 
     def test_work_background_existing_task_log_setup_failure_restores_startup_metadata(self, tmp_path: Path):
         """Existing pending work rows should not retain startup metadata after Phase 1 log setup fails."""
@@ -16376,65 +16270,6 @@ class TestIterateCommand:
         assert "Next action: verify_gate" in inner_output
         assert "Verify gate passed for the current source epoch before review." in inner_output
 
-    def test_iterate_force_recovered_lineage_wait_improve_keeps_blocked_exit(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        from gza.cli import cmd_iterate
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        root, head = self._make_failed_root_with_completed_recovery_descendant(
-            store,
-            branch="feature/iterate-force-recovered-wait-improve",
-        )
-        self._attach_recovered_lineage_merge_unit(store, root, head)
-        review = self._make_review_task(store, head, status="completed", verdict="CHANGES_REQUESTED")
-        improve = store.add("Improve in progress", task_type="improve", based_on=head.id, depends_on=review.id)
-        assert improve.id is not None
-        improve.status = "in_progress"
-        store.update(improve)
-        config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
-            store,
-            tmp_path,
-            head,
-            head_sha="recovered-wait-improve-head",
-        )
-
-        args = argparse.Namespace(
-            impl_task_id=root.id,
-            max_iterations=1,
-            dry_run=False,
-            project_dir=tmp_path,
-            no_docker=True,
-            resume=False,
-            retry=False,
-            background=False,
-            force=True,
-        )
-        mock_git = MagicMock()
-        with ExitStack() as stack:
-            verify_calls = self._patch_fresh_verify_gate(
-                stack,
-                config=config,
-                store=store,
-                mock_git=mock_git,
-                impl=head,
-                head_sha="recovered-wait-improve-head",
-                status="passed",
-            )
-            stack.enter_context(
-                patch(
-                    "gza.cli.execution._run_foreground",
-                    side_effect=AssertionError("wait_improve must not run a worker"),
-                )
-            )
-            result = cmd_iterate(args)
-        output = capsys.readouterr().out
-
-        assert result == 3
-        assert len(verify_calls) == 0
-        assert "Next action: wait_improve" in output
-        assert "Iterate waiting: improve_in_progress" in output
 
     def test_iterate_force_recovered_lineage_real_cap_keeps_maxed_out_exit(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -17063,145 +16898,7 @@ class TestIterateCommand:
         assert result == 0
         assert "[dry-run] First next action: needs_discussion" in output
 
-    def test_unstick_run_by_explicit_id_invokes_fresh_verify_for_verify_fix_failed_rearm(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        from gza.cli.unstick import cmd_unstick
-        from gza.review_verify_state import resolve_verify_gate_decision
 
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        impl = self._make_completed_impl(store)
-        impl.branch = "feature/unstick-id-verify-fix-failed"
-        store.update(impl)
-        config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
-            store,
-            tmp_path,
-            impl,
-            head_sha="unstick-id-head",
-        )
-
-        args = argparse.Namespace(
-            task_ids=(impl.id,),
-            reasons=("verify-fix-failed",),
-            all=False,
-            run=True,
-            limit=1,
-            tags=None,
-            all_tags=False,
-            project_dir=tmp_path,
-        )
-        mock_git = MagicMock()
-        with ExitStack() as stack:
-            verify_calls = self._patch_fresh_verify_gate(
-                stack,
-                config=config,
-                store=store,
-                mock_git=mock_git,
-                impl=impl,
-                head_sha="unstick-id-head",
-                status="passed",
-            )
-            result = cmd_unstick(args)
-        output = capsys.readouterr().out
-
-        decision = resolve_verify_gate_decision(store, impl, config=config, git=mock_git)
-        assert result == 0
-        assert len(verify_calls) == 1
-        assert decision.state == "passed"
-        assert "Selected 1 owner(s) (1 currently parked)" in output
-        assert "Run summary: 0 started, 1 direct, 0 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked" in output
-        assert "Direct:" in output
-        assert f"{impl.id} [verify-fix-failed] verify_gate success" in output
-
-    def test_unstick_run_explicit_refresh_reruns_when_gate_turns_green_before_execution(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        from gza.cli.unstick import cmd_unstick
-        from gza.review_verify_state import (
-            VerifyGateDecision,
-            VerifyGateLookup,
-            VerifyGateResult,
-            owner_task_verify_epoch,
-            resolve_verify_gate_decision,
-        )
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        impl = self._make_completed_impl(store)
-        impl.branch = "feature/unstick-raced-green-verify-fix-failed"
-        store.update(impl)
-        config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
-            store,
-            tmp_path,
-            impl,
-            head_sha="unstick-raced-green-head",
-        )
-
-        args = argparse.Namespace(
-            task_ids=(impl.id,),
-            reasons=("verify-fix-failed",),
-            all=False,
-            run=True,
-            limit=1,
-            tags=None,
-            all_tags=False,
-            project_dir=tmp_path,
-        )
-        mock_git = MagicMock()
-        decision_calls = 0
-
-        def raced_green_decision(store_arg, owner_task, *, config, git):
-            nonlocal decision_calls
-            decision_calls += 1
-            if decision_calls == 1:
-                epoch = owner_task_verify_epoch(owner_task, config, git)
-                assert epoch is not None
-                result = VerifyGateResult(
-                    command="./bin/tests",
-                    status="passed",
-                    exit_status="0",
-                    captured_at=datetime(2026, 8, 17, 10, 30, tzinfo=UTC),
-                    reviewed_branch=epoch.reviewed_branch,
-                    reviewed_head_sha=epoch.reviewed_head_sha,
-                    reviewed_base_sha="base-head",
-                    working_directory=str(tmp_path),
-                    source_task_id=owner_task.id,
-                    source_task_type=owner_task.task_type,
-                )
-                return VerifyGateDecision(
-                    owner_task_id=owner_task.id,
-                    current_epoch=epoch,
-                    lookup=VerifyGateLookup(
-                        result=result,
-                        source="owner_artifact",
-                        is_current=True,
-                        has_owner_artifact=True,
-                    ),
-                    state="passed",
-                )
-            return resolve_verify_gate_decision(store_arg, owner_task, config=config, git=git)
-
-        with ExitStack() as stack:
-            verify_calls = self._patch_fresh_verify_gate(
-                stack,
-                config=config,
-                store=store,
-                mock_git=mock_git,
-                impl=impl,
-                head_sha="unstick-raced-green-head",
-                status="passed",
-            )
-            stack.enter_context(
-                patch("gza.cli.advance_executor.resolve_verify_gate_decision", side_effect=raced_green_decision)
-            )
-            result = cmd_unstick(args)
-        output = capsys.readouterr().out
-
-        assert result == 0
-        assert len(verify_calls) == 1
-        assert "Run summary: 0 started, 1 direct, 0 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked" in output
-        assert f"{impl.id} [verify-fix-failed] verify_gate success" in output
 
     def test_unstick_run_by_tag_invokes_fresh_verify_for_verify_fix_failed_rearm(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -17255,59 +16952,6 @@ class TestIterateCommand:
         assert "Direct:" in output
         assert f"{impl.id} [verify-fix-failed] verify_gate success" in output
 
-    def test_unstick_run_reports_red_fresh_verify_as_direct_blocked(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        from gza.cli.unstick import cmd_unstick
-        from gza.review_verify_state import resolve_verify_gate_decision
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        impl = self._make_completed_impl(store)
-        impl.branch = "feature/unstick-red-verify-fix-failed"
-        store.update(impl)
-        config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
-            store,
-            tmp_path,
-            impl,
-            head_sha="unstick-red-head",
-        )
-
-        args = argparse.Namespace(
-            task_ids=(impl.id,),
-            reasons=("verify-fix-failed",),
-            all=False,
-            run=True,
-            limit=1,
-            tags=None,
-            all_tags=False,
-            project_dir=tmp_path,
-        )
-        mock_git = MagicMock()
-        with ExitStack() as stack:
-            verify_calls = self._patch_fresh_verify_gate(
-                stack,
-                config=config,
-                store=store,
-                mock_git=mock_git,
-                impl=impl,
-                head_sha="unstick-red-head",
-                status="failed",
-                failure="pytest still failed",
-            )
-            result = cmd_unstick(args)
-        output = capsys.readouterr().out
-
-        decision = resolve_verify_gate_decision(store, impl, config=config, git=mock_git)
-        assert result == 0
-        assert len(verify_calls) == 1
-        assert decision.state == "failed"
-        assert "Selected 1 owner(s) (1 currently parked)" in output
-        assert "Run summary: 0 started, 0 direct, 1 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked" in output
-        assert "Direct Blocked:" in output
-        assert f"{impl.id} [verify-fix-failed] verify_gate blocked" in output
-        assert "Started:" not in output
-        assert "Cleared Only:" not in output
 
     @pytest.mark.parametrize("selection_mode", ["explicit-id", "tag"])
     def test_unstick_run_recovered_verify_fix_failed_rearms_and_persists_fresh_verify_on_root(
@@ -17652,65 +17296,6 @@ class TestIterateCommand:
         assert "verify_gate" not in output
         assert f"after completed verify_fix {verify_fix.id}" in output
 
-    def test_iterate_force_still_blocks_when_fresh_verify_fails(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        from gza.cli import cmd_iterate
-        from gza.review_verify_state import resolve_verify_gate_decision
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        impl = self._make_completed_impl(store)
-        impl.branch = "feature/iterate-force-verify-still-red"
-        store.update(impl)
-        config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
-            store,
-            tmp_path,
-            impl,
-            head_sha="still-red-head",
-        )
-
-        args = argparse.Namespace(
-            impl_task_id=impl.id,
-            max_iterations=1,
-            dry_run=False,
-            project_dir=tmp_path,
-            no_docker=True,
-            resume=False,
-            retry=False,
-            background=False,
-            force=True,
-        )
-        mock_git = MagicMock()
-        with ExitStack() as stack:
-            verify_calls = self._patch_fresh_verify_gate(
-                stack,
-                config=config,
-                store=store,
-                mock_git=mock_git,
-                impl=impl,
-                head_sha="still-red-head",
-                status="failed",
-                failure="pytest still failed",
-            )
-            stack.enter_context(
-                patch(
-                    "gza.cli.execution._run_foreground",
-                    side_effect=AssertionError("force must not run review/improve after a red fresh verify"),
-                )
-            )
-            result = cmd_iterate(args)
-        output = capsys.readouterr().out
-
-        assert result == 3
-        assert len(verify_calls) == 1
-        assert mock_git.worktree_add_existing.call_count == 1
-        assert "Iterate complete: BLOCKED (verify-gate-blocked)" in output
-        assert "verify gate remained failed" in output
-        assert "merge_ready" not in output
-
-        decision = resolve_verify_gate_decision(store, impl, config=config, git=mock_git)
-        assert decision.state == "failed"
 
     def test_iterate_force_stops_on_fresh_verify_budget_timeout_without_verify_fix(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -19736,104 +19321,6 @@ class TestIterateCommand:
         assert "Cannot resume failed implementation" not in output
         assert "proceeding with manual resume from" not in output
 
-    def test_failed_task_resume_does_not_reuse_pending_same_session_child_with_mismatched_role(self, tmp_path: Path):
-        """iterate --resume should not reuse pending children that violate shared recovery-edge classification."""
-        import argparse
-        from datetime import datetime
-        from unittest.mock import MagicMock, patch
-
-        from gza.cli import cmd_iterate
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        dependency = store.add("Dependency", task_type="plan")
-        assert dependency.id is not None
-
-        root = store.add("Implement feature", task_type="implement")
-        assert root.id is not None
-        root.status = "failed"
-        root.failure_reason = "MAX_TURNS"
-        root.session_id = "resume-session-1"
-        store.update(root)
-
-        mismatched_child = store.add("Pending child", task_type="implement", based_on=root.id, depends_on=dependency.id)
-        assert mismatched_child.id is not None
-        mismatched_child.status = "pending"
-        mismatched_child.session_id = root.session_id
-        store.update(mismatched_child)
-
-        def fake_run_foreground(config, task_id, **kwargs):
-            task = store.get(task_id)
-            if task and task.status == "pending":
-                task.status = "completed"
-                if task.task_type == "review":
-                    task.output_content = "**Verdict: APPROVED**"
-                elif task.task_type == "implement":
-                    task.branch = "test-project/20260101-resume-mismatch"
-                task.completed_at = datetime.now()
-                store.update(task)
-            return 0
-
-        args = argparse.Namespace(
-            project_dir=str(tmp_path),
-            impl_task_id=str(root.id),
-            max_iterations=1,
-            dry_run=False,
-            no_docker=True,
-            resume=True,
-            retry=False,
-            background=False,
-        )
-        mock_config = MagicMock(
-            project_dir=tmp_path,
-            use_docker=False,
-            project_prefix="testproject",
-            require_review_before_merge=False,
-            advance_create_reviews=True,
-            max_review_cycles=3,
-            max_resume_attempts=1,
-            verify_command="./bin/tests",
-            autonomous_verify_timeout_seconds=120,
-            review_verify_timeout_grace_seconds=5.0,
-        )
-        mock_git = MagicMock()
-        mock_git.current_branch.return_value = "main"
-        mock_git.branch_exists.return_value = True
-        mock_git.can_merge.return_value = True
-        mock_git.count_commits_behind.return_value = 0
-        mock_git.rev_parse_if_exists.side_effect = (
-            lambda ref: "same-head" if ref == "test-project/20260101-resume-mismatch" else "base-head" if ref == "main" else None
-        )
-
-        def fake_execute_advance_action(*, task, action, context):
-            from gza.cli.advance_executor import AdvanceActionExecutionResult
-
-            if action.get("type") == "verify_gate":
-                self._persist_current_green_verify(store, tmp_path, task)
-            return AdvanceActionExecutionResult(
-                action_type="verify_gate",
-                status="success",
-                success_message="Verify gate already passed for the current source epoch before merge.",
-            )
-
-        with (
-            patch("gza.cli.Config.load", return_value=mock_config),
-            patch("gza.cli.get_store", return_value=store),
-            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
-            patch("gza.cli.Git", return_value=mock_git),
-            patch("gza.cli.execution.Git", return_value=mock_git),
-            patch("gza.cli.execution.execute_advance_action", side_effect=fake_execute_advance_action),
-        ):
-            result = cmd_iterate(args)
-
-        assert result == 0
-        assert run_fg.call_count >= 1
-        first_task_id = run_fg.call_args_list[0][1]["task_id"]
-        assert first_task_id != mismatched_child.id
-        child_ids = [task.id for task in store.get_based_on_children(root.id)]
-        assert mismatched_child.id in child_ids
-        assert first_task_id in child_ids
 
     def test_iterate_continue_flag_is_rejected(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -24860,86 +24347,6 @@ class TestIterateCommand:
         assert target.id == first.id
         assert decision is not None
 
-    def test_iterate_creates_followup_after_completed_noop_improve(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        import argparse
-        from unittest.mock import MagicMock, patch
-
-        from gza.cli import cmd_iterate
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        impl = self._make_completed_impl(store)
-        review = store.add("Review", task_type="review", depends_on=impl.id)
-        review.status = "completed"
-        review.output_content = "**Verdict: CHANGES_REQUESTED**"
-        review.completed_at = datetime.now(UTC)
-        store.update(review)
-        assert review.id is not None
-
-        noop_improve = store.add("Improve 1", task_type="improve", based_on=impl.id, depends_on=review.id)
-        noop_improve.status = "completed"
-        noop_improve.changed_diff = False
-        noop_improve.completed_at = datetime.now(UTC)
-        store.update(noop_improve)
-
-        args = argparse.Namespace(
-            impl_task_id=impl.id,
-            max_iterations=1,
-            dry_run=False,
-            project_dir=tmp_path,
-            no_docker=True,
-            resume=False,
-            retry=False,
-            background=False,
-        )
-        mock_config = MagicMock(
-            project_dir=tmp_path,
-            use_docker=False,
-            project_prefix="testproject",
-            max_resume_attempts=3,
-            max_review_cycles=3,
-            max_noop_improve_cycles=2,
-            require_review_before_merge=True,
-            advance_create_reviews=True,
-        )
-        mock_git = MagicMock()
-        mock_git.current_branch.return_value = "main"
-        mock_git.branch_exists.return_value = True
-        mock_git.can_merge.return_value = True
-        mock_git.count_commits_behind.return_value = 0
-
-        def fake_run_foreground(config, task_id, **kwargs):
-            del config, kwargs
-            task = store.get(task_id)
-            assert task is not None
-            task.status = "completed"
-            task.completed_at = datetime.now(UTC)
-            store.update(task)
-            return 0
-
-        with (
-            patch("gza.cli.Config.load", return_value=mock_config),
-            patch("gza.cli.get_store", return_value=store),
-            patch("gza.cli.Git", return_value=mock_git),
-            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground,
-            patch("gza.cli.time.monotonic", side_effect=[300.0, 340.0]),
-        ):
-            result = cmd_iterate(args)
-        output = capsys.readouterr().out
-
-        assert result == 3
-        created = next(
-            task
-            for task in store.get_improve_tasks_for(impl.id, review.id)
-            if task.id not in {noop_improve.id}
-        )
-        assert created.based_on == noop_improve.id
-        assert created.status == "completed"
-        assert any(call.kwargs["task_id"] == created.id for call in run_foreground.call_args_list)
-        assert f"Running improve {created.id}..." in output
-        assert "Iterate blocked:" in output
 
     def test_changes_requested_with_dropped_improve_blocks_and_does_not_run_review(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

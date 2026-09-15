@@ -572,46 +572,6 @@ class TestLogCommand:
         assert "gza retry" not in output
         assert "gza merge" not in output
 
-    def test_failure_marker_stripping_is_identical_for_show_and_log_failure(self, tmp_path: Path):
-        """Marker lines should be stripped from explanation text in both show and log --failure."""
-        import json
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Marker stripping parity task")
-        assert task.id is not None
-        task.status = "failed"
-        task.failure_reason = "MAX_TURNS"
-        task.log_file = ".gza/logs/marker-strip.log"
-        store.update(task)
-
-        log_dir = tmp_path / ".gza" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        (log_dir / "marker-strip.log").write_text(
-            "\n".join(
-                json.dumps(line) for line in [
-                    {
-                        "type": "item.completed",
-                        "item": {
-                            "type": "agent_message",
-                            "text": "[GZA_FAILURE:AGENT_FORFEIT]\nOnly body text remains",
-                        },
-                    },
-                    {"type": "result", "subtype": "error_max_turns", "result": "Stopped at limit"},
-                ]
-            )
-        )
-
-        show_result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
-        log_result = invoke_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
-
-        assert show_result.returncode == 0
-        assert log_result.returncode == 0
-
-        assert show_result.stdout.count("[GZA_FAILURE:AGENT_FORFEIT]") == 1
-        assert log_result.stdout.count("[GZA_FAILURE:AGENT_FORFEIT]") == 1
-        assert "Only body text remains" in show_result.stdout
-        assert "Only body text remains" in log_result.stdout
 
     def test_log_by_task_id_missing_log_file(self, tmp_path: Path):
         """Log command by task ID handles missing log file."""

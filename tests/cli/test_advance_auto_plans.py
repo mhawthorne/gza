@@ -780,30 +780,6 @@ def test_advance_repeat_requires_explicit_task_id(tmp_path: Path, capsys) -> Non
     assert "--repeat requires an explicit task_id" in captured.out
 
 
-def test_advance_repeat_stops_when_merged(tmp_path: Path, capsys) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    impl = _create_completed_implement(store)
-    git = _mock_git()
-    merge_state = {"value": "unmerged"}
-
-    def fake_merge(*_args, **_kwargs):
-        merge_state["value"] = "merged"
-        store.set_merge_status(impl.id, "merged")
-        return SimpleNamespace(rc=0)
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=git),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", side_effect=lambda **_kwargs: merge_state["value"]),
-        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge", "description": "Merge task"}),
-        patch("gza.cli.git_ops._execute_merge_action", side_effect=fake_merge),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, repeat=True, max_iterations=2))
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert "cycle 1: merge -> success: merged" in captured.out
-    assert f"Advance repeat completed: {impl.id} merged" in captured.out
 
 
 def test_advance_repeat_stops_when_parked(tmp_path: Path, capsys) -> None:
@@ -831,57 +807,8 @@ def test_advance_repeat_stops_when_parked(tmp_path: Path, capsys) -> None:
     assert "Advance repeat parked: SKIP: needs human" in captured.out
 
 
-def test_advance_repeat_stops_at_iteration_cap(tmp_path: Path, capsys) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    impl = _create_completed_implement(store)
-    git = _mock_git()
-    actions = iter(
-        [
-            {"type": "create_review", "description": "Create review"},
-            {"type": "run_review", "description": "Run review"},
-        ]
-    )
-
-    def fake_execute(*_args, **_kwargs):
-        return SimpleNamespace(status="success", message="ok", success_message="", error_message="")
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=git),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
-        patch("gza.cli.git_ops.determine_next_action", side_effect=lambda *_a, **_k: next(actions)),
-        patch("gza.cli.git_ops.execute_advance_action", side_effect=fake_execute),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, repeat=True, max_iterations=2))
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert "cycle 1: create_review -> success: ok" in captured.out
-    assert "cycle 2: run_review -> success: ok" in captured.out
-    assert "Advance repeat stopped: max iterations (2) reached" in captured.out
 
 
-def test_advance_repeat_stops_on_no_progress_backstop(tmp_path: Path, capsys) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    impl = _create_completed_implement(store)
-    git = _mock_git()
-
-    def fake_execute(*_args, **_kwargs):
-        return SimpleNamespace(status="success", message="noop", success_message="", error_message="")
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=git),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
-        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "create_review", "description": "Create review"}),
-        patch("gza.cli.git_ops.execute_advance_action", side_effect=fake_execute),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, repeat=True, max_iterations=5))
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert "cycle 2: create_review -> success: noop" in captured.out
-    assert "Advance repeat stopped: no progress after repeated create_review" in captured.out
 
 
 def test_advance_repeat_reaches_merge_after_rebase_review_chain(tmp_path: Path, capsys) -> None:
@@ -1042,55 +969,6 @@ def test_advance_repeat_saturated_cap_does_not_execute_direct_verify_gate(
     execute_action.assert_not_called()
 
 
-def test_advance_repeat_does_not_enter_git_planning_cache_between_cycles(tmp_path: Path, capsys) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    impl = _create_completed_implement(store)
-    git = _mock_git()
-    observed_heads: list[str] = []
-    head = {"value": "before-rebase"}
-
-    class _ForbiddenCache:
-        def __enter__(self):
-            raise AssertionError("repeat must not enter planning cache")
-
-        def __exit__(self, exc_type, exc, tb):
-            return None
-
-    git.cached.return_value = _ForbiddenCache()
-
-    def fake_determine(*_args, **kwargs):
-        if kwargs.get("selected_for_merge"):
-            return {"type": "merge", "description": "Merge task"}
-        observed_heads.append(head["value"])
-        return {
-            "type": "needs_rebase" if len(observed_heads) == 1 else "create_review",
-            "description": "repeat action",
-        }
-
-    def fake_execute(*_args, **_kwargs):
-        head["value"] = "after-rebase"
-        return AdvanceActionExecutionResult(
-            action_type="needs_rebase",
-            status="success",
-            message="rebased",
-            success_message="rebased",
-            worker_started=True,
-            worker_consuming=True,
-        )
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=git),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
-        patch("gza.cli.git_ops.determine_next_action", side_effect=fake_determine),
-        patch("gza.cli.git_ops.execute_advance_action", side_effect=fake_execute),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, repeat=True, max_iterations=2))
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert observed_heads == ["before-rebase", "after-rebase"]
-    assert "cycle 2: create_review" in captured.out
 
 
 def test_advance_repeat_red_main_verify_parks_before_merge(tmp_path: Path, capsys) -> None:

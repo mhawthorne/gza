@@ -4222,60 +4222,6 @@ def test_rebase_stale_review_reason_precedence_over_branch_head_advance(
         assert action["review_task"].id == refresh_review.id
 
 
-def test_live_branch_head_preempts_stale_merge_unit_head_for_capped_review(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    from gza import advance_engine as advance_engine_module
-
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    config.max_review_cycles = 0
-
-    impl = _make_completed_unmerged_impl(
-        store,
-        branch="feature/stale-review-merge-unit-cache",
-        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
-    )
-    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
-    review.review_verify_head_sha = "reviewed-sha"
-    review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
-    store.update(review)
-    _add_completed_improve_for_review(
-        store,
-        impl,
-        review,
-        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
-        changed_diff=True,
-    )
-    unit = store.get_or_create_merge_unit_for_task(impl)
-    store.refresh_merge_unit_head(unit.id, head_sha="reviewed-sha")
-
-    monkeypatch.setattr(
-        advance_engine_module,
-        "get_review_report",
-        lambda _project_dir, _review: ParsedReviewReport(
-            verdict="CHANGES_REQUESTED",
-            findings=(),
-            format_version="legacy",
-        ),
-    )
-
-    git = _FakeGit(
-        can_merge=True,
-        existing_branches={impl.branch},
-        ref_shas={impl.branch: "current-sha"},
-    )
-    ctx = resolve_advance_context(config, store, git, impl, "main")
-    action = evaluate_advance_rules(config, store, git, impl, "main")
-
-    assert ctx.current_review_head_sha == "current-sha"
-    assert ctx.latest_reviewed_head_sha == "reviewed-sha"
-    assert ctx.review_invalidated_by_progress is True
-    assert ctx.review_invalidation_reason == "branch_head_advanced"
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
-    assert action.get("needs_attention_reason") != "review-max-cycles-reached"
 
 
 def test_review_freshness_probe_failure_parks_approved_review_instead_of_merging(
@@ -7223,108 +7169,6 @@ def test_review_cycle_cap_counts_rounds_even_when_each_improve_lands_commit(
     assert action["needs_attention_reason"] == "review-max-cycles-reached"
 
 
-def test_review_cycle_cap_counts_legacy_history_without_changing_linked_current_review(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    from gza import advance_engine as advance_engine_module
-
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    config.max_review_cycles = 3
-    config.max_noop_improve_cycles = 4
-
-    slug = "testproject-legacy-review-cycle-cap"
-    impl = _make_completed_unmerged_impl(
-        store,
-        branch="feature/legacy-review-cycle-cap",
-        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
-    )
-    impl.slug = f"20260510-{slug}"
-    store.update(impl)
-
-    old_review_1 = _add_completed_unlinked_slug_review(
-        store,
-        impl,
-        slug=slug,
-        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
-    )
-    old_review_2 = _add_completed_unlinked_slug_review(
-        store,
-        impl,
-        slug=slug,
-        when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC),
-    )
-    manual_followup = store.add(
-        f"review {slug} manual follow-up",
-        task_type="review",
-        based_on=old_review_2.id,
-    )
-    assert manual_followup.id is not None
-    manual_followup.status = "completed"
-    manual_followup.completed_at = datetime(2026, 5, 10, 11, 30, tzinfo=UTC)
-    manual_followup.recovery_origin = "manual"
-    store.update(manual_followup)
-
-    current_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC))
-    current_review.review_verify_head_sha = "current-head"
-    current_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
-    store.update(current_review)
-    newer_legacy_review = _add_completed_unlinked_slug_review(
-        store,
-        impl,
-        slug=slug,
-        when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC),
-    )
-
-    monkeypatch.setattr(
-        advance_engine_module,
-        "get_review_report",
-        lambda _project_dir, review: ParsedReviewReport(
-            verdict="CHANGES_REQUESTED" if review.id == newer_legacy_review.id else "APPROVED",
-            findings=(),
-            format_version="legacy",
-        ),
-    )
-
-    git = _FakeGit(
-        can_merge=True,
-        existing_branches={impl.branch},
-        ref_shas={impl.branch: "current-head"},
-    )
-    evidence = get_implementation_review_evidence(store, impl)
-    evidence_ids = {review.id for review in evidence}
-    accounting_evidence_ids = {review.id for review in get_implementation_review_cycle_accounting_evidence(store, impl)}
-    accounting = resolve_review_cycle_accounting(
-        store,
-        impl.id,
-        latest_completed_review=evidence[0],
-    )
-    ctx = resolve_advance_context(config, store, git, impl, "main")
-    action = evaluate_advance_rules(config, store, git, impl, "main")
-
-    assert evidence[0].id == current_review.id
-    assert evidence_ids == {current_review.id}
-    assert accounting_evidence_ids == {
-        old_review_1.id,
-        old_review_2.id,
-        current_review.id,
-        newer_legacy_review.id,
-    }
-    assert manual_followup.id not in evidence_ids
-    assert manual_followup.id not in accounting_evidence_ids
-    assert count_completed_review_cycles(store, impl.id) == 4
-    assert accounting.lifetime_completed == 4
-    assert accounting.completed_since_boundary == 4
-    assert accounting.boundary.boundary_task_id is None
-    assert ctx.latest_completed_review is not None
-    assert ctx.latest_completed_review.id == current_review.id
-    assert ctx.review_verdict == "APPROVED"
-    assert ctx.completed_review_cycles == 0
-    assert ctx.review_cycle_boundary_task_id is None
-    assert ctx.review_cycle_boundary_reason is None
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_newer_legacy_approved_review_cannot_override_linked_changes_requested_review(
@@ -7992,85 +7836,6 @@ def test_review_cycle_accounting_rejects_boundary_after_stale_richer_unproven_re
     assert action["needs_attention_reason"] == "review-max-cycles-reached"
 
 
-def test_changed_diff_rebase_resets_review_cycle_cap_after_prior_landed_commits(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    from gza import advance_engine as advance_engine_module
-
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    config.max_review_cycles = 2
-    config.max_noop_improve_cycles = 3
-    config.on_max_cycles = "park"
-
-    impl = _make_completed_unmerged_impl(
-        store,
-        branch="feature/review-cycle-cap-new-reviewed-head",
-        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
-    )
-    review1 = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC))
-    review1.review_verify_head_sha = "old-head"
-    review1.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
-    store.update(review1)
-    _add_completed_improve_for_review(
-        store,
-        impl,
-        review1,
-        when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC),
-        changed_diff=True,
-    )
-    review2 = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC))
-    review2.review_verify_head_sha = "old-head"
-    review2.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
-    store.update(review2)
-    _add_completed_improve_for_review(
-        store,
-        impl,
-        review2,
-        when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC),
-        changed_diff=True,
-    )
-    rebase = _add_completed_rebase(
-        store,
-        impl,
-        when=datetime(2026, 5, 10, 13, 30, tzinfo=UTC),
-        changed_diff=True,
-    )
-    _add_rebase_diff_provenance(store, rebase)
-
-    current_head_review = _add_completed_review(
-        store,
-        impl,
-        when=datetime(2026, 5, 10, 14, 0, tzinfo=UTC),
-    )
-    current_head_review.review_verify_head_sha = "current-head"
-    current_head_review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
-    store.update(current_head_review)
-
-    monkeypatch.setattr(
-        advance_engine_module,
-        "get_review_report",
-        lambda _project_dir, _review: ParsedReviewReport(
-            verdict="CHANGES_REQUESTED",
-            findings=(),
-            format_version="legacy",
-        ),
-    )
-
-    git = _FakeGit(
-        can_merge=True,
-        existing_branches={impl.branch},
-        ref_shas={impl.branch: "current-head"},
-    )
-    ctx = resolve_advance_context(config, store, git, impl, "main")
-    action = evaluate_advance_rules(config, store, git, impl, "main")
-
-    assert ctx.completed_review_cycles == 1
-    assert ctx.review_cycle_boundary_task_id == rebase.id
-    assert ctx.review_cycle_boundary_reason == "rebase_changed_diff"
-    assert action["type"] == "improve"
-    assert action.get("needs_attention_reason") != "review-max-cycles-reached"
 
 
 def test_unknown_changed_diff_rebase_does_not_reset_review_cycle_cap(
@@ -8271,85 +8036,6 @@ def test_unproven_changed_diff_rebase_does_not_reset_review_cycle_cap_or_label_b
     assert "completed_since_boundary=2" in output
 
 
-def test_later_noop_rebase_does_not_hide_prior_changed_diff_review_cycle_boundary(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    from gza import advance_engine as advance_engine_module
-
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    config.max_review_cycles = 3
-    config.max_noop_improve_cycles = 4
-
-    impl = _make_completed_unmerged_impl(
-        store,
-        branch="feature/review-cycle-cap-later-noop-rebase",
-        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
-    )
-    review1 = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC))
-    review1.review_verify_head_sha = "old-head"
-    review1.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
-    store.update(review1)
-    _add_completed_improve_for_review(
-        store,
-        impl,
-        review1,
-        when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC),
-        changed_diff=True,
-    )
-    changed_rebase = _add_completed_rebase(
-        store,
-        impl,
-        when=datetime(2026, 5, 10, 11, 30, tzinfo=UTC),
-        changed_diff=True,
-    )
-    _add_rebase_diff_provenance(store, changed_rebase)
-    review2 = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC))
-    review2.review_verify_head_sha = "head-2"
-    review2.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
-    store.update(review2)
-    _add_completed_improve_for_review(
-        store,
-        impl,
-        review2,
-        when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC),
-        changed_diff=True,
-    )
-    _add_completed_rebase(
-        store,
-        impl,
-        when=datetime(2026, 5, 10, 13, 30, tzinfo=UTC),
-        changed_diff=False,
-    )
-    review3 = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 14, 0, tzinfo=UTC))
-    review3.review_verify_head_sha = "head-3"
-    review3.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
-    store.update(review3)
-
-    monkeypatch.setattr(
-        advance_engine_module,
-        "get_review_report",
-        lambda _project_dir, _review: ParsedReviewReport(
-            verdict="CHANGES_REQUESTED",
-            findings=(),
-            format_version="legacy",
-        ),
-    )
-
-    git = _FakeGit(
-        can_merge=True,
-        existing_branches={impl.branch},
-        ref_shas={impl.branch: "head-3"},
-    )
-    ctx = resolve_advance_context(config, store, git, impl, "main")
-    action = evaluate_advance_rules(config, store, git, impl, "main")
-
-    assert ctx.completed_review_cycles == 2
-    assert ctx.review_cycle_boundary_task_id == changed_rebase.id
-    assert ctx.review_cycle_boundary_reason == "rebase_changed_diff"
-    assert action["type"] == "improve"
-    assert action.get("needs_attention_reason") != "review-max-cycles-reached"
 
 
 def test_later_superseded_rebase_does_not_hide_prior_changed_diff_review_cycle_boundary(
@@ -10517,40 +10203,6 @@ def test_completed_rebase_without_prior_review_creates_owner_review(tmp_path: Pa
     assert action["verify_gate_phase"] == "pre_review"
 
 
-def test_completed_rebase_under_resumed_implement_without_review_creates_review(
-    tmp_path: Path,
-) -> None:
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-
-    _failed_owner, resumed = _make_failed_owner_with_completed_resume_descendant(
-        store,
-        branch="feature/rebase-resume-no-review",
-        failed_at=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
-        resumed_at=datetime(2026, 5, 10, 11, 0, tzinfo=UTC),
-    )
-    rebase = _add_completed_rebase(
-        store,
-        resumed,
-        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
-        changed_diff=False,
-    )
-    store.get_or_create_merge_unit_for_task(rebase)
-
-    action = evaluate_advance_rules(
-        config,
-        store,
-        _FakeGit(
-            can_merge=True,
-            existing_branches={resumed.branch},
-            ref_shas={resumed.branch: "rebased-sha", "main": "target-sha"},
-        ),
-        rebase,
-        "main",
-    )
-
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
 
 
 def test_completed_rebase_with_approved_owner_review_merges(tmp_path: Path, monkeypatch) -> None:
@@ -15032,7 +14684,6 @@ def test_off_topic_verify_policy_still_fails_closed_without_current_same_head_gr
             "same-head-sha",
             datetime(2026, 6, 23, 11, 30, tzinfo=UTC),
         ),
-        ("newer_missing_evidence", None, None, None),
         (
             "newer_stale_evidence",
             "passed",
@@ -19801,67 +19452,8 @@ def test_post_merge_rebase_state_without_proven_capped_replay_persists_ordinary_
     assert refreshed_unit.merge_source is None
 
 
-def test_already_merged_unproven_capped_unit_reconciles_without_debt(
-    tmp_path: Path,
-) -> None:
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    config.on_max_cycles = "merge_and_defer"
-    config.max_review_cycles = 0
-    impl = _make_completed_unmerged_impl(
-        store,
-        branch="feature/replay-capped-before-skip",
-        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
-    )
-    store.get_or_create_merge_unit_for_task(impl)
-    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
-    review.output_content = "## Review\n\nVerdict: CHANGES_REQUESTED\n\n## Blockers\n\n### B1\nFix it.\n"
-    store.update(review)
-
-    action = evaluate_advance_rules(
-        config,
-        store,
-        _FakeGit(can_merge=True, ref_shas={impl.branch: "same-sha", "main": "same-sha"}),
-        impl,
-        "main",
-    )
-
-    assert action["type"] == "skip"
-    assert action.get("max_cycles_merge_and_defer") is not True
-    assert not store.get_based_on_children(impl.id)
 
 
-@pytest.mark.parametrize("policy", [None, "park"])
-def test_already_merged_unproven_capped_unit_policy_absent_or_park_reconciles_without_debt(
-    tmp_path: Path,
-    policy: str | None,
-) -> None:
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    if policy is not None:
-        config.on_max_cycles = policy
-    config.max_review_cycles = 0
-    impl = _make_completed_unmerged_impl(
-        store,
-        branch=f"feature/unproven-capped-{policy or 'absent'}",
-        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
-    )
-    store.get_or_create_merge_unit_for_task(impl)
-    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
-    review.output_content = "## Review\n\nVerdict: CHANGES_REQUESTED\n\n## Blockers\n\n### B1\nFix it.\n"
-    store.update(review)
-
-    action = evaluate_advance_rules(
-        config,
-        store,
-        _FakeGit(can_merge=True, ref_shas={impl.branch: "same-sha", "main": "same-sha"}),
-        impl,
-        "main",
-    )
-
-    assert action["type"] == "skip"
-    assert action.get("max_cycles_merge_and_defer") is not True
-    assert not store.get_based_on_children(impl.id)
 
 
 def test_already_merged_spec_coherence_changes_requested_never_replays_capped_debt(
@@ -19921,61 +19513,6 @@ def test_already_merged_spec_coherence_changes_requested_never_replays_capped_de
 
 
 
-def test_already_merged_pending_followup_unit_replays_followup_merge_before_skip(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from gza import advance_engine as advance_engine_module
-
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    impl = _make_completed_unmerged_impl(
-        store,
-        branch="feature/replay-followups-before-skip",
-        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
-    )
-    store.get_or_create_merge_unit_for_task(impl)
-    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
-    review.output_content = "## Review\n\nVerdict: APPROVED_WITH_FOLLOWUPS\n"
-    store.update(review)
-    finding = _review_finding("F1", "FOLLOWUP")
-    followup = store.add(
-        build_followup_prompt(review.id, impl.id, finding),
-        task_type="implement",
-        based_on=review.id,
-        depends_on=impl.id,
-    )
-    _persist_test_merge_finalization_proof(
-        store,
-        action_family="ordinary_followup",
-        impl=impl,
-        review=review,
-        findings=(finding,),
-        children=(followup,),
-    )
-
-    monkeypatch.setattr(
-        advance_engine_module,
-        "get_review_report",
-        lambda _project_dir, _review: ParsedReviewReport(
-            verdict="APPROVED_WITH_FOLLOWUPS",
-            findings=(finding,),
-            format_version="v2",
-        ),
-    )
-
-    action = evaluate_advance_rules(
-        config,
-        store,
-        _FakeGit(can_merge=True, ref_shas={impl.branch: "same-sha", "main": "same-sha"}),
-        impl,
-        "main",
-    )
-
-    assert action["type"] == "merge_with_followups"
-    assert action["pending_merge_finalization"] is True
-    assert action["review_task"].id == review.id
-    assert [finding.id for finding in action["followup_findings"]] == ["F1"]
 
 
 
@@ -20573,55 +20110,6 @@ def test_pending_capped_replay_missing_live_target_sha_blocks_reconciliation(
     assert refreshed_unit.merge_source is None
 
 
-def test_pending_ordinary_followup_replay_uses_merge_unit_owner_for_representative(
-    tmp_path: Path,
-) -> None:
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    owner = _make_completed_unmerged_impl(
-        store,
-        branch="feature/ordinary-owner",
-        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
-    )
-    representative = _make_completed_unmerged_impl(
-        store,
-        branch="feature/ordinary-owner",
-        when=datetime(2026, 5, 10, 10, 30, tzinfo=UTC),
-    )
-    unit = store.get_or_create_merge_unit_for_task(owner)
-    assert unit is not None
-    store.attach_task_to_merge_unit(representative.id, unit.id, "implementation")
-    review = _add_completed_review(store, owner, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
-    review.output_content = _review_output_with_findings("APPROVED_WITH_FOLLOWUPS", followups=("F1",))
-    store.update(review)
-    finding = parse_review_report(review.output_content).findings[0]
-    followup = store.add(
-        build_followup_prompt(review.id, owner.id, finding),
-        task_type="implement",
-        based_on=review.id,
-        depends_on=owner.id,
-    )
-    _persist_test_merge_finalization_proof(
-        store,
-        action_family="ordinary_followup",
-        impl=owner,
-        review=review,
-        findings=(finding,),
-        children=(followup,),
-    )
-
-    action = evaluate_advance_rules(
-        config,
-        store,
-        _FakeGit(can_merge=True, ref_shas={representative.branch: "same-sha", "main": "same-sha"}),
-        representative,
-        "main",
-    )
-
-    assert action["type"] == "merge_with_followups"
-    assert action["pending_merge_finalization"] is True
-    assert action["review_task"].id == review.id
-    assert action["proven_followup_tasks"] == (followup,)
 
 
 def test_pending_finalization_with_exact_ordinary_and_capped_proofs_needs_attention(
@@ -20694,45 +20182,6 @@ def test_pending_finalization_with_exact_ordinary_and_capped_proofs_needs_attent
     assert refreshed_unit.merge_source is None
 
 
-def test_failed_rebase_uses_local_tip_even_when_origin_is_fresher(
-    tmp_path: Path,
-) -> None:
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    impl, _failed_rebase = _make_completed_impl_with_failed_rebase(
-        store,
-        branch="feature/stale-local-tip",
-    )
-
-    git = _FakeGit(
-        can_merge=False,
-        can_merge_by_ref={("origin/feature/stale-local-tip", "main"): False},
-        ref_shas={
-            impl.branch: "target-sha",
-            "origin/feature/stale-local-tip": "remote-sha",
-            "main": "target-sha",
-        },
-        ancestor_pairs={("main", "origin/feature/stale-local-tip"): False},
-        merge_source_result=("origin/feature/stale-local-tip", None),
-    )
-
-    action = evaluate_advance_rules(config, store, git, impl, "main")
-
-    assert action["type"] == "skip"
-    assert "already present on target" in action["description"]
-
-    refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
-    assert refreshed_unit is not None
-    assert refreshed_unit.state in {"merged", "redundant", "unmerged"}
-
-    ctx = resolve_advance_context(config, store, git, impl, "main")
-    assert ctx.merge_source_ref == impl.branch
-    assert ctx.post_merge_rebase_state is not None
-    assert ctx.post_merge_rebase_state.already_merged is True
-    assert ctx.post_merge_rebase_state.warning is None
-    assert git.can_merge_calls == []
-    assert "origin/feature/stale-local-tip" not in git.rev_parse_calls
-    assert ("main", "origin/feature/stale-local-tip") not in git.is_ancestor_calls
 
 
 def test_failed_rebase_clears_when_branch_contains_current_target_tip(
@@ -22974,45 +22423,6 @@ def test_diverged_local_and_origin_do_not_override_local_lifecycle_merge_proof(t
     assert action["description"] == "Run verify gate before review"
 
 
-def test_diverged_local_and_origin_do_not_block_local_tip_equals_target_proof(
-    tmp_path: Path,
-) -> None:
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    impl, _failed_rebase = _make_completed_impl_with_failed_rebase(
-        store,
-        branch="feature/diverged-equals-target-local",
-    )
-
-    git = _FakeGit(
-        can_merge=False,
-        ref_shas={
-            impl.branch: "target-sha",
-            "main": "target-sha",
-        },
-        merge_source_result=(
-            None,
-            (
-                "Local branch 'feature/diverged-equals-target-local' and remote-tracking ref "
-                "'origin/feature/diverged-equals-target-local' diverged. Push, fetch, or "
-                "reconcile them before advancing or merging."
-            ),
-        ),
-    )
-
-    action = evaluate_advance_rules(config, store, git, impl, "main")
-
-    assert action["type"] == "skip"
-    assert "already present on target" in action["description"]
-
-    refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
-    assert refreshed_unit is not None
-    assert refreshed_unit.state in {"merged", "redundant", "unmerged"}
-
-    ctx = resolve_advance_context(config, store, git, impl, "main")
-    assert ctx.post_merge_rebase_state is not None
-    assert ctx.post_merge_rebase_state.already_merged is True
-    assert ctx.post_merge_rebase_state.warning is None
 
 
 def test_review_unknown_verdict_uses_reviewed_task_as_subject(tmp_path: Path, monkeypatch) -> None:

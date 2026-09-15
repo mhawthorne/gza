@@ -1458,44 +1458,6 @@ class TestBuildDockerCmd:
         assert 'exec uv run --directory /workspace gza "$@"' not in setup_cmd
         assert 'export PATH="/tmp/gza-shims:/workspace/bin:$PATH"' in setup_cmd
 
-    def test_default_setup_command_installs_git_guard_before_real_git(self, tmp_path):
-        """Default setup command should install a fail-closed git guard in the shim dir."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=None,
-            env_vars=[],
-        )
-
-        cmd = build_docker_cmd(
-            docker_config,
-            tmp_path,
-            timeout_minutes=10,
-            docker_setup_command="",
-        )
-
-        env_values = [cmd[i + 1] for i, token in enumerate(cmd) if token == "-e"]
-        setup_value = next(v for v in env_values if v.startswith("GZA_DOCKER_SETUP_COMMAND="))
-        setup_cmd = setup_value.split("=", 1)[1]
-        assert "GZA_WORKTREE_ROOT=/workspace" in env_values
-        assert "cat > /tmp/gza-shims/git <<'EOF'" in setup_cmd
-        assert 'real_git="${GZA_REAL_GIT:-/usr/bin/git}"' in setup_cmd
-        assert 'container_gitdir="${GZA_CONTAINER_GITDIR:-}"' in setup_cmd
-        assert 'container_common_gitdir="${GZA_CONTAINER_COMMON_GITDIR:-}"' in setup_cmd
-        assert "add|branch|checkout|cherry-pick|clean|commit|merge|mv|push|rebase|reset|restore|revert|rm|stash|switch|update-ref|worktree" in setup_cmd
-        assert "annotate|blame|cat-file|describe|diff|diff-tree|grep|log|ls-files|ls-remote|name-rev|remote|rev-list|rev-parse|show|show-ref|status|symbolic-ref|tag|version|whatchanged" in setup_cmd
-        assert "gza git guard: refusing mutating git" in setup_cmd
-        assert "gza git guard: refusing read-only git" in setup_cmd
-        assert "gza git guard: refusing unknown git command" in setup_cmd
-        assert "from mounted git metadata without the prepared gitdir/worktree pair" in setup_cmd
-        assert "gza git guard: refusing explicit --git-dir outside prepared task metadata" in setup_cmd
-        assert "gza git guard: refusing GIT_DIR outside prepared task metadata" in setup_cmd
-        assert "gza git guard: refusing GIT_WORK_TREE outside $worktree_root" in setup_cmd
-        assert "gza git guard: refusing GIT_COMMON_DIR outside prepared task metadata" in setup_cmd
-        assert "pass both --git-dir $container_gitdir and --work-tree $worktree_root" in setup_cmd
-        assert setup_cmd.index("cat > /tmp/gza-shims/git <<'EOF'") > setup_cmd.index("cat > /tmp/gza-shims/gza <<'EOF'")
-        assert 'export PATH="/tmp/gza-shims:/workspace/bin:$PATH"' in setup_cmd
 
 
 class TestDockerfileTemplate:

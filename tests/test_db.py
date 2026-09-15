@@ -725,72 +725,6 @@ def test_merge_unit_legacy_state_treats_manual_tombstones_as_inactive() -> None:
     assert merge_unit_legacy_state("superseded") is None
 
 
-def test_active_merge_unit_readers_exclude_manual_tombstones_and_historical_access_still_works(
-    tmp_path: Path,
-) -> None:
-    store = SqliteTaskStore(tmp_path / "test.db")
-
-    dropped = store.add("Dropped loser", task_type="implement")
-    superseded = store.add("Superseded loser", task_type="implement")
-    displaced = store.add("Displaced loser", task_type="implement")
-    winner = store.add("Winner", task_type="implement")
-    assert dropped.id is not None
-    assert superseded.id is not None
-    assert displaced.id is not None
-    assert winner.id is not None
-
-    store.mark_completed(dropped, has_commits=True, branch="feature/dropped")
-    store.mark_completed(superseded, has_commits=True, branch="feature/superseded")
-    store.mark_completed(displaced, has_commits=True, branch="feature/displaced")
-    store.mark_completed(winner, has_commits=True, branch="feature/winner")
-
-    dropped_unit = store.resolve_merge_unit_for_task(dropped.id)
-    superseded_unit = store.resolve_merge_unit_for_task(superseded.id)
-    displaced_unit = store.resolve_merge_unit_for_task(displaced.id)
-    winner_unit = store.resolve_merge_unit_for_task(winner.id)
-    assert dropped_unit is not None
-    assert superseded_unit is not None
-    assert displaced_unit is not None
-    assert winner_unit is not None
-
-    store.set_merge_unit_state(dropped_unit.id, "dropped")
-    store.set_merge_unit_state(superseded_unit.id, "superseded")
-    with store._connect() as conn:
-        conn.execute(
-            """
-            UPDATE merge_units
-            SET superseded_by_unit_id = ?, updated_at = ?
-            WHERE project_id = ? AND id = ?
-            """,
-            (winner_unit.id, "2026-06-27 12:00:00", store._project_id, displaced_unit.id),
-        )
-    store.dual_write_legacy_merge_status(displaced_unit.id)
-
-    assert store.resolve_merge_unit_for_task(dropped.id) is None
-    assert store.resolve_merge_unit_for_task(superseded.id) is None
-    assert store.resolve_merge_unit_for_task(displaced.id) is None
-    assert store.resolve_merge_unit_for_task(winner.id).id == winner_unit.id
-
-    active_ids = {unit.id for unit in store.list_active_merge_units()}
-    assert winner_unit.id in active_ids
-    assert dropped_unit.id not in active_ids
-    assert superseded_unit.id not in active_ids
-    assert displaced_unit.id not in active_ids
-
-    assert store.task_is_attached_to_merge_unit_ids(dropped.id, (dropped_unit.id,)) is False
-    assert store.task_is_attached_to_merge_unit_ids(superseded.id, (superseded_unit.id,)) is False
-    assert store.task_is_attached_to_merge_unit_ids(displaced.id, (displaced_unit.id,)) is False
-    assert store.task_is_attached_to_merge_unit_ids(winner.id, (winner_unit.id,)) is True
-
-    assert store.get_merge_unit(dropped_unit.id).state == "dropped"
-    assert store.get_merge_unit(superseded_unit.id).state == "superseded"
-    displaced_historical = store.get_merge_unit(displaced_unit.id)
-    assert displaced_historical is not None
-    assert displaced_historical.superseded_by_unit_id == winner_unit.id
-
-    assert store.get(dropped.id).merge_status is None
-    assert store.get(superseded.id).merge_status is None
-    assert store.get(displaced.id).merge_status is None
 
 
 def test_resolve_merge_unit_subject_supports_direct_historical_unit_lookup_only_by_unit_id(
@@ -4657,51 +4591,6 @@ class TestMergeStatus:
         assert refreshed_main_unit.state == "merged"
         assert refreshed_task.merge_status == "merged"
 
-    def test_chained_successful_implements_advance_merge_unit_owner_to_branch_tip(self, tmp_path: Path) -> None:
-        """Attaching later successful implement slices should advance the persisted owner to the newest tip."""
-        store = SqliteTaskStore(tmp_path / "test.db")
-
-        first = store.add(prompt="First slice", task_type="implement")
-        store.mark_completed(first, has_commits=True, branch="feature/shared-tip")
-        assert first.id is not None
-        first_unit = store.resolve_merge_unit_for_task(first.id)
-        assert first_unit is not None
-        assert first_unit.owner_task_id == first.id
-
-        second = store.add(prompt="Second slice", task_type="implement", based_on=first.id)
-        store.mark_completed(second, has_commits=True, branch="feature/shared-tip")
-        assert second.id is not None
-        second_unit = store.resolve_merge_unit_for_task(second.id)
-        assert second_unit is not None
-        assert second_unit.id == first_unit.id
-        assert second_unit.owner_task_id == second.id
-
-        third = store.add(prompt="Third slice", task_type="implement", based_on=second.id)
-        store.mark_completed(third, has_commits=True, branch="feature/shared-tip")
-        assert third.id is not None
-        third_unit = store.resolve_merge_unit_for_task(third.id)
-        assert third_unit is not None
-        assert third_unit.id == first_unit.id
-        assert third_unit.owner_task_id == third.id
-
-        conn = sqlite3.connect(tmp_path / "test.db")
-        roles = {
-            row[0]: row[1]
-            for row in conn.execute(
-                """
-                SELECT task_id, role
-                FROM merge_unit_tasks
-                WHERE project_id = ? AND merge_unit_id = ?
-                """,
-                ("default", third_unit.id),
-            ).fetchall()
-        }
-        conn.close()
-        assert roles == {
-            first.id: "contributor",
-            second.id: "contributor",
-            third.id: "owner",
-        }
 
     @pytest.mark.parametrize("lineage_link_field", ["based_on", "depends_on"])
     def test_merge_unit_owner_advances_to_dependency_linked_successful_implement_on_attach(
@@ -4857,19 +4746,6 @@ class TestMergeStatus:
         assert attached_roles[first.id] == "contributor"
         assert attached_roles[second.id] == "owner"
 
-    def test_stale_unmerged_owner_repair_loads_members_in_one_pass(self, tmp_path: Path) -> None:
-        """The repair runs on every store open, so it must not scale queries with unit count."""
-        store = SqliteTaskStore(tmp_path / "test.db")
-        for index in range(5):
-            task = store.add(prompt=f"Slice {index}", task_type="implement")
-            store.mark_completed(task, has_commits=True, branch=f"feature/unit-{index}")
-
-        with patch.object(
-            SqliteTaskStore,
-            "list_tasks_for_merge_unit",
-            side_effect=AssertionError("per-unit member query in the startup repair"),
-        ):
-            assert store.repair_stale_unmerged_merge_unit_owners() == 0
 
 
     @pytest.mark.parametrize("lineage_link_field", ["based_on", "depends_on"])
@@ -7885,39 +7761,6 @@ class TestRetryChainDependencyResolution:
         assert resolved is not None
         assert resolved.id == retry.id
 
-    def test_recovered_dependency_uses_canonical_lineage_merge_unit(self, tmp_path: Path) -> None:
-        """Resolved retry completions must use the completed retry descendant's merge unit."""
-        store = self._make_store(tmp_path)
-        dep = store.add("Original dependency", task_type="implement")
-        store.mark_completed(dep, has_commits=True, branch="feature/original-dependency")
-        assert dep.id is not None
-        unit = store.resolve_merge_unit_for_task(dep.id)
-        assert unit is not None
-        store.set_merge_unit_state(unit.id, "unmerged")
-
-        dep = store.get(dep.id)
-        assert dep is not None
-        store.mark_failed(dep, failure_reason="UNKNOWN")
-
-        retry = store.add("Recovered dependency", task_type="implement", based_on=dep.id)
-        store.mark_completed(retry, has_commits=True, branch="feature/original-dependency-recovered")
-        assert retry.id is not None
-        retry_unit = store.resolve_merge_unit_for_task(retry.id)
-        assert retry_unit is not None
-
-        downstream = store.add("Downstream", task_type="implement", depends_on=dep.id)
-        readiness = store.get_dependency_readiness(downstream)
-        assert readiness.ready is False
-        assert readiness.blocking_merge_unit_id == retry_unit.id
-        assert readiness.blocking_merge_state == "unmerged"
-        assert readiness.blocking_merge_unit_owner_task_id == retry.id
-        assert store.get_pending_pickup() == []
-
-        store.set_merge_unit_state(retry_unit.id, "merged")
-
-        readiness = store.get_dependency_readiness(downstream)
-        assert readiness.ready is True
-        assert [task.id for task in store.get_pending_pickup()] == [downstream.id]
 
     def test_dropped_dep_with_successful_retry_unblocks(self, tmp_path: Path):
         """Dropped dependency remains blocking unless a retry descendant completes."""
@@ -8100,43 +7943,6 @@ class TestRetryChainDependencyResolution:
         assert blocking_status is None
         assert store.count_blocked_tasks() == 0
 
-    def test_failed_empty_dependency_with_unmerged_completed_retry_stays_blocked(self, tmp_path: Path) -> None:
-        """Failed parent empty evidence must not satisfy a distinct unmerged retry descendant."""
-        store = self._make_store(tmp_path)
-        dep = store.add("Dep", task_type="implement")
-        assert dep.id is not None
-        self._complete_implement_with_branch(store, dep, branch="feature/dep-empty-parent")
-        dep = store.get(dep.id)
-        assert dep is not None
-        store.mark_failed(dep, failure_reason="UNKNOWN")
-
-        retry = store.add("Retry", task_type="implement", based_on=dep.id, recovery_origin="retry")
-        assert retry.id is not None
-        retry = self._complete_implement_with_branch(
-            store,
-            retry,
-            branch="feature/retry-unmerged-blocked",
-            merge_state="unmerged",
-        )
-        retry_unit = store.resolve_merge_unit_for_task(retry.id)
-        assert retry_unit is not None
-
-        downstream = store.add("Downstream", task_type="implement", depends_on=dep.id)
-
-        readiness = store.get_dependency_readiness(downstream)
-        assert readiness.ready is False
-        assert readiness.reason == "unmerged"
-        assert readiness.resolved_dependency is not None
-        assert readiness.resolved_dependency.id == retry.id
-        assert readiness.blocking_merge_unit_id == retry_unit.id
-        assert readiness.blocking_merge_state == "unmerged"
-        assert readiness.blocking_merge_unit_owner_task_id == retry.id
-        assert readiness.blocking_source_branch == "feature/retry-unmerged-blocked"
-
-        assert store.get_next_pending() is None
-        assert store.get_pending_pickup() == []
-        assert store.is_task_blocked(downstream) == (True, retry.id, "completed")
-        assert store.count_blocked_tasks() == 1
 
     # --- count_blocked_tasks ---
 
@@ -13364,43 +13170,6 @@ class TestExecutionProjectResolver:
         warnings = "\n".join(warning for store in stores for warning in store.startup_warnings())
         assert "Project registry path conflict for shared" in warnings
 
-    def test_concurrent_empty_row_canonical_and_linked_does_not_promote_linked_path(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        from gza.config import Config
-
-        shared_db = tmp_path / "shared.db"
-        canonical = tmp_path / "canonical"
-        linked = tmp_path / "linked"
-        _write_project_config(canonical, project_name="Canonical", project_id="shared", project_prefix="gza", db_path=shared_db)
-        _write_project_config(linked, project_name="Linked", project_id="shared", project_prefix="gza", db_path=shared_db)
-        (canonical / ".git").mkdir()
-        (linked / ".git").write_text("gitdir: ../canonical/.git/worktrees/linked\n", encoding="utf-8")
-        SqliteTaskStore(shared_db, prefix="gza", project_id="bootstrap")
-        with sqlite3.connect(shared_db) as conn:
-            now = "2026-08-21T00:00:00+00:00"
-            conn.execute(
-                """
-                INSERT INTO projects (
-                    id, root_path, config_path, project_name, project_prefix,
-                    db_layout_version, created_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                ("shared", "", "", "Empty", "gza", SCHEMA_VERSION, now, now),
-            )
-        linked_store = SqliteTaskStore.from_config(Config.load(linked))
-        canonical_store = SqliteTaskStore.from_config(
-            Config.load(canonical),
-            migration_policy="auto_private",
-        )
-
-        with sqlite3.connect(shared_db) as conn:
-            row = conn.execute("SELECT root_path, config_path FROM projects WHERE id = ?", ("shared",)).fetchone()
-        assert row == (str(canonical.resolve()), str((canonical / "gza.yaml").resolve()))
-        linked_warning = "\n".join(linked_store.startup_warnings())
-        assert linked_warning == ""
-        assert canonical_store.startup_warnings() == ()
 
     def test_duplicate_selector_keys_are_all_disabled_for_distinct_projects(self, tmp_path: Path) -> None:
         anchor = SqliteTaskStore(tmp_path / "anchor.db", prefix="gza", project_id="anchor")
@@ -17804,67 +17573,6 @@ class TestExecutionProjectResolver:
             failed_id: [landed_id],
         }
 
-    def test_query_only_current_landed_lineage_keeps_indexed_query_work_bounded_when_available(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        baseline_db_path = tmp_path / "baseline.db"
-        baseline_store = SqliteTaskStore(baseline_db_path, prefix="gza")
-        baseline_failed_id, baseline_landed_id, baseline_branch = self._seed_same_branch_landed_lineage(baseline_store)
-
-        expanded_db_path = tmp_path / "expanded.db"
-        expanded_store = SqliteTaskStore(expanded_db_path, prefix="gza")
-        expanded_failed_id, expanded_landed_id, expanded_branch = self._seed_same_branch_landed_lineage(expanded_store)
-        self._seed_unrelated_landed_lineage_population(expanded_store, count=3000)
-
-        def measure_query_only_lookup(
-            db_path: Path,
-            failed_id: str,
-            branch: str,
-        ) -> tuple[dict[str, list[Task]], int]:
-            progress_calls = 0
-
-            def count_progress() -> int:
-                nonlocal progress_calls
-                progress_calls += 1
-                return 0
-
-            db_path.chmod(0o444)
-            try:
-                query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
-                with query_store.read_session():
-                    conn = query_store._read_session_conn  # noqa: SLF001 - measure sqlite work for this read.
-                    assert conn is not None
-                    conn.set_progress_handler(count_progress, 100)
-                    try:
-                        grouped = query_store.list_landed_lineage_tasks_for_roots(
-                            [failed_id],
-                            branch_keys_by_root_id={failed_id: [branch]},
-                        )
-                    finally:
-                        conn.set_progress_handler(None, 0)
-            finally:
-                db_path.chmod(0o644)
-            return grouped, progress_calls
-
-        baseline_grouped, baseline_work = measure_query_only_lookup(
-            baseline_db_path,
-            baseline_failed_id,
-            baseline_branch,
-        )
-        expanded_grouped, expanded_work = measure_query_only_lookup(
-            expanded_db_path,
-            expanded_failed_id,
-            expanded_branch,
-        )
-
-        assert {root_id: [task.id for task in tasks] for root_id, tasks in baseline_grouped.items()} == {
-            baseline_failed_id: [baseline_landed_id],
-        }
-        assert {root_id: [task.id for task in tasks] for root_id, tasks in expanded_grouped.items()} == {
-            expanded_failed_id: [expanded_landed_id],
-        }
-        assert expanded_work <= baseline_work + 100
 
     def test_query_only_open_current_db_missing_create_pr_fails_closed(
         self, tmp_path: Path

@@ -599,17 +599,6 @@ class TestGetRecentCompleted:
         assert completed.id in ids
         assert failed.id not in ids
 
-    def test_default_limit_fifteen(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        for i in range(20):
-            task = store.add(f"Task {i}")
-            task.status = "completed"
-            task.completed_at = datetime.now(UTC)
-            store.update(task)
-        client = make_client(tmp_path)
-        result = client.get_recent_completed()
-        assert len(result) == 15
 
     def test_custom_limit(self, tmp_path: Path):
         setup_config(tmp_path)

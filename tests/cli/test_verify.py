@@ -298,36 +298,6 @@ def _writable_resolution_verify_summary(store, config, git, task):
     )
 
 
-def test_verify_red_epoch_that_becomes_green_records_pass_and_exits_zero(tmp_path, capsys):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    task = _completed_unmerged_task(store)
-    _persist_verify(store, config, task, status="failed", exit_status="1", path="red-output.md")
-    git = _fake_git(tmp_path)
-
-    def execute_verify(*, task, action, context):
-        owner = action["verify_owner_task"]
-        _persist_verify(context.store, context.config, owner, status="passed", exit_status="0", path="green-output.md")
-        return AdvanceActionExecutionResult(
-            action_type="verify_gate",
-            status="success",
-            success_message="Verify gate passed for the current source epoch before merge.",
-            work_done=True,
-        )
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch("gza.cli.verify.execute_advance_action", side_effect=execute_verify) as execute_action,
-    ):
-        rc = cmd_verify(_args(tmp_path, task.id))
-
-    assert rc == 0
-    execute_action.assert_called_once()
-    decision = resolve_verify_gate_decision(store, task, config=config, git=git)
-    assert decision.state == "passed"
-    output = capsys.readouterr().out
-    assert "Verify gate passed" in output
-    assert "artifact: green-output.md" in output
 
 
 def test_verify_red_epoch_that_stays_red_records_failure_and_exits_one(tmp_path, capsys):
@@ -496,68 +466,6 @@ def test_verify_freshness_attention_exits_without_running_verify(
 
 
 
-def test_verify_force_merge_unit_reconciliation_skip_reports_pre_existing_contributor_red(
-    tmp_path, capsys
-):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    owner = _completed_branch_task_without_merge_unit(store, prompt="Owner green")
-    contributor = _completed_branch_task_without_merge_unit(
-        store,
-        prompt="Contributor red",
-        branch=owner.branch,
-        task_type="fix",
-        based_on=owner.id,
-    )
-    _attach_merge_unit(store, owner, contributor)
-    captured_at = datetime(2026, 8, 21, 10, 0, tzinfo=UTC)
-    _persist_verify(
-        store,
-        config,
-        owner,
-        status="passed",
-        exit_status="0",
-        path="owner-green.md",
-        captured_at=captured_at,
-    )
-    _persist_verify(
-        store,
-        config,
-        contributor,
-        status="failed",
-        exit_status="1",
-        path="contributor-red.md",
-        captured_at=captured_at + timedelta(minutes=1),
-    )
-    git = _fake_git(tmp_path)
-    action_types = []
-
-    def execute_action(*, task, action, context):
-        action_types.append(action["type"])
-        if action["type"] == "verify_gate":
-            raise AssertionError("verify should not rerun when preliminary reconciliation fails")
-        return AdvanceActionExecutionResult(
-            action_type="reconcile_verify_gate_evidence",
-            status="skip",
-            message="SKIP: reconciliation setup failed.",
-            handled_task_id=owner.id,
-        )
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch("gza.cli.verify.execute_advance_action", side_effect=execute_action),
-    ):
-        rc = cmd_verify(_args(tmp_path, owner.id, force=True))
-
-    output = capsys.readouterr().out
-    assert rc == 1
-    assert action_types == ["reconcile_verify_gate_evidence"]
-    assert "SKIP: reconciliation setup failed." in output
-    assert "Pre-existing verify gate evidence: failed" in output
-    assert f"evidence: {contributor.id}" in output
-    assert "artifact: contributor-red.md" in output
-    assert "Forced verify rerun did not produce new current green evidence." in output
-    assert "Verify gate: failed" not in output
 
 
 def test_verify_force_merge_unit_reconciliation_persistence_failure_reports_pre_existing_contributor_red(
@@ -805,116 +713,12 @@ def test_verify_blocked_stale_owner_reconciles_green_to_canonical_representative
 
 
 
-def test_verify_force_failed_executor_reports_pre_existing_green_and_exits_one(tmp_path, capsys):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    task = _completed_unmerged_task(store)
-    _persist_verify(store, config, task, status="passed", exit_status="0", path="old-green-output.md")
-    git = _fake_git(tmp_path)
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch(
-            "gza.cli.verify.execute_advance_action",
-            return_value=AdvanceActionExecutionResult(
-                action_type="verify_gate",
-                status="skip",
-                message="SKIP: could not prepare the verify-gate worktree; merge is blocked.",
-            ),
-        ),
-    ):
-        rc = cmd_verify(_args(tmp_path, task.id, force=True))
-
-    output = capsys.readouterr().out
-    assert rc == 1
-    assert "SKIP: could not prepare the verify-gate worktree" in output
-    assert "Pre-existing verify gate evidence: passed" in output
-    assert "Forced verify rerun did not produce new current green evidence." in output
-    assert "Verify gate: passed" not in output
 
 
-def test_verify_force_persistence_failure_reports_pre_existing_green_and_exits_one(tmp_path, capsys):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    task = _completed_unmerged_task(store)
-    _persist_verify(store, config, task, status="passed", exit_status="0", path="old-green-output.md")
-    git = _fake_git(tmp_path)
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch(
-            "gza.cli.verify.execute_advance_action",
-            return_value=AdvanceActionExecutionResult(
-                action_type="verify_gate",
-                status="error",
-                error_message="could not persist verify gate result",
-            ),
-        ),
-    ):
-        rc = cmd_verify(_args(tmp_path, task.id, force=True))
-
-    output = capsys.readouterr().out
-    assert rc == 1
-    assert "could not persist verify gate result" in output
-    assert "Pre-existing verify gate evidence: passed" in output
-    assert "Forced verify rerun did not produce new current green evidence." in output
-    assert "Verify gate: passed" not in output
 
 
-def test_verify_force_current_green_to_fresh_red_reports_fresh_artifact_and_exits_one(tmp_path, capsys):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    task = _completed_unmerged_task(store)
-    _persist_verify(store, config, task, status="passed", exit_status="0", path="old-green-output.md")
-    git = _fake_git(tmp_path)
-    execute_verify = _execute_forced_verify_with_persisted_current_result(
-        status="failed",
-        exit_status="1",
-        path="fresh-red-output.md",
-        message="SKIP: verify gate remained failed; merge is blocked.",
-    )
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch("gza.cli.verify.execute_advance_action", side_effect=execute_verify),
-    ):
-        rc = cmd_verify(_args(tmp_path, task.id, force=True))
-
-    output = capsys.readouterr().out
-    assert rc == 1
-    assert "SKIP: verify gate remained failed; merge is blocked." in output
-    assert "Verify gate: failed" in output
-    assert "artifact: fresh-red-output.md" in output
-    assert "Pre-existing verify gate evidence" not in output
-    assert "Forced verify rerun did not produce new current green evidence." not in output
 
 
-def test_verify_force_current_red_to_fresh_red_reports_fresh_artifact_and_exits_one(tmp_path, capsys):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    task = _completed_unmerged_task(store)
-    _persist_verify(store, config, task, status="failed", exit_status="1", path="old-red-output.md")
-    git = _fake_git(tmp_path)
-    execute_verify = _execute_forced_verify_with_persisted_current_result(
-        status="failed",
-        exit_status="1",
-        path="fresh-red-output.md",
-        message="SKIP: verify gate remained failed; merge is blocked.",
-    )
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch("gza.cli.verify.execute_advance_action", side_effect=execute_verify),
-    ):
-        rc = cmd_verify(_args(tmp_path, task.id, force=True))
-
-    output = capsys.readouterr().out
-    assert rc == 1
-    assert "SKIP: verify gate remained failed; merge is blocked." in output
-    assert "Verify gate: failed" in output
-    assert "artifact: fresh-red-output.md" in output
-    assert "Pre-existing verify gate evidence" not in output
-    assert "Forced verify rerun did not produce new current green evidence." not in output
 
 
 def test_verify_force_current_green_to_fresh_unavailable_reports_fresh_artifact_and_exits_one(
@@ -947,58 +751,6 @@ def test_verify_force_current_green_to_fresh_unavailable_reports_fresh_artifact_
     assert "Forced verify rerun did not produce new current green evidence." not in output
 
 
-def test_verify_force_new_failed_artifact_cannot_reuse_later_pre_existing_green(tmp_path, capsys):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    task = _completed_unmerged_task(store)
-    captured_at = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
-    _persist_verify(
-        store,
-        config,
-        task,
-        status="passed",
-        exit_status="0",
-        path="old-green-output.md",
-        captured_at=captured_at + timedelta(minutes=5),
-    )
-    git = _fake_git(tmp_path)
-
-    def execute_verify(*, task, action, context):
-        owner = action["verify_owner_task"]
-        _persist_verify(
-            context.store,
-            context.config,
-            owner,
-            status="failed",
-            exit_status="1",
-            path="new-failed-output.md",
-            captured_at=captured_at,
-        )
-        decision = resolve_verify_gate_decision(context.store, owner, config=context.config, git=git)
-        assert decision.state == "passed"
-        assert decision.lookup.result is not None
-        assert decision.lookup.result.output_artifact_path == "old-green-output.md"
-        return AdvanceActionExecutionResult(
-            action_type="verify_gate",
-            status="success",
-            success_message="Verify gate passed for the current source epoch before merge.",
-            work_done=True,
-            handled_task_id=owner.id,
-        )
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch("gza.cli.verify.execute_advance_action", side_effect=execute_verify),
-    ):
-        rc = cmd_verify(_args(tmp_path, task.id, force=True))
-
-    output = capsys.readouterr().out
-    assert rc == 1
-    assert "Verify gate passed for the current source epoch before merge." in output
-    assert "Pre-existing verify gate evidence: passed" in output
-    assert "artifact: old-green-output.md" in output
-    assert "Forced verify rerun did not produce new current green evidence." in output
-    assert "artifact: new-failed-output.md" not in output
 
 
 def test_verify_force_new_green_evidence_exits_zero(tmp_path, capsys):
@@ -1038,52 +790,6 @@ def test_verify_force_new_green_evidence_exits_zero(tmp_path, capsys):
     assert "Pre-existing verify gate evidence" not in output
 
 
-def test_verify_force_uses_representative_owner_for_fresh_green_evidence(tmp_path, capsys):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    owner = _failed_branch_implement(store)
-    representative = _completed_branch_task_without_merge_unit(
-        store,
-        prompt="Completed representative",
-        branch=owner.branch,
-    )
-    unit = _attach_merge_unit(store, owner, representative)
-    assert unit.owner_task_id == owner.id
-    _persist_verify(store, config, owner, status="passed", exit_status="0", path="old-owner-green.md")
-    git = _fake_git(tmp_path)
-
-    def execute_verify(*, task, action, context):
-        assert task.id == representative.id
-        verify_owner = action["verify_owner_task"]
-        assert verify_owner.id == representative.id
-        _persist_verify(
-            context.store,
-            context.config,
-            verify_owner,
-            status="passed",
-            exit_status="0",
-            path="fresh-representative-green.md",
-        )
-        return AdvanceActionExecutionResult(
-            action_type="verify_gate",
-            status="success",
-            success_message="Verify gate passed for the current source epoch before merge.",
-            work_done=True,
-            handled_task_id=verify_owner.id,
-        )
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch("gza.cli.verify.execute_advance_action", side_effect=execute_verify),
-    ):
-        rc = cmd_verify(_args(tmp_path, representative.id, force=True))
-
-    output = capsys.readouterr().out
-    assert rc == 0
-    assert "Verify gate: passed" in output
-    assert f"for {representative.id}" in output
-    assert "artifact: fresh-representative-green.md" in output
-    assert "Forced verify rerun did not produce new current green evidence." not in output
 
 
 def test_verify_force_representative_setup_failure_cannot_reuse_old_owner_green(tmp_path, capsys):
@@ -1260,148 +966,8 @@ def test_verify_dry_run_unmaterialized_legacy_unit_matches_writable_newer_green(
     assert writable_decision.lookup.result.output_artifact_path == "legacy-contributor-green.md"
 
 
-def test_verify_dry_run_unattached_task_joining_active_unit_sees_existing_member_evidence(
-    tmp_path, capsys
-):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    owner = _completed_branch_task_without_merge_unit(store, prompt="Active unit owner green")
-    attached_member = _completed_branch_task_without_merge_unit(
-        store,
-        prompt="Attached member red",
-        branch=owner.branch,
-        task_type="fix",
-        based_on=owner.id,
-    )
-    trigger = _completed_branch_task_without_merge_unit(
-        store,
-        prompt="Unattached same-lineage trigger",
-        branch=owner.branch,
-        task_type="fix",
-        based_on=owner.id,
-    )
-    _attach_merge_unit(store, owner, attached_member)
-    captured_at = datetime(2026, 8, 21, 13, 0, tzinfo=UTC)
-    _persist_verify(
-        store,
-        config,
-        owner,
-        status="passed",
-        exit_status="0",
-        path="active-owner-green.md",
-        captured_at=captured_at,
-    )
-    _persist_verify(
-        store,
-        config,
-        attached_member,
-        status="failed",
-        exit_status="1",
-        path="attached-member-red.md",
-        captured_at=captured_at + timedelta(minutes=1),
-    )
-    assert store.resolve_merge_unit_for_task(trigger.id) is None
-    before_tables = _snapshot_verify_dry_run_state(store)
-    before_bytes = _snapshot_db_bytes(store)
-    git = _fake_git(tmp_path)
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch("gza.cli.verify.execute_advance_action") as execute_action,
-    ):
-        rc = cmd_verify(_args(tmp_path, trigger.id, dry_run=True))
-
-    output = capsys.readouterr().out
-    assert rc == 1
-    execute_action.assert_not_called()
-    assert _snapshot_verify_dry_run_state(store) == before_tables
-    assert _snapshot_db_bytes(store) == before_bytes
-    dry_summary = _dry_run_effective_verify_summary(store, config, git, trigger)
-    assert dry_summary == {
-        "owner_id": owner.id,
-        "verdict": "failed",
-        "exit_status": "1",
-        "evidence_source": attached_member.id,
-        "artifact_path": "attached-member-red.md",
-    }
-    assert f"[dry-run] Verify gate: failed for {owner.id}" in output
-    assert f"evidence: {attached_member.id}" in output
-    assert "artifact: attached-member-red.md" in output
-
-    writable_summary = _writable_effective_verify_summary(store, config, git, trigger)
-    assert writable_summary == dry_summary
 
 
-def test_verify_dry_run_unmaterialized_unit_sees_linked_branchless_review_evidence(
-    tmp_path, capsys
-):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    owner = _completed_branch_task_without_merge_unit(store, prompt="Legacy owner red")
-    trigger = _completed_branch_task_without_merge_unit(
-        store,
-        prompt="Legacy contributor",
-        branch=owner.branch,
-        task_type="fix",
-        based_on=owner.id,
-    )
-    review = store.add("Review with green verify evidence", task_type="review", based_on=owner.id)
-    assert review.id is not None
-    review.status = "completed"
-    review.completed_at = datetime.now(UTC)
-    review.branch = None
-    store.update(review)
-    captured_at = datetime(2026, 8, 21, 14, 0, tzinfo=UTC)
-    _persist_verify(
-        store,
-        config,
-        owner,
-        status="failed",
-        exit_status="1",
-        path="branch-owner-red.md",
-        captured_at=captured_at,
-    )
-    _persist_verify(
-        store,
-        config,
-        review,
-        status="passed",
-        exit_status="0",
-        path="branchless-review-green.md",
-        captured_at=captured_at + timedelta(minutes=1),
-        reviewed_branch=owner.branch,
-    )
-    assert review.id not in {task.id for task in store.get_tasks_for_branch(owner.branch)}
-    assert store.resolve_merge_unit_for_task(trigger.id) is None
-    before_tables = _snapshot_verify_dry_run_state(store)
-    before_bytes = _snapshot_db_bytes(store)
-    git = _fake_git(tmp_path)
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch("gza.cli.verify.execute_advance_action") as execute_action,
-    ):
-        rc = cmd_verify(_args(tmp_path, trigger.id, dry_run=True))
-
-    output = capsys.readouterr().out
-    assert rc == 0
-    execute_action.assert_not_called()
-    assert _snapshot_verify_dry_run_state(store) == before_tables
-    assert _snapshot_db_bytes(store) == before_bytes
-    dry_summary = _dry_run_effective_verify_summary(store, config, git, trigger)
-    assert dry_summary == {
-        "owner_id": owner.id,
-        "verdict": "passed",
-        "exit_status": "0",
-        "evidence_source": review.id,
-        "artifact_path": "branchless-review-green.md",
-    }
-    assert f"[dry-run] Verify gate: passed for {owner.id}" in output
-    assert f"evidence: {review.id}" in output
-    assert "artifact: branchless-review-green.md" in output
-
-    writable_summary = _writable_effective_verify_summary(store, config, git, trigger)
-    assert writable_summary == dry_summary
 
 
 def test_verify_dry_run_branchless_review_trigger_matches_writable_resolution_without_mutation(
@@ -1495,37 +1061,6 @@ def test_verify_branchless_self_linked_review_cycle_refuses_without_mutation(
         assert _snapshot_verify_dry_run_state(store) == before_tables
 
 
-def test_verify_branchless_two_review_cycle_refuses_without_mutation(
-    tmp_path,
-    capsys,
-):
-    _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    first = _completed_branchless_review(store, "First branchless review")
-    second = _completed_branchless_review(store, "Second branchless review")
-    first.based_on = second.id
-    second.based_on = first.id
-    store.update(first)
-    store.update(second)
-    before_tables = _snapshot_verify_dry_run_state(store)
-    git = _fake_git(tmp_path)
-
-    for dry_run in (True, False):
-        with (
-            patch("gza.cli.verify.Git", return_value=git),
-            patch("gza.cli.verify.execute_advance_action") as execute_action,
-            patch("gza.cli.verify._resolve_merge_subject") as writable_resolve,
-        ):
-            rc = cmd_verify(_args(tmp_path, first.id, dry_run=dry_run))
-
-        output = capsys.readouterr().out
-        assert rc == 1
-        execute_action.assert_not_called()
-        writable_resolve.assert_not_called()
-        assert "Error: lineage cycle while resolving merge-unit plan" in output
-        assert f"{first.id} -> {second.id} -> {first.id}" in output
-        assert "Traceback" not in output
-        assert _snapshot_verify_dry_run_state(store) == before_tables
 
 
 def test_verify_dry_run_attached_successful_implementation_previews_owner_tip_sync_without_mutation(

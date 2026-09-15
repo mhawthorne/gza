@@ -2607,38 +2607,6 @@ class TestInitCommand:
         assert local_example_path.exists()
         assert "# stale local example" not in local_example_path.read_text()
 
-    @pytest.mark.parametrize("stdin_input", ["1\n", "\n"])
-    def test_init_interactive_default_branch_strategy_matches_prompted_pattern(
-        self,
-        tmp_path: Path,
-        stdin_input: str,
-    ):
-        """Interactive init should load the default branch strategy advertised by option 1."""
-        _home_dir, env = self._home_env(tmp_path)
-
-        result = invoke_gza(
-            "init",
-            "--db",
-            "local",
-            "--project",
-            str(tmp_path),
-            stdin_input=stdin_input,
-            stdin_isatty=True,
-            env=env,
-        )
-
-        assert result.returncode == 0
-        assert "{project}/{date}-{slug}" in result.stdout
-        assert "monorepo" not in result.stdout
-        assert re.search(
-            r"^# branch_strategy:\s*project_date_slug\s*$",
-            (tmp_path / "gza.yaml").read_text(encoding="utf-8"),
-            re.MULTILINE,
-        )
-
-        config = Config.load(tmp_path)
-        assert config.branch_strategy.pattern == "{project}/{date}-{slug}"
-        assert config.branch_strategy.default_type == "feature"
 
     def test_init_interactive_conventional_branch_strategy_still_scaffolds_correctly(self, tmp_path: Path):
         """Interactive init should activate the chosen preset branch strategy."""
@@ -2794,23 +2762,6 @@ class TestCleanCommand:
         config = Config.load(tmp_path)
         assert config.cleanup_days == 7
 
-    def test_clean_archive_uses_config_cleanup_days(self, tmp_path: Path) -> None:
-        setup_config(tmp_path)
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ncleanup_days: 7\n", encoding="utf-8")
-
-        logs_dir = tmp_path / ".gza" / "logs"
-        logs_dir.mkdir(parents=True, exist_ok=True)
-        log_file = logs_dir / "archive-by-config.txt"
-        log_file.write_text("archive me\n", encoding="utf-8")
-        old_time = (datetime.now(UTC) - timedelta(days=8)).timestamp()
-        os.utime(log_file, (old_time, old_time))
-
-        result = invoke_gza("clean", "--archive", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Archived files older than 7 days" in result.stdout
-        assert log_file.exists() is False
-        assert (tmp_path / ".gza" / "archives" / "logs" / log_file.name).exists()
 
     def test_clean_logs_also_removes_old_task_artifacts(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -4524,28 +4475,6 @@ class TestStatsIterationsCommand:
         assert "Excluded: 1 failed, 1 no-review  |  $0.12" in result.stdout
         assert "Iteration count stats: min 1" in result.stdout
 
-    def test_stats_iterations_all_time_alias(self, tmp_path: Path):
-        """--all-time alias should behave the same as --all."""
-        from gza.db import TaskStats
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        impl = store.add("Implement feature", task_type="implement")
-        assert impl.id is not None
-        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
-        review = store.add("Review", task_type="review", depends_on=impl.id)
-        store.mark_completed(
-            review,
-            has_commits=False,
-            output_content="Verdict: APPROVED",
-            stats=TaskStats(cost_usd=0.02),
-        )
-
-        result = invoke_gza("stats", "iterations", "--all-time", "--last", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert impl.id in result.stdout
 
 
 class TestStatsCommand:

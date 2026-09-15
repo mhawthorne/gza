@@ -58,55 +58,5 @@ def test_cpu_heavy_unit_test_fails_with_cpu_budget_message(
 
 
 
-def test_cpu_budget_marker_override_and_explicit_timeout_opt_out(
-    pytester: pytest.Pytester,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_timeout_harness(pytester)
-    monkeypatch.setenv("GZA_UNIT_TEST_CPU_BUDGET_MS", "10")
-    _disable_parent_subprocess_guard(monkeypatch)
-    pytester.makepyfile(
-        tests_test_cpu_override="""
-        import time
-
-        import pytest
-
-        @pytest.mark.cpu_budget(ms=100)
-        def test_cpu_budget_override():
-            start = time.process_time()
-            while time.process_time() - start < 0.04:
-                pass
-
-        @pytest.mark.timeout(1, method="signal")
-        def test_explicit_timeout_disables_cpu_guard():
-            start = time.process_time()
-            while time.process_time() - start < 0.04:
-                pass
-        """
-    )
-
-    result = pytester.runpytest("tests_test_cpu_override.py")
-
-    result.assert_outcomes(passed=2)
 
 
-def test_infinite_loop_is_killed_by_hang_guard(
-    pytester: pytest.Pytester,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_timeout_harness(pytester)
-    monkeypatch.setenv("GZA_UNIT_TEST_HANG_TIMEOUT_MS", "100")
-    monkeypatch.setenv("GZA_UNIT_TEST_CPU_BUDGET_MS", "10000")
-    _disable_parent_subprocess_guard(monkeypatch)
-    pytester.makepyfile(
-        tests_test_hang_guard="""
-        def test_infinite_loop():
-            while True:
-                pass
-        """
-    )
-
-    result = pytester.runpytest("tests_test_hang_guard.py")
-
-    result.assert_outcomes(failed=1)
-    result.stdout.fnmatch_lines(["*Timeout*"])

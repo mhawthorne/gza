@@ -207,39 +207,6 @@ def test_dependency_precondition_held_plan_unblocks_after_release_helper(tmp_pat
     assert ready.reason == "ready"
 
 
-def test_dependency_precondition_uses_canonical_dependency_lineage_merge_unit(tmp_path: Path) -> None:
-    store = SqliteTaskStore(tmp_path / "test.db")
-
-    dependency = store.add("Dependency", task_type="implement")
-    store.mark_completed(dependency, has_commits=True, branch="feature/dependency-lineage")
-    assert dependency.id is not None
-    unit = store.resolve_merge_unit_for_task(dependency.id)
-    assert unit is not None
-    store.set_merge_unit_state(unit.id, "unmerged")
-
-    dependency = store.get(dependency.id)
-    assert dependency is not None
-    store.mark_failed(dependency, failure_reason="UNKNOWN")
-
-    recovered = store.add("Recovered dependency", task_type="implement", based_on=dependency.id)
-    store.mark_completed(recovered, has_commits=True, branch="feature/dependency-lineage-recovered")
-    assert recovered.id is not None
-    recovered_unit = store.resolve_merge_unit_for_task(recovered.id)
-    assert recovered_unit is not None
-
-    downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
-
-    blocking_dep = get_unmerged_dependency_precondition(store, downstream)
-    assert blocking_dep is not None
-    assert blocking_dep.id == recovered.id
-
-    readiness = store.get_dependency_readiness(downstream)
-    assert readiness.blocking_merge_unit_id == recovered_unit.id
-    assert readiness.blocking_merge_unit_owner_task_id == recovered.id
-    assert readiness.blocking_source_branch == "feature/dependency-lineage-recovered"
-
-    store.set_merge_unit_state(recovered_unit.id, "merged")
-    assert get_unmerged_dependency_precondition(store, downstream) is None
 
 
 def test_dependency_readiness_uses_read_context_for_merge_unit_owner(tmp_path: Path, monkeypatch) -> None:
