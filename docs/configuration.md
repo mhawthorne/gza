@@ -158,6 +158,14 @@ GZA_DB_PATH=~/.gza/gza.db gza next
 
 In multi-project execution, the supervisor owns `GZA_DB_PATH` per selected runtime. Explicit path selections load their configured `db_path` and ignore any ambient `GZA_DB_PATH`; registry-ID selections assert the anchor registry DB deliberately. Child workers receive a runtime environment with `GZA_DB_PATH` set to their owning project DB.
 
+Provider and verify children do not receive the live shared DB path. Provider tasks see
+the staged worktree snapshot at their scoped `.gza/gza.db` path; ordinary provider
+snapshots are read-only, while the rebase exception is writable but still isolated.
+Lifecycle, candidate, recovery, and local-target integration verify commands receive a
+fresh disposable writable SQLite backup for each attempt. Writes made by nested
+`uv run gza` commands during verify are discarded with the snapshot and SQLite sidecars
+after that attempt, and the host control plane records only the explicit verify result.
+
 Example:
 
 ```yaml
@@ -528,6 +536,7 @@ inner_verify_command: ./bin/tests --quick
 - Lifecycle verify launches are capped by `max_concurrent_verify` across the project. The default is `1`, so advance, watch, manual verify, cross-project verify children, and local-target integration verify wait for a slot before starting another `verify_command` process.
 - When autonomous lifecycle verification times out, Gza sends SIGTERM to the verify process group, waits `review_verify_timeout_grace_seconds`, then escalates to SIGKILL if the process tree is still alive.
 - Local-target integration verify reuses green checkpoints until the tree fingerprint or verify-gate identity changes. The configured-gate identity includes the verify environment identity recorded with the checkpoint, using stable semantic runtime fields like runner class, platform system/machine, and Python implementation/version instead of an exact interpreter path, so a checkpoint from a different environment, or an older checkpoint that lacks that identity, is treated as stale. Failed/unavailable checkpoints are rerun after `main_integration_verify_red_ttl_minutes` even on the same tree.
+- If verify reports `schema-runtime-skew`, the running gza code is stale relative to the selected task database schema. This is merge-blocking unavailable control-plane evidence, not a red code verdict and not input for verify-fix remediation. Restart or update long-lived runtimes such as `gza watch`, make sure the canonical default-branch checkout contains the landed migration code, and rerun the blocked command or `uv run gza migrate --project PATH` from that checkout.
 
 ---
 
@@ -2474,7 +2483,7 @@ uv run gza migrate [--status] [--dry-run] [--yes/-y] [--import-local-db]
 
 When run without flags, `uv run gza migrate` prompts for confirmation before applying migrations. Each migration is atomic (wrapped in BEGIN/COMMIT/ROLLBACK) and creates a pre-migration backup (for example, `<db_path>.backup.pre-v25.db` and `<db_path>.backup.pre-v26.db`). It is safe to re-run: calling it on an already-migrated database is a no-op.
 
-Shared databases have an additional authority gate. A write-capable shared-DB migration must be run from the primary canonical checkout on the configured default branch, with `HEAD` equal to the current local tip of `refs/heads/<default-branch>`, after the migration code has landed there. Running `uv run gza migrate --yes` from a linked worktree, feature branch, detached checkout, or stale default-branch checkout is refused before write-capable database inspection or mutation; the refusal does not create backups or SQLite companion files. Recover by switching to the primary checkout, updating it to the landed default-branch tip, and rerunning the selected-project command shown in the error, for example `uv run gza migrate --project PATH`.
+Shared databases have an additional authority gate. A write-capable shared-DB migration must be run from the primary canonical checkout on the configured default branch, with `HEAD` equal to the current local tip of `refs/heads/<default-branch>`, after the migration code has landed there. Running `uv run gza migrate --yes` from a linked worktree, feature branch, detached checkout, or stale default-branch checkout is refused before write-capable database inspection or mutation; the refusal does not create backups or SQLite companion files. The same gate applies to implicit startup migration, current-version repair, and schema-dependent project registration. Local project DBs and disposable task/verify snapshots may still migrate privately because their writes cannot advance the shared durable DB. Recover by switching to the primary checkout, updating it to the landed default-branch tip, restarting stale long-lived processes that loaded older gza code, and rerunning the selected-project command shown in the error, for example `uv run gza migrate --project PATH`.
 
 Local project databases (`db_path: .gza/gza.db`) and isolated private snapshots are not shared durable control-plane databases, so they remain independently migratable from their owning checkout. `--status` and `--dry-run` are read-only inspection modes for both local and shared databases.
 
