@@ -169,10 +169,14 @@ For legacy verify-only `CHANGES_REQUESTED` reviews, the preserved-rebase path is
 
 Resumed or recovered rebase runs are intentionally fail-closed. This includes direct provider resumes and automatic failed-task recovery descendants such as retry-created rebase children. The runner records those baselines with `recovered=True`, so completion persists `changed_diff = 1` and surfaces a warning instead of claiming the diff was preserved from the original pre-rebase state.
 
-The `--resolve` and `--force` flags remain accepted for compatibility with the public
-rebase surface. Foreground service-backed rebase execution currently always uses the
-task-backed conflict-resolution route when conflicts need provider help, and the managed
-temporary worktree is recreated by the host flow.
+The `--resolve` and `--force` flags remain part of the public `gza rebase` surface.
+They are accepted compatibility options, but they currently do not change the
+task-backed rebase request or execution path. These flags are not accepted by `gza merge`;
+use `gza rebase <task-id> --run` for standalone foreground task-backed rebase execution,
+or `gza land <task-id>` for the full rebase/review/judgment/merge orchestration path.
+Foreground service-backed rebase execution currently always uses the same task-backed
+conflict-resolution route when conflicts need provider help, and the managed temporary
+worktree is recreated by the host flow regardless of `--resolve` or `--force`.
 
 With `--background`, `gza rebase` creates a rebase task via `_create_rebase_task()` and runs it through the standard runner, which already manages its own worktree lifecycle.
 

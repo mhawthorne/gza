@@ -7992,10 +7992,7 @@ def _cmd_iterate_impl(
         if impl_task.id is not None:
             impl_task = store.get(impl_task.id) or impl_task
 
-    if final_status in {"approved", "merge_ready", "maxed_out"} and final_stop_reason not in {
-        "approved",
-        "approved_with_followups",
-    }:
+    if final_status in {"merge_ready", "maxed_out"}:
         _run_forced_closing_review(iteration)
 
     iterate_wall_seconds = time.monotonic() - iterate_started_at

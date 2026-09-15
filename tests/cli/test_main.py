@@ -355,6 +355,79 @@ def test_task_backed_rebase_entrypoint_passes_captured_runtime_context(
     assert runtime_context.db_path == db_path.resolve()
 
 
+def test_rebase_compatibility_flags_do_not_change_task_backed_service_request(
+    tmp_path: Path,
+) -> None:
+    """Standalone rebase compatibility flags should parse without changing execution wiring."""
+    from gza.cli.main import main
+    from gza.rebase_service import RebaseServiceResult
+
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore.from_config(config)
+    task = store.add("completed task", task_type="implement")
+    task.status = "completed"
+    task.branch = "feature/completed"
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+    assert task.id is not None
+
+    requests: list[object] = []
+    executors: list[object] = []
+
+    def fake_rebase_service(**kwargs: object) -> RebaseServiceResult:
+        request = kwargs["request"]
+        requests.append(request)
+        executors.append(kwargs["executor"])
+        return RebaseServiceResult(
+            status="completed_no_op",
+            parent_task_id=getattr(request, "parent_task_id"),
+            branch=getattr(request, "branch"),
+            target_ref=getattr(request, "target_branch"),
+            exit_code=0,
+        )
+
+    with (
+        patch("gza.cli.git_ops.Git", _RecordingLifecycleGit),
+        patch("gza.cli.git_ops._run_task_backed_rebase", return_value=0) as run_rebase,
+        patch("gza.cli.git_ops.execute_task_backed_rebase_service", side_effect=fake_rebase_service),
+    ):
+        for extra_flags in ([], ["--resolve", "--force"]):
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "gza",
+                    "rebase",
+                    task.id,
+                    "--run",
+                    *extra_flags,
+                    "--project",
+                    str(tmp_path),
+                ],
+            ):
+                assert main() == 0
+
+    assert len(requests) == 2
+    baseline, compat = requests
+    comparable_fields = (
+        "parent_task_id",
+        "branch",
+        "target_branch",
+        "remote",
+        "trigger_source",
+        "run",
+        "skip_if_target_contained",
+        "reuse_completed",
+        "duplicate_as_result",
+    )
+    assert {field: getattr(compat, field) for field in comparable_fields} == {
+        field: getattr(baseline, field) for field in comparable_fields
+    }
+    assert getattr(compat, "run") is True
+    assert executors == [run_rebase, run_rebase]
+
+
 def test_advance_repeat_foreground_callbacks_use_captured_runtime_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1718,12 +1718,12 @@ def main() -> int:
         "--force",
         "-f",
         action="store_true",
-        help="Force remove worktree even if it has uncommitted changes",
+        help="Compatibility option; accepted but does not change task-backed rebase execution",
     )
     rebase_parser.add_argument(
         "--resolve",
         action="store_true",
-        help="Auto-resolve conflicts using AI (non-interactive)",
+        help="Compatibility option; accepted but does not change task-backed rebase execution",
     )
     add_execution_mode_args(rebase_parser)
     add_common_args(rebase_parser)
