@@ -319,6 +319,26 @@ def test_get_store_warns_for_readwrite_canonical_registry_conflict(
     assert row == (str(canonical_a.resolve()), str((canonical_a / "gza.yaml").resolve()))
 
 
+def test_get_store_skips_shared_authority_resolution_for_project_local_db(tmp_path: Path) -> None:
+    project_dir = tmp_path / "local"
+    local_db = project_dir / ".gza" / "gza.db"
+    _write_project_config(
+        project_dir,
+        project_name="Local",
+        project_id="local",
+        db_path=Path(".gza/gza.db"),
+    )
+    SqliteTaskStore(local_db, prefix="gza", project_id="local")
+
+    with patch(
+        "gza.cli._common.resolve_canonical_migration_authority",
+        side_effect=AssertionError("local DB should not resolve shared migration authority"),
+    ):
+        store = get_store(Config.load(project_dir))
+
+    assert store.db_path.resolve() == local_db.resolve()
+
+
 def test_get_store_warns_for_readwrite_linked_registry_conflict_without_promoting_linked_path(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

@@ -12348,6 +12348,51 @@ class TestExecutionProjectResolver:
             version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
         assert version == SCHEMA_VERSION
 
+    def test_configured_local_db_ignores_supplied_shared_authority_during_migration(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "local-with-proof"
+        local_db = project_dir / ".gza" / "gza.db"
+        _write_project_config(
+            project_dir,
+            project_name="LocalWithProof",
+            project_id="localproof",
+            db_path=Path(".gza/gza.db"),
+        )
+        SqliteTaskStore(local_db, prefix="local", project_id="localproof")
+        with sqlite3.connect(local_db) as conn:
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,))
+
+        calls = 0
+
+        def revalidate() -> None:
+            nonlocal calls
+            calls += 1
+            raise SchemaIntegrityError("local db must not revalidate shared authority")
+
+        proof = MigrationAuthorityProof(
+            canonical_root=project_dir.resolve(),
+            default_branch="main",
+            head_sha="1" * 40,
+            revalidate=revalidate,
+        )
+
+        store = SqliteTaskStore.from_config(
+            Config.load(project_dir),
+            migration_policy="auto_canonical_shared",
+            migration_authority=proof,
+            require_migration_authority=True,
+        )
+
+        assert store.shared_initialization_deferred() is False
+        assert calls == 0
+        with sqlite3.connect(local_db) as conn:
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        assert version == SCHEMA_VERSION
+
     def test_private_snapshot_constructor_auto_migrates_existing_schema(self, tmp_path: Path) -> None:
         snapshot_db = tmp_path / "snapshot.db"
         SqliteTaskStore(snapshot_db, prefix="gza", project_id="snapshot")
@@ -13277,6 +13322,52 @@ class TestExecutionProjectResolver:
             runtime = result.open_runtime_store()
 
         assert isinstance(runtime, ExecutionProjectRuntime)
+        with sqlite3.connect(project_db) as conn:
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
+
+    def test_execution_runtime_local_db_ignores_supplied_shared_authority_during_migration(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        project_dir = tmp_path / "owned-local"
+        project_db = project_dir / ".gza" / "gza.db"
+        _write_project_config(
+            project_dir,
+            project_name="OwnedLocal",
+            project_id="ownedlocal",
+            project_prefix="own",
+            db_path=Path(".gza/gza.db"),
+        )
+        anchor = SqliteTaskStore(tmp_path / "anchor.db", prefix="gza", project_id="anchor")
+        SqliteTaskStore(project_db, prefix="own", project_id="ownedlocal")
+        with sqlite3.connect(project_db) as conn:
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,))
+
+        calls = 0
+
+        def revalidate() -> None:
+            nonlocal calls
+            calls += 1
+            raise SchemaIntegrityError("local runtime db must not revalidate shared authority")
+
+        proof = MigrationAuthorityProof(
+            canonical_root=project_dir.resolve(),
+            default_branch="main",
+            head_sha="1" * 40,
+            revalidate=revalidate,
+        )
+        with patch("gza.migration_authority.resolve_canonical_migration_authority", return_value=proof):
+            (result,) = resolve_execution_projects(
+                anchor,
+                (ExecutionProjectSelector("owned-local-runtime", "path", project_dir),),
+            )
+        assert isinstance(result, ExecutionProjectResolved)
+        assert result.migration_authority is proof
+
+        runtime = result.open_runtime_store()
+
+        assert isinstance(runtime, ExecutionProjectRuntime)
+        assert calls == 0
         with sqlite3.connect(project_db) as conn:
             assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
 

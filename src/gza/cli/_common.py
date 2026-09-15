@@ -52,6 +52,7 @@ from ..db import (
     SqliteTaskStore,
     StoreOpenMode,
     Task as DbTask,
+    _migration_policy_from_config,
     merge_unit_is_active,
     merge_unit_membership_role,
     resolve_task_id,
@@ -268,12 +269,12 @@ def get_store(config: Config, *, open_mode: StoreOpenMode = "readwrite") -> Sqli
         ManualMigrationRequired: If the DB needs a manual schema upgrade.
             Callers should run ``gza migrate`` to fix this.
     """
-    migration_policy: MigrationPolicy | None = (
-        "auto_canonical_shared" if open_mode in {"readwrite", "watch_lease_activation"} else None
-    )
+    readwrite_open = open_mode in {"readwrite", "watch_lease_activation"}
+    inferred_migration_policy = _migration_policy_from_config(config)
+    migration_policy: MigrationPolicy | None = "auto_canonical_shared" if readwrite_open else None
     migration_authority = (
         resolve_canonical_migration_authority(config)
-        if open_mode in {"readwrite", "watch_lease_activation"}
+        if readwrite_open and inferred_migration_policy != "auto_private"
         else None
     )
     store = SqliteTaskStore.from_config(
@@ -281,7 +282,7 @@ def get_store(config: Config, *, open_mode: StoreOpenMode = "readwrite") -> Sqli
         open_mode=open_mode,
         migration_policy=migration_policy,
         migration_authority=migration_authority,
-        require_migration_authority=open_mode in {"readwrite", "watch_lease_activation"},
+        require_migration_authority=readwrite_open and inferred_migration_policy != "auto_private",
     )
     for warning in store.startup_warnings():
         print(f"Warning: {warning}", file=sys.stderr)

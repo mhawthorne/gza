@@ -5941,17 +5941,19 @@ def _legacy_local_db_path(project_dir: Path) -> Path:
     return project_dir / ".gza" / "gza.db"
 
 
+def _is_project_local_db_path(db_path: Path, project_dir: Path) -> bool:
+    try:
+        return db_path.resolve() == _legacy_local_db_path(project_dir).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _migration_policy_from_config(config: "Config") -> MigrationPolicy:
     """Infer private-vs-shared intent from config without granting canonical authority."""
     project_dir = getattr(config, "project_dir", None)
     if not isinstance(project_dir, Path):
         return "auto_private"
-    try:
-        if config.db_path.resolve() == _legacy_local_db_path(project_dir).resolve():
-            return "auto_private"
-    except (OSError, RuntimeError, ValueError):
-        return "defer_shared"
-    return "defer_shared"
+    return "auto_private" if _is_project_local_db_path(config.db_path, project_dir) else "defer_shared"
 
 
 def _shared_import_marker_path(project_dir: Path) -> Path:
@@ -6066,16 +6068,13 @@ class SqliteTaskStore:
         self._project_name = project_name
         self._registration_db_path_override = registration_db_path_override
         self._open_mode = open_mode
-        if (
-            project_root is not None
-            and migration_policy == "auto_canonical_shared"
-            and migration_authority is None
-        ):
-            try:
-                project_backed_local = db_path.resolve() == _legacy_local_db_path(project_root).resolve()
-            except (OSError, RuntimeError, ValueError):
-                project_backed_local = False
-            self._migration_policy = "auto_private" if project_backed_local else "defer_shared"
+        project_backed_local = (
+            _is_project_local_db_path(db_path, project_root) if project_root is not None else False
+        )
+        if project_backed_local:
+            self._migration_policy = "auto_private"
+        elif project_root is not None and migration_policy == "auto_canonical_shared" and migration_authority is None:
+            self._migration_policy = "defer_shared"
         else:
             self._migration_policy = migration_policy
         self._migration_authority = migration_authority
@@ -6186,11 +6185,9 @@ class SqliteTaskStore:
             registration_db_path_override = config.db_path
         inferred_migration_policy = _migration_policy_from_config(config)
         resolved_migration_policy = migration_policy or inferred_migration_policy
-        if (
-            resolved_migration_policy == "auto_canonical_shared"
-            and migration_authority is None
-            and inferred_migration_policy != "auto_private"
-        ):
+        if inferred_migration_policy == "auto_private":
+            resolved_migration_policy = "auto_private"
+        elif resolved_migration_policy == "auto_canonical_shared" and migration_authority is None:
             resolved_migration_policy = "defer_shared"
         return cls(
             config.db_path,
@@ -6681,14 +6678,14 @@ class SqliteTaskStore:
             if self._migration_policy == "defer_shared":
                 self._ensure_db_without_shared_migration_authority(allow_bootstrap=allow_bootstrap)
                 return
-            if self._migration_authority is not None:
+            if self._migration_policy == "auto_canonical_shared" and self._migration_authority is not None:
                 self._migration_authority.revalidate()
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             with self._connect() as conn:
                 inspection = self._inspect_schema(conn, db_exists=True)
                 artifacts_verified_at_current_schema = self._validate_schema_compatibility(inspection)
-                if self._migration_authority is not None:
+                if self._migration_policy == "auto_canonical_shared" and self._migration_authority is not None:
                     self._migration_authority.revalidate()
                 if inspection.is_fresh_database:
                     self._bootstrap_current_schema(conn)
@@ -6722,7 +6719,7 @@ class SqliteTaskStore:
         if not repair_merge_units and not ensure_project:
             return
         with _schema_bootstrap_lock(self.db_path):
-            if self._migration_authority is not None:
+            if self._migration_policy == "auto_canonical_shared" and self._migration_authority is not None:
                 self._migration_authority.revalidate()
             if repair_merge_units:
                 self.repair_inconsistent_unmerged_merge_units()
