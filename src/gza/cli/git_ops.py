@@ -6933,6 +6933,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
     persist_planning_state = not dry_run
     recovery_planning_read_contexts_by_task_id: dict[str, RecoveryReadContext] = {}
 
+    def _heartbeat_for_lifecycle_phase(phase: str, _task: DbTask) -> _CliVerifyProgressHeartbeat:
+        return _CliVerifyProgressHeartbeat(
+            _advance_progress_console,
+            "Verify gate" if phase == "verify" else f"Verify gate ({phase})",
+        )
+
     def _remember_recovery_planning_read_context(
         read_context: RecoveryReadContext,
         *tasks: DbTask | None,
@@ -7071,6 +7077,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         persist_post_merge_rebase_state=persist_planning_state,
                         persist_review_clearance=persist_planning_state,
                         reuse_recovery_merge_context=True,
+                        heartbeat_for_lifecycle_phase=(
+                            _heartbeat_for_lifecycle_phase if persist_planning_state else None
+                        ),
                     )
                 )
                 dropped_owner_lineage = False
@@ -7094,6 +7103,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                             persist_post_merge_rebase_state=persist_planning_state,
                             persist_review_clearance=persist_planning_state,
                             reuse_recovery_merge_context=True,
+                            heartbeat_for_lifecycle_phase=(
+                                _heartbeat_for_lifecycle_phase if persist_planning_state else None
+                            ),
                         )
                         if row.owner_task.status == "dropped"
                     ]
@@ -7187,6 +7199,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         persist_post_merge_rebase_state=persist_planning_state,
                         persist_review_clearance=persist_planning_state,
                         reuse_recovery_merge_context=True,
+                        heartbeat_for_lifecycle_phase=(
+                            _heartbeat_for_lifecycle_phase if persist_planning_state else None
+                        ),
                     )
                 )
                 return owner_rows
@@ -7475,12 +7490,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 heartbeat_for_lifecycle_phase=(
                     None
                     if dry_run_mode
-                    else (
-                        lambda phase, _task: _CliVerifyProgressHeartbeat(
-                            _advance_progress_console,
-                            "Verify gate" if phase == "verify" else f"Verify gate ({phase})",
-                        )
-                    )
+                    else _heartbeat_for_lifecycle_phase
                 ),
                 runtime_context=runtime_context,
             )
@@ -7714,6 +7724,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         persist_post_merge_rebase_state=not dry_run,
                         persist_review_clearance=not dry_run,
                         reuse_recovery_merge_context=True,
+                        heartbeat_for_lifecycle_phase=None if dry_run else _heartbeat_for_lifecycle_phase,
                     )
                 )
 
@@ -7771,6 +7782,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     persist_post_merge_rebase_state=not dry_run,
                     persist_review_clearance=not dry_run,
                     read_context=_recovery_planning_read_context_for_row(row, action_task),
+                    heartbeat_for_lifecycle_phase=None if dry_run else _heartbeat_for_lifecycle_phase,
                 )
             )
             decision = plan_lifecycle_execution(
@@ -7793,6 +7805,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     persist_review_clearance=not dry_run,
                     read_context=_recovery_planning_read_context_for_row(item[0], item[1]),
                     selected_for_merge=True,
+                    heartbeat_for_lifecycle_phase=None if dry_run else _heartbeat_for_lifecycle_phase,
                 ),
             )[0]
             if classify_advance_action(decision.action) == "actionable" and not decision.selected:
@@ -8222,6 +8235,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     persist_post_merge_rebase_state=persist_planning_state,
                     persist_review_clearance=persist_planning_state,
                     read_context=_recovery_planning_read_context_for_row(row, action_task),
+                    heartbeat_for_lifecycle_phase=(
+                        _heartbeat_for_lifecycle_phase if persist_planning_state else None
+                    ),
                 )
             )
             plan.append((row, action_task, action))
@@ -8270,6 +8286,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     persist_review_clearance=persist_planning_state,
                     read_context=_recovery_planning_read_context_for_row(item[0], item[1]),
                     selected_for_merge=True,
+                    heartbeat_for_lifecycle_phase=(
+                        _heartbeat_for_lifecycle_phase if persist_planning_state else None
+                    ),
                 ),
             )
 

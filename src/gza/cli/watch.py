@@ -3111,6 +3111,7 @@ def _query_owner_rows_with_context(
     persist_post_merge_rebase_state: bool = True,
     persist_review_clearance: bool = True,
     apply_deferred_recovery_reconciliations: bool = True,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> tuple[list[LineageOwnerRow], RecoveryReadContext]:
     rows, read_context = query_lineage_owner_rows_in_read_session(
         store,
@@ -3131,6 +3132,7 @@ def _query_owner_rows_with_context(
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
         persist_review_clearance=persist_review_clearance,
         apply_deferred_recovery_reconciliations=apply_deferred_recovery_reconciliations,
+        heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
     )
     return list(rows), read_context
 
@@ -3151,6 +3153,7 @@ def _query_owner_rows(
     persist_post_merge_rebase_state: bool = True,
     persist_review_clearance: bool = True,
     apply_deferred_recovery_reconciliations: bool = True,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> list[LineageOwnerRow]:
     rows, _ = _query_owner_rows_with_context(
         store=store,
@@ -3167,6 +3170,7 @@ def _query_owner_rows(
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
         persist_review_clearance=persist_review_clearance,
         apply_deferred_recovery_reconciliations=apply_deferred_recovery_reconciliations,
+        heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
     )
     return rows
 
@@ -3218,6 +3222,7 @@ def _query_scoped_owner_rows_with_context(
     selectors: tuple[_WatchScopeSelector, ...] | None,
     max_recovery_attempts: int,
     include_skipped: bool,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> tuple[list[LineageOwnerRow], RecoveryReadContext]:
     if selectors is None:
         return _query_owner_rows_with_context(
@@ -3229,6 +3234,7 @@ def _query_scoped_owner_rows_with_context(
             any_tag=any_tag,
             max_recovery_attempts=max_recovery_attempts,
             include_skipped=include_skipped,
+            heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
         )
 
     rows: list[LineageOwnerRow] = []
@@ -3259,6 +3265,7 @@ def _query_scoped_owner_rows_with_context(
             else "intersection",
             max_recovery_attempts=max_recovery_attempts,
             include_skipped=include_skipped,
+            heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
         )
         if read_context is None:
             read_context = selector_context
@@ -3288,6 +3295,7 @@ def _query_scoped_owner_rows_with_context(
                     selector_filter_mode="union",
                     max_recovery_attempts=max_recovery_attempts,
                     include_skipped=include_skipped,
+                    heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
                 )
                 rows.extend(leaf_rows)
     return _merge_scoped_owner_rows(rows), read_context or RecoveryReadContext()
@@ -15395,6 +15403,7 @@ def _collect_scoped_recovery_lane_entries(
     recovery_rows: list[LineageOwnerRow],
     read_context: RecoveryReadContext,
     max_recovery_attempts: int,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> dict[str, RecoveryLaneEntry]:
     entries: dict[str, RecoveryLaneEntry] = {}
     for row in recovery_rows:
@@ -15421,6 +15430,7 @@ def _collect_scoped_recovery_lane_entries(
             max_recovery_attempts=max_recovery_attempts,
             read_context=read_context,
             decision=decision,
+            heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
         )
         if action is not None and classify_advance_action(action) == "actionable":
             entries[str(failed.id)] = RecoveryLaneEntry(
@@ -15469,6 +15479,7 @@ def _determine_recovery_lane_action(
     read_context: RecoveryReadContext,
     decision: FailedRecoveryDecision,
     impl_based_on_ids: set[str] | None = None,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> dict[str, Any]:
     from .advance_engine import determine_next_action as _shared_determine_next_action
 
@@ -15494,6 +15505,7 @@ def _determine_recovery_lane_action(
         impl_based_on_ids=impl_based_on_ids,
         max_resume_attempts=max_recovery_attempts,
         read_context=read_context,
+        heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
     )
     if str(shared_action.get("type", "")) == "needs_rebase":
         return shared_action
@@ -15663,6 +15675,7 @@ def _analyze_watch_cycle(
     scoped_task_ids: tuple[str, ...] | None = None,
     known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
     excluded_owner_ids: frozenset[str] = frozenset(),
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> _WatchCycleAnalysis:
     del slots, recovery_slots, recovery_mode
     cache_scope = git.cached() if hasattr(git, "cached") else contextlib.nullcontext(git)
@@ -15694,6 +15707,7 @@ def _analyze_watch_cycle(
             selectors=scope_selectors,
             max_recovery_attempts=max_recovery_attempts,
             include_skipped=True,
+            heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
         )
         owner_rows = list(owner_rows)
         if excluded_owner_ids:
@@ -15757,12 +15771,15 @@ def _analyze_watch_cycle(
                 recovery_rows=recovery_rows,
                 read_context=watch_read_context,
                 max_recovery_attempts=max_recovery_attempts,
+                heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
             )
 
         action_plan: list[tuple[LineageOwnerRow, DbTask, dict[str, Any]]] = []
         for row in lifecycle_rows:
             task = row.lifecycle_action_task or row.owner_task
             parked_action = _watch_parked_lineage_action(row)
+            if parked_action is not None and get_needs_attention_reason(parked_action) == "improve-no-op":
+                parked_action = None
             precomputed_skip_action = (
                 row.next_action
                 if row.next_action is not None and classify_advance_action(row.next_action) == "skip"
@@ -15784,6 +15801,7 @@ def _analyze_watch_cycle(
                         target_branch,
                         impl_based_on_ids=impl_based_on_ids,
                         read_context=watch_read_context,
+                        heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
                     ),
                 )
             )
@@ -15818,6 +15836,7 @@ def _analyze_watch_cycle(
                 read_context=watch_read_context,
                 decision=decision,
                 impl_based_on_ids=impl_based_on_ids,
+                heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
             )
             recovery_action_type = str(recovery_action.get("type", ""))
             recovery_action_class = classify_advance_action(recovery_action)
@@ -17240,6 +17259,7 @@ def _build_watch_cycle_plan(
     git: Git | None = None,
     runtime_context: RuntimeExecutionContext | None = None,
     reconciled_runtime_state: ProjectRuntimeReconcileResult | None = None,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> _WatchCyclePlan:
     runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     if reconciled_runtime_state is None:
@@ -17297,6 +17317,7 @@ def _build_watch_cycle_plan(
         scoped_task_ids=scoped_task_ids,
         known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
         excluded_owner_ids=excluded_owner_ids,
+        heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
     )
     unit_accounting = (
         None
@@ -17343,11 +17364,17 @@ def _build_reported_watch_cycle_plan(
     git: Git | None = None,
     runtime_context: RuntimeExecutionContext | None = None,
     reconciled_runtime_state: ProjectRuntimeReconcileResult | None = None,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
+    worker_heartbeat: Callable[[], None] | None = None,
 ) -> _WatchCyclePlan:
     reporter = _WatchLongPhaseReporter(
         log=log,
         threshold_seconds=threshold_seconds,
         interval_seconds=heartbeat_interval_seconds,
+    )
+    lifecycle_heartbeat_factory = heartbeat_for_lifecycle_phase or _make_watch_lifecycle_heartbeat_factory(
+        reporter,
+        worker_heartbeat=worker_heartbeat,
     )
     with _watch_cycle_phase(reporter, "cycle-plan"):
         plan = _build_watch_cycle_plan(
@@ -17366,6 +17393,7 @@ def _build_reported_watch_cycle_plan(
             git=git,
             runtime_context=runtime_context,
             reconciled_runtime_state=reconciled_runtime_state,
+            heartbeat_for_lifecycle_phase=lifecycle_heartbeat_factory,
         )
     return plan
 
@@ -17519,6 +17547,10 @@ def _run_cycle(
         threshold_seconds=config.watch.long_phase_threshold_seconds,
         interval_seconds=config.watch.heartbeat_interval_seconds,
     )
+    lifecycle_heartbeat_factory = _make_watch_lifecycle_heartbeat_factory(
+        long_phase_reporter,
+        worker_heartbeat=worker_heartbeat,
+    )
 
     def _restart_requested_at_checkpoint() -> bool:
         if restart_checkpoint is not None:
@@ -17627,6 +17659,8 @@ def _run_cycle(
             git=git,
             runtime_context=runtime_context,
             reconciled_runtime_state=reconciled_runtime_state,
+            heartbeat_for_lifecycle_phase=lifecycle_heartbeat_factory,
+            worker_heartbeat=worker_heartbeat,
         )
     _remember_cycle_plan(plan)
     if _restart_requested_at_checkpoint():
@@ -17662,11 +17696,6 @@ def _run_cycle(
     reserved_recovery_slots = 0
     remaining_new_worker_starts = max(0, new_worker_start_cap) if new_worker_start_cap is not None else None
     project_analysis_invalidated = False
-    lifecycle_heartbeat_factory = _make_watch_lifecycle_heartbeat_factory(
-        long_phase_reporter,
-        worker_heartbeat=worker_heartbeat,
-    )
-
     def _emit_worker_heartbeat() -> None:
         if worker_heartbeat is not None:
             worker_heartbeat()
@@ -18486,6 +18515,10 @@ def _run_cycle(
                             target_branch,
                             impl_based_on_ids=impl_based_on_ids,
                             selected_for_merge=True,
+                            heartbeat_for_lifecycle_phase=lambda phase, task: lifecycle_heartbeat_factory(
+                                _watch_lifecycle_verify_phase_label(phase),
+                                task,
+                            ),
                         )
                     ),
                 )
@@ -18608,6 +18641,10 @@ def _run_cycle(
                             task,
                             target_branch,
                             impl_based_on_ids=impl_based_on_ids,
+                            heartbeat_for_lifecycle_phase=lambda phase, task: lifecycle_heartbeat_factory(
+                                _watch_lifecycle_verify_phase_label(phase),
+                                task,
+                            ),
                         )
                         if not show_skipped and classify_advance_action(owner_action) != "needs_attention":
                             work_done = True
@@ -19486,6 +19523,7 @@ def _run_cycle(
                     scoped_task_ids=scoped_task_ids,
                     known_effective_scoped_owner_ids=effective_scoped_owner_ids,
                     excluded_owner_ids=excluded_owner_ids,
+                    heartbeat_for_lifecycle_phase=lifecycle_heartbeat_factory,
                 )
                 current_analysis = analysis
         finally:

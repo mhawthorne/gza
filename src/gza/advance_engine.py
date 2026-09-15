@@ -501,6 +501,7 @@ class AdvanceContext:
     max_resume_attempts: int
     selected_for_merge: bool = False
     persist_derived_state: bool = True
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None
 
     auto_implement_enabled: bool = True
     has_non_dropped_implement_descendant: bool = False
@@ -1894,6 +1895,7 @@ def _classify_off_topic_noop_improve_verify_clearance(
     current_head_sha: str,
     latest_completed_noop_improve: DbTask,
     persist: bool,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> tuple[bool, datetime | None, str | None, tuple[str, ...], tuple[str, ...]]:
     from gza.off_topic_verify import (
         run_local_target_baseline_plan,
@@ -1992,6 +1994,13 @@ def _classify_off_topic_noop_improve_verify_clearance(
             timeout_grace_seconds=float(getattr(config, "review_verify_timeout_grace_seconds", 5.0)),
             runtime_context=RuntimeExecutionContext.from_config(config),
             config=config,
+            heartbeat_threshold_seconds=config.watch.long_phase_threshold_seconds,
+            heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
+            on_heartbeat=(
+                heartbeat_for_lifecycle_phase("off-topic-baseline", task)
+                if heartbeat_for_lifecycle_phase is not None
+                else None
+            ),
         )
     except Exception as exc:
         return False, None, f"off-topic local-target baseline failed for {target_branch}: {exc}", (), ()
@@ -2071,19 +2080,43 @@ def _resolve_noop_improve_verify_clearance(
     latest_completed_review: DbTask | None,
     improve_tasks: list[DbTask],
     persist: bool,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> tuple[bool, datetime | None, str | None, tuple[str, ...], tuple[str, ...]]:
-    del (
-        config,
-        store,
-        git,
-        project_dir,
-        target_branch,
-        task,
-        latest_completed_review,
-        improve_tasks,
-        persist,
+    del project_dir
+    if latest_completed_review is None:
+        return False, None, None, (), ()
+    latest_completed_noop_improve = _latest_completed_noop_improve(improve_tasks)
+    if latest_completed_noop_improve is None:
+        return False, None, None, (), ()
+    if latest_completed_noop_improve.review_verify_status not in {"failed", "unavailable"}:
+        return False, None, None, (), ()
+    if latest_completed_noop_improve.review_verify_captured_at is None:
+        return False, None, None, (), ()
+    if latest_completed_noop_improve.review_verify_branch != task.branch:
+        return False, None, None, (), ()
+    if not latest_completed_noop_improve.review_verify_head_sha:
+        return False, None, None, (), ()
+    if (
+        latest_completed_review.completed_at is not None
+        and latest_completed_noop_improve.review_verify_captured_at <= latest_completed_review.completed_at
+    ):
+        return False, None, None, (), ()
+    branch_head = _resolve_branch_head_sha(git, task.branch)
+    if branch_head.warning is not None or branch_head.head_sha is None:
+        return False, None, branch_head.warning, (), ()
+    return _classify_off_topic_noop_improve_verify_clearance(
+        config=config,
+        store=store,
+        git=git,
+        target_branch=target_branch,
+        task=task,
+        latest_completed_review=latest_completed_review,
+        improve_tasks=improve_tasks,
+        current_head_sha=branch_head.head_sha,
+        latest_completed_noop_improve=latest_completed_noop_improve,
+        persist=persist,
+        heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase if persist else None,
     )
-    return False, None, None, (), ()
 
 
 def _latest_matching_verify_only_noop_review_clearance(
@@ -5353,6 +5386,7 @@ def _resolve_review_state(
     target_branch: str,
     *,
     persist_review_clearance: bool,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> tuple[
     list[DbTask],
     DbTask | None,
@@ -5516,6 +5550,9 @@ def _resolve_review_state(
                 latest_completed_review=latest_completed_review,
                 improve_tasks=improve_tasks,
                 persist=persist_review_clearance,
+                heartbeat_for_lifecycle_phase=(
+                    heartbeat_for_lifecycle_phase if persist_review_clearance else None
+                ),
             )
             branch_head = _resolve_branch_head_sha(git, task.branch)
             noop_improve_verify_recovery_attention_message = (
@@ -7763,6 +7800,7 @@ def _build_base_advance_context(
     has_resume_children: bool,
     resume_chain_depth: int,
     persist_derived_state: bool,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> AdvanceContext:
     """Build the DB-known portion of advance context shared by cheap and full paths."""
     return AdvanceContext(
@@ -7785,6 +7823,7 @@ def _build_base_advance_context(
         max_noop_improve_cycles=effective_max_noop_improves,
         max_resume_attempts=effective_max_resume,
         persist_derived_state=persist_derived_state,
+        heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
         auto_implement_enabled=auto_implement_enabled,
         failed_recovery_decision=failed_recovery_decision,
         failed_recovery_attention_reason=failed_recovery_attention_reason,
@@ -8441,6 +8480,7 @@ def resolve_advance_context(
     persist_review_clearance: bool = True,
     read_context: RecoveryReadContext | None = None,
     selected_for_merge: bool = False,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> AdvanceContext:
     """Resolve state once, then let rules evaluate pure context."""
     assert task.id is not None
@@ -8598,6 +8638,9 @@ def resolve_advance_context(
         git,
         target_branch=target_branch,
         persist_review_clearance=persist_review_clearance,
+        heartbeat_for_lifecycle_phase=(
+            heartbeat_for_lifecycle_phase if persist_review_clearance else None
+        ),
     )
 
     ctx = _build_base_advance_context(
@@ -8620,6 +8663,7 @@ def resolve_advance_context(
         has_resume_children=has_resume_children,
         resume_chain_depth=resume_chain_depth,
         persist_derived_state=persist_post_merge_rebase_state,
+        heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
     )
     ctx = replace(
         ctx,
@@ -10023,6 +10067,7 @@ def evaluate_advance_rules(
     persist_review_clearance: bool = True,
     read_context: RecoveryReadContext | None = None,
     selected_for_merge: bool = False,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> dict[str, Any]:
     """Evaluate ordered advance rules for a task and return an action dict."""
     context = resolve_advance_context(
@@ -10037,6 +10082,7 @@ def evaluate_advance_rules(
         persist_review_clearance=persist_review_clearance,
         read_context=read_context,
         selected_for_merge=selected_for_merge,
+        heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
     )
 
     return select_advance_action_for_context(context)

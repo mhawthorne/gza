@@ -32,6 +32,7 @@ import gza.recovery_engine as recovery_engine
 from gza.advance_engine import (
     NOOP_IMPROVE_KIND_VERIFY_ONLY,
     PARK_REASON_VERIFY_BUDGET_EXCEEDED,
+    REVIEW_CLEARANCE_ARTIFACT_KIND,
     classify_advance_action,
     failed_recovery_decision_to_action,
     pending_merge_finalization_action,
@@ -252,7 +253,12 @@ from gza.review_verify_state import (
     VERIFY_GATE_ARTIFACT_KIND,
     persist_verify_gate_artifact,
 )
-from gza.runner import LongPhaseProgress, _make_review_verify_result, _read_darwin_process_tree_cpu_seconds
+from gza.runner import (
+    LongPhaseProgress,
+    ReviewVerifyResult,
+    _make_review_verify_result,
+    _read_darwin_process_tree_cpu_seconds,
+)
 from gza.runtime_context import RuntimeExecutionContext
 from gza.sync_ops import BranchSyncResult
 from gza.unstick import VERIFY_FIX_FAILED_REASON, select_and_clear_parked_tasks
@@ -977,6 +983,164 @@ def _make_watch_git() -> Git:
     git.patch_equivalent_commits_present_on_target = MagicMock(return_value={})  # type: ignore[method-assign]
     git.content_equivalent_refs_on_target = MagicMock(return_value={})  # type: ignore[method-assign]
     return git
+
+
+def _watch_verify_failure_only_review_report() -> str:
+    return (
+        "## Summary\n\n- Implementation matches the requested shape; verify failed at the current tip.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: failed root resume attention regression\n"
+        "Evidence: `tests/cli/test_execution.py::test_failed_root_resume_with_existing_failed_resume_child_auto_iterate_uses_shared_attention` failed at the current branch head.\n"
+        "Impact: autonomous verify failed even though the review found no code defect.\n"
+        "Required fix: rerun verify_command.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
+def _watch_passing_verify_output(*, tree_fingerprint: str) -> str:
+    return (
+        f"gza-verify phase=passed name=unit duration_seconds=0.10 tree_fingerprint={tree_fingerprint}\n"
+        "============================== 5 passed in 0.10s =============================="
+    )
+
+
+def _watch_off_topic_failed_verify_output(*, tree_fingerprint: str) -> str:
+    return (
+        f"gza-verify phase=failed name=unit duration_seconds=0.20 tree_fingerprint={tree_fingerprint}\n"
+        "_________________________________ test_worker_registry __________________________________\n\n"
+        "    def test_worker_registry():\n"
+        '>       assert worker.status == "completed"\n'
+        "E       AssertionError: assert 'running' == 'completed'\n\n"
+        "tests/cli/test_query.py:10:\n"
+        "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n"
+        "src/gza/workers.py:42: in get_status\n"
+        "    return registry.status()\n"
+        "E   AssertionError: assert 'running' == 'completed'\n\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/cli/test_query.py::test_worker_registry - AssertionError: assert 'running' == 'completed'\n"
+        "============================== 1 failed in 0.20s =============================="
+    )
+
+
+def _persist_watch_review_verify_artifact(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    task: DbTask,
+    output: str,
+    status: str,
+    exit_status: str,
+    tree_fingerprint: str,
+) -> None:
+    stored = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="test",
+        label="verify_command",
+        output=output,
+        status=status,
+        exit_status=exit_status,
+        head_sha=task.review_verify_head_sha,
+        metadata={"tree_fingerprint": tree_fingerprint},
+        created_at=task.review_verify_captured_at,
+    )
+    task.review_verify_artifact_file = stored.path
+    store.update(task)
+
+
+def _add_watch_off_topic_clearance_candidate(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    branch: str,
+    tree_fingerprint: str,
+) -> DbTask:
+    impl = store.add("Watch off-topic clearance candidate", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 6, 23, 9, 0, tzinfo=UTC)
+    impl.branch = branch
+    impl.has_commits = True
+    impl.merge_status = "unmerged"
+    store.update(impl)
+
+    review = store.add(f"Review {impl.id}", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 23, 10, 0, tzinfo=UTC)
+    review.output_content = _watch_verify_failure_only_review_report()
+    review.report_file = f"reviews/{review.id}.md"
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "watchtestsourcesha"
+    review.review_verify_command = "uv run pytest tests/ -q --maxfail=0"
+    review.review_verify_exit_status = "1"
+    review.review_verify_captured_at = review.completed_at + timedelta(seconds=1)
+    store.update(review)
+
+    green_improve = store.add(
+        "Green watch no-op improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        same_branch=True,
+    )
+    assert green_improve.id is not None
+    green_improve.status = "completed"
+    green_improve.completed_at = datetime(2026, 6, 23, 11, 0, tzinfo=UTC)
+    green_improve.branch = impl.branch
+    green_improve.changed_diff = False
+    green_improve.review_verify_status = "passed"
+    green_improve.review_verify_branch = impl.branch
+    green_improve.review_verify_head_sha = "watchtestsourcesha"
+    green_improve.review_verify_command = "uv run pytest tests/ -q --maxfail=0"
+    green_improve.review_verify_exit_status = "0"
+    green_improve.review_verify_captured_at = review.completed_at + timedelta(seconds=30)
+    store.update(green_improve)
+    _persist_watch_review_verify_artifact(
+        config=config,
+        store=store,
+        task=green_improve,
+        output=_watch_passing_verify_output(tree_fingerprint=tree_fingerprint),
+        status="passed",
+        exit_status="0",
+        tree_fingerprint=tree_fingerprint,
+    )
+
+    red_improve = store.add(
+        "Red watch no-op improve",
+        task_type="improve",
+        based_on=green_improve.id,
+        depends_on=review.id,
+        same_branch=True,
+    )
+    assert red_improve.id is not None
+    red_improve.status = "completed"
+    red_improve.completed_at = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    red_improve.branch = impl.branch
+    red_improve.changed_diff = False
+    red_improve.review_verify_status = "failed"
+    red_improve.review_verify_branch = impl.branch
+    red_improve.review_verify_head_sha = "watchtestsourcesha"
+    red_improve.review_verify_command = "uv run pytest tests/ -q --maxfail=0"
+    red_improve.review_verify_exit_status = "1"
+    red_improve.review_verify_captured_at = review.completed_at + timedelta(minutes=3)
+    store.update(red_improve)
+    _persist_watch_review_verify_artifact(
+        config=config,
+        store=store,
+        task=red_improve,
+        output=_watch_off_topic_failed_verify_output(tree_fingerprint=tree_fingerprint),
+        status="failed",
+        exit_status="1",
+        tree_fingerprint=tree_fingerprint,
+    )
+    return impl
 
 
 def _live_settle_results(
@@ -10118,7 +10282,7 @@ def test_run_cycle_direct_phase_only_replans_when_stale_dropped_active_owner_cle
             git=_make_watch_git(),
         )
 
-    assert result.work_done is True
+    assert result.restart_requested is False
     assert result.needs_replan is True
     attempt_state = store.get_main_verify_remediation_attempt_state(
         signature="phases:functional",
@@ -10246,7 +10410,7 @@ def test_run_cycle_direct_phase_only_replans_after_merged_remediation_final_atte
             git=_make_watch_git(),
         )
 
-    assert result.work_done is True
+    assert result.restart_requested is False
     assert result.needs_replan is True
     exhausted = store.get(remediation_task.id)
     assert exhausted is not None
@@ -21933,6 +22097,98 @@ def test_watch_cycle_logs_off_topic_clearance_success_message_without_starting_i
     assert "REPAIR" in log_text
     assert success_message in log_text
     assert f"START     {impl.id}" not in log_text
+
+
+def test_watch_cycle_threads_off_topic_baseline_heartbeat_and_persists_clearance(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.advance_off_topic_verify_unblock = True
+    config.watch.long_phase_threshold_seconds = 31
+    config.watch.heartbeat_interval_seconds = 37
+    tree_fingerprint = "a" * 64
+    impl = _add_watch_off_topic_clearance_candidate(
+        config=config,
+        store=store,
+        branch="feature/watch-off-topic-heartbeat",
+        tree_fingerprint=tree_fingerprint,
+    )
+    git = _make_watch_git()
+    git.get_diff_name_status = MagicMock(return_value="M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py\n")  # type: ignore[method-assign]
+
+    baseline_calls: list[dict[str, Any]] = []
+
+    def _baseline_for_main(plan, **kwargs):
+        baseline_calls.append(kwargs)
+        assert plan.target_branch == "main"
+        return SimpleNamespace(
+            results=(
+                ReviewVerifyResult(
+                    command="uv run pytest tests/cli/test_query.py::test_worker_registry -q --maxfail=0",
+                    status="failed",
+                    exit_status="1",
+                    captured_at=datetime(2026, 6, 23, 12, 5, tzinfo=UTC),
+                    output=(
+                        "=========================== short test summary info ============================\n"
+                        "FAILED tests/cli/test_query.py::test_worker_registry - AssertionError: assert 'running' == 'completed'\n"
+                        "============================== 1 failed in 0.20s =============================="
+                    ),
+                ),
+            )
+        )
+
+    execution_result = AdvanceActionExecutionResult(
+        action_type="verify_gate",
+        status="success",
+        message="verify gate handled in test",
+        work_done=True,
+        worker_consuming=False,
+    )
+
+    with (
+        patch(
+            "gza.cli.watch.check_canonical_checkout_invariant",
+            return_value=SimpleNamespace(
+                restored=False,
+                needs_attention=False,
+                dirty_tracked_paths=[],
+                current_branch="main",
+                expected_branch="main",
+            ),
+        ),
+        patch(
+            "gza.cli.watch._run_watch_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, remediation=None, state=None),
+        ),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch.execute_advance_action", return_value=execution_result),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.off_topic_verify.run_local_target_baseline_plan", side_effect=_baseline_for_main),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            git=git,
+            skip_runtime_reconcile=True,
+            skip_stale_no_progress_reconcile=True,
+        )
+
+    assert result.restart_requested is False
+    assert len(baseline_calls) == 1
+    assert baseline_calls[0]["heartbeat_threshold_seconds"] == 31
+    assert baseline_calls[0]["heartbeat_interval_seconds"] == 37
+    assert baseline_calls[0]["on_heartbeat"] is not None
+    refreshed = store.get(str(impl.id))
+    assert refreshed is not None
+    assert refreshed.review_cleared_at is not None
+    assert len(store.list_artifacts(str(impl.id), kind=REVIEW_CLEARANCE_ARTIFACT_KIND)) == 1
 
 
 @pytest.mark.parametrize("dry_run", [False, True])

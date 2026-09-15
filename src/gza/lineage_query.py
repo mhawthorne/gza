@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict, deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
@@ -1821,6 +1821,7 @@ def query_lineage_owner_rows(
     persist_post_merge_rebase_state: bool = True,
     persist_review_clearance: bool = True,
     reuse_recovery_merge_context: bool = False,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> tuple[LineageOwnerRow, ...]:
     rows, read_context = _query_lineage_owner_rows_with_context(
         store,
@@ -1831,6 +1832,7 @@ def query_lineage_owner_rows(
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
         persist_review_clearance=persist_review_clearance,
         reuse_recovery_merge_context=reuse_recovery_merge_context,
+        heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase if persist_review_clearance else None,
     )
     if not read_context.allow_reconcile_mutation:
         _record_pending_recovery_reconciliation_context(store, read_context)
@@ -1870,6 +1872,7 @@ def query_lineage_owner_rows_in_read_session(
     persist_review_clearance: bool = True,
     reuse_recovery_merge_context: bool = False,
     apply_deferred_recovery_reconciliations: bool = True,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> tuple[tuple[LineageOwnerRow, ...], RecoveryReadContext]:
     from .recovery_engine import apply_pending_recovery_reconciliations
 
@@ -1883,6 +1886,7 @@ def query_lineage_owner_rows_in_read_session(
             persist_post_merge_rebase_state=False,
             persist_review_clearance=False,
             reuse_recovery_merge_context=reuse_recovery_merge_context,
+            heartbeat_for_lifecycle_phase=None,
         )
     if apply_deferred_recovery_reconciliations:
         apply_pending_recovery_reconciliations(store, read_context=read_context)
@@ -1899,6 +1903,7 @@ def _query_lineage_owner_rows_with_context(
     persist_post_merge_rebase_state: bool = True,
     persist_review_clearance: bool = True,
     reuse_recovery_merge_context: bool = False,
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], Any | None] | None = None,
 ) -> tuple[tuple[LineageOwnerRow, ...], RecoveryReadContext]:
     from .cli.advance_engine import determine_next_action, failed_recovery_decision_to_attention_action
     from .query import is_lineage_complete
@@ -1931,6 +1936,10 @@ def _query_lineage_owner_rows_with_context(
             query,
             tag_matcher=task_matches_tag_filters,
         ),
+    )
+    effective_persist_review_clearance = persist_review_clearance and read_context.allow_reconcile_mutation
+    effective_heartbeat_for_lifecycle_phase = (
+        heartbeat_for_lifecycle_phase if effective_persist_review_clearance else None
     )
     with store.use_read_session_child_indexes(based_on_children=indexes.based_on_children):
         if isinstance(git, Git) and target_branch is not None:
@@ -2053,8 +2062,9 @@ def _query_lineage_owner_rows_with_context(
                     impl_based_on_ids=indexes.non_dropped_impl_source_ids,
                     max_resume_attempts=query.max_recovery_attempts,
                     persist_post_merge_rebase_state=persist_post_merge_rebase_state,
-                    persist_review_clearance=persist_review_clearance,
+                    persist_review_clearance=effective_persist_review_clearance,
                     read_context=read_context,
+                    heartbeat_for_lifecycle_phase=effective_heartbeat_for_lifecycle_phase,
                 )
             lineage_status = _classify_lineage_status(action) if action is not None else "actionable"
             if not query.include_skipped and lineage_status == "skipped":
@@ -2562,8 +2572,9 @@ def _query_lineage_owner_rows_with_context(
                     impl_based_on_ids=indexes.non_dropped_impl_source_ids,
                     max_resume_attempts=query.max_recovery_attempts,
                     persist_post_merge_rebase_state=persist_post_merge_rebase_state,
-                    persist_review_clearance=persist_review_clearance,
+                    persist_review_clearance=effective_persist_review_clearance,
                     read_context=read_context,
+                    heartbeat_for_lifecycle_phase=effective_heartbeat_for_lifecycle_phase,
                 )
                 if lifecycle_action_task is not None and lifecycle_action_task.id is not None:
                     candidate = build_watch_progress_candidate(

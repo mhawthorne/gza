@@ -12,6 +12,7 @@ from ..flaky_investigations import (
 from ..runner import _resolve_review_verify_timeout_grace_seconds, _resolve_review_verify_timeout_seconds
 from ..runtime_context import RuntimeExecutionContext
 from ._common import get_store, resolve_id
+from .git_ops import _advance_progress_console, _CliVerifyProgressHeartbeat
 
 
 def cmd_flaky_reproduce(args) -> int:
@@ -49,6 +50,9 @@ def cmd_flaky_reproduce(args) -> int:
         hypotheses=hypotheses,
         runtime_context=RuntimeExecutionContext.from_config(config),
         config=config,
+        heartbeat_threshold_seconds=config.watch.long_phase_threshold_seconds,
+        heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
+        on_heartbeat=_CliVerifyProgressHeartbeat(_advance_progress_console, "Flaky reproduce verify"),
     )
     print(f"Task: {task_id}")
     print(f"Harness cwd: {plan.working_directory}")

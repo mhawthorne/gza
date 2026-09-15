@@ -15982,12 +15982,11 @@ def test_off_topic_verify_unblock_clears_review_and_persists_audit_artifact(
         and store.list_artifacts(task.id, kind=OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND)
     ]
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "improve-no-op"
     assert stored_impl is not None
-    assert stored_impl.review_cleared_at is None
-    assert artifacts == []
-    assert investigation_tasks == []
+    assert stored_impl.review_cleared_at is not None
+    assert action["type"] == "verify_gate"
+    assert len(artifacts) == 1
+    assert len(investigation_tasks) == 1
 
 
 def test_off_topic_verify_unblock_reads_failed_noop_reverify_from_improve_artifact_pointer(
@@ -16115,11 +16114,10 @@ def test_off_topic_verify_unblock_reads_failed_noop_reverify_from_improve_artifa
     stored_impl = store.get(impl.id)
     artifacts = store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND)
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "improve-no-op"
     assert stored_impl is not None
-    assert stored_impl.review_cleared_at is None
-    assert artifacts == []
+    assert stored_impl.review_cleared_at is not None
+    assert action["type"] == "verify_gate"
+    assert len(artifacts) == 1
 
 
 def test_off_topic_verify_unblock_fails_closed_when_investigation_persistence_fails(
@@ -16241,7 +16239,8 @@ def test_off_topic_verify_unblock_fails_closed_when_investigation_persistence_fa
     )
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
-    assert "review feedback remains unresolved" in action["description"]
+    assert "verify-only auto-clear could not be validated" in action["description"]
+    assert "artifact write failed" in action["description"]
     assert stored_impl is not None
     assert stored_impl.review_cleared_at is None
     assert store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND) == []
@@ -16348,7 +16347,8 @@ def test_off_topic_verify_unblock_baseline_exception_parks_with_warning_and_no_a
     stored_impl = store.get(impl.id)
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
-    assert "review feedback remains unresolved" in action["description"]
+    assert "verify-only auto-clear could not be validated" in action["description"]
+    assert "local-target baseline cwd does not exist" in action["description"]
     assert stored_impl is not None
     assert stored_impl.review_cleared_at is None
     assert store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND) == []
@@ -16366,6 +16366,8 @@ def test_off_topic_verify_unblock_uses_requested_target_branch(
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     config.advance_off_topic_verify_unblock = True
+    config.watch.long_phase_threshold_seconds = 19
+    config.watch.heartbeat_interval_seconds = 29
     tree_fingerprint = "7" * 64
 
     impl = _make_completed_unmerged_impl(
@@ -16450,10 +16452,15 @@ def test_off_topic_verify_unblock_uses_requested_target_branch(
         name_status_by_range={f"release...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"},
     )
 
-    def _baseline_for_release(plan, **_kwargs):
+    heartbeat = object()
+
+    def _baseline_for_release(plan, **kwargs):
         assert plan.target_branch == "release"
         assert plan.target_head_sha == "release-head-sha"
         assert plan.target_tree_fingerprint == "8" * 64
+        assert kwargs["heartbeat_threshold_seconds"] == 19
+        assert kwargs["heartbeat_interval_seconds"] == 29
+        assert kwargs["on_heartbeat"] is heartbeat
         return SimpleNamespace(
             results=(
                 ReviewVerifyResult(
@@ -16470,17 +16477,33 @@ def test_off_topic_verify_unblock_uses_requested_target_branch(
             )
         )
 
+    heartbeat_calls: list[tuple[str, str | None]] = []
+
+    def _heartbeat_for_lifecycle_phase(phase: str, task: DbTask) -> object:
+        heartbeat_calls.append((phase, task.id))
+        return heartbeat
+
     with patch("gza.off_topic_verify.run_local_target_baseline_plan", side_effect=_baseline_for_release):
-        action = evaluate_advance_rules(config, store, git, impl, "release")
+        action = evaluate_advance_rules(
+            config,
+            store,
+            git,
+            impl,
+            "release",
+            heartbeat_for_lifecycle_phase=_heartbeat_for_lifecycle_phase,
+        )
 
     artifacts = store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND)
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "improve-no-op"
+    stored_impl = store.get(impl.id)
+    assert stored_impl is not None
+    assert stored_impl.review_cleared_at is not None
+    assert action["type"] in {"merge", "verify_gate"}
+    assert heartbeat_calls == [("off-topic-baseline", impl.id)]
     assert git.name_status_calls
     assert set(git.name_status_calls) == {f"release...{impl.branch}"}
     assert "release" in git.rev_parse_calls
     assert "main" not in git.rev_parse_calls
-    assert artifacts == []
+    assert len(artifacts) == 1
 
 
 def test_read_only_off_topic_verify_candidate_skips_baseline_and_keeps_review_blocking(

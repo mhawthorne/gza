@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from gza.config import Config, ConfigError
+from gza.cli.flaky import cmd_flaky_reproduce
 from gza.db import SqliteTaskStore
 from gza.flaky_investigations import (
     DEFAULT_FLAKY_REPRO_RUNS,
@@ -549,6 +550,53 @@ def test_run_flaky_reproduction_threads_verify_heartbeat_kwargs(tmp_path: Path) 
     assert run_verify.call_args.kwargs["heartbeat_threshold_seconds"] == 7
     assert run_verify.call_args.kwargs["heartbeat_interval_seconds"] == 11
     assert run_verify.call_args.kwargs["on_heartbeat"] is heartbeat
+
+
+def test_cmd_flaky_reproduce_threads_configured_verify_heartbeat(tmp_path: Path, monkeypatch) -> None:
+    config = _task_scoped_config(tmp_path, ("implement",))
+    config.watch.long_phase_threshold_seconds = 17
+    config.watch.heartbeat_interval_seconds = 23
+    task = SimpleNamespace(id="gza-7")
+    store = SimpleNamespace(get=lambda task_id: task if task_id == "gza-7" else None)
+    plan = FlakyReproductionPlan(
+        task_id="gza-7",
+        dedup_key="flaky-key",
+        nodeid="tests/test_example.py::test_flaky",
+        assertion_signature="assert actual == expected",
+        command="pytest tests/test_example.py::test_flaky",
+        working_directory=tmp_path,
+        runs=1,
+        reviewed_head_sha="deadbeef",
+        tree_fingerprint="f" * 64,
+    )
+    captured: dict[str, object] = {}
+
+    def _run_plan(*_args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(reproduced=False, attempts=(object(),), inconclusive_artifact_id=42)
+
+    monkeypatch.setattr("gza.cli.flaky.Config.load", lambda _project_dir: config)
+    monkeypatch.setattr("gza.cli.flaky.get_store", lambda _config: store)
+    monkeypatch.setattr("gza.cli.flaky.resolve_id", lambda _config, task_id: task_id)
+    monkeypatch.setattr("gza.cli.flaky.build_flaky_reproduction_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr("gza.cli.flaky.run_flaky_reproduction_plan", _run_plan)
+
+    rc = cmd_flaky_reproduce(
+        SimpleNamespace(
+            project_dir=tmp_path,
+            task_id="gza-7",
+            runs=1,
+            no_xdist=False,
+            no_randomization=False,
+            seed=None,
+            hypothesis=(),
+        )
+    )
+
+    assert rc == 0
+    assert captured["heartbeat_threshold_seconds"] == 17
+    assert captured["heartbeat_interval_seconds"] == 23
+    assert captured["on_heartbeat"] is not None
 
 
 def test_run_flaky_reproduction_plan_isolates_each_attempt_db_and_persists_artifacts(

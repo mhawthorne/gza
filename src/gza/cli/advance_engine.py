@@ -70,6 +70,7 @@ def determine_next_action(
     persist_review_clearance: bool = True,
     read_context: RecoveryReadContext | None = None,
     selected_for_merge: bool = False,
+    heartbeat_for_lifecycle_phase: Any | None = None,
 ) -> dict[str, Any]:
     """Backward-compatible entrypoint for advance action selection."""
     return evaluate_advance_rules(
@@ -84,6 +85,7 @@ def determine_next_action(
         persist_review_clearance=persist_review_clearance,
         read_context=read_context,
         selected_for_merge=selected_for_merge,
+        heartbeat_for_lifecycle_phase=heartbeat_for_lifecycle_phase,
     )
 
 

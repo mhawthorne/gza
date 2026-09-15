@@ -16,10 +16,12 @@ from unittest.mock import ANY, MagicMock, call, patch
 import pytest
 
 from gza.advance_engine import (
+    REVIEW_CLEARANCE_ARTIFACT_KIND,
     pending_merge_finalization_action,
     resolve_review_cycle_accounting,
     resolve_review_cycle_boundary,
 )
+from gza.artifacts import store_command_output_artifact
 from gza.cli._lifecycle_actions import should_execute_lifecycle_action as real_should_execute_lifecycle_action
 from gza.cli.advance_engine import determine_next_action
 from gza.cli.advance_executor import AdvanceActionExecutionResult
@@ -100,6 +102,7 @@ from gza.review_tasks import (
 )
 from gza.review_verdict import ParsedReviewReport, ReviewFinding, parse_review_report
 from gza.review_verify_state import VerifyEpoch, persist_verify_gate_artifact
+from gza.runner import ReviewVerifyResult
 from gza.task_query import count_outstanding_deferred_review_blockers
 from gza.worktree_roots import managed_worktree_root_paths
 
@@ -590,6 +593,155 @@ def _advance_args(tmp_path: Path, task_id: str) -> argparse.Namespace:
         tags=None,
         all_tags=False,
     )
+
+
+def _verify_failure_only_review_report() -> str:
+    return (
+        "## Summary\n\n- Implementation matches the requested shape; verify failed at the current tip.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: failed root resume attention regression\n"
+        "Evidence: `tests/cli/test_execution.py::test_failed_root_resume_with_existing_failed_resume_child_auto_iterate_uses_shared_attention` failed at the current branch head.\n"
+        "Impact: autonomous verify failed even though the review found no code defect.\n"
+        "Required fix: rerun verify_command.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
+def _passing_verify_output(*, tree_fingerprint: str) -> str:
+    return (
+        f"gza-verify phase=passed name=unit duration_seconds=0.10 tree_fingerprint={tree_fingerprint}\n"
+        "============================== 5 passed in 0.10s =============================="
+    )
+
+
+def _off_topic_failed_verify_output(*, tree_fingerprint: str) -> str:
+    return (
+        f"gza-verify phase=failed name=unit duration_seconds=0.20 tree_fingerprint={tree_fingerprint}\n"
+        "_________________________________ test_worker_registry __________________________________\n\n"
+        "    def test_worker_registry():\n"
+        '>       assert worker.status == "completed"\n'
+        "E       AssertionError: assert 'running' == 'completed'\n\n"
+        "tests/cli/test_query.py:10:\n"
+        "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n"
+        "src/gza/workers.py:42: in get_status\n"
+        "    return registry.status()\n"
+        "E   AssertionError: assert 'running' == 'completed'\n\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/cli/test_query.py::test_worker_registry - AssertionError: assert 'running' == 'completed'\n"
+        "============================== 1 failed in 0.20s =============================="
+    )
+
+
+def _persist_review_verify_artifact(
+    *,
+    config: Config,
+    store: Any,
+    task: DbTask,
+    output: str,
+    status: str,
+    exit_status: str,
+    tree_fingerprint: str,
+) -> None:
+    stored = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="test",
+        label="verify_command",
+        output=output,
+        status=status,
+        exit_status=exit_status,
+        head_sha=task.review_verify_head_sha,
+        metadata={"tree_fingerprint": tree_fingerprint},
+        created_at=task.review_verify_captured_at,
+    )
+    task.review_verify_artifact_file = stored.path
+    store.update(task)
+
+
+def _add_off_topic_clearance_candidate(
+    *,
+    config: Config,
+    store: Any,
+    branch: str,
+    tree_fingerprint: str,
+) -> DbTask:
+    impl = _completed_merge_task(store, "Off-topic clearance candidate", branch)
+    impl.completed_at = datetime(2026, 6, 23, 9, 0, tzinfo=UTC)
+    store.update(impl)
+    review = _completed_review(store, impl, _verify_failure_only_review_report())
+    review.completed_at = datetime(2026, 6, 23, 10, 0, tzinfo=UTC)
+    review.report_file = f"reviews/{review.id}.md"
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-sha"
+    review.review_verify_command = "uv run pytest tests/ -q --maxfail=0"
+    review.review_verify_exit_status = "1"
+    review.review_verify_captured_at = review.completed_at + timedelta(seconds=1)
+    store.update(review)
+
+    green_improve = store.add(
+        "Green no-op improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        same_branch=True,
+    )
+    assert green_improve.id is not None
+    green_improve.status = "completed"
+    green_improve.completed_at = datetime(2026, 6, 23, 11, 0, tzinfo=UTC)
+    green_improve.branch = impl.branch
+    green_improve.changed_diff = False
+    green_improve.review_verify_status = "passed"
+    green_improve.review_verify_branch = impl.branch
+    green_improve.review_verify_head_sha = "same-sha"
+    green_improve.review_verify_command = "uv run pytest tests/ -q --maxfail=0"
+    green_improve.review_verify_exit_status = "0"
+    green_improve.review_verify_captured_at = review.completed_at + timedelta(seconds=30)
+    store.update(green_improve)
+    _persist_review_verify_artifact(
+        config=config,
+        store=store,
+        task=green_improve,
+        output=_passing_verify_output(tree_fingerprint=tree_fingerprint),
+        status="passed",
+        exit_status="0",
+        tree_fingerprint=tree_fingerprint,
+    )
+
+    red_improve = store.add(
+        "Red no-op improve",
+        task_type="improve",
+        based_on=green_improve.id,
+        depends_on=review.id,
+        same_branch=True,
+    )
+    assert red_improve.id is not None
+    red_improve.status = "completed"
+    red_improve.completed_at = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    red_improve.branch = impl.branch
+    red_improve.changed_diff = False
+    red_improve.review_verify_status = "failed"
+    red_improve.review_verify_branch = impl.branch
+    red_improve.review_verify_head_sha = "same-sha"
+    red_improve.review_verify_command = "uv run pytest tests/ -q --maxfail=0"
+    red_improve.review_verify_exit_status = "1"
+    red_improve.review_verify_captured_at = review.completed_at + timedelta(minutes=3)
+    store.update(red_improve)
+    _persist_review_verify_artifact(
+        config=config,
+        store=store,
+        task=red_improve,
+        output=_off_topic_failed_verify_output(tree_fingerprint=tree_fingerprint),
+        status="failed",
+        exit_status="1",
+        tree_fingerprint=tree_fingerprint,
+    )
+    return impl
 
 
 def _durable_preview_snapshot(store: Any) -> dict[str, tuple[tuple[Any, ...], ...]]:
@@ -17649,6 +17801,86 @@ def test_cmd_advance_explicit_owner_row_run_persists_legacy_pr_required_reconcil
 
     assert rc == 0
     assert store.get(failed.id).failure_reason == "BRANCH_UNPUSHABLE"
+
+
+def test_cmd_advance_initial_owner_row_threads_off_topic_baseline_heartbeat(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.advance_off_topic_verify_unblock = True
+    config.watch.long_phase_threshold_seconds = 17
+    config.watch.heartbeat_interval_seconds = 23
+    tree_fingerprint = "e" * 64
+    branch = "feature/off-topic-advance-entry"
+    impl = _add_off_topic_clearance_candidate(
+        config=config,
+        store=store,
+        branch=branch,
+        tree_fingerprint=tree_fingerprint,
+    )
+
+    fake_git = _make_read_session_reconciliation_git(tmp_path, branch)
+    fake_git.resolve_refs.side_effect = lambda refs, **_kwargs: {
+        str(ref): "f" * 64 if str(ref) == "main" else str(ref)
+        for ref in refs
+    }
+    fake_git.get_diff_name_status.return_value = "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py\n"
+
+    baseline_calls: list[dict[str, Any]] = []
+
+    def _baseline_for_main(plan, **kwargs):
+        baseline_calls.append(kwargs)
+        assert plan.target_branch == "main"
+        return SimpleNamespace(
+            results=(
+                ReviewVerifyResult(
+                    command="uv run pytest tests/cli/test_query.py::test_worker_registry -q --maxfail=0",
+                    status="failed",
+                    exit_status="1",
+                    captured_at=datetime(2026, 6, 23, 12, 5, tzinfo=UTC),
+                    output=(
+                        "=========================== short test summary info ============================\n"
+                        "FAILED tests/cli/test_query.py::test_worker_registry - AssertionError: assert 'running' == 'completed'\n"
+                        "============================== 1 failed in 0.20s =============================="
+                    ),
+                ),
+            )
+        )
+
+    execution_result = AdvanceActionExecutionResult(
+        action_type="verify_gate",
+        status="success",
+        message="verify gate handled in test",
+        work_done=True,
+        worker_consuming=False,
+    )
+
+    with (
+        patch("gza.cli.git_ops.Config.load", return_value=config),
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        _mock_git_default_branch_run(),
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
+        patch("gza.cli.git_ops.prime_advance_planning_refs"),
+        patch("gza.cli.git_ops.execute_advance_action", return_value=execution_result),
+        patch("gza.off_topic_verify.run_local_target_baseline_plan", side_effect=_baseline_for_main),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, str(impl.id)))
+
+    assert rc == 0
+    assert len(baseline_calls) == 1
+    assert baseline_calls[0]["heartbeat_threshold_seconds"] == 17
+    assert baseline_calls[0]["heartbeat_interval_seconds"] == 23
+    assert baseline_calls[0]["on_heartbeat"] is not None
+    refreshed = store.get(str(impl.id))
+    assert refreshed is not None
+    assert refreshed.review_cleared_at is not None
+    assert len(store.list_artifacts(str(impl.id), kind=REVIEW_CLEARANCE_ARTIFACT_KIND)) == 1
 
 
 def test_cmd_advance_explicit_no_owner_fallback_dry_run_skips_prerequisite_reconciliation(
