@@ -205,6 +205,10 @@ fleet-wide direct-action-before-dispatch barrier.
   commands and local `max_concurrent`; the aggregate budget protects this supervisor's
   selected watch-managed work. A true hard ceiling across unrelated DBs and all commands
   requires a machine-global registry or permit and is outside this contract.
+- Lifecycle verify executions remain subject to the project-local
+  `max_concurrent_verify` slot gate. Watch MUST wait for that gate before launching a
+  configured verify command, including local-target integration verify and lifecycle
+  verify gates reached through the shared advance executor.
 - Worker-consuming recovery capacity is allocated from the same fleet budget. The
   supervisor MUST NOT multiply `watch.recovery_slots` by the number of projects.
   In multi-project mode, the effective recovery reservation is one supervisor-global value
@@ -1252,6 +1256,7 @@ The existence of these knobs is contract; their values are operator policy.
 |------|---------|
 | `watch.batch` / supervisor batch | Maximum concurrent detached worker processes the supervisor maintains; in multi-project mode this is one supervisor-global aggregate watch budget enforced by `dispatch_slots = max(0, supervisor_batch - aggregate_occupied)`, except for the single exact active main-verify remediation emergency slot capped by `supervisor_batch + 1` |
 | `max_concurrent` | Project-local launch ceiling; legacy single-project watch clamps batch to this when explicit, and multi-project watch treats each selected project's value as a local sub-cap |
+| `max_concurrent_verify` | Project-local lifecycle verify ceiling; watch waits for this slot gate before launching configured verify commands |
 | `watch.poll` / supervisor poll | Delay between completed cycles; in multi-project mode this is one supervisor-global fleet-level sleep boundary |
 | `watch.max_idle` / supervisor max-idle | Consecutive idle loop time before clean exit; in multi-project mode idle is aggregate across selected runtimes |
 | `watch.max_iterations` | Iterate-worker loop cap for implementation chains launched by watch; an explicit CLI override may apply to every selected project, otherwise each project runtime uses its own value |

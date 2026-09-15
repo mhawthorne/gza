@@ -207,6 +207,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         "Hard global ceiling on concurrently running task-executing processes across all commands. Explicit `max_concurrent` wins; when it is unset, `gza watch` derives its runtime cap from the effective watch batch (including `--batch`), while other commands keep the loaded fallback (`watch.batch` if configured, otherwise `5`).",
         example_value=5,
     ),
+    ConfigKeySpec(
+        "max_concurrent_verify",
+        "int",
+        1,
+        "Hard project-wide ceiling on concurrently running lifecycle verify_command processes. Additional verify attempts wait for a slot before launching.",
+    ),
     ConfigKeySpec("max_steps", "int", 50, "Global default step budget."),
     ConfigKeySpec("max_turns", "int", 50, "Deprecated global alias for `max_steps`."),
     ConfigKeySpec("main_checkout_isolate", "bool", False, "Stage watch-time merges in a detached integration checkout before advancing the real default branch on success."),

@@ -101,6 +101,7 @@ DEFAULT_MAX_PLAN_SLICES: int | None = None
 DEFAULT_PLAN_SLICE_TARGET_TIMEOUT_MINUTES: int | None = None
 DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES = 3
 DEFAULT_MAX_CONCURRENT = 5
+DEFAULT_MAX_CONCURRENT_VERIFY = 1
 DEFAULT_WATCH_BATCH = 2
 DEFAULT_WATCH_POLL = 300
 DEFAULT_WATCH_NO_ACTIVITY_TIMEOUT = 60
@@ -175,6 +176,7 @@ VALID_CONFIG_FIELDS = {
     "max_noop_improve_cycles", "max_plan_slices",
     "advance_off_topic_verify_unblock",
     "plan_slice_target_timeout_minutes", "max_failed_closing_review_retries", "max_concurrent",
+    "max_concurrent_verify",
     "iterate_max_iterations", "watch", "interactive_worktree_dir",
     "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "backup_size_warn_gb", "backup_compression", "backup_retention_hourly_hours",
     "backup_retention_intraday_days", "backup_retention_intraday_per_day",
@@ -265,6 +267,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "pr_integration": None,
     "max_resume_attempts": None,
     "max_concurrent": None,
+    "max_concurrent_verify": None,
     "max_review_cycles": None,
     "on_max_cycles": None,
     "max_plan_review_cycles": None,
@@ -433,6 +436,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "iterate_max_iterations": None,
     "max_resume_attempts": None,
     "max_concurrent": None,
+    "max_concurrent_verify": None,
     "max_review_cycles": None,
     "on_max_cycles": None,
     "max_plan_review_cycles": None,
@@ -1633,6 +1637,7 @@ class Config:
     advance_mode: str = DEFAULT_ADVANCE_MODE
     max_resume_attempts: int = DEFAULT_MAX_RESUME_ATTEMPTS
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
+    max_concurrent_verify: int = DEFAULT_MAX_CONCURRENT_VERIFY
     max_review_cycles: int = DEFAULT_MAX_REVIEW_CYCLES
     on_max_cycles: str = DEFAULT_ON_MAX_CYCLES
     max_plan_review_cycles: int = DEFAULT_MAX_PLAN_REVIEW_CYCLES
@@ -2798,6 +2803,13 @@ class Config:
             max_concurrent = watch_batch
         else:
             max_concurrent = DEFAULT_MAX_CONCURRENT
+        max_concurrent_verify = _load_strict_int_field(
+            data,
+            "max_concurrent_verify",
+            DEFAULT_MAX_CONCURRENT_VERIFY,
+        )
+        if max_concurrent_verify <= 0:
+            raise ConfigError("'max_concurrent_verify' must be positive")
         try:
             watch_poll = int(watch_data.get("poll", DEFAULT_WATCH_POLL))
         except (TypeError, ValueError):
@@ -3377,6 +3389,7 @@ class Config:
             advance_mode=advance_mode,
             max_resume_attempts=max_resume_attempts,
             max_concurrent=max_concurrent,
+            max_concurrent_verify=max_concurrent_verify,
             max_review_cycles=max_review_cycles,
             on_max_cycles=on_max_cycles,
             max_plan_review_cycles=max_plan_review_cycles,
@@ -3984,6 +3997,11 @@ class Config:
                 errors.append("'max_concurrent' must be an integer")
             elif data["max_concurrent"] <= 0:
                 errors.append("'max_concurrent' must be positive")
+        if "max_concurrent_verify" in data:
+            if not _is_strict_int(data["max_concurrent_verify"]):
+                errors.append("'max_concurrent_verify' must be an integer")
+            elif data["max_concurrent_verify"] <= 0:
+                errors.append("'max_concurrent_verify' must be positive")
         if "max_review_cycles" in data:
             if not _is_strict_int(data["max_review_cycles"]):
                 errors.append("'max_review_cycles' must be an integer")

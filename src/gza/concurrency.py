@@ -6,6 +6,7 @@ import contextlib
 import fcntl
 import os
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -26,6 +27,8 @@ _PROCESS_LOCKS: dict[str, _ProcessLockState] = {}
 _PROCESS_LOCKS_GUARD = threading.Lock()
 _RESERVED_LAUNCH_PERMITS: dict[str, LaunchPermit] = {}
 _RESERVED_LAUNCH_PERMITS_GUARD = threading.Lock()
+_PROCESS_VERIFY_SLOT_KEYS: set[str] = set()
+_PROCESS_VERIFY_SLOT_KEYS_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,34 @@ class _LiveRunningState:
 
 class MaxConcurrentTasksError(RuntimeError):
     """Raised when a launch would exceed the project-wide concurrency ceiling."""
+
+
+@dataclass
+class VerifyPermit:
+    """Slot-file-backed permit for one active lifecycle verify process."""
+
+    _lock_file: BinaryIO
+    _slot_key: str
+    slot_index: int
+    limit: int
+    _released: bool = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        with _PROCESS_VERIFY_SLOT_KEYS_GUARD:
+            _PROCESS_VERIFY_SLOT_KEYS.discard(self._slot_key)
+        try:
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._lock_file.close()
+
+    def __enter__(self) -> VerifyPermit:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
 
 
 @dataclass
@@ -106,6 +137,10 @@ def format_max_concurrent_message(*, running: int, limit: int) -> str:
 
 def _lock_path(config: Config) -> Path:
     return config.project_dir / ".gza" / "max-concurrent.lock"
+
+
+def _verify_slot_path(config: Config, slot_index: int) -> Path:
+    return config.project_dir / ".gza" / "verify-slots" / f"slot-{slot_index}.lock"
 
 
 def _pid_alive(pid: int | None) -> bool:
@@ -316,6 +351,34 @@ def launch_permit(
         elif owns_flock and lock_file is not None:
             lock_file.close()
         raise
+
+
+def verify_permit(config: Config, *, poll_seconds: float = 0.05) -> VerifyPermit:
+    """Wait for and acquire one project-wide lifecycle verify slot."""
+    limit = config.max_concurrent_verify
+    if limit <= 0:
+        raise MaxConcurrentTasksError(
+            format_max_concurrent_message(running=limit, limit=limit)
+        )
+    slot_dir = config.project_dir / ".gza" / "verify-slots"
+    slot_dir.mkdir(parents=True, exist_ok=True)
+
+    while True:
+        for slot_index in range(limit):
+            slot_path = _verify_slot_path(config, slot_index)
+            slot_key = str(slot_path.resolve())
+            with _PROCESS_VERIFY_SLOT_KEYS_GUARD:
+                if slot_key in _PROCESS_VERIFY_SLOT_KEYS:
+                    continue
+                lock_file = slot_path.open("a+b")
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    lock_file.close()
+                    continue
+                _PROCESS_VERIFY_SLOT_KEYS.add(slot_key)
+            return VerifyPermit(lock_file, slot_key, slot_index, limit)
+        time.sleep(poll_seconds)
 
 
 def _clone_launch_permit(permit: LaunchPermit) -> LaunchPermit:

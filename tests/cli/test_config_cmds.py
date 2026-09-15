@@ -1818,6 +1818,7 @@ class TestLocalConfigOverrides:
         assert "watch.restart_failed_batch" in result.stdout
         assert "watch.no_activity_timeout" in result.stdout
         assert "max_concurrent" in result.stdout
+        assert "max_concurrent_verify" in result.stdout
         assert "Slots per `gza watch` pass reserved for worker-consuming failed-task recovery before pending pickup; `0` is pending-only." in result.stdout
         assert "Deprecated alias for `watch.recovery_slots`." in result.stdout
         assert "Seconds before watch reconciliation marks a silent registered worker for a pending or in-progress task `NO_ACTIVITY`." in result.stdout
@@ -1867,6 +1868,8 @@ class TestLocalConfigOverrides:
         assert keyed_entries["watch.no_activity_timeout"]["type"] == "int"
         assert keyed_entries["watch.main_verify_remediation_max_attempts"]["type"] == "int"
         assert keyed_entries["max_concurrent"]["type"] == "int"
+        assert keyed_entries["max_concurrent_verify"]["type"] == "int"
+        assert keyed_entries["max_concurrent_verify"]["default"] == 1
         assert keyed_entries["max_concurrent"]["default"] == "effective watch batch or 5"
         assert "Default concurrent worker target" in keyed_entries["watch.batch"]["description"]
         assert "reserved for worker-consuming failed-task recovery" in keyed_entries["watch.recovery_slots"]["description"]
@@ -5111,6 +5114,16 @@ class TestWatchConfigValidation:
         assert config.watch.batch == 7
         assert config.max_concurrent == 3
 
+    def test_config_max_concurrent_verify_loads_with_conservative_default(self, tmp_path: Path) -> None:
+        """Lifecycle verify concurrency should default to one and accept explicit positive values."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "")
+        assert Config.load(tmp_path).max_concurrent_verify == 1
+
+        self._write_config(tmp_path, "max_concurrent_verify: 2\n")
+        assert Config.load(tmp_path).max_concurrent_verify == 2
+
     @pytest.mark.parametrize(
         ("value", "message"),
         [
@@ -5123,6 +5136,26 @@ class TestWatchConfigValidation:
         from gza.config import Config, ConfigError
 
         self._write_config(tmp_path, f"max_concurrent: {value}\n")
+
+        with pytest.raises(ConfigError, match=re.escape(message)):
+            Config.load(tmp_path)
+
+    @pytest.mark.parametrize(
+        ("value", "message"),
+        [
+            ("bad", "'max_concurrent_verify' must be an integer"),
+            ("0", "'max_concurrent_verify' must be positive"),
+        ],
+    )
+    def test_config_invalid_explicit_max_concurrent_verify_fails(
+        self,
+        tmp_path: Path,
+        value: str,
+        message: str,
+    ) -> None:
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, f"max_concurrent_verify: {value}\n")
 
         with pytest.raises(ConfigError, match=re.escape(message)):
             Config.load(tmp_path)

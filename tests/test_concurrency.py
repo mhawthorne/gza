@@ -10,6 +10,7 @@ from gza.concurrency import (
     _collect_live_running_state,
     get_concurrency_snapshot,
     launch_permit,
+    verify_permit,
 )
 from gza.config import Config
 from gza.workers import WorkerMetadata, WorkerRegistry
@@ -256,6 +257,79 @@ def test_launch_permit_blocks_other_threads_until_owner_releases(tmp_path) -> No
         "second-acquired",
         "second-released",
     ]
+
+
+def test_verify_permit_limit_one_waits_for_active_verify(tmp_path) -> None:
+    setup_config(tmp_path)
+    _append_config(tmp_path, "max_concurrent_verify: 1\n")
+    config = Config.load(tmp_path)
+
+    first_acquired = threading.Event()
+    release_first = threading.Event()
+    events: list[str] = []
+
+    def _first() -> None:
+        with verify_permit(config):
+            events.append("first-acquired")
+            first_acquired.set()
+            release_first.wait(timeout=1)
+        events.append("first-released")
+
+    def _second() -> None:
+        first_acquired.wait(timeout=1)
+        events.append("second-waiting")
+        with verify_permit(config):
+            events.append("second-acquired")
+        events.append("second-released")
+
+    first = threading.Thread(target=_first)
+    second = threading.Thread(target=_second)
+    first.start()
+    second.start()
+    first_acquired.wait(timeout=1)
+    time.sleep(0.05)
+    assert events == ["first-acquired", "second-waiting"]
+
+    release_first.set()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert events == [
+        "first-acquired",
+        "second-waiting",
+        "first-released",
+        "second-acquired",
+        "second-released",
+    ]
+
+
+def test_verify_permit_respects_limit_two(tmp_path) -> None:
+    setup_config(tmp_path)
+    _append_config(tmp_path, "max_concurrent_verify: 2\n")
+    config = Config.load(tmp_path)
+
+    release = threading.Event()
+    events: list[str] = []
+
+    def _worker(name: str) -> None:
+        with verify_permit(config):
+            events.append(f"{name}-acquired")
+            release.wait(timeout=1)
+        events.append(f"{name}-released")
+
+    first = threading.Thread(target=_worker, args=("first",))
+    second = threading.Thread(target=_worker, args=("second",))
+    first.start()
+    second.start()
+
+    deadline = time.monotonic() + 1
+    while len([event for event in events if event.endswith("-acquired")]) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert sorted(events) == ["first-acquired", "second-acquired"]
+    release.set()
+    first.join(timeout=1)
+    second.join(timeout=1)
 
 
 def test_get_concurrency_snapshot_stale_cleanup_reuses_the_caller_store(tmp_path) -> None:

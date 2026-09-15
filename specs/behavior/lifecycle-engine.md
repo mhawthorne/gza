@@ -91,6 +91,7 @@ as confidence grows.
 | rebase-failure circuit breaker | 3 | Bound on repeated failed rebases with no progress (§5). |
 | duplicate-blocker bound | 3 | Bound on the same blocker repeating across reviews (§6). |
 | recovery attempts | bounded | Automatic resume/retry budget before escalation (§7). |
+| `max_concurrent_verify` | 1 | Project-wide cap on lifecycle `verify_command` processes; additional verify attempts wait for a slot before launching. |
 | `merge_squash_threshold` | off | Auto-squash branches at/above N commits on merge (§8). |
 
 The *values* above are generally non-normative defaults. Only the **existence and

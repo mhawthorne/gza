@@ -439,6 +439,11 @@ provider: codex
 # Default: 30
 # main_integration_verify_red_ttl_minutes: 30
 
+# Hard project-wide ceiling on concurrently running lifecycle verify_command processes. Additional
+# verify attempts wait for a slot before launching.
+# Default: 1
+# max_concurrent_verify: 1
+
 # Deprecated compatibility key; accepted but ignored.
 # Default: 1
 # recommend_rebase_behind_commits: 1

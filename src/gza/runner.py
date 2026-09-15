@@ -19,7 +19,7 @@ import threading
 import time
 import tomllib
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -39,6 +39,7 @@ from .branch_publication import (
 from .branch_resolution import resolve_rebase_base_branch, resolve_rebase_target_branch
 from .canonical_checkout import CANONICAL_CHECKOUT_ATTENTION_REASON, check_canonical_checkout_invariant
 from .commit_messages import build_task_commit_message
+from .concurrency import verify_permit
 from .config import (
     APP_NAME,
     DEFAULT_AUTONOMOUS_VERIFY_BOOTSTRAP_TIMEOUT_SECONDS,
@@ -7081,6 +7082,7 @@ def _run_review_verify_command(
     env: Mapping[str, str] | None = None,
     runtime_context: RuntimeExecutionContext | None = None,
     config: Config | object | None = None,
+    permit_owner_config: Config | None = None,
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
     reviewed_tree_sha: str | None = None,
@@ -7094,7 +7096,11 @@ def _run_review_verify_command(
     """Compatibility wrapper for legacy review-specific verify execution."""
     if runtime_context is None:
         raise ValueError("runtime_context is required for isolated verify DB routing")
-    with disposable_verify_db_snapshot_env(runtime_context, cwd=cwd, config=config, env=env) as snapshot:
+    permit_config = permit_owner_config if permit_owner_config is not None else config
+    with (
+        verify_permit(permit_config) if isinstance(permit_config, Config) else nullcontext(),
+        disposable_verify_db_snapshot_env(runtime_context, cwd=cwd, config=config, env=env) as snapshot,
+    ):
         return _run_verify_command(
             verify_command,
             cwd=cwd,
@@ -7774,6 +7780,7 @@ def _run_verify_commands_for_projects(
                     env=normalize_subprocess_env(project_runtime_context.env, project_cwd),
                     runtime_context=project_runtime_context,
                     config=project.config,
+                    permit_owner_config=owning_runtime.config,
                     reviewed_branch=reviewed_branch,
                     reviewed_head_sha=reviewed_head_sha,
                     reviewed_tree_sha=reviewed_tree_sha,

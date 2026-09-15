@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Mapping
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
@@ -228,6 +229,67 @@ def _docker_verify_snapshot_process_worker(
         entered.set()
     finally:
         Path.chmod = original_chmod  # type: ignore[method-assign]
+
+
+def _cross_project_verify_permit_process_worker(
+    *,
+    owner_project_dir_text: str,
+    evaluated_project_dir_text: str,
+    db_path_text: str,
+    command: str,
+    max_concurrent_verify: int,
+    entered: Any,
+    release: Any,
+    messages: Any,
+) -> None:
+    owner_project_dir = Path(owner_project_dir_text)
+    evaluated_project_dir = Path(evaluated_project_dir_text)
+    db_path = Path(db_path_text)
+    owner_config = Config(
+        project_dir=owner_project_dir,
+        project_name="canonical-owner",
+        provider="codex",
+        model="gpt-5.5",
+        max_concurrent_verify=max_concurrent_verify,
+    )
+    evaluated_config = Config(
+        project_dir=evaluated_project_dir,
+        project_name=f"evaluated-{command}",
+        provider="codex",
+        model="gpt-5.5",
+        max_concurrent_verify=99,
+    )
+    runtime_context = RuntimeExecutionContext(
+        cwd=owner_project_dir,
+        env={"GZA_DB_PATH": str(db_path), "PATH": os.environ.get("PATH", "")},
+        project_id="canonical-owner",
+        db_path=db_path,
+    )
+
+    def fake_run(verify_command: str, **_kwargs: object) -> runner._ReviewVerifyCommandRun:
+        messages.put(("launched", verify_command))
+        entered.set()
+        if not release.wait(timeout=10):
+            messages.put(("error", f"{verify_command} release timeout"))
+            return runner._ReviewVerifyCommandRun(returncode=2, stdout=b"", stderr=b"release timeout")
+        return runner._ReviewVerifyCommandRun(returncode=0, stdout=b"ok", stderr=b"")
+
+    original_runner = runner._run_review_verify_command_with_timeout_diagnostics
+    runner._run_review_verify_command_with_timeout_diagnostics = fake_run
+    try:
+        result = _run_review_verify_command(
+            command,
+            cwd=evaluated_project_dir,
+            runtime_context=runtime_context,
+            config=evaluated_config,
+            permit_owner_config=owner_config,
+        )
+        messages.put(("result", f"{command}:{result.status}"))
+    except BaseException as exc:
+        messages.put(("error", repr(exc)))
+        entered.set()
+    finally:
+        runner._run_review_verify_command_with_timeout_diagnostics = original_runner
 
 
 def _runner_verify_failure_only_review_report() -> str:
@@ -3853,6 +3915,157 @@ class TestReviewContextFromChain:
         assert verify_calls[1].kwargs["runtime_context"].cwd == sibling_dir
         assert verify_calls[0].kwargs["config"].project_name == "foo"
         assert verify_calls[1].kwargs["config"].project_name == "bar"
+        assert verify_calls[0].kwargs["permit_owner_config"].project_dir == project_dir
+        assert verify_calls[1].kwargs["permit_owner_config"].project_dir == sibling_dir
+
+    def test_cross_project_verify_uses_canonical_owner_permit_across_processes(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        owner_project_dir = tmp_path / "canonical" / "project"
+        first_evaluated_dir = tmp_path / "worktree-a" / "project"
+        second_evaluated_dir = tmp_path / "worktree-b" / "project"
+        for path in (owner_project_dir, first_evaluated_dir, second_evaluated_dir):
+            path.mkdir(parents=True)
+        db_path = owner_project_dir / ".gza" / "gza.db"
+        _write_verify_marker_db(db_path)
+
+        ctx = multiprocessing.get_context("spawn")
+        messages = ctx.Queue()
+        first_entered = ctx.Event()
+        second_entered = ctx.Event()
+        release_first = ctx.Event()
+        release_second = ctx.Event()
+        first_process = ctx.Process(
+            target=_cross_project_verify_permit_process_worker,
+            kwargs={
+                "owner_project_dir_text": str(owner_project_dir),
+                "evaluated_project_dir_text": str(first_evaluated_dir),
+                "db_path_text": str(db_path),
+                "command": "first",
+                "max_concurrent_verify": 1,
+                "entered": first_entered,
+                "release": release_first,
+                "messages": messages,
+            },
+        )
+        second_process = ctx.Process(
+            target=_cross_project_verify_permit_process_worker,
+            kwargs={
+                "owner_project_dir_text": str(owner_project_dir),
+                "evaluated_project_dir_text": str(second_evaluated_dir),
+                "db_path_text": str(db_path),
+                "command": "second",
+                "max_concurrent_verify": 1,
+                "entered": second_entered,
+                "release": release_second,
+                "messages": messages,
+            },
+        )
+        try:
+            first_process.start()
+            assert first_entered.wait(timeout=10)
+            second_process.start()
+            time.sleep(0.15)
+            assert not second_entered.is_set()
+
+            release_first.set()
+            first_process.join(timeout=10)
+            assert first_process.exitcode == 0
+            assert second_entered.wait(timeout=10)
+            release_second.set()
+            second_process.join(timeout=10)
+            assert second_process.exitcode == 0
+        finally:
+            for process in (first_process, second_process):
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=10)
+
+        drained = []
+        while True:
+            try:
+                drained.append(messages.get_nowait())
+            except queue.Empty:
+                break
+        assert ("launched", "first") in drained
+        assert ("launched", "second") in drained
+        assert ("result", "first:passed") in drained
+        assert ("result", "second:passed") in drained
+        assert not [message for message in drained if message[0] == "error"]
+
+    def test_cross_project_verify_canonical_owner_permit_respects_limit_two(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        owner_project_dir = tmp_path / "canonical" / "project"
+        first_evaluated_dir = tmp_path / "worktree-a" / "project"
+        second_evaluated_dir = tmp_path / "worktree-b" / "project"
+        for path in (owner_project_dir, first_evaluated_dir, second_evaluated_dir):
+            path.mkdir(parents=True)
+        db_path = owner_project_dir / ".gza" / "gza.db"
+        _write_verify_marker_db(db_path)
+
+        ctx = multiprocessing.get_context("spawn")
+        messages = ctx.Queue()
+        first_entered = ctx.Event()
+        second_entered = ctx.Event()
+        release_first = ctx.Event()
+        release_second = ctx.Event()
+        first_process = ctx.Process(
+            target=_cross_project_verify_permit_process_worker,
+            kwargs={
+                "owner_project_dir_text": str(owner_project_dir),
+                "evaluated_project_dir_text": str(first_evaluated_dir),
+                "db_path_text": str(db_path),
+                "command": "first",
+                "max_concurrent_verify": 2,
+                "entered": first_entered,
+                "release": release_first,
+                "messages": messages,
+            },
+        )
+        second_process = ctx.Process(
+            target=_cross_project_verify_permit_process_worker,
+            kwargs={
+                "owner_project_dir_text": str(owner_project_dir),
+                "evaluated_project_dir_text": str(second_evaluated_dir),
+                "db_path_text": str(db_path),
+                "command": "second",
+                "max_concurrent_verify": 2,
+                "entered": second_entered,
+                "release": release_second,
+                "messages": messages,
+            },
+        )
+        try:
+            first_process.start()
+            assert first_entered.wait(timeout=10)
+            second_process.start()
+            assert second_entered.wait(timeout=10)
+            release_first.set()
+            release_second.set()
+            first_process.join(timeout=10)
+            second_process.join(timeout=10)
+            assert first_process.exitcode == 0
+            assert second_process.exitcode == 0
+        finally:
+            for process in (first_process, second_process):
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=10)
+
+        drained = []
+        while True:
+            try:
+                drained.append(messages.get_nowait())
+            except queue.Empty:
+                break
+        assert ("launched", "first") in drained
+        assert ("launched", "second") in drained
+        assert ("result", "first:passed") in drained
+        assert ("result", "second:passed") in drained
+        assert not [message for message in drained if message[0] == "error"]
 
     def test_cross_project_verify_uses_canonical_owner_db_snapshots(self, tmp_path: Path) -> None:
         project_dir = tmp_path / "services" / "foo"
@@ -8158,6 +8371,60 @@ class TestReviewVerifyCommandDbIsolation:
         assert seen_snapshot_paths
         assert all(not path.exists() for path in seen_snapshot_paths)
         assert runtime_env["GZA_DB_PATH"] == str(live_db)
+
+    def test_run_review_verify_command_waits_for_configured_verify_slot(self, tmp_path: Path) -> None:
+        live_db = tmp_path / "project" / ".gza" / "gza.db"
+        _write_verify_marker_db(live_db)
+        project_dir = live_db.parent.parent
+        verify_cwd = tmp_path / "worktree"
+        verify_cwd.mkdir()
+        config = Config(
+            project_dir=project_dir,
+            project_name="test-project",
+            provider="codex",
+            model="gpt-5.5",
+            max_concurrent_verify=1,
+        )
+        runtime_context = RuntimeExecutionContext(
+            cwd=project_dir,
+            env={"GZA_DB_PATH": str(live_db), "PATH": os.environ.get("PATH", "")},
+            project_id="project",
+            db_path=live_db,
+        )
+        first_inside = threading.Event()
+        release_first = threading.Event()
+        events: list[str] = []
+
+        def fake_run(command: str, **_kwargs: object) -> object:
+            events.append(f"{command}-launched")
+            if command == "first":
+                first_inside.set()
+                release_first.wait(timeout=1)
+            return runner._ReviewVerifyCommandRun(returncode=0, stdout=b"ok", stderr=b"")
+
+        def run_verify(command: str) -> None:
+            _run_review_verify_command(
+                command,
+                cwd=verify_cwd,
+                runtime_context=runtime_context,
+                config=config,
+            )
+
+        with patch("gza.runner._run_review_verify_command_with_timeout_diagnostics", side_effect=fake_run):
+            first = threading.Thread(target=run_verify, args=("first",))
+            second = threading.Thread(target=run_verify, args=("second",))
+            first.start()
+            assert first_inside.wait(timeout=1)
+            second.start()
+            time.sleep(0.05)
+            assert events == ["first-launched"]
+            release_first.set()
+            first.join(timeout=1)
+            second.join(timeout=1)
+
+        assert events == ["first-launched", "second-launched"]
+        assert not first.is_alive()
+        assert not second.is_alive()
 
     def test_run_review_verify_command_preserves_explicit_env_while_routing_snapshot(
         self,
