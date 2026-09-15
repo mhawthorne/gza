@@ -11,6 +11,11 @@ from .main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
 )
+from .main_verify_scope import (
+    normalize_verify_phase_names,
+    verify_failure_signature,
+    verify_phase_label,
+)
 from .main_verify_target import current_local_target_head_sha
 from .schema_compat import (
     SCHEMA_RUNTIME_SKEW_EXIT_STATUS,
@@ -84,9 +89,13 @@ def main_verify_state_failure_signature(state: Any) -> str | None:
     exhausted = main_verify_state_exhausted_remediation_attention(state)
     if exhausted is not None:
         return exhausted.signature
-    failing_phase = getattr(state, "failing_phase", None)
-    if isinstance(failing_phase, str) and failing_phase:
-        return f"phase:{failing_phase}"
+    failing_phases = normalize_verify_phase_names(getattr(state, "failing_phases", ()))
+    if failing_phases:
+        return verify_failure_signature(
+            failing_phases=failing_phases,
+            verify_status=getattr(state, "verify_status", None),
+            verify_exit_status=getattr(state, "verify_exit_status", None),
+        )
     verify_status = getattr(state, "verify_status", None)
     verify_exit_status = getattr(state, "verify_exit_status", None)
     if isinstance(verify_status, str) and verify_status:
@@ -241,9 +250,9 @@ def resolve_main_verify_target_proof(
 
 def _format_current_red_message(state: Any) -> str:
     short_sha = (getattr(state, "head_sha", None) or "unknown")[:12]
-    failing_phase = getattr(state, "failing_phase", None)
-    if isinstance(failing_phase, str) and failing_phase:
-        return f"main verify RED at `{short_sha}` - merges halted; phase `{failing_phase}` failing"
+    failing_phases = normalize_verify_phase_names(getattr(state, "failing_phases", ()))
+    if failing_phases:
+        return f"main verify RED at `{short_sha}` - merges halted; {verify_phase_label(failing_phases)} failing"
     verify_status = getattr(state, "verify_status", None)
     if isinstance(verify_status, str) and verify_status and verify_status != "failed":
         return f"main verify RED at `{short_sha}` - merges halted; verify status `{verify_status}`"
@@ -302,7 +311,7 @@ def _format_launch_failed_message(state: Any) -> str:
         verify_output=None,
         verify_exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
         verify_failure=getattr(state, "failure", None),
-        failing_phase=getattr(state, "failing_phase", None),
+        phase_name=None,
     )
     if issue is not None and issue.tool_name:
         return _build_launch_issue_alert_message(head_sha=getattr(state, "head_sha", None), issue=issue)

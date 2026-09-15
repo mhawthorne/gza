@@ -16,6 +16,11 @@ from .artifact_paths import InvalidArtifactPathError, resolve_artifact_path
 from .config import Config
 from .db import SqliteTaskStore, Task
 from .git import Git, GitError
+from .main_verify_scope import (
+    normalize_verify_phase_names,
+    verify_failure_signature as build_verify_failure_signature,
+    verify_phase_label,
+)
 from .off_topic_verify import extract_pytest_failing_nodeids
 from .runner import (
     LifecycleVerifyBudgetError,
@@ -49,6 +54,8 @@ VERIFY_COMMAND_OUTPUT_ARTIFACT_KIND = "verify_command_output"
 MAIN_VERIFY_REMEDIATION_ARTIFACT_MAX_BYTES = 32 * 1024
 MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_LINES = 24
 MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_CHARS = 2000
+MAIN_VERIFY_REMEDIATION_PHASE_EXCERPT_MAX_CHARS = 2000
+MAIN_VERIFY_REMEDIATION_PHASE_CAPTURE_MAX_CHARS = 8 * 1024
 _HEAD_SHA_UNSET = object()
 _VERIFY_PHASE_LAUNCH_FAILURE_RE = re.compile(
     r"verify_phase: failed to launch command (?P<command>\[.+?\]): (?P<detail>.+)"
@@ -99,6 +106,23 @@ def _verify_runtime_context(config: Config, env: Mapping[str, str] | None, *, cw
 
 
 @dataclass(frozen=True)
+class MainIntegrationVerifyPhaseResult:
+    """Compact structured terminal result for one verify phase."""
+
+    phase_name: str
+    status: Literal["passed", "failed"]
+
+
+@dataclass(frozen=True)
+class MainIntegrationVerifyPhaseEvidence:
+    """Bounded remediation evidence for one failed verify phase."""
+
+    phase_name: str
+    excerpt: str | None
+    failing_test_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class MainIntegrationVerifyState:
     """Persisted verification state for the canonical local target branch."""
 
@@ -114,11 +138,12 @@ class MainIntegrationVerifyState:
     verify_exit_status: str | None
     failure_signature: str | None
     failure: str | None
-    failing_phase: str | None
+    failing_phases: tuple[str, ...]
     alert_message: str | None
     pending_retirement_signatures: tuple[str, ...]
     red_since: datetime | None
     captured_at: datetime | None
+    phase_results: tuple[MainIntegrationVerifyPhaseResult, ...] = ()
     schema_compatibility: SchemaCompatibilityDiagnostic | None = None
 
 
@@ -206,12 +231,11 @@ class MainIntegrationVerifyRemediation:
     kind: Literal["deflake", "fix"]
     signature: str
     tree_fingerprint: str | None
-    failing_phase: str | None
+    failing_phases: tuple[str, ...]
     failure: str | None
     observed_environment_identity: MainIntegrationVerifyEnvironmentIdentity | None
     artifact_path: str | None
-    failing_test_ids: tuple[str, ...]
-    verify_excerpt: str | None
+    phase_evidence: tuple[MainIntegrationVerifyPhaseEvidence, ...]
 
 
 @dataclass(frozen=True)
@@ -311,10 +335,11 @@ class CandidateIntegrationVerifyEvidence:
     verify_status: str | None
     verify_exit_status: str | None
     failure: str | None
-    failing_phase: str | None
+    failing_phases: tuple[str, ...]
     reviewed_branch: str | None
     working_directory: str | None
     captured_at: datetime | None
+    phase_results: tuple[MainIntegrationVerifyPhaseResult, ...] = ()
     schema_compatibility: SchemaCompatibilityDiagnostic | None = None
 
 
@@ -401,7 +426,9 @@ def load_main_integration_verify_state(store: SqliteTaskStore) -> MainIntegratio
             red_since = datetime.fromisoformat(red_since_raw)
         except ValueError:
             red_since = None
-    failing_phase = payload.get("failing_phase") if isinstance(payload.get("failing_phase"), str) else None
+    raw_failing_phases = payload.get("failing_phases")
+    failing_phases = normalize_verify_phase_names(raw_failing_phases) if isinstance(raw_failing_phases, list) else ()
+    phase_results = _phase_results_from_payload(payload.get("phase_results"))
     failure_signature = payload.get("failure_signature") if isinstance(payload.get("failure_signature"), str) else None
     schema_compatibility = SchemaCompatibilityDiagnostic.from_payload(payload.get("schema_compatibility"))
     if failure_signature is None and _verify_result_halts_merges(
@@ -414,7 +441,7 @@ def load_main_integration_verify_state(store: SqliteTaskStore) -> MainIntegratio
         schema_compatibility=schema_compatibility,
     ):
         failure_signature = _verify_failure_signature(
-            failing_phase=failing_phase,
+            failing_phases=failing_phases,
             verify_status=task.review_verify_status,
             verify_exit_status=task.review_verify_exit_status,
         )
@@ -437,7 +464,8 @@ def load_main_integration_verify_state(store: SqliteTaskStore) -> MainIntegratio
         verify_exit_status=task.review_verify_exit_status,
         failure_signature=failure_signature,
         failure=task.review_verify_failure,
-        failing_phase=failing_phase,
+        failing_phases=failing_phases,
+        phase_results=phase_results,
         alert_message=payload.get("alert_message") if isinstance(payload.get("alert_message"), str) else None,
         pending_retirement_signatures=pending_retirement_signatures,
         red_since=red_since,
@@ -446,13 +474,53 @@ def load_main_integration_verify_state(store: SqliteTaskStore) -> MainIntegratio
     )
 
 
-def _verify_failure_phase_name(output: str | None) -> str | None:
+def _phase_results_from_output(output: str | None) -> tuple[MainIntegrationVerifyPhaseResult, ...]:
+    results: list[MainIntegrationVerifyPhaseResult] = []
     for phase in _extract_review_verify_phase_results(output):
-        if phase.get("status") == "failed":
-            name = phase.get("name")
-            if isinstance(name, str) and name:
-                return name
-    return None
+        name = phase.get("name")
+        status = phase.get("status")
+        if not isinstance(name, str) or status not in {"passed", "failed"}:
+            continue
+        normalized = normalize_verify_phase_names((name,))
+        if not normalized:
+            continue
+        results.append(
+            MainIntegrationVerifyPhaseResult(
+                phase_name=normalized[0],
+                status=cast(Literal["passed", "failed"], status),
+            )
+        )
+    return tuple(results)
+
+
+def _phase_results_from_payload(raw: object) -> tuple[MainIntegrationVerifyPhaseResult, ...]:
+    if not isinstance(raw, list):
+        return ()
+    results: list[MainIntegrationVerifyPhaseResult] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        status = item.get("status")
+        if not isinstance(name, str) or status not in {"passed", "failed"}:
+            continue
+        normalized = normalize_verify_phase_names((name,))
+        if not normalized:
+            continue
+        results.append(MainIntegrationVerifyPhaseResult(normalized[0], cast(Literal["passed", "failed"], status)))
+    return tuple(results)
+
+
+def _phase_results_to_payload(
+    phase_results: tuple[MainIntegrationVerifyPhaseResult, ...],
+) -> list[dict[str, str]]:
+    return [{"name": result.phase_name, "status": result.status} for result in phase_results]
+
+
+def _verify_failure_phase_names(output: str | None) -> tuple[str, ...]:
+    return normalize_verify_phase_names(
+        result.phase_name for result in _phase_results_from_output(output) if result.status == "failed"
+    )
 
 
 def _verify_tree_fingerprint(output: str | None) -> str | None:
@@ -466,15 +534,15 @@ def _verify_tree_fingerprint(output: str | None) -> str | None:
 
 def _verify_failure_signature(
     *,
-    failing_phase: str | None,
+    failing_phases: tuple[str, ...],
     verify_status: str | None,
     verify_exit_status: str | None,
 ) -> str:
-    if failing_phase:
-        return f"phase:{failing_phase}"
-    status = verify_status or "unknown"
-    exit_status = verify_exit_status or "unknown"
-    return f"status:{status}:exit:{exit_status}"
+    return build_verify_failure_signature(
+        failing_phases=failing_phases,
+        verify_status=verify_status,
+        verify_exit_status=verify_exit_status,
+    )
 
 
 def _build_integration_verify_remediation(
@@ -487,17 +555,16 @@ def _build_integration_verify_remediation(
     return MainIntegrationVerifyRemediation(
         kind=kind,
         signature=_verify_failure_signature(
-            failing_phase=state.failing_phase,
+            failing_phases=state.failing_phases,
             verify_status=state.verify_status,
             verify_exit_status=state.verify_exit_status,
         ),
         tree_fingerprint=state.tree_fingerprint,
-        failing_phase=state.failing_phase,
+        failing_phases=state.failing_phases,
         failure=state.failure,
         observed_environment_identity=getattr(state, "environment_identity", None),
         artifact_path=artifact_path,
-        failing_test_ids=extract_pytest_failing_nodeids(artifact_output) if artifact_output else (),
-        verify_excerpt=_build_main_verify_excerpt(artifact_output),
+        phase_evidence=_build_main_verify_phase_evidence(artifact_output, state.failing_phases),
     )
 
 
@@ -513,12 +580,12 @@ def _build_main_integration_verify_remediation(
         config=config,
         store=store,
         task=state.task,
+        failing_phases=state.failing_phases,
     )
     return replace(
         remediation,
         artifact_path=artifact_path,
-        failing_test_ids=extract_pytest_failing_nodeids(artifact_output) if artifact_output else (),
-        verify_excerpt=_build_main_verify_excerpt(artifact_output),
+        phase_evidence=_build_main_verify_phase_evidence(artifact_output, state.failing_phases),
     )
 
 
@@ -535,6 +602,18 @@ def _candidate_review_verify_artifact_paths(
     artifacts = store.list_artifacts(task.id, kind=VERIFY_COMMAND_OUTPUT_ARTIFACT_KIND)
     candidates.extend(artifact.path for artifact in artifacts if artifact.path and artifact.path != preferred)
     return tuple(candidates)
+
+
+def _trim_bounded_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return "[...]\n" + text[-max_chars:].lstrip()
+
+
+def _append_bounded_line(lines: list[str], line: str, *, max_chars: int) -> None:
+    lines.append(line)
+    while lines and sum(len(item) + 1 for item in lines) > max_chars:
+        lines.pop(0)
 
 
 def _read_main_verify_artifact_tail(
@@ -557,24 +636,142 @@ def _read_main_verify_artifact_tail(
         return None
 
 
+def _read_main_verify_artifact_phase_evidence(
+    *,
+    config: Config,
+    stored_path: str,
+    failing_phases: tuple[str, ...],
+) -> str | None:
+    requested = set(failing_phases)
+    if not requested:
+        return _read_main_verify_artifact_tail(config=config, stored_path=stored_path)
+    try:
+        artifact_path = resolve_artifact_path(Path(config.project_dir), stored_path)
+    except InvalidArtifactPathError:
+        return None
+    sections: dict[str, list[str]] = {phase: [] for phase in failing_phases}
+    current_phase: str | None = None
+    try:
+        with artifact_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw_line in handle:
+                line = raw_line.rstrip("\n")
+                start_match = _VERIFY_PHASE_START_LINE_RE.match(line)
+                if start_match is not None:
+                    current_phase = start_match.group("name")
+                    if current_phase in requested:
+                        _append_bounded_line(
+                            sections[current_phase],
+                            line,
+                            max_chars=MAIN_VERIFY_REMEDIATION_PHASE_CAPTURE_MAX_CHARS,
+                        )
+                    continue
+                if current_phase in requested:
+                    _append_bounded_line(
+                        sections[current_phase],
+                        line,
+                        max_chars=MAIN_VERIFY_REMEDIATION_PHASE_CAPTURE_MAX_CHARS,
+                    )
+                terminal_match = _VERIFY_PHASE_TERMINAL_LINE_RE.match(line)
+                if terminal_match is not None:
+                    terminal_phase = terminal_match.group("name")
+                    if terminal_phase in requested and terminal_phase != current_phase:
+                        _append_bounded_line(
+                            sections[terminal_phase],
+                            line,
+                            max_chars=MAIN_VERIFY_REMEDIATION_PHASE_CAPTURE_MAX_CHARS,
+                        )
+                    if terminal_phase == current_phase:
+                        current_phase = None
+    except OSError:
+        return None
+    if not any(sections.values()):
+        return _read_main_verify_artifact_tail(config=config, stored_path=stored_path)
+    output = "\n".join("\n".join(lines) for phase, lines in sections.items() if lines)
+    return _trim_bounded_text(output, MAIN_VERIFY_REMEDIATION_ARTIFACT_MAX_BYTES)
+
+
 def _load_main_verify_artifact_evidence(
     *,
     config: Config,
     store: SqliteTaskStore,
     task: Task,
+    failing_phases: tuple[str, ...] = (),
 ) -> tuple[str | None, str | None]:
+    best_partial: tuple[str | None, str | None, int] = (None, None, -1)
     for stored_path in _candidate_review_verify_artifact_paths(store, task):
         try:
             resolve_artifact_path(Path(config.project_dir), stored_path)
         except InvalidArtifactPathError:
             continue
-        artifact_output = _read_main_verify_artifact_tail(config=config, stored_path=stored_path)
+        artifact_output = _read_main_verify_artifact_phase_evidence(
+            config=config,
+            stored_path=stored_path,
+            failing_phases=failing_phases,
+        )
         if artifact_output is None:
             continue
         if not artifact_output.strip():
             continue
-        return stored_path, artifact_output
-    return None, None
+        if not failing_phases:
+            return stored_path, artifact_output
+        covered = len(set(_artifact_phase_sections(artifact_output)).intersection(failing_phases))
+        if covered == len(set(failing_phases)):
+            return stored_path, artifact_output
+        if covered > best_partial[2]:
+            best_partial = (stored_path, artifact_output, covered)
+    return best_partial[0], best_partial[1]
+
+
+_VERIFY_PHASE_START_LINE_RE = re.compile(r"^gza-verify phase=start name=(?P<name>[A-Za-z0-9_.-]+)$")
+_VERIFY_PHASE_TERMINAL_LINE_RE = re.compile(
+    r"^gza-verify phase=(?:passed|failed) name=(?P<name>[A-Za-z0-9_.-]+) "
+    r"duration_seconds=(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+    r"(?: tree_fingerprint=[0-9a-f]{64})?$"
+)
+
+
+def _artifact_phase_sections(output: str | None) -> dict[str, str]:
+    if not output:
+        return {}
+    sections: dict[str, list[str]] = {}
+    current_phase: str | None = None
+    for line in output.splitlines():
+        start_match = _VERIFY_PHASE_START_LINE_RE.match(line)
+        if start_match is not None:
+            current_phase = start_match.group("name")
+            sections.setdefault(current_phase, []).append(line)
+            continue
+        if current_phase is not None:
+            sections.setdefault(current_phase, []).append(line)
+        terminal_match = _VERIFY_PHASE_TERMINAL_LINE_RE.match(line)
+        if terminal_match is not None:
+            terminal_phase = terminal_match.group("name")
+            if terminal_phase != current_phase:
+                sections.setdefault(terminal_phase, []).append(line)
+            if terminal_phase == current_phase:
+                current_phase = None
+    return {phase: "\n".join(lines) for phase, lines in sections.items()}
+
+
+def _build_main_verify_phase_evidence(
+    output: str | None,
+    failing_phases: tuple[str, ...],
+) -> tuple[MainIntegrationVerifyPhaseEvidence, ...]:
+    sections = _artifact_phase_sections(output)
+    evidence: list[MainIntegrationVerifyPhaseEvidence] = []
+    for phase in failing_phases:
+        section = sections.get(phase)
+        excerpt = _build_main_verify_excerpt(section)
+        if excerpt is not None and len(excerpt) > MAIN_VERIFY_REMEDIATION_PHASE_EXCERPT_MAX_CHARS:
+            excerpt = "[...]\n" + excerpt[-MAIN_VERIFY_REMEDIATION_PHASE_EXCERPT_MAX_CHARS:].lstrip()
+        evidence.append(
+            MainIntegrationVerifyPhaseEvidence(
+                phase_name=phase,
+                excerpt=excerpt,
+                failing_test_ids=extract_pytest_failing_nodeids(section) if section else (),
+            )
+        )
+    return tuple(evidence)
 
 
 def _build_main_verify_excerpt(output: str | None) -> str | None:
@@ -605,11 +802,11 @@ def _build_red_alert_message(
     *,
     head_sha: str | None,
     verify_status: str | None,
-    failing_phase: str | None,
+    failing_phases: tuple[str, ...],
 ) -> str:
     del head_sha
-    if failing_phase:
-        return f"main verify RED - merges halted; phase `{failing_phase}` failing"
+    if failing_phases:
+        return f"main verify RED - merges halted; {verify_phase_label(failing_phases)} failing"
     if verify_status and verify_status != "failed":
         return f"main verify RED - merges halted; verify status `{verify_status}`"
     return "main verify RED - merges halted"
@@ -688,15 +885,20 @@ def _detect_verify_launch_issue(
     verify_output: str | None,
     verify_exit_status: str | None,
     verify_failure: str | None,
-    failing_phase: str | None,
+    phase_name: str | None,
 ) -> VerifyLaunchIssue | None:
     output = verify_output or ""
+    current_phase_name: str | None = None
     for line in output.splitlines():
+        start_match = _VERIFY_PHASE_START_LINE_RE.match(line)
+        if start_match is not None:
+            current_phase_name = start_match.group("name")
+            continue
         match = _VERIFY_PHASE_LAUNCH_FAILURE_RE.search(line)
         if match is None:
             continue
         return VerifyLaunchIssue(
-            phase_name=failing_phase,
+            phase_name=phase_name or current_phase_name,
             tool_name=_extract_launch_issue_tool_from_command_repr(match.group("command")),
             detail=_summarize_launch_issue_detail(match.group("detail")),
         )
@@ -704,15 +906,15 @@ def _detect_verify_launch_issue(
     if verify_exit_status in {"126", "127"}:
         issue = _extract_launch_issue_from_text(output)
         if issue is not None:
-            return replace(issue, phase_name=failing_phase or issue.phase_name)
+            return replace(issue, phase_name=phase_name or issue.phase_name)
 
     if verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS and verify_failure:
         failure_detail = verify_failure.removeprefix("failed to launch verify_command: ").strip()
         issue = _extract_launch_issue_from_text(failure_detail)
         if issue is not None:
-            return replace(issue, phase_name=failing_phase or issue.phase_name)
+            return replace(issue, phase_name=phase_name or issue.phase_name)
         return VerifyLaunchIssue(
-            phase_name=failing_phase,
+            phase_name=phase_name,
             tool_name=None,
             detail=_summarize_launch_issue_detail(failure_detail),
         )
@@ -1092,7 +1294,8 @@ def _persist_main_integration_verify_payload(
     tree_fingerprint: str | None,
     head_sha: str | None,
     failure_signature: str | None,
-    failing_phase: str | None,
+    failing_phases: tuple[str, ...],
+    phase_results: tuple[MainIntegrationVerifyPhaseResult, ...],
     alert_message: str | None,
     pending_retirement_signatures: tuple[str, ...],
     red_since: datetime | None,
@@ -1109,7 +1312,8 @@ def _persist_main_integration_verify_payload(
         "tree_fingerprint": tree_fingerprint,
         "head_sha": head_sha,
         "failure_signature": failure_signature,
-        "failing_phase": failing_phase,
+        "failing_phases": list(failing_phases),
+        "phase_results": _phase_results_to_payload(phase_results),
         "alert_message": alert_message,
         "pending_retirement_signatures": list(pending_retirement_signatures),
         "red_since": red_since.isoformat() if red_since is not None else None,
@@ -1142,7 +1346,7 @@ def persist_main_integration_verify_alert_message(
     captured_at = state.captured_at or state.task.completed_at or datetime.now(UTC)
     failure_signature = getattr(state, "failure_signature", None)
     if not isinstance(failure_signature, str) or not failure_signature:
-        failing_phase = getattr(state, "failing_phase", None)
+        failing_phases = getattr(state, "failing_phases", ())
         verify_status = getattr(state, "verify_status", None)
         verify_exit_status = getattr(state, "verify_exit_status", None)
         if (
@@ -1156,11 +1360,11 @@ def persist_main_integration_verify_alert_message(
                 exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
                 schema_compatibility=getattr(state, "schema_compatibility", None),
             )
-            and isinstance(failing_phase, str)
-            and failing_phase
+            and isinstance(failing_phases, tuple)
+            and failing_phases
         ):
             failure_signature = _verify_failure_signature(
-                failing_phase=failing_phase,
+                failing_phases=failing_phases,
                 verify_status=verify_status if isinstance(verify_status, str) else None,
                 verify_exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
             )
@@ -1179,7 +1383,7 @@ def persist_main_integration_verify_alert_message(
             and verify_status
         ):
             failure_signature = _verify_failure_signature(
-                failing_phase=None,
+                failing_phases=(),
                 verify_status=verify_status,
                 verify_exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
             )
@@ -1196,7 +1400,8 @@ def persist_main_integration_verify_alert_message(
         tree_fingerprint=state.tree_fingerprint,
         head_sha=state.head_sha,
         failure_signature=failure_signature,
-        failing_phase=state.failing_phase,
+        failing_phases=normalize_verify_phase_names(getattr(state, "failing_phases", ())),
+        phase_results=tuple(getattr(state, "phase_results", ())),
         alert_message=alert_message,
         pending_retirement_signatures=_pending_retirement_signatures_from_state(state),
         red_since=getattr(state, "red_since", None),
@@ -1227,7 +1432,8 @@ def persist_main_integration_verify_pending_retire_signatures(
         tree_fingerprint=state.tree_fingerprint,
         head_sha=state.head_sha,
         failure_signature=getattr(state, "failure_signature", None),
-        failing_phase=state.failing_phase,
+        failing_phases=normalize_verify_phase_names(getattr(state, "failing_phases", ())),
+        phase_results=tuple(getattr(state, "phase_results", ())),
         alert_message=state.alert_message,
         pending_retirement_signatures=pending_retirement_signatures,
         red_since=getattr(state, "red_since", None),
@@ -1285,7 +1491,8 @@ def persist_main_integration_verify_remediation_passed(
         tree_fingerprint=state.tree_fingerprint,
         head_sha=state.head_sha,
         failure_signature=None,
-        failing_phase=None,
+        failing_phases=(),
+        phase_results=(),
         alert_message=None,
         pending_retirement_signatures=_pending_retirement_signatures_from_state(state),
         red_since=None,
@@ -1342,7 +1549,8 @@ def promote_candidate_integration_verify_evidence(
         tree_fingerprint=evidence.tree_fingerprint,
         head_sha=evidence.head_sha,
         failure_signature=None,
-        failing_phase=evidence.failing_phase,
+        failing_phases=evidence.failing_phases,
+        phase_results=evidence.phase_results,
         alert_message=None,
         pending_retirement_signatures=pending_retirement_signatures,
         red_since=None,
@@ -1489,12 +1697,13 @@ def run_main_integration_verify(
                 timeout_grace_seconds=gate.verify_timeout_grace_seconds,
             )
 
-    failing_phase = _verify_failure_phase_name(result.output)
+    phase_results = _phase_results_from_output(result.output)
+    failing_phases = _verify_failure_phase_names(result.output)
     launch_issue = _detect_verify_launch_issue(
         verify_output=result.output,
         verify_exit_status=result.exit_status,
         verify_failure=result.failure,
-        failing_phase=failing_phase,
+        phase_name=None,
     )
     if launch_issue is not None:
         result = _make_review_verify_result(
@@ -1550,7 +1759,7 @@ def run_main_integration_verify(
         alert_message = _build_red_alert_message(
             head_sha=head_sha,
             verify_status=result.status,
-            failing_phase=failing_phase,
+            failing_phases=failing_phases,
         )
     if _verify_result_halts_merges(
         status=result.status,
@@ -1594,7 +1803,7 @@ def run_main_integration_verify(
         head_sha=head_sha,
         failure_signature=(
             _verify_failure_signature(
-                failing_phase=failing_phase,
+                failing_phases=failing_phases,
                 verify_status=result.status,
                 verify_exit_status=result.exit_status,
             )
@@ -1610,7 +1819,8 @@ def run_main_integration_verify(
             )
             else None
         ),
-        failing_phase=failing_phase,
+        failing_phases=failing_phases,
+        phase_results=phase_results,
         alert_message=alert_message,
         pending_retirement_signatures=pending_retirement_signatures,
         red_since=red_since,
@@ -1771,12 +1981,12 @@ def _run_main_integration_verify_with_red_reruns(
             config=config,
             store=store,
             task=remediation_source.task,
+            failing_phases=remediation.failing_phases,
         )
         remediation = replace(
             remediation,
             artifact_path=artifact_path,
-            failing_test_ids=extract_pytest_failing_nodeids(artifact_output) if artifact_output else (),
-            verify_excerpt=_build_main_verify_excerpt(artifact_output),
+            phase_evidence=_build_main_verify_phase_evidence(artifact_output, remediation.failing_phases),
         )
     return main_state, remediation, verify_runs
 
@@ -1843,8 +2053,8 @@ def check_main_integration_verify(
         )
     state = load_main_integration_verify_state(store)
     prior_red_signature = (
-        _verify_failure_signature(
-            failing_phase=state.failing_phase,
+            _verify_failure_signature(
+            failing_phases=state.failing_phases,
             verify_status=state.verify_status,
             verify_exit_status=state.verify_exit_status,
         )
@@ -1902,7 +2112,7 @@ def check_main_integration_verify(
         exit_status=state.verify_exit_status,
     ):
         prior_red_signature = _verify_failure_signature(
-            failing_phase=state.failing_phase,
+            failing_phases=state.failing_phases,
             verify_status=state.verify_status,
             verify_exit_status=state.verify_exit_status,
         )
@@ -2068,12 +2278,13 @@ def run_candidate_integration_verify(
                 timeout_grace_seconds=gate.verify_timeout_grace_seconds,
             )
 
-    failing_phase = _verify_failure_phase_name(result.output)
+    phase_results = _phase_results_from_output(result.output)
+    failing_phases = _verify_failure_phase_names(result.output)
     launch_issue = _detect_verify_launch_issue(
         verify_output=result.output,
         verify_exit_status=result.exit_status,
         verify_failure=result.failure,
-        failing_phase=failing_phase,
+        phase_name=None,
     )
     if launch_issue is not None:
         result = _make_review_verify_result(
@@ -2106,7 +2317,8 @@ def run_candidate_integration_verify(
         verify_status=result.status,
         verify_exit_status=result.exit_status,
         failure=result.failure,
-        failing_phase=failing_phase,
+        failing_phases=failing_phases,
+        phase_results=phase_results,
         reviewed_branch=result.reviewed_branch,
         working_directory=result.working_directory,
         captured_at=result.captured_at,

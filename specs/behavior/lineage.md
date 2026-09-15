@@ -290,6 +290,19 @@ It is the object L1/L2 ultimately resolve against.
   `tasks.status` and actionable unit listings need no owner-status filter. Units the
   dropped task belongs to but does not own, and units already in a landed/no-work state
   (`merged`/`empty`/`redundant`), MUST be left untouched — those record merge truth.
+- **Owner drop cascades only over proven same-scope completion work.** A deliberate
+  operator or watch drop of an owner/remediation MAY also transition same-unit
+  contributors and transitive same-unit `verify_fix` descendants to `dropped` when
+  merge-unit membership proves they exist only to complete the same merge outcome.
+  Automatic watch cleanup MUST defer the entire owner/unit transition while any
+  same-unit descendant is live in progress, report the deferred descendant IDs, and
+  replay the same owner drop once those descendants settle; it MUST NOT tombstone the
+  shared unit first and strand the live descendant outside active-unit resolution.
+  `based_on` alone is not proof: distinct-branch descendants, ordinary dependency
+  edges, plan/explore descendants, recovery work with its own unit, and ambiguous
+  children MUST remain visible. Cascaded rows record an auditable child drop reason
+  naming the parent; landed/no-work unit truth (`merged`, `empty`, `redundant`) MUST
+  not be overwritten.
 - A unit MAY also be inactive via `superseded_by_unit_id != NULL` even if its literal
   `state` is not itself `superseded`. Shared active-unit readers MUST treat both
   mechanisms the same way: only units with `superseded_by_unit_id == NULL` and

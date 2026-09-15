@@ -708,8 +708,9 @@ class TestHelpOutput:
         task.review_verify_failure = "verify_command failed"
         task.review_verify_head_sha = "abc123"
         task.output_content = (
-            '{"alert_message":"main verify RED at `abc123` - merges halted; phase `unit` failing",'
-            '"captured_at":"2026-06-23T00:00:00+00:00","failing_phase":"unit","gate_enabled":true,'
+            '{"alert_message":"main verify RED at `abc123` - merges halted; phase unit failing",'
+            '"captured_at":"2026-06-23T00:00:00+00:00","failing_phases":["unit"],"phase_results":[],'
+            '"gate_enabled":true,'
             '"head_sha":"abc123","tree_fingerprint":"fp-verified","verify_command":"./bin/tests",'
             '"verify_timeout_grace_seconds":5.0,"verify_timeout_seconds":120}'
         )
@@ -764,10 +765,11 @@ class TestHelpOutput:
         )
         state = SimpleNamespace(
             head_sha="abc123deadbeef",
-            failing_phase="unit",
+            failing_phases=("unit",),
+        phase_results=(),
             verify_status="failed",
             verify_exit_status="1",
-            alert_message="main verify RED - merges halted; phase `unit` failing",
+            alert_message="main verify RED - merges halted; phase unit failing",
             red_since=None,
         )
         check = SimpleNamespace(
@@ -789,7 +791,7 @@ class TestHelpOutput:
             result = invoke_gza("main-verify", "--project", str(tmp_path))
 
         assert result.returncode == 1
-        assert result.stdout.strip() == "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing"
+        assert result.stdout.strip() == "main verify RED at `abc123deadbe` - merges halted; phase unit failing"
 
     def test_main_verify_weakens_cached_red_when_exact_target_ref_advanced(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
@@ -799,10 +801,11 @@ class TestHelpOutput:
         )
         state = SimpleNamespace(
             head_sha="aaaaaaaaaaaa1111",
-            failing_phase="unit",
+            failing_phases=("unit",),
+        phase_results=(),
             verify_status="failed",
             verify_exit_status="1",
-            alert_message="main verify RED - merges halted; phase `unit` failing",
+            alert_message="main verify RED - merges halted; phase unit failing",
             red_since=None,
         )
         check = SimpleNamespace(
@@ -842,10 +845,11 @@ class TestHelpOutput:
         )
         state = SimpleNamespace(
             head_sha="aaaaaaaaaaaa1111",
-            failing_phase=None,
+            failing_phases=(),
+        phase_results=(),
             verify_status=7,
             verify_exit_status="1",
-            alert_message="main verify RED at `aaaaaaaaaaaa` - merges halted; phase `unit` failing",
+            alert_message="main verify RED at `aaaaaaaaaaaa` - merges halted; phase unit failing",
             red_since=None,
         )
         check = SimpleNamespace(
@@ -886,7 +890,8 @@ class TestHelpOutput:
         state = SimpleNamespace(
             gate_enabled=True,
             head_sha="aaaaaaaaaaaa1111",
-            failing_phase=None,
+            failing_phases=(),
+        phase_results=(),
             verify_status=None,
             verify_exit_status="1",
             alert_message=None,
@@ -924,10 +929,11 @@ class TestHelpOutput:
         )
         state = SimpleNamespace(
             head_sha="aaaaaaaaaaaa1111",
-            failing_phase="unit",
+            failing_phases=("unit",),
+        phase_results=(),
             verify_status="failed",
             verify_exit_status="1",
-            alert_message="main verify RED - merges halted; phase `unit` failing",
+            alert_message="main verify RED - merges halted; phase unit failing",
             red_since=None,
         )
         check = SimpleNamespace(
@@ -958,7 +964,8 @@ class TestHelpOutput:
         )
         state = SimpleNamespace(
             head_sha="feedfacecafebeef",
-            failing_phase=None,
+            failing_phases=(),
+        phase_results=(),
             verify_status="unavailable",
             verify_exit_status=MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
             alert_message="main verify freshness unproven; exact tree fingerprint unavailable",
@@ -999,10 +1006,11 @@ class TestHelpOutput:
         )
         state = SimpleNamespace(
             head_sha="feedfacecafebeef",
-            failing_phase="unit",
+            failing_phases=("unit",),
+        phase_results=(),
             verify_status="unavailable",
             verify_exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
-            alert_message="main verify RED at `feedfacecafe` - merges halted; phase `unit` failing",
+            alert_message="main verify RED at `feedfacecafe` - merges halted; phase unit failing",
             red_since=None,
         )
         check = SimpleNamespace(
@@ -1041,10 +1049,11 @@ class TestHelpOutput:
         state = SimpleNamespace(
             gate_enabled=True,
             head_sha="feedfacecafebeef",
-            failing_phase="unit",
+            failing_phases=("unit",),
+        phase_results=(),
             verify_status="mystery",
             verify_exit_status="42",
-            alert_message="main verify RED at `feedfacecafe` - merges halted; phase `unit` failing",
+            alert_message="main verify RED at `feedfacecafe` - merges halted; phase unit failing",
             red_since=None,
         )
         check = SimpleNamespace(
@@ -1099,11 +1108,12 @@ class TestHelpOutput:
         )
         state = SimpleNamespace(
             head_sha="feedfacecafebeef",
-            failing_phase="unit",
-            failure_signature="phase:unit",
+            failing_phases=("unit",),
+        phase_results=(),
+            failure_signature="phases:unit",
             alert_message=(
-                "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing; "
-                "automatic remediation exhausted after 2/2 attempts for phase:unit on fp-verified; "
+                "main verify RED at `feedfacecafe` - merges halted; phase unit failing; "
+                "automatic remediation exhausted after 2/2 attempts for phases:unit on fp-verified; "
                 "human intervention required"
             ),
             red_since=None,
@@ -1165,13 +1175,14 @@ class TestHelpOutput:
         state = SimpleNamespace(
             gate_enabled=True,
             head_sha="feedfacecafebeef",
-            failing_phase="unit",
-            failure_signature="phase:unit",
+            failing_phases=("unit",),
+        phase_results=(),
+            failure_signature="phases:unit",
             verify_status="unavailable",
             verify_exit_status=verify_exit_status,
             alert_message=(
-                "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing; "
-                "automatic remediation exhausted after 2/2 attempts for phase:unit on fp-verified; "
+                "main verify RED at `feedfacecafe` - merges halted; phase unit failing; "
+                "automatic remediation exhausted after 2/2 attempts for phases:unit on fp-verified; "
                 "human intervention required"
             ),
             red_since=None,

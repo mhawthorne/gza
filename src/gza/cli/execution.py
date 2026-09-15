@@ -3738,16 +3738,28 @@ def cmd_set_status(args: argparse.Namespace) -> int:
             f"(current target: '{args.status}')"
         )
 
-    apply_manual_task_status(
+    status_result = apply_manual_task_status(
         config=config,
         store=store,
         task=task,
         status=args.status,
         reason=args.reason,
     )
-    _cleanup_worker_registry(config, task_id)
+    cleanup_task_ids = (
+        status_result.dropped_task_ids
+        if status_result is not None and status_result.dropped_task_ids
+        else (task_id,)
+    )
+    for cleanup_task_id in cleanup_task_ids:
+        _cleanup_worker_registry(config, cleanup_task_id)
 
-    print(f"Task {task_id} status: {old_status} → {args.status}")
+    if status_result is not None and status_result.dropped_task_ids and tuple(status_result.dropped_task_ids) != (task_id,):
+        print(
+            f"Task {task_id} status: {old_status} → {args.status} "
+            f"(also dropped: {', '.join(extra_id for extra_id in status_result.dropped_task_ids if extra_id != task_id)})"
+        )
+    else:
+        print(f"Task {task_id} status: {old_status} → {args.status}")
     return 0
 
 

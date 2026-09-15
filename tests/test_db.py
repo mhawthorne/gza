@@ -14,6 +14,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from gza.advance_engine import resolve_review_cycle_boundary
+from gza.config import Config
 from gza.db import (
     DB_UNSET,
     MERGE_SOURCE_MANUAL_LAND,
@@ -62,7 +64,6 @@ from gza.db import (
     task_updated_at,
 )
 from gza.migration_authority import resolve_canonical_migration_authority
-from gza.advance_engine import resolve_review_cycle_boundary
 from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance, parse_rebase_diff_provenance
 from gza.review_tasks import build_auto_review_prompt
 from gza.runner import _compute_slug_override
@@ -840,6 +841,191 @@ def test_resolve_merge_unit_subject_supports_direct_historical_unit_lookup_only_
     assert historical.state == "superseded"
     assert historical.superseded_by_unit_id == winner_unit.id
     assert store.resolve_merge_unit_subject(loser.id) is None
+
+
+def test_drop_task_with_scope_cascade_non_owner_does_not_drop_owner_or_peers(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    owner = store.add("Owner implementation", task_type="implement")
+    contributor = store.add("Review contributor", task_type="review", based_on=owner.id, depends_on=owner.id)
+    peer = store.add("Peer contributor", task_type="review", based_on=owner.id, depends_on=owner.id)
+    assert owner.id is not None
+    assert contributor.id is not None
+    assert peer.id is not None
+    owner.status = "completed"
+    owner.branch = "feature/drop-non-owner"
+    owner.has_commits = True
+    store.update(owner)
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(contributor.id, unit.id, "review")
+    store.attach_task_to_merge_unit(peer.id, unit.id, "review")
+
+    result = store.drop_task_with_scope_cascade(contributor.id, reason="not needed")
+
+    assert result.dropped_task_ids == (contributor.id,)
+    assert result.tombstoned_merge_unit_ids == ()
+    assert store.get(contributor.id).status == "dropped"  # type: ignore[union-attr]
+    assert store.get(owner.id).status == "completed"  # type: ignore[union-attr]
+    assert store.get(peer.id).status == "pending"  # type: ignore[union-attr]
+    assert store.get_merge_unit(unit.id).state == "unmerged"  # type: ignore[union-attr]
+
+
+def test_drop_task_with_scope_cascade_owner_drops_only_same_unit_proven_work(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    owner = store.add("Owner implementation", task_type="implement")
+    verify_fix = store.add("Same-unit verify fix", task_type="verify_fix", based_on=owner.id)
+    ambiguous = store.add("Ambiguous based_on follow-up", task_type="implement", based_on=owner.id)
+    dependent = store.add("Dependent work", task_type="implement", depends_on=owner.id)
+    distinct = store.add("Distinct unit child", task_type="verify_fix", based_on=owner.id)
+    for task in (owner, verify_fix, ambiguous, dependent, distinct):
+        assert task.id is not None
+    owner.status = "completed"
+    owner.branch = "feature/drop-owner"
+    owner.has_commits = True
+    verify_fix.status = "completed"
+    verify_fix.branch = owner.branch
+    verify_fix.has_commits = True
+    distinct.status = "completed"
+    distinct.branch = "feature/distinct"
+    distinct.has_commits = True
+    for task in (owner, verify_fix, distinct):
+        store.update(task)
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    distinct_unit = store.create_merge_unit(
+        source_branch=distinct.branch,
+        target_branch="main",
+        owner_task_id=distinct.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(verify_fix.id, unit.id, "contributor")
+    store.attach_task_to_merge_unit(distinct.id, distinct_unit.id, "owner")
+
+    result = store.drop_task_with_scope_cascade(owner.id, reason="redundant remediation")
+
+    assert result.dropped_task_ids == (owner.id, verify_fix.id)
+    assert result.tombstoned_merge_unit_ids == (unit.id,)
+    assert store.get(owner.id).status == "dropped"  # type: ignore[union-attr]
+    assert store.get(verify_fix.id).status == "dropped"  # type: ignore[union-attr]
+    assert store.get(ambiguous.id).status == "pending"  # type: ignore[union-attr]
+    assert store.get(dependent.id).status == "pending"  # type: ignore[union-attr]
+    assert store.get(distinct.id).status == "completed"  # type: ignore[union-attr]
+    assert store.get_merge_unit(unit.id).state == "dropped"  # type: ignore[union-attr]
+    assert store.get_merge_unit(distinct_unit.id).state == "unmerged"  # type: ignore[union-attr]
+
+
+def test_drop_task_with_scope_cascade_rolls_back_task_and_unit_mutations_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    owner = store.add("Owner implementation", task_type="implement")
+    contributor = store.add("Same-unit contributor", task_type="review", based_on=owner.id, depends_on=owner.id)
+    assert owner.id is not None
+    assert contributor.id is not None
+    owner.status = "completed"
+    owner.branch = "feature/drop-rollback"
+    owner.has_commits = True
+    store.update(owner)
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(contributor.id, unit.id, "review")
+
+    def fail_touch(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("injected rollback")
+
+    monkeypatch.setattr(store, "_touch_tasks_updated_at", fail_touch)
+
+    with pytest.raises(RuntimeError, match="injected rollback"):
+        store.drop_task_with_scope_cascade(owner.id, reason="boom")
+
+    assert store.get(owner.id).status == "completed"  # type: ignore[union-attr]
+    assert store.get(contributor.id).status == "pending"  # type: ignore[union-attr]
+    assert store.get_merge_unit(unit.id).state == "unmerged"  # type: ignore[union-attr]
+
+
+def test_drop_task_with_scope_cascade_is_idempotent_and_live_mode_aware(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    owner = store.add("Owner implementation", task_type="implement")
+    live = store.add("Live same-unit contributor", task_type="verify_fix", based_on=owner.id)
+    assert owner.id is not None
+    assert live.id is not None
+    owner.status = "completed"
+    owner.branch = "feature/drop-live"
+    owner.has_commits = True
+    live.status = "in_progress"
+    live.started_at = datetime.now(UTC)
+    live.running_pid = 12345
+    live.branch = owner.branch
+    for task in (owner, live):
+        store.update(task)
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(live.id, unit.id, "contributor")
+
+    automatic = store.drop_task_with_scope_cascade(owner.id, reason="automatic cleanup", mode="automatic")
+
+    assert automatic.dropped_task_ids == ()
+    assert automatic.deferred_task_ids == (live.id,)
+    assert store.get(owner.id).status == "completed"  # type: ignore[union-attr]
+    assert store.get(live.id).status == "in_progress"  # type: ignore[union-attr]
+    assert store.get_merge_unit(unit.id).state == "unmerged"  # type: ignore[union-attr]
+
+    repeated = store.drop_task_with_scope_cascade(owner.id, reason="automatic cleanup", mode="automatic")
+    assert repeated.dropped_task_ids == ()
+    assert repeated.deferred_task_ids == (live.id,)
+
+    settled = store.get(live.id)
+    assert settled is not None
+    settled.status = "completed"
+    settled.completed_at = datetime.now(UTC)
+    settled.running_pid = None
+    settled.has_commits = True
+    store.update(settled)
+
+    replayed = store.drop_task_with_scope_cascade(owner.id, reason="automatic cleanup", mode="automatic")
+    assert replayed.dropped_task_ids == (owner.id, live.id)
+    assert replayed.deferred_task_ids == ()
+    assert replayed.tombstoned_merge_unit_ids == (unit.id,)
+    assert store.get(owner.id).status == "dropped"  # type: ignore[union-attr]
+    assert store.get(live.id).status == "dropped"  # type: ignore[union-attr]
+    assert store.get_merge_unit(unit.id).state == "dropped"  # type: ignore[union-attr]
+
+
+def test_mark_completed_does_not_revive_dropped_task_after_late_worker_completion(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = store.add("Late worker completion", task_type="implement")
+    assert task.id is not None
+    store.drop_task_with_scope_cascade(task.id, reason="operator dropped")
+
+    stale_worker_view = task
+    stale_worker_view.status = "in_progress"
+    store.mark_completed(stale_worker_view, has_commits=True, branch="feature/late-completion")
+
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "dropped"
+    assert refreshed.drop_reason == "operator dropped"
 
 
 def test_supersede_merge_unit_cascades_members_preserves_history_and_is_idempotent(tmp_path: Path) -> None:
@@ -3508,7 +3694,7 @@ class TestGetReviewsForTask:
         )
         store.attach_task_to_merge_unit(task.id, unit.id, "owner")
         store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id=task.id,
         )
@@ -3595,7 +3781,7 @@ class TestGetReviewsForTask:
                 (
                     "2026-01-03T11:06:00",
                     "default",
-                    "phase:functional",
+                    "phases:functional",
                     "fp-functional-a",
                     task.id,
                 ),
@@ -3663,7 +3849,7 @@ class TestGetReviewsForTask:
                 FROM main_verify_remediation_consumed_task_ids
                 WHERE project_id = ? AND signature = ? AND tree_fingerprint = ? AND task_id = ?
                 """,
-                ("default", "phase:functional", "fp-functional-a", task.id),
+                ("default", "phases:functional", "fp-functional-a", task.id),
             ).fetchone()
 
         assert version == SCHEMA_VERSION
@@ -10658,7 +10844,6 @@ class TestExecutionProjectResolver:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from gza.config import Config
 
         anchor_dir = tmp_path / "anchor"
         poison_cwd = tmp_path / "poison"
@@ -11764,7 +11949,6 @@ class TestExecutionProjectResolver:
         assert f"projects register --project {linked.resolve()}" not in linked_warning
 
     def test_execution_resolution_does_not_apply_repairable_startup_writes(self, tmp_path: Path) -> None:
-        from gza.config import Config
 
         project_dir = tmp_path / "project"
         project_db = tmp_path / "project.db"
@@ -11920,12 +12104,10 @@ class TestExecutionProjectResolver:
         self,
         tmp_path: Path,
     ) -> None:
-        from gza.config import Config
-
         project_dir = tmp_path / "project"
         project_db = tmp_path / "shared-v70.db"
         _write_project_config(project_dir, project_name="Shared", project_id="shared", db_path=project_db)
-        seeded = SqliteTaskStore(project_db, prefix="shared", project_id="shared")
+        SqliteTaskStore(project_db, prefix="shared", project_id="shared")
         with sqlite3.connect(project_db) as conn:
             conn.execute("ALTER TABLE watch_failed_recovery_scans DROP COLUMN unit_fingerprint")
             conn.execute("UPDATE schema_version SET version = 70")
@@ -16104,7 +16286,7 @@ class TestExecutionProjectResolver:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path, prefix="gza")
         initial = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-100",
             last_observed_head_sha="abc123",
@@ -16121,7 +16303,7 @@ class TestExecutionProjectResolver:
 
         migrated_store = SqliteTaskStore(db_path, prefix="gza")
         duplicate = migrated_store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-100",
             last_observed_head_sha="def456",
@@ -16382,7 +16564,7 @@ class TestExecutionProjectResolver:
         store = SqliteTaskStore(db_path, prefix="gza")
 
         first = store.record_main_verify_remediation_active_task(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint=None,
             task_id="gza-100",
             last_observed_head_sha="abc123",
@@ -16390,7 +16572,7 @@ class TestExecutionProjectResolver:
         )
 
         assert first == MainVerifyRemediationAttemptState(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint=None,
             consumed_attempt_count=0,
             active_task_id="gza-100",
@@ -16404,7 +16586,7 @@ class TestExecutionProjectResolver:
         assert first.updated_at is not None
 
         consumed = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint=None,
             task_id="gza-100",
             last_observed_head_sha="def456",
@@ -16421,7 +16603,7 @@ class TestExecutionProjectResolver:
         assert consumed.updated_at is not None
 
         exhausted = store.mark_main_verify_remediation_exhausted(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint=None,
             last_observed_head_sha="ghi789",
             last_observed_failure="budget exhausted",
@@ -16433,7 +16615,7 @@ class TestExecutionProjectResolver:
         assert exhausted.last_observed_head_sha == "ghi789"
         assert exhausted.last_observed_failure == "budget exhausted"
         assert store.get_main_verify_remediation_attempt_state(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint=None,
         ) == exhausted
 
@@ -16444,7 +16626,7 @@ class TestExecutionProjectResolver:
         store = SqliteTaskStore(db_path, prefix="gza")
 
         active = store.record_main_verify_remediation_active_task(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-100",
             last_observed_head_sha="abc123",
@@ -16453,7 +16635,7 @@ class TestExecutionProjectResolver:
 
         assert active is not None
         consumed = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-099",
             last_observed_head_sha="def456",
@@ -16462,7 +16644,7 @@ class TestExecutionProjectResolver:
 
         assert consumed is not None
         reactivated = store.record_main_verify_remediation_active_task(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-101",
             last_observed_head_sha="ghi789",
@@ -16474,7 +16656,7 @@ class TestExecutionProjectResolver:
         assert reactivated.active_task_id == "gza-101"
 
         exhausted = store.mark_main_verify_remediation_exhausted(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             last_observed_head_sha="jkl012",
             last_observed_failure="budget exhausted",
@@ -16489,7 +16671,7 @@ class TestExecutionProjectResolver:
         assert exhausted.last_observed_failure == "budget exhausted"
 
         persisted = store.get_main_verify_remediation_attempt_state(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
         )
 
@@ -16506,7 +16688,7 @@ class TestExecutionProjectResolver:
         store = SqliteTaskStore(db_path, prefix="gza")
 
         exhausted = store.mark_main_verify_remediation_exhausted(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint=None,
             consumed_attempt_count=2,
             last_observed_head_sha="abc123",
@@ -16528,7 +16710,7 @@ class TestExecutionProjectResolver:
         store = SqliteTaskStore(db_path, prefix="gza")
 
         first = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint=None,
             task_id="gza-100",
             consumption_key="gza-100:failed-requeue:1",
@@ -16536,7 +16718,7 @@ class TestExecutionProjectResolver:
             last_observed_failure="failed remediation requeued once",
         )
         second = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint=None,
             task_id="gza-100",
             consumption_key="gza-100:failed-requeue:2",
@@ -16557,7 +16739,7 @@ class TestExecutionProjectResolver:
         store = SqliteTaskStore(db_path, prefix="gza")
 
         exhausted = store.mark_main_verify_remediation_exhausted(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             last_observed_head_sha="abc123",
             last_observed_failure="budget exhausted",
@@ -16566,7 +16748,7 @@ class TestExecutionProjectResolver:
         assert exhausted is not None
         assert exhausted.exhausted_at is not None
         reactivated = store.record_main_verify_remediation_active_task(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-101",
             last_observed_head_sha="def456",
@@ -16580,7 +16762,7 @@ class TestExecutionProjectResolver:
         assert reactivated.last_observed_failure == "ordinary active-pointer refresh"
 
         persisted = store.get_main_verify_remediation_attempt_state(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
         )
 
@@ -16594,7 +16776,7 @@ class TestExecutionProjectResolver:
         store = SqliteTaskStore(db_path, prefix="gza")
 
         exhausted = store.mark_main_verify_remediation_exhausted(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             last_observed_head_sha="abc123",
             last_observed_failure="budget exhausted",
@@ -16603,7 +16785,7 @@ class TestExecutionProjectResolver:
         assert exhausted is not None
         assert exhausted.exhausted_at is not None
         reactivated = store.reset_main_verify_remediation_exhaustion(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-101",
             last_observed_head_sha="def456",
@@ -16617,7 +16799,7 @@ class TestExecutionProjectResolver:
         assert reactivated.last_observed_failure == "human reset opened a new remediation"
 
         persisted = store.get_main_verify_remediation_attempt_state(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
         )
 
@@ -16631,12 +16813,12 @@ class TestExecutionProjectResolver:
         store = SqliteTaskStore(db_path, prefix="gza")
 
         store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-100",
         )
         cleared = store.clear_main_verify_remediation_active_task(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             last_observed_head_sha="abc123",
             last_observed_failure="verify green after rerun",
@@ -16656,17 +16838,17 @@ class TestExecutionProjectResolver:
         store = SqliteTaskStore(db_path, prefix="gza")
 
         store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:unit",
+            signature="phases:unit",
             tree_fingerprint=None,
             task_id="gza-100",
         )
         store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:unit",
+            signature="phases:unit",
             tree_fingerprint=None,
             task_id="gza-101",
         )
         exhausted = store.mark_main_verify_remediation_exhausted(
-            signature="phase:unit",
+            signature="phases:unit",
             tree_fingerprint=None,
         )
         assert exhausted is not None
@@ -16674,13 +16856,13 @@ class TestExecutionProjectResolver:
         assert exhausted.consumed_attempt_count == 2
 
         store.reset_main_verify_remediation_ledger_on_green(
-            signature="phase:unit",
+            signature="phases:unit",
             tree_fingerprint=None,
             last_observed_head_sha="deadbeef",
         )
 
         reset_state = store.get_main_verify_remediation_attempt_state(
-            signature="phase:unit",
+            signature="phases:unit",
             tree_fingerprint=None,
         )
         assert reset_state is not None
@@ -16690,9 +16872,9 @@ class TestExecutionProjectResolver:
         assert reset_state.last_consumed_task_id is None
         assert reset_state.last_observed_head_sha == "deadbeef"
 
-        # A later, unrelated phase:unit failure must not inherit the old exhaustion.
+        # A later, unrelated phases:unit failure must not inherit the old exhaustion.
         reconsumed = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:unit",
+            signature="phases:unit",
             tree_fingerprint=None,
             task_id="gza-200",
         )
@@ -16707,7 +16889,7 @@ class TestExecutionProjectResolver:
         store = SqliteTaskStore(db_path, prefix="gza")
 
         first = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-100",
             last_observed_head_sha="abc123",
@@ -16720,7 +16902,7 @@ class TestExecutionProjectResolver:
         assert first.last_consumed_task_id == "gza-100"
 
         duplicate = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-100",
             last_observed_head_sha="def456",
@@ -16735,7 +16917,7 @@ class TestExecutionProjectResolver:
         assert duplicate.last_observed_failure == "duplicate observe after restart"
 
         persisted_duplicate = store.get_main_verify_remediation_attempt_state(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
         )
 
@@ -16744,7 +16926,7 @@ class TestExecutionProjectResolver:
         assert persisted_duplicate.consumed_attempt_count == 1
 
         later = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-101",
             last_observed_head_sha="ghi789",
@@ -16757,7 +16939,7 @@ class TestExecutionProjectResolver:
         assert later.last_consumed_task_id == "gza-101"
 
         persisted_later = store.get_main_verify_remediation_attempt_state(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
         )
 
@@ -16772,21 +16954,21 @@ class TestExecutionProjectResolver:
         store = SqliteTaskStore(db_path, prefix="gza")
 
         first = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-100",
             last_observed_head_sha="abc123",
             last_observed_failure="first remediation still red after merge",
         )
         second = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-101",
             last_observed_head_sha="def456",
             last_observed_failure="second remediation still red after merge",
         )
         duplicate_first = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-100",
             last_observed_head_sha="ghi789",
@@ -16805,7 +16987,7 @@ class TestExecutionProjectResolver:
         assert duplicate_first.last_observed_failure == "duplicate observe after restart"
 
         persisted = store.get_main_verify_remediation_attempt_state(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
         )
 
@@ -16821,21 +17003,21 @@ class TestExecutionProjectResolver:
         store = SqliteTaskStore(db_path, prefix="gza")
 
         first = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-100",
             last_observed_head_sha="abc123",
             last_observed_failure="first remediation still red after merge",
         )
         active = store.record_main_verify_remediation_active_task(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-101",
             last_observed_head_sha="def456",
             last_observed_failure="new remediation attempt active",
         )
         duplicate_first = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-100",
             last_observed_head_sha="ghi789",
@@ -16854,7 +17036,7 @@ class TestExecutionProjectResolver:
         assert duplicate_first.last_observed_failure == "duplicate observe after restart"
 
         persisted = store.get_main_verify_remediation_attempt_state(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
         )
 
@@ -16871,14 +17053,14 @@ class TestExecutionProjectResolver:
         store = SqliteTaskStore(db_path, prefix="gza")
 
         first_active = store.record_main_verify_remediation_active_task(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-101",
             last_observed_head_sha="abc123",
             last_observed_failure="new remediation attempt active",
         )
         consumed_older = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-100",
             last_observed_head_sha="def456",
@@ -16895,7 +17077,7 @@ class TestExecutionProjectResolver:
         assert consumed_older.last_observed_failure == "older remediation still red after merge"
 
         persisted = store.get_main_verify_remediation_attempt_state(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
         )
 
@@ -16912,14 +17094,14 @@ class TestExecutionProjectResolver:
         store = SqliteTaskStore(db_path, prefix="gza")
 
         active = store.record_main_verify_remediation_active_task(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-101",
             last_observed_head_sha="abc123",
             last_observed_failure="new remediation attempt active",
         )
         consumed_unknown = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id=None,
             last_observed_head_sha="def456",
@@ -16936,7 +17118,7 @@ class TestExecutionProjectResolver:
         assert consumed_unknown.last_observed_failure == "still red after unknown merge"
 
         persisted = store.get_main_verify_remediation_attempt_state(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
         )
 
@@ -16952,14 +17134,14 @@ class TestExecutionProjectResolver:
         store = SqliteTaskStore(db_path, prefix="gza")
 
         first = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id=None,
             last_observed_head_sha="abc123",
             last_observed_failure="still red after unknown merge",
         )
         second = store.record_main_verify_remediation_consumed_attempt(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
             task_id=None,
             last_observed_head_sha="def456",
@@ -16973,7 +17155,7 @@ class TestExecutionProjectResolver:
         assert second.last_consumed_task_id is None
 
         persisted = store.get_main_verify_remediation_attempt_state(
-            signature="phase:functional",
+            signature="phases:functional",
             tree_fingerprint="fp-functional-a",
         )
 
@@ -17351,7 +17533,7 @@ class TestExecutionProjectResolver:
             query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
             supported = query_store.supports_main_verify_remediation_attempts()
             state = query_store.get_main_verify_remediation_attempt_state(
-                signature="phase:functional",
+                signature="phases:functional",
                 tree_fingerprint=None,
             )
         finally:
@@ -17382,7 +17564,7 @@ class TestExecutionProjectResolver:
             query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
             supported = query_store.supports_main_verify_remediation_attempts()
             state = query_store.get_main_verify_remediation_attempt_state(
-                signature="phase:functional",
+                signature="phases:functional",
                 tree_fingerprint="fp-functional-a",
             )
         finally:
@@ -17413,7 +17595,7 @@ class TestExecutionProjectResolver:
             query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
             supported = query_store.supports_main_verify_remediation_attempts()
             state = query_store.get_main_verify_remediation_attempt_state(
-                signature="phase:functional",
+                signature="phases:functional",
                 tree_fingerprint="fp-functional-a",
             )
         finally:

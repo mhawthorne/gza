@@ -3528,17 +3528,22 @@ def _apply_stale_unmerged_candidate_drops(
     candidate: StaleUnmergedSweepCandidate,
 ) -> tuple[str, ...]:
     applied_drop_task_ids: list[str] = []
+    seen_drop_task_ids: set[str] = set()
     for task_id in candidate.drop_task_ids:
         task = store.get(task_id)
         if task is None or task.status == "dropped":
             continue
-        apply_manual_task_status(
+        result = apply_manual_task_status(
             config=config,
             store=store,
             task=task,
             status="dropped",
         )
-        applied_drop_task_ids.append(task_id)
+        transitioned_ids = result.dropped_task_ids if result is not None else (task_id,)
+        for transitioned_id in transitioned_ids:
+            if transitioned_id not in seen_drop_task_ids:
+                applied_drop_task_ids.append(transitioned_id)
+                seen_drop_task_ids.add(transitioned_id)
     return tuple(applied_drop_task_ids)
 
 

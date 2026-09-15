@@ -126,6 +126,14 @@ from ..main_verify_format import (
     main_verify_state_needs_non_red_attention,
     resolve_main_verify_target_proof,
 )
+from ..main_verify_scope import (
+    canonical_verify_phase_names,
+    normalize_verify_phase_names,
+    parse_verify_phase_signature,
+    verify_failure_signature,
+    verify_phase_label,
+    verify_phase_value,
+)
 from ..merge_state import (
     effective_no_work_merge_state,
     resolve_task_merge_state_for_target,
@@ -168,7 +176,7 @@ from ..runner import (
 )
 from ..runtime_context import RuntimeExecutionContext
 from ..source_followup import collect_non_dropped_implement_source_ids
-from ..status_ops import apply_manual_task_status
+from ..status_ops import TaskDropCascadeResult, apply_manual_task_status, drop_task_with_scope_cascade
 from ..sync_ops import (
     BranchCohort,
     _git_reconcile_update,
@@ -414,6 +422,100 @@ class _MainVerifyRemediationIdentity:
     tree_fingerprint: str | None
 
 
+def _main_verify_remediation_identity_phases(identity: _MainVerifyRemediationIdentity | None) -> tuple[str, ...]:
+    if identity is None:
+        return ()
+    return parse_verify_phase_signature(identity.signature)
+
+
+def _main_verify_remediation_phase_set(identity: _MainVerifyRemediationIdentity | None) -> frozenset[str]:
+    return frozenset(_main_verify_remediation_identity_phases(identity))
+
+
+def _main_verify_remediation_signatures_overlap(
+    left: _MainVerifyRemediationIdentity | None,
+    right: _MainVerifyRemediationIdentity | None,
+) -> bool:
+    left_phases = _main_verify_remediation_phase_set(left)
+    right_phases = _main_verify_remediation_phase_set(right)
+    return bool(left_phases and right_phases and left_phases.intersection(right_phases))
+
+
+def _main_verify_remediation_union_identity(
+    left: _MainVerifyRemediationIdentity,
+    right: _MainVerifyRemediationIdentity,
+) -> _MainVerifyRemediationIdentity | None:
+    phases = canonical_verify_phase_names(
+        (*_main_verify_remediation_identity_phases(left), *_main_verify_remediation_identity_phases(right))
+    )
+    if not phases:
+        return None
+    return _MainVerifyRemediationIdentity(
+        signature=verify_failure_signature(
+            failing_phases=phases,
+            verify_status=None,
+            verify_exit_status=None,
+        ),
+        tree_fingerprint=right.tree_fingerprint,
+    )
+
+
+def _main_verify_remediation_covers(
+    existing: _MainVerifyRemediationIdentity,
+    requested: _MainVerifyRemediationIdentity,
+) -> bool:
+    if existing.signature == requested.signature:
+        return True
+    existing_phases = _main_verify_remediation_phase_set(existing)
+    requested_phases = _main_verify_remediation_phase_set(requested)
+    return bool(existing_phases and requested_phases and existing_phases.issuperset(requested_phases))
+
+
+def _main_verify_phase_results_by_name(state: Any) -> dict[str, str]:
+    results: dict[str, str] = {}
+    for result in tuple(getattr(state, "phase_results", ()) or ()):
+        phase = getattr(result, "phase_name", None)
+        status = getattr(result, "status", None)
+        normalized = normalize_verify_phase_names((phase,))
+        if normalized and status in {"passed", "failed"}:
+            results[normalized[0]] = str(status)
+    return results
+
+
+def _main_verify_remediation_covered_phases_passed(
+    *,
+    identity: _MainVerifyRemediationIdentity,
+    state: Any,
+    gate_passed: bool,
+) -> bool:
+    covered = _main_verify_remediation_phase_set(identity)
+    if not covered:
+        return gate_passed
+    if gate_passed:
+        return True
+    results = _main_verify_phase_results_by_name(state)
+    return all(results.get(phase) == "passed" for phase in covered)
+
+
+def _main_verify_remediation_with_identity(
+    remediation: MainIntegrationVerifyRemediation,
+    identity: _MainVerifyRemediationIdentity,
+) -> MainIntegrationVerifyRemediation:
+    try:
+        return replace(
+            remediation,
+            signature=identity.signature,
+            tree_fingerprint=identity.tree_fingerprint,
+            failing_phases=_main_verify_remediation_identity_phases(identity),
+        )
+    except TypeError:
+        clone = cast(Any, copy.copy(remediation))
+        clone.signature = identity.signature
+        clone.tree_fingerprint = identity.tree_fingerprint
+        clone.failing_phases = _main_verify_remediation_identity_phases(identity)
+        return cast(MainIntegrationVerifyRemediation, clone)
+
+
 @dataclass(frozen=True)
 class _MainVerifyRemediationEnsureResult:
     task: DbTask | None
@@ -495,13 +597,15 @@ def _main_verify_remediation_prompt(
 ) -> str:
     if spent_attempts is not None:
         attempts_spent = spent_attempts
-    phase = remediation.failing_phase or remediation.signature
+    phases = normalize_verify_phase_names(getattr(remediation, "failing_phases", ()))
+    phase_label = verify_phase_label(phases, fallback=remediation.signature)
+    phase_value = verify_phase_value(phases, fallback="unknown")
     short_sha = (head_sha or "unknown")[:12]
     if remediation.kind == "deflake":
-        heading = f"De-flake local main integration verify phase `{phase}`"
+        heading = f"De-flake local main integration verify {phase_label}"
         outcome = "The verify gate went red once, passed on rerun, and should be stabilized so watch does not keep rediscovering the flake."
     else:
-        heading = f"Fix local main integration verify phase `{phase}`"
+        heading = f"Fix local main integration verify {phase_label}"
         outcome = "The verify gate stayed red across bounded reruns and is currently halting merges onto local main."
     body = [
         heading,
@@ -509,6 +613,7 @@ def _main_verify_remediation_prompt(
         outcome,
         "",
         f"Remediation kind: {remediation.kind}",
+        f"Failing phases: {phase_value}",
         f"Failure signature: {remediation.signature}",
         f"Tree fingerprint: {remediation.tree_fingerprint or 'unavailable'}",
         f"Observed main HEAD: {short_sha}",
@@ -523,27 +628,32 @@ def _main_verify_remediation_prompt(
     body.append(f"Observed verify environment: {observed_environment or 'unknown/unavailable'}")
     failure = getattr(remediation, "failure", None)
     artifact_path = getattr(remediation, "artifact_path", None)
-    failing_test_ids = tuple(getattr(remediation, "failing_test_ids", ()))
-    verify_excerpt = getattr(remediation, "verify_excerpt", None)
+    phase_evidence = tuple(getattr(remediation, "phase_evidence", ()))
     if failure:
         body.append(f"Verify failure: {failure}")
     if artifact_path:
         body.append(f"Verify artifact: {artifact_path}")
-    if failing_test_ids:
-        body.append(f"Failing test IDs: {', '.join(failing_test_ids)}")
-    if verify_excerpt:
-        body.extend(["Verify excerpt:", "", *_render_inert_prompt_excerpt(verify_excerpt)])
+    if phase_evidence:
+        body.extend(["", "Per-phase evidence:"])
+        for evidence in phase_evidence:
+            body.extend(["", f"Phase `{evidence.phase_name}`:"])
+            if evidence.failing_test_ids:
+                body.append(f"Failing test IDs: {', '.join(evidence.failing_test_ids)}")
+            if evidence.excerpt:
+                body.extend(["Excerpt:", "", *_render_inert_prompt_excerpt(evidence.excerpt)])
+            else:
+                body.append("Evidence unavailable in the retained verify artifact; keep this phase in scope.")
     body.extend(
         [
             "",
             "Required outcome:",
-            "- restore a stable green local main integration verify result for this failure signature",
-            "- add targeted regression coverage for the failing phase or flake mode",
-            "- make only the minimal targeted change that addresses the specific verify failure",
+            "- restore stable green local main integration verify proof for every listed phase",
+            "- add targeted regression coverage for the listed phase failures or flake mode",
+            "- make only the minimal direct changes needed to address the listed verify failures",
             "- do not refactor, rename, restructure, or expand scope beyond the direct root cause",
-            "- if the fix requires touching more than the failure's direct cause, stop and flag it for human review instead of proceeding",
+            "- if the fix requires work beyond the combined direct causes listed here, stop and flag it for human review instead of proceeding",
             "",
-            "While iterating, run only the targeted test(s) for the failing phase (e.g. a single file or -k selection), not the full suite.",
+            "While iterating, target the listed phase failures with the smallest useful command(s), not the full suite.",
             "Do not run the full project verify command yourself — the runner re-verifies automatically after you finish.",
         ]
     )
@@ -682,7 +792,7 @@ def _main_verify_remediation_identity_matches(
     existing: _MainVerifyRemediationIdentity,
     requested: _MainVerifyRemediationIdentity,
 ) -> bool:
-    return existing.signature == requested.signature
+    return _main_verify_remediation_covers(existing, requested)
 
 
 def _main_verify_remediation_ledger_fingerprint(_tree_fingerprint: str | None) -> str | None:
@@ -992,8 +1102,15 @@ def _main_verify_remediation_selection_rank(
     task: DbTask,
     existing: _MainVerifyRemediationIdentity,
     requested: _MainVerifyRemediationIdentity,
-) -> tuple[int, int]:
-    return (1 if task.status != "in_progress" else 0, _legacy_main_verify_remediation_rank(existing, requested))
+) -> tuple[int, int, int, int]:
+    exact = 1 if existing.signature == requested.signature else 0
+    covering = 1 if _main_verify_remediation_covers(existing, requested) else 0
+    return (
+        1 if task.status != "in_progress" else 0,
+        covering,
+        exact,
+        _legacy_main_verify_remediation_rank(existing, requested),
+    )
 
 
 def _select_legacy_open_main_verify_remediation_tasks(
@@ -1003,7 +1120,7 @@ def _select_legacy_open_main_verify_remediation_tasks(
     active_task_id: str | None = None,
 ) -> _MainVerifyRemediationSelection:
     preferred: DbTask | None = None
-    preferred_rank = (-1, -1)
+    preferred_rank = (-1, -1, -1, -1)
     matches: list[DbTask] = []
     for task in store.get_all():
         if not _main_verify_remediation_task_is_reusable(store, task):
@@ -1011,12 +1128,16 @@ def _select_legacy_open_main_verify_remediation_tasks(
         existing_identity = _main_verify_remediation_identity_from_prompt(task.prompt)
         if existing_identity is None:
             continue
-        if not _main_verify_remediation_identity_matches(existing_identity, identity):
+        existing_phases = _main_verify_remediation_phase_set(existing_identity)
+        requested_phases = _main_verify_remediation_phase_set(identity)
+        if existing_identity.signature != identity.signature and not (
+            existing_phases and requested_phases and existing_phases.intersection(requested_phases)
+        ):
             continue
         matches.append(task)
         if active_task_id is not None and task.id == active_task_id:
             preferred = task
-            preferred_rank = (999, 999)
+            preferred_rank = (999, 999, 999, 999)
             continue
         rank = _main_verify_remediation_selection_rank(task, existing_identity, identity)
         if rank > preferred_rank:
@@ -1058,18 +1179,16 @@ def _retire_duplicate_main_verify_remediation_tasks(
             # reconciliation path proves the task can be stopped or retired.
             deferred_live_ids.append(duplicate_id)
             continue
-        fresh.status = "dropped"
-        fresh.started_at = None
-        fresh.running_pid = None
-        fresh.completed_at = datetime.now(UTC)
-        fresh.failure_reason = None
-        fresh.completion_reason = None
-        fresh.drop_reason = f"{MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON}:{identity.signature}:{canonical.id}"
-        fresh.urgent = False
-        fresh.queue_position = None
-        store.update(fresh)
-        store.drop_active_merge_units_owned_by(duplicate_id)
-        retired_ids.append(duplicate_id)
+        drop_result = drop_task_with_scope_cascade(
+            store=store,
+            task=fresh,
+            reason=f"{MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON}:{identity.signature}:{canonical.id}",
+        )
+        if drop_result.dropped_task_ids:
+            retired_ids.extend(drop_result.dropped_task_ids)
+        elif not drop_result.deferred_task_ids:
+            retired_ids.append(duplicate_id)
+        deferred_live_ids.extend(drop_result.deferred_task_ids)
     return _MainVerifyRemediationDuplicateRetireResult(
         merged_tags=merged_tags,
         retired_ids=tuple(retired_ids),
@@ -1113,18 +1232,11 @@ def _retire_moot_main_verify_remediation_tasks(
         fresh = store.get(task.id)
         if fresh is None or not _main_verify_remediation_task_is_moot_retirement_candidate(fresh):
             continue
-        fresh.status = "dropped"
-        fresh.started_at = None
-        fresh.running_pid = None
-        fresh.completed_at = datetime.now(UTC)
-        fresh.failure_reason = None
-        fresh.completion_reason = None
-        fresh.drop_reason = reason
-        fresh.urgent = False
-        fresh.queue_position = None
-        store.update(fresh)
-        store.drop_active_merge_units_owned_by(task.id)
-        retired.append(task.id)
+        drop_result = drop_task_with_scope_cascade(store=store, task=fresh, reason=reason)
+        if drop_result.dropped_task_ids:
+            retired.extend(drop_result.dropped_task_ids)
+        elif not drop_result.deferred_task_ids:
+            retired.append(task.id)
     return tuple(retired)
 
 
@@ -1133,26 +1245,15 @@ def _drop_main_verify_remediation_task(
     store: SqliteTaskStore,
     task_id: str | None,
     reason: str,
-) -> bool:
+) -> TaskDropCascadeResult:
     if task_id is None:
-        return False
+        return TaskDropCascadeResult(dropped_task_ids=())
     fresh = store.get(task_id)
     if fresh is None or not _main_verify_remediation_task_is_reusable(store, fresh):
-        return False
+        return TaskDropCascadeResult(dropped_task_ids=())
     if fresh.status == "in_progress":
-        return False
-    fresh.status = "dropped"
-    fresh.started_at = None
-    fresh.running_pid = None
-    fresh.completed_at = datetime.now(UTC)
-    fresh.failure_reason = None
-    fresh.completion_reason = None
-    fresh.drop_reason = reason
-    fresh.urgent = False
-    fresh.queue_position = None
-    store.update(fresh)
-    store.drop_active_merge_units_owned_by(task_id)
-    return True
+        return TaskDropCascadeResult(dropped_task_ids=(), deferred_task_ids=(task_id,))
+    return drop_task_with_scope_cascade(store=store, task=fresh, reason=reason)
 
 
 def _retire_greenlit_main_verify_remediation_active_tasks(
@@ -1180,14 +1281,19 @@ def _retire_greenlit_main_verify_remediation_active_tasks(
             elif task.status == "in_progress":
                 continue
             else:
-                if _drop_main_verify_remediation_task(
+                drop_result = _drop_main_verify_remediation_task(
                     store=store,
                     task_id=task.id,
                     reason=MAIN_VERIFY_REMEDIATION_MOOT_GREEN_REASON,
-                ):
-                    assert task.id is not None
-                    retired.append(task.id)
-                should_clear_active = True
+                )
+                retired.extend(drop_result.dropped_task_ids)
+                deferred = list(drop_result.deferred_task_ids)
+                if deferred:
+                    log.emit(
+                        "REMEDY",
+                        "deferred green-cleared active main-verify remediation rows: " + ", ".join(deferred),
+                    )
+                should_clear_active = bool(drop_result.dropped_task_ids)
         if should_clear_active:
             store.clear_main_verify_remediation_active_task(
                 signature=attempt_state.signature,
@@ -1740,7 +1846,7 @@ def _consume_merged_main_verify_remediation_attempt(
             status="dropped",
             reason="main verify remained red after merged remediation; attempt consumed",
         )
-    phase = remediation.failing_phase or remediation.signature
+    phase = verify_phase_value(getattr(remediation, "failing_phases", ()), fallback=remediation.signature)
     fingerprint_label = remediation.tree_fingerprint or "unavailable"
     log.emit(
         "REMEDY",
@@ -1804,7 +1910,7 @@ def _ensure_main_verify_remediation_task(
                 signature=identity.signature,
                 reason=MAIN_VERIFY_REMEDIATION_MOOT_GREEN_REASON,
             )
-            green_phase = remediation.failing_phase or remediation.signature
+            green_phase = verify_phase_value(getattr(remediation, "failing_phases", ()), fallback=remediation.signature)
             log.emit(
                 "REMEDY",
                 f"{active_owner.id}: remediation verify passed for {green_phase} on "
@@ -1900,7 +2006,7 @@ def _ensure_main_verify_remediation_task(
                 last_observed_head_sha=state.head_sha,
                 last_observed_failure=remediation.failure,
             )
-            phase = remediation.failing_phase or remediation.signature
+            phase = verify_phase_value(getattr(remediation, "failing_phases", ()), fallback=remediation.signature)
             fingerprint_label = remediation.tree_fingerprint or "unavailable"
             log.emit(
                 "WARN",
@@ -1914,7 +2020,7 @@ def _ensure_main_verify_remediation_task(
                 dispatch_state_changed=True,
             )
         consumed_count = attempt_state.consumed_attempt_count if attempt_state is not None else 0
-        phase = remediation.failing_phase or remediation.signature
+        phase = verify_phase_value(getattr(remediation, "failing_phases", ()), fallback=remediation.signature)
         fingerprint_label = remediation.tree_fingerprint or "unavailable"
         log.emit(
             "REMEDY",
@@ -1948,6 +2054,67 @@ def _ensure_main_verify_remediation_task(
     )
     existing = selection.canonical
     if existing is not None:
+        existing_identity = _main_verify_remediation_identity_from_prompt(existing.prompt)
+        if existing_identity is None:
+            existing_identity = identity
+        attempt_state = store.get_main_verify_remediation_attempt_state(
+            signature=existing_identity.signature,
+            tree_fingerprint=_main_verify_remediation_ledger_fingerprint(existing_identity.tree_fingerprint),
+        )
+        existing_phases = _main_verify_remediation_phase_set(existing_identity)
+        requested_phases = _main_verify_remediation_phase_set(identity)
+        uses_broader_existing_scope = (
+            existing_identity.signature != identity.signature
+            and bool(existing_phases and requested_phases and existing_phases.issuperset(requested_phases))
+        )
+        uses_narrower_existing_scope = (
+            existing_identity.signature != identity.signature
+            and bool(existing_phases and requested_phases and existing_phases.issubset(requested_phases))
+        )
+        uses_partial_overlap_scope = (
+            existing_identity.signature != identity.signature
+            and bool(existing_phases and requested_phases and existing_phases.intersection(requested_phases))
+            and not uses_broader_existing_scope
+            and not uses_narrower_existing_scope
+        )
+        union_identity = (
+            _main_verify_remediation_union_identity(existing_identity, identity) if uses_partial_overlap_scope else None
+        )
+        if (uses_narrower_existing_scope or uses_partial_overlap_scope) and existing.status == "in_progress":
+            log.emit(
+                "REMEDY",
+                f"{existing.id}: live remediation for {existing_identity.signature} overlaps current "
+                f"{identity.signature}; leaving worker unchanged and deferring uncovered phases",
+            )
+            return _MainVerifyRemediationEnsureResult(
+                task=existing,
+                outcome="reused_live",
+                dispatch_state_changed=False,
+            )
+        expanded_identity = union_identity if union_identity is not None else identity
+        if (uses_narrower_existing_scope or uses_partial_overlap_scope) and existing.id is not None:
+            attempt_state = store.rekey_main_verify_remediation_attempt_state(
+                old_signature=existing_identity.signature,
+                old_tree_fingerprint=_main_verify_remediation_ledger_fingerprint(existing_identity.tree_fingerprint),
+                new_signature=expanded_identity.signature,
+                new_tree_fingerprint=ledger_fingerprint,
+                active_task_id=existing.id,
+                last_observed_head_sha=state.head_sha,
+                last_observed_failure=remediation.failure,
+            )
+            existing_identity = expanded_identity
+            existing_phases = _main_verify_remediation_phase_set(expanded_identity)
+            log.emit(
+                "REMEDY",
+                f"{existing.id}: expanded main-verify remediation scope to {expanded_identity.signature}; "
+                "preserved consumed attempts",
+            )
+        selected_remediation = remediation
+        if uses_broader_existing_scope or uses_partial_overlap_scope or uses_narrower_existing_scope:
+            selected_remediation = _main_verify_remediation_with_identity(
+                remediation,
+                existing_identity,
+            )
         merged_legacy_tags = _merge_main_verify_remediation_tags(
             [tuple(task.tags or ()) for task in (existing, *selection.duplicates)],
             scope_tags=None,
@@ -1957,18 +2124,18 @@ def _ensure_main_verify_remediation_task(
             attempt_limit=attempt_limit,
             attempt_state=attempt_state,
         )
-        desired_prompt = _main_verify_remediation_prompt(
-            remediation,
+        desired_prompt = existing.prompt if uses_broader_existing_scope else _main_verify_remediation_prompt(
+            selected_remediation,
             head_sha=state.head_sha,
             attempts_spent=spent_attempts,
             attempt_limit=attempt_limit,
         )
         desired_tags = _merge_main_verify_remediation_tags([merged_legacy_tags], tags)
-        should_refresh_existing_metadata = existing.status != "in_progress"
+        should_refresh_existing_metadata = existing.status != "in_progress" and not uses_broader_existing_scope
         _preflight_main_verify_remediation_route(
             config=config,
             task=existing,
-            remediation=remediation,
+            remediation=selected_remediation,
             head_sha=state.head_sha,
             desired_tags=desired_tags,
             attempts_spent=spent_attempts,
@@ -1988,7 +2155,7 @@ def _ensure_main_verify_remediation_task(
                 config=config,
                 store=store,
                 task=existing,
-                remediation=remediation,
+                remediation=selected_remediation,
                 head_sha=state.head_sha,
                 desired_tags=desired_tags,
                 spent_attempts=spent_attempts,
@@ -2018,7 +2185,7 @@ def _ensure_main_verify_remediation_task(
                 config=config,
                 store=store,
                 task=existing,
-                remediation=remediation,
+                remediation=selected_remediation,
                 head_sha=state.head_sha,
                 desired_tags=desired_tags,
                 tags=tags,
@@ -2036,7 +2203,7 @@ def _ensure_main_verify_remediation_task(
             )
         if existing.id is not None:
             store.record_main_verify_remediation_active_task(
-                signature=identity.signature,
+                signature=existing_identity.signature,
                 tree_fingerprint=ledger_fingerprint,
                 task_id=existing.id,
                 last_observed_head_sha=state.head_sha,
@@ -2149,18 +2316,12 @@ def _transition_non_live_main_verify_remediations(
         fresh = store.get(task.id)
         if fresh is None or not _main_verify_remediation_task_is_moot_retirement_candidate(fresh):
             continue
-        fresh.status = "dropped"
-        fresh.started_at = None
-        fresh.running_pid = None
-        fresh.completed_at = datetime.now(UTC)
-        fresh.failure_reason = None
-        fresh.completion_reason = None
-        fresh.drop_reason = reason
-        fresh.urgent = False
-        fresh.queue_position = None
-        store.update(fresh)
-        store.drop_active_merge_units_owned_by(task.id)
-        transitioned.append(task.id)
+        drop_result = drop_task_with_scope_cascade(store=store, task=fresh, reason=reason)
+        if drop_result.dropped_task_ids:
+            transitioned.extend(drop_result.dropped_task_ids)
+        elif not drop_result.deferred_task_ids:
+            transitioned.append(task.id)
+        deferred_live.extend(drop_result.deferred_task_ids)
     return _MainVerifyMootRetireResult(
         retired_ids=tuple(transitioned),
         deferred_live_ids=tuple(deferred_live),
@@ -2285,7 +2446,7 @@ def _maybe_file_main_verify_remediation(
         tags=tags,
         any_tag=any_tag,
     )
-    phase = remediation.failing_phase or remediation.signature
+    phase = verify_phase_value(getattr(remediation, "failing_phases", ()), fallback=remediation.signature)
     attempt_limit = _main_verify_remediation_attempt_limit(config)
     if result.outcome == "exhausted":
         exhausted_task = result.task.id if result.task is not None and result.task.id is not None else "no-open-task"
@@ -2405,7 +2566,7 @@ def _consume_unmerged_main_verify_remediation_attempt(
         tags=tags,
         any_tag=any_tag,
     )
-    phase = remediation.failing_phase or remediation.signature
+    phase = verify_phase_value(getattr(remediation, "failing_phases", ()), fallback=remediation.signature)
     fingerprint_label = remediation.tree_fingerprint or "unavailable"
     if queue_result.outcome == "exhausted":
         return _MainVerifyRemediationConsumeResult(
@@ -2514,23 +2675,36 @@ def _handle_post_merge_main_verify_remediation_verdict(
         merged_identity,
         current_identity,
     )
+    overlapping_failed_identity = current_identity is not None and _main_verify_remediation_signatures_overlap(
+        merged_identity,
+        current_identity,
+    )
     head_sha = getattr(check.state, "head_sha", None)
 
-    if check.merges_halted and current_remediation is not None and same_identity:
+    if check.merges_halted and current_remediation is not None and (same_identity or overlapping_failed_identity):
+        consumed_remediation = current_remediation
+        if current_identity is not None and current_identity.signature != merged_identity.signature:
+            consumed_remediation = _main_verify_remediation_with_identity(
+                current_remediation,
+                merged_identity,
+            )
         consume_result = _consume_merged_main_verify_remediation_attempt(
             config=config,
             store=store,
             log=log,
             task=remediation_task,
-            remediation=current_remediation,
+            remediation=consumed_remediation,
             state=check.state,
             reason="post-merge verify still red",
         )
         attempt_state = consume_result.attempt_state
         consumed_count = attempt_state.consumed_attempt_count if attempt_state is not None else 0
         attempt_budget = config.watch.main_verify_remediation_max_attempts
-        phase = current_remediation.failing_phase or current_remediation.signature
-        fingerprint_label = current_remediation.tree_fingerprint or "unavailable"
+        phase = verify_phase_value(
+            getattr(consumed_remediation, "failing_phases", ()),
+            fallback=consumed_remediation.signature,
+        )
+        fingerprint_label = consumed_remediation.tree_fingerprint or "unavailable"
         log.emit(
             "REMEDY",
             f"{remediation_task.id}: post-merge verify still red for {phase} on {fingerprint_label}; "
@@ -2539,12 +2713,26 @@ def _handle_post_merge_main_verify_remediation_verdict(
         return
 
     clear_detail = None
-    if not check.merges_halted:
+    if _main_verify_remediation_covered_phases_passed(
+        identity=merged_identity,
+        state=check.state,
+        gate_passed=not check.merges_halted,
+    ):
         clear_detail = "post-merge verify green; cleared active remediation state"
     elif current_remediation is not None:
-        clear_detail = "post-merge verify red for a different remediation identity; cleared active state"
+        log.emit(
+            "REMEDY",
+            f"{remediation_task.id}: post-merge verify did not prove every covered phase green for "
+            f"{merged_identity.signature}; preserving active remediation state",
+        )
+        return
     else:
-        clear_detail = "post-merge verify red without remediation identity; cleared active state"
+        log.emit(
+            "REMEDY",
+            f"{remediation_task.id}: post-merge verify lacked phase proof for {merged_identity.signature}; "
+            "preserving active remediation state",
+        )
+        return
 
     store.clear_main_verify_remediation_active_task(
         signature=merged_identity.signature,
@@ -4956,7 +5144,11 @@ def _candidate_rework_identity(display_task: DbTask, check: CandidateIntegration
     )
     signature = (
         getattr(check.remediation, "signature", None)
-        or evidence.failing_phase
+        or verify_failure_signature(
+            failing_phases=getattr(evidence, "failing_phases", ()),
+            verify_status=evidence.verify_status,
+            verify_exit_status=evidence.verify_exit_status,
+        )
         or evidence.verify_exit_status
         or evidence.verify_status
         or "unknown"
@@ -4982,7 +5174,8 @@ def _candidate_rework_prompt(
 ) -> str:
     evidence = check.evidence
     verify_command = evidence.verify_command or "(verify_command unavailable)"
-    failing_phase = evidence.failing_phase or "unknown"
+    failing_phases = normalize_verify_phase_names(getattr(evidence, "failing_phases", ()))
+    failing_phase_label = verify_phase_value(failing_phases, fallback="unknown")
     failure = evidence.failure or "verify gate failed without a structured failure message"
     fingerprint = evidence.tree_fingerprint or "unavailable"
     batch_context_lines: list[str] = []
@@ -5004,7 +5197,7 @@ def _candidate_rework_prompt(
         f"{batch_context_block}"
         f"Tree fingerprint: {fingerprint}\n"
         f"Verify command: {verify_command}\n"
-        f"Failing phase: {failing_phase}\n"
+        f"Failing phases: {failing_phase_label}\n"
         f"Failure: {failure}\n\n"
         "Fix the branch so it passes the project verify command, then rerun that verify command before completion."
     )
@@ -7537,16 +7730,16 @@ def _run_watch_main_integration_verify(
     )
     elapsed = _format_watch_duration(time.perf_counter() - started)
     state = getattr(check, "state", None)
-    phase = getattr(state, "failing_phase", None)
+    phases = normalize_verify_phase_names(getattr(state, "failing_phases", ()))
     remediation = getattr(check, "remediation", None)
-    if not phase and remediation is not None:
-        phase = getattr(remediation, "failing_phase", None)
+    if not phases and remediation is not None:
+        phases = normalize_verify_phase_names(getattr(remediation, "failing_phases", ()))
     gate_enabled = getattr(state, "gate_enabled", True)
     verdict = _main_verify_completion_verdict(check)
     cached_prefix = "cached " if not getattr(check, "performed_verify", True) else ""
     phase_suffix = ""
     if verdict == "red":
-        phase_suffix = f"; phase {phase or 'unknown'}"
+        phase_suffix = f"; {verify_phase_label(phases, fallback='phase unknown')}"
     runs = getattr(check, "verify_runs", None)
     suite_ran = getattr(check, "performed_verify", True) and gate_enabled is not False
     runs_suffix = f"; attempts {runs}/{total_attempts}" if suite_ran and isinstance(runs, int) and runs > 0 else ""
@@ -22517,11 +22710,10 @@ def cmd_main_verify(args: argparse.Namespace) -> int:
     )
     verify_status = getattr(check.state, "verify_status", None)
     status = verify_status if isinstance(verify_status, str) and verify_status else "unknown"
-    failing_phase = getattr(check.state, "failing_phase", None)
+    failing_phases = normalize_verify_phase_names(getattr(check.state, "failing_phases", ()))
     phase = (
-        f" phase={failing_phase}"
-        if isinstance(failing_phase, str)
-        and failing_phase
+        f" phases={','.join(failing_phases)}"
+        if failing_phases
         and status not in {"passed", "unavailable"}
         and getattr(check.state, "gate_enabled", None) is not False
         else ""

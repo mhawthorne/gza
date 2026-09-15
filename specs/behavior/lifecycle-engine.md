@@ -987,8 +987,8 @@ failure *and* actionable merge/review work remains eligible for the latter.
   [main-verify-self-heal.md](main-verify-self-heal.md) before halting merges or assigning a
   remediation identity. A red verdict MUST halt further merges for the cycle and surface
   one durable needs-attention signal with reason `main-integration-verify-red` that names
-  the failing local target SHA and, when structured phase output exists, the failing
-  phase. Schema-runtime skew MUST block only merge actions that require current target
+  the failing local target SHA and, when structured phase output exists, every failed
+  phase covered by the canonical red-main remediation identity. Schema-runtime skew MUST block only merge actions that require current target
   verify evidence for the affected target lane, and MUST surface as non-red unavailable
   evidence with reason `main-integration-verify-schema-runtime-skew`; it MUST NOT route
   through `main-integration-verify-red`, red-main remediation, `red_since`, or

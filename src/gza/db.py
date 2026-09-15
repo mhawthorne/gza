@@ -77,6 +77,7 @@ __all__ = [
     "SchemaIntegrityError",
     "Task",
     "TaskArtifact",
+    "TaskDropCascadeMutationResult",
     "MergeUnit",
     "MergeUnitResolutionPlan",
     "MergeUnitResolutionDiagnostic",
@@ -2197,6 +2198,15 @@ class MergeUnitSupersedeResult:
     completion_reason: str
     affected_task_ids: tuple[str, ...]
     changed: bool
+
+
+@dataclass(frozen=True)
+class TaskDropCascadeMutationResult:
+    """Rows and merge units affected by a scope-aware task drop."""
+
+    dropped_task_ids: tuple[str, ...]
+    deferred_task_ids: tuple[str, ...]
+    tombstoned_merge_unit_ids: tuple[str, ...]
 
 
 def _task_is_actionable_merge_unit_member(task: "Task", unit: MergeUnit) -> bool:
@@ -12158,6 +12168,217 @@ class SqliteTaskStore:
             state for row in rows if (state := self._row_to_main_verify_remediation_attempt_state(row)) is not None
         )
 
+    def rekey_main_verify_remediation_attempt_state(
+        self,
+        *,
+        old_signature: str,
+        old_tree_fingerprint: str | None,
+        new_signature: str,
+        new_tree_fingerprint: str | None,
+        active_task_id: str | None = None,
+        last_observed_head_sha: str | None = None,
+        last_observed_failure: str | None = None,
+    ) -> MainVerifyRemediationAttemptState | None:
+        """Move a remediation attempt ledger row to a replacement signature."""
+        if not self.supports_main_verify_remediation_attempts():
+            return None
+        old_fingerprint = _normalize_main_verify_tree_fingerprint(old_tree_fingerprint)
+        new_fingerprint = _normalize_main_verify_tree_fingerprint(new_tree_fingerprint)
+        if old_signature == new_signature and old_fingerprint == new_fingerprint:
+            return self.record_main_verify_remediation_active_task(
+                signature=new_signature,
+                tree_fingerprint=new_tree_fingerprint,
+                task_id=active_task_id,
+                last_observed_head_sha=last_observed_head_sha,
+                last_observed_failure=last_observed_failure,
+            )
+        updated_at = _format_db_timestamp(datetime.now(UTC))
+        assert updated_at is not None
+        with self._write_transaction() as conn:
+            old_row = conn.execute(
+                """
+                SELECT *
+                FROM main_verify_remediation_attempts
+                WHERE project_id = ?
+                  AND signature = ?
+                  AND tree_fingerprint = ?
+                """,
+                (self._project_id, old_signature, old_fingerprint),
+            ).fetchone()
+            old_state = self._row_to_main_verify_remediation_attempt_state(old_row)
+            if old_state is None:
+                conn.execute(
+                    """
+                    INSERT INTO main_verify_remediation_attempts(
+                        project_id,
+                        signature,
+                        tree_fingerprint,
+                        consumed_attempt_count,
+                        active_task_id,
+                        exhausted_at,
+                        last_consumed_task_id,
+                        last_observed_head_sha,
+                        last_observed_failure,
+                        greenlit_while_in_progress_task_id,
+                        greenlit_while_in_progress_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, 0, ?, NULL, NULL, ?, ?, NULL, NULL, ?)
+                    ON CONFLICT(project_id, signature, tree_fingerprint)
+                    DO UPDATE SET
+                        active_task_id = excluded.active_task_id,
+                        last_observed_head_sha = excluded.last_observed_head_sha,
+                        last_observed_failure = excluded.last_observed_failure,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        self._project_id,
+                        new_signature,
+                        new_fingerprint,
+                        active_task_id,
+                        last_observed_head_sha,
+                        last_observed_failure,
+                        updated_at,
+                    ),
+                )
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM main_verify_remediation_attempts
+                    WHERE project_id = ?
+                      AND signature = ?
+                      AND tree_fingerprint = ?
+                    """,
+                    (self._project_id, new_signature, new_fingerprint),
+                ).fetchone()
+                return self._row_to_main_verify_remediation_attempt_state(row)
+            new_row = conn.execute(
+                """
+                SELECT *
+                FROM main_verify_remediation_attempts
+                WHERE project_id = ?
+                  AND signature = ?
+                  AND tree_fingerprint = ?
+                """,
+                (self._project_id, new_signature, new_fingerprint),
+            ).fetchone()
+            new_state = self._row_to_main_verify_remediation_attempt_state(new_row)
+            consumed_count = max(
+                old_state.consumed_attempt_count,
+                new_state.consumed_attempt_count if new_state is not None else 0,
+            )
+            exhausted_at = old_state.exhausted_at or (new_state.exhausted_at if new_state is not None else None)
+            last_consumed_task_id = old_state.last_consumed_task_id or (
+                new_state.last_consumed_task_id if new_state is not None else None
+            )
+            conn.execute(
+                """
+                INSERT INTO main_verify_remediation_attempts(
+                    project_id,
+                    signature,
+                    tree_fingerprint,
+                    consumed_attempt_count,
+                    active_task_id,
+                    exhausted_at,
+                    last_consumed_task_id,
+                    last_observed_head_sha,
+                    last_observed_failure,
+                    greenlit_while_in_progress_task_id,
+                    greenlit_while_in_progress_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+                ON CONFLICT(project_id, signature, tree_fingerprint)
+                DO UPDATE SET
+                    consumed_attempt_count = MAX(
+                        main_verify_remediation_attempts.consumed_attempt_count,
+                        excluded.consumed_attempt_count
+                    ),
+                    active_task_id = excluded.active_task_id,
+                    exhausted_at = excluded.exhausted_at,
+                    last_consumed_task_id = COALESCE(
+                        excluded.last_consumed_task_id,
+                        main_verify_remediation_attempts.last_consumed_task_id
+                    ),
+                    last_observed_head_sha = excluded.last_observed_head_sha,
+                    last_observed_failure = excluded.last_observed_failure,
+                    greenlit_while_in_progress_task_id = NULL,
+                    greenlit_while_in_progress_at = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    self._project_id,
+                    new_signature,
+                    new_fingerprint,
+                    consumed_count,
+                    active_task_id,
+                    _format_db_timestamp(exhausted_at),
+                    last_consumed_task_id,
+                    last_observed_head_sha,
+                    last_observed_failure,
+                    updated_at,
+                ),
+            )
+            consumed_rows = conn.execute(
+                """
+                SELECT task_id, consumed_at
+                FROM main_verify_remediation_consumed_task_ids
+                WHERE project_id = ?
+                  AND signature = ?
+                  AND tree_fingerprint = ?
+                """,
+                (self._project_id, old_signature, old_fingerprint),
+            ).fetchall()
+            for consumed_row in consumed_rows:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO main_verify_remediation_consumed_task_ids(
+                        project_id,
+                        signature,
+                        tree_fingerprint,
+                        task_id,
+                        consumed_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self._project_id,
+                        new_signature,
+                        new_fingerprint,
+                        consumed_row["task_id"],
+                        consumed_row["consumed_at"],
+                    ),
+                )
+            conn.execute(
+                """
+                DELETE FROM main_verify_remediation_consumed_task_ids
+                WHERE project_id = ?
+                  AND signature = ?
+                  AND tree_fingerprint = ?
+                """,
+                (self._project_id, old_signature, old_fingerprint),
+            )
+            conn.execute(
+                """
+                DELETE FROM main_verify_remediation_attempts
+                WHERE project_id = ?
+                  AND signature = ?
+                  AND tree_fingerprint = ?
+                """,
+                (self._project_id, old_signature, old_fingerprint),
+            )
+            row = conn.execute(
+                """
+                SELECT *
+                FROM main_verify_remediation_attempts
+                WHERE project_id = ?
+                  AND signature = ?
+                  AND tree_fingerprint = ?
+                """,
+                (self._project_id, new_signature, new_fingerprint),
+            ).fetchone()
+        return self._row_to_main_verify_remediation_attempt_state(row)
+
     def record_main_verify_remediation_active_task(
         self,
         *,
@@ -13132,6 +13353,163 @@ class SqliteTaskStore:
             if tombstoned is not None:
                 dropped.append(tombstoned)
         return dropped
+
+    def drop_task_with_scope_cascade(
+        self,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        mode: Literal["operator", "automatic"] = "operator",
+    ) -> TaskDropCascadeMutationResult:
+        """Atomically drop one task plus same-outcome work proven by merge-unit ownership."""
+        if mode not in {"operator", "automatic"}:
+            raise ValueError(f"Unsupported drop cascade mode: {mode}")
+        supports_merge_units = self.supports_merge_units()
+        now_dt = datetime.now(UTC)
+        now = _format_db_timestamp(now_dt)
+        assert now is not None
+
+        with self._write_transaction() as conn:
+            selected_row = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
+            ).fetchone()
+            if selected_row is None:
+                return TaskDropCascadeMutationResult((), (), ())
+            selected = self._rows_to_tasks(conn, [selected_row])[0]
+            closure: dict[str, tuple[Task, str | None]] = {task_id: (selected, reason)}
+            deferred: list[str] = []
+
+            if supports_merge_units:
+                selected_unit_row = conn.execute(
+                    f"""
+                    SELECT mu.*
+                    FROM merge_unit_tasks mut
+                    JOIN merge_units mu
+                      ON mu.project_id = mut.project_id
+                     AND mu.id = mut.merge_unit_id
+                    WHERE mut.project_id = ?
+                      AND mut.task_id = ?
+                      AND {active_merge_unit_where_sql("mu")}
+                    ORDER BY mu.created_at DESC, mu.id DESC
+                    LIMIT 1
+                    """,
+                    (self._project_id, task_id),
+                ).fetchone()
+                selected_unit = self._row_to_merge_unit(selected_unit_row)
+                if selected_unit is not None and selected_unit.owner_task_id == task_id:
+                    member_rows = conn.execute(
+                        """
+                        SELECT t.*
+                        FROM merge_unit_tasks mut
+                        JOIN tasks t
+                          ON t.project_id = mut.project_id
+                         AND t.id = mut.task_id
+                        WHERE mut.project_id = ?
+                          AND mut.merge_unit_id = ?
+                        ORDER BY t.created_at ASC, t.id ASC
+                        """,
+                        (self._project_id, selected_unit.id),
+                    ).fetchall()
+                    for member in self._rows_to_tasks(conn, member_rows):
+                        if member.id is None:
+                            continue
+                        if member.status == "in_progress" and member.id != task_id and mode == "automatic":
+                            deferred.append(member.id)
+                            continue
+                        cascade_reason = (
+                            reason
+                            if member.id == task_id
+                            else f"cascaded from {task_id}: {reason or 'dropped'}"
+                        )
+                        closure[member.id] = (member, cascade_reason)
+                    if deferred and mode == "automatic":
+                        return TaskDropCascadeMutationResult(
+                            dropped_task_ids=(),
+                            deferred_task_ids=tuple(dict.fromkeys(deferred)),
+                            tombstoned_merge_unit_ids=(),
+                        )
+
+            transitioned: list[str] = []
+            for candidate_id, (candidate, candidate_reason) in closure.items():
+                if candidate.status == "dropped":
+                    if candidate_id == task_id and reason and candidate.drop_reason != reason:
+                        conn.execute(
+                            """
+                            UPDATE tasks
+                            SET drop_reason = ?
+                            WHERE project_id = ?
+                              AND id = ?
+                            """,
+                            (reason, self._project_id, candidate_id),
+                        )
+                        transitioned.append(candidate_id)
+                    continue
+                completed_at = candidate.completed_at or now_dt
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'dropped',
+                        completed_at = ?,
+                        started_at = NULL,
+                        running_pid = NULL,
+                        drop_reason = ?,
+                        urgent = 0,
+                        queue_position = NULL
+                    WHERE project_id = ?
+                      AND id = ?
+                    """,
+                    (
+                        _format_db_timestamp(completed_at),
+                        candidate_reason,
+                        self._project_id,
+                        candidate_id,
+                    ),
+                )
+                transitioned.append(candidate_id)
+
+            tombstoned: list[str] = []
+            if supports_merge_units and transitioned:
+                placeholders = ",".join("?" for _ in transitioned)
+                unit_rows = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM merge_units
+                    WHERE project_id = ?
+                      AND owner_task_id IN ({placeholders})
+                      AND {active_merge_unit_where_sql("merge_units")}
+                      AND state IN ({",".join("?" for _ in MERGE_UNIT_ACTIONABLE_STATES)})
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    (self._project_id, *transitioned, *sorted(MERGE_UNIT_ACTIONABLE_STATES)),
+                ).fetchall()
+                for row in unit_rows:
+                    unit = self._row_to_merge_unit(row)
+                    if unit is None:
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE merge_units
+                        SET state = 'dropped',
+                            merged_at = NULL,
+                            merged_by_task_id = NULL,
+                            merge_source = NULL,
+                            updated_at = ?
+                        WHERE project_id = ?
+                          AND id = ?
+                          AND state = ?
+                          AND superseded_by_unit_id IS NULL
+                        """,
+                        (now, self._project_id, unit.id, unit.state),
+                    )
+                    tombstoned.append(unit.id)
+            self._touch_tasks_updated_at(conn, transitioned, now=now_dt)
+
+        return TaskDropCascadeMutationResult(
+            dropped_task_ids=tuple(dict.fromkeys(transitioned)),
+            deferred_task_ids=tuple(dict.fromkeys(deferred)),
+            tombstoned_merge_unit_ids=tuple(dict.fromkeys(tombstoned)),
+        )
 
     def _legacy_merge_status_owner_for_unit(self, unit: MergeUnit) -> Task | None:
         owner_task: Task | None = self.get(unit.owner_task_id) if unit.owner_task_id is not None else None
@@ -16483,6 +16861,10 @@ class SqliteTaskStore:
         """Mark a task as completed."""
         if terminal_merge_state is not None and terminal_merge_state not in {"empty", "redundant"}:
             raise ValueError("terminal_merge_state must be one of {'empty', 'redundant'} when provided")
+        if task.id is not None:
+            current = self.get(task.id)
+            if current is not None and current.status == "dropped":
+                return
         task.status = "completed"
         task.completed_at = datetime.now(UTC)
         task.running_pid = None

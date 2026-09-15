@@ -140,7 +140,7 @@ def _completed_main_verify_remediation(store: SqliteTaskStore, *, branch: str) -
     remediation = store.add(
         "Fix local main integration verify phase `unit`\n\n"
         "Remediation kind: fix\n"
-        "Failure signature: phase:unit\n"
+        "Failure signature: phases:unit\n"
         "Tree fingerprint: fp-unit-a\n",
         task_type="implement",
         tags=("system", MAIN_INTEGRATION_VERIFY_TAG),
@@ -7237,10 +7237,10 @@ def test_query_lineage_owner_rows_includes_current_main_verify_red_attention(tmp
     main_verify_task.review_verify_head_sha = "abc123"
     main_verify_task.output_content = json.dumps(
         {
-            "alert_message": "main verify RED - merges halted; phase `unit` failing",
+            "alert_message": "main verify RED - merges halted; phase unit failing",
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
-            "failing_phase": "unit",
+            "failing_phases": ["unit"], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -7270,13 +7270,13 @@ def test_query_lineage_owner_rows_includes_current_main_verify_red_attention(tmp
     assert row.owner_task.id == main_verify_task.id
     assert row.next_action is not None
     assert row.next_action["needs_attention_reason"] == MAIN_INTEGRATION_VERIFY_REASON
-    assert "main verify RED at `abc123` - merges halted; phase `unit` failing" in row.next_action["description"]
+    assert "main verify RED at `abc123` - merges halted; phase unit failing" in row.next_action["description"]
 
 
 @pytest.mark.parametrize(
     ("verify_status", "verify_exit_status", "alert_message", "failing_phase"),
     [
-        ("failed", "1", "main verify RED at `abc123` - merges halted; phase `unit` failing", "unit"),
+        ("failed", "1", "main verify RED at `abc123` - merges halted; phase unit failing", "unit"),
         (
             "unavailable",
             "tree fingerprint unavailable",
@@ -7313,7 +7313,8 @@ def test_query_lineage_owner_rows_ignores_ambiguous_short_main_verify_ref(
             "alert_message": alert_message,
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
-            "failing_phase": failing_phase,
+            "failing_phases": [failing_phase] if failing_phase else [],
+            "phase_results": [{"name": failing_phase, "status": "failed"}] if failing_phase else [],
             "gate_enabled": True,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -7370,10 +7371,10 @@ def test_query_lineage_owner_rows_sanitizes_current_malformed_main_verify_legacy
     main_verify_task.review_verify_head_sha = "abc123"
     main_verify_task.output_content = json.dumps(
         {
-            "alert_message": "main verify RED at `abc123` - merges halted; phase `unit` failing",
+            "alert_message": "main verify RED at `abc123` - merges halted; phase unit failing",
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
-            "failing_phase": "unit",
+            "failing_phases": ["unit"], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -7436,7 +7437,7 @@ def test_query_lineage_owner_rows_keeps_current_missing_main_verify_evidence_vis
             "alert_message": None,
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
-            "failing_phase": None,
+            "failing_phases": [], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -7506,7 +7507,7 @@ def test_query_lineage_owner_rows_renders_wholly_missing_main_verify_evidence_as
             "alert_message": None,
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
-            "failing_phase": None,
+            "failing_phases": [], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -7565,10 +7566,10 @@ def test_query_lineage_owner_rows_uses_exact_main_ref_for_current_main_verify_pr
     main_verify_task.review_verify_head_sha = "aaaaaaaaaaaa1111"
     main_verify_task.output_content = json.dumps(
         {
-            "alert_message": "main verify RED at `aaaaaaaaaaaa` - merges halted; phase `unit` failing",
+            "alert_message": "main verify RED at `aaaaaaaaaaaa` - merges halted; phase unit failing",
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
-            "failing_phase": "unit",
+            "failing_phases": ["unit"], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "aaaaaaaaaaaa1111",
             "tree_fingerprint": "fp",
@@ -7622,10 +7623,10 @@ def test_query_lineage_owner_rows_weakens_matching_fingerprint_red_when_exact_ta
     main_verify_task.review_verify_head_sha = "aaaaaaaaaaaa1111"
     main_verify_task.output_content = json.dumps(
         {
-            "alert_message": "main verify RED at `aaaaaaaaaaaa` - merges halted; phase `unit` failing",
+            "alert_message": "main verify RED at `aaaaaaaaaaaa` - merges halted; phase unit failing",
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
-            "failing_phase": "unit",
+            "failing_phases": ["unit"], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "aaaaaaaaaaaa1111",
             "tree_fingerprint": "fp",
@@ -7737,7 +7738,7 @@ def test_query_lineage_owner_rows_merges_verified_main_verify_remediation_withou
     remediation = store.add(
         "Fix local main integration verify phase `unit`\n\n"
         "Remediation kind: fix\n"
-        "Failure signature: phase:unit\n"
+        "Failure signature: phases:unit\n"
         "Tree fingerprint: fp-unit-a\n",
         task_type="implement",
         tags=("system", MAIN_INTEGRATION_VERIFY_TAG),
@@ -8037,10 +8038,10 @@ def test_query_lineage_owner_rows_omits_stale_current_main_verify_red_attention_
     main_verify_task.review_verify_head_sha = "abc123"
     main_verify_task.output_content = json.dumps(
         {
-            "alert_message": "main verify RED at `abc123` - merges halted; phase `unit` failing",
+            "alert_message": "main verify RED at `abc123` - merges halted; phase unit failing",
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
-            "failing_phase": "unit",
+            "failing_phases": ["unit"], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -8088,9 +8089,9 @@ def test_query_lineage_owner_rows_omits_stale_current_main_verify_red_attention_
     main_verify_task.review_verify_failure = "verify_command failed"
     main_verify_task.review_verify_head_sha = "abc123"
     main_verify_task.output_content = (
-        '{"alert_message":"main verify RED at `abc123` - merges halted; phase `unit` failing",'
+        '{"alert_message":"main verify RED at `abc123` - merges halted; phase unit failing",'
         '"captured_at":"2026-06-23T00:00:00+00:00",'
-        '"failing_phase":"unit",'
+        '"failing_phases":["unit"],"phase_results":[],'
         '"gate_enabled":true,'
         '"head_sha":"abc123",'
         '"tree_fingerprint":"fp",'
@@ -8137,7 +8138,7 @@ def test_query_lineage_owner_rows_omits_stale_current_main_verify_red_attention_
     main_verify_task.review_verify_head_sha = "abc123"
     main_verify_task.output_content = json.dumps(
         {
-            "alert_message": "main verify RED at `abc123` - merges halted; phase `unit` failing",
+            "alert_message": "main verify RED at `abc123` - merges halted; phase unit failing",
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": {
                 "runner_class": "container",
@@ -8145,7 +8146,7 @@ def test_query_lineage_owner_rows_omits_stale_current_main_verify_red_attention_
                 "platform_machine": "x86_64",
                 "python_version": "3.12",
             },
-            "failing_phase": "unit",
+            "failing_phases": ["unit"], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -8197,10 +8198,10 @@ def test_query_lineage_owner_rows_keeps_visible_main_verify_attention_when_defau
     main_verify_task.review_verify_head_sha = "abc123"
     main_verify_task.output_content = json.dumps(
         {
-            "alert_message": "main verify RED at `abc123` - merges halted; phase `unit` failing",
+            "alert_message": "main verify RED at `abc123` - merges halted; phase unit failing",
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
-            "failing_phase": "unit",
+            "failing_phases": ["unit"], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -8260,10 +8261,10 @@ def test_query_lineage_owner_rows_weakens_default_branch_fingerprint_unavailable
     main_verify_task.review_verify_head_sha = "abc123"
     main_verify_task.output_content = json.dumps(
         {
-            "alert_message": "main verify RED at `abc123` - merges halted; phase `unit` failing",
+            "alert_message": "main verify RED at `abc123` - merges halted; phase unit failing",
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
-            "failing_phase": "unit",
+            "failing_phases": ["unit"], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -8325,10 +8326,10 @@ def test_query_lineage_owner_rows_uses_structured_freshness_status_over_legacy_r
     main_verify_task.review_verify_head_sha = "abc123"
     main_verify_task.output_content = json.dumps(
         {
-            "alert_message": "main verify RED at `abc123` - merges halted; phase `unit` failing",
+            "alert_message": "main verify RED at `abc123` - merges halted; phase unit failing",
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
-            "failing_phase": "unit",
+            "failing_phases": ["unit"], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -8399,7 +8400,7 @@ def test_query_lineage_owner_rows_fails_closed_for_malformed_unclassified_main_v
             "alert_message": "legacy alert at `abc123` says merges halted",
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
-            "failing_phase": None,
+            "failing_phases": [], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -8457,10 +8458,10 @@ def test_query_lineage_owner_rows_renders_current_unknown_main_verify_status_as_
     main_verify_task.review_verify_head_sha = "abc123"
     main_verify_task.output_content = json.dumps(
         {
-            "alert_message": "main verify RED at `abc123` - merges halted; phase `unit` failing",
+            "alert_message": "main verify RED at `abc123` - merges halted; phase unit failing",
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
-            "failing_phase": "unit",
+            "failing_phases": ["unit"], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -8531,14 +8532,14 @@ def test_query_lineage_owner_rows_suppresses_incompatible_legacy_main_verify_att
     main_verify_task.output_content = json.dumps(
         {
             "alert_message": (
-                "main verify RED at `abc123` - merges halted; phase `unit` failing; "
-                "automatic remediation exhausted after 2/2 attempts for phase:unit on fp; "
+                "main verify RED at `abc123` - merges halted; phase unit failing; "
+                "automatic remediation exhausted after 2/2 attempts for phases:unit on fp; "
                 "human intervention required"
             ),
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload() if gate_enabled else None,
-            "failure_signature": "phase:unit",
-            "failing_phase": "unit",
+            "failure_signature": "phases:unit",
+            "failing_phases": ["unit"], "phase_results": [],
             "gate_enabled": gate_enabled,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -8603,14 +8604,14 @@ def test_query_lineage_owner_rows_prefers_structured_special_status_over_legacy_
     main_verify_task.output_content = json.dumps(
         {
             "alert_message": (
-                "main verify RED at `abc123` - merges halted; phase `unit` failing; "
-                "automatic remediation exhausted after 2/2 attempts for phase:unit on fp; "
+                "main verify RED at `abc123` - merges halted; phase unit failing; "
+                "automatic remediation exhausted after 2/2 attempts for phases:unit on fp; "
                 "human intervention required"
             ),
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
-            "failure_signature": "phase:unit",
-            "failing_phase": "unit",
+            "failure_signature": "phases:unit",
+            "failing_phases": ["unit"], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -8683,7 +8684,7 @@ def test_query_lineage_owner_rows_surfaces_canonical_launch_failure_concisely(
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
             "failure_signature": None,
-            "failing_phase": "ruff",
+            "failing_phases": ["ruff"], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -8755,13 +8756,13 @@ def test_query_lineage_owner_rows_rejects_legacy_exhaustion_for_unknown_invalid_
         {
             "alert_message": (
                 "main verify RED at `abc123` - merges halted; "
-                "automatic remediation exhausted after 2/2 attempts for phase:unit on fp; "
+                "automatic remediation exhausted after 2/2 attempts for phases:unit on fp; "
                 "human intervention required"
             ),
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
-            "failure_signature": "phase:unit",
-            "failing_phase": "unit",
+            "failure_signature": "phases:unit",
+            "failing_phases": ["unit"], "phase_results": [],
             "gate_enabled": True,
             "head_sha": "abc123",
             "tree_fingerprint": "fp",
@@ -8816,12 +8817,13 @@ def test_query_lineage_owner_rows_rejects_legacy_exhaustion_for_invalid_non_stri
         head_sha="abc123",
         verify_status=7,
         verify_exit_status="42",
-        failing_phase="unit",
-        failure_signature="phase:unit",
+        failing_phases=("unit",),
+        phase_results=(),
+        failure_signature="phases:unit",
         failure="unexpected verify status",
         alert_message=(
             "main verify RED at `abc123` - merges halted; "
-            "automatic remediation exhausted after 2/2 attempts for phase:unit on fp; "
+            "automatic remediation exhausted after 2/2 attempts for phases:unit on fp; "
             "human intervention required"
         ),
         red_since=datetime(2026, 6, 24, 12, 5, tzinfo=UTC),

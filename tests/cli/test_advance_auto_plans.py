@@ -1362,7 +1362,7 @@ def test_advance_repeat_candidate_verify_block_parks_not_error(tmp_path: Path, c
         candidate_verify=SimpleNamespace(
             evidence=SimpleNamespace(
                 tree_fingerprint="fp-repeat-candidate",
-                failing_phase="unit",
+                failing_phases=("unit",),
                 verify_status="failed",
             )
         ),

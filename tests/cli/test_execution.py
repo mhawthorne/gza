@@ -29085,6 +29085,54 @@ class TestSetStatusCommand:
         assert tombstoned.state == "dropped"
         assert check.get_unmerged_merge_units() == []
 
+    def test_set_status_dropped_cleans_worker_registry_for_cascaded_tasks(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        owner = store.add("Owner implementation", task_type="implement")
+        child = store.add("Same-unit live child", task_type="verify_fix", based_on=owner.id)
+        assert owner.id is not None
+        assert child.id is not None
+        owner.status = "completed"
+        owner.branch = "feature/drop-workers"
+        owner.has_commits = True
+        child.status = "in_progress"
+        child.started_at = datetime.now(UTC)
+        child.running_pid = 12346
+        child.branch = owner.branch
+        store.update(owner)
+        store.update(child)
+        unit = store.create_merge_unit(
+            source_branch=owner.branch,
+            target_branch="main",
+            owner_task_id=owner.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+        store.attach_task_to_merge_unit(child.id, unit.id, "contributor")
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(WorkerMetadata(worker_id="w-owner-drop", task_id=owner.id, pid=12345))
+        registry.register(WorkerMetadata(worker_id="w-child-drop", task_id=child.id, pid=12346))
+
+        with patch.object(WorkerRegistry, "is_running", return_value=True):
+            result = invoke_gza(
+                "set-status",
+                str(owner.id),
+                "dropped",
+                "--reason",
+                "Abandoned",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert f"also dropped: {child.id}" in result.stdout
+        workers = {worker.worker_id: worker for worker in WorkerRegistry(config.workers_path).list_all(include_completed=True)}
+        assert workers["w-owner-drop"].status == "completed"
+        assert workers["w-child-drop"].status == "completed"
+        assert store.get(owner.id).status == "dropped"  # type: ignore[union-attr]
+        assert store.get(child.id).status == "dropped"  # type: ignore[union-attr]
+
     def test_set_status_dropped_without_reason_leaves_drop_reason_null(self, tmp_path: Path) -> None:
         """set-status dropped without --reason should leave drop_reason unset."""
         setup_db_with_tasks(tmp_path, [

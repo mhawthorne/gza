@@ -1770,7 +1770,7 @@ def test_collect_scoped_tag_scope_gaps_reuses_supplied_owner_rows_and_read_conte
             "failed",
             "1",
             "unit",
-            "SKIP: main verify RED at `feedfacecafe` - merges halted; phase `unit` failing",
+            "SKIP: main verify RED at `feedfacecafe` - merges halted; phase unit failing",
         ),
         (
             "unavailable",
@@ -1800,10 +1800,10 @@ def test_lineage_query_main_verify_attention_renders_current_target_sha_from_liv
         head_sha="feedfacecafe9999",
         verify_status=verify_status,
         verify_exit_status=verify_exit_status,
-        failing_phase=failing_phase,
+        failing_phases=(failing_phase,) if failing_phase else (),
         failure=None,
         alert_message=(
-            "main verify RED - merges halted; phase `unit` failing"
+            "main verify RED - merges halted; phase unit failing"
             if verify_status == "failed"
             else "main verify freshness unproven; exact tree fingerprint unavailable"
         ),
@@ -1854,9 +1854,10 @@ def test_lineage_query_main_verify_attention_never_asserts_unproven_target_sha_o
         head_sha="feedfacecafe9999",
         verify_status="failed",
         verify_exit_status="1",
-        failing_phase="unit",
+        failing_phases=("unit",),
+        phase_results=(),
         failure=None,
-        alert_message="main verify RED - merges halted; phase `unit` failing",
+        alert_message="main verify RED - merges halted; phase unit failing",
     )
     git = SimpleNamespace(
         default_branch=lambda: "main",

@@ -75,6 +75,12 @@ gza-verify phase=failed name=functional duration_seconds=12.500000
   reconcile them through the same normalized evidence: full terminal phase payloads,
   phase name lists, expected-partition identity, and lifecycle summary fields that both
   representations explicitly supply must agree.
+- Consumers that remediate a failed gate collect every valid terminal
+  `phase=failed` result. Display order follows verify output order, while remediation
+  identities canonicalize the phase set so reordered terminal lines do not create
+  duplicate work. A phase that disappears from a later partial red run is not treated
+  as green; retirement requires a current `phase=passed` terminal result for that
+  phase or a full configured-gate pass.
 - A verify timeout with `failure_origin == "timeout"` and no parsed failed phase is
   classified as a wall-clock budget condition, not as a code-fixing `verify_fix`
   candidate, only when the structured phase records affirmatively validate as

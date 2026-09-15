@@ -136,7 +136,8 @@ def _stub_candidate_integration_verify() -> object:
                     environment_identity=None,
                     verify_exit_status="0",
                     failure=None,
-                    failing_phase=None,
+                    failing_phases=(),
+        phase_results=(),
                     reviewed_branch="main",
                     working_directory="/tmp/main-integration",
                     captured_at=datetime.now(UTC),
@@ -7522,7 +7523,8 @@ def test_max_cycle_post_materialization_authority_race_preserves_debt_without_me
                     environment_identity=None,
                     verify_exit_status="0",
                     failure=None,
-                    failing_phase=None,
+                    failing_phases=(),
+        phase_results=(),
                     reviewed_branch="main",
                     working_directory=str(tmp_path),
                     captured_at=datetime.now(UTC),
@@ -11033,7 +11035,8 @@ def test_execute_merge_action_isolated_candidate_verify_red_blocks_promotion(
             head_sha="isolated-merge-oid",
             tree_fingerprint="fp-candidate",
             failure="verify_command failed",
-            failing_phase="unit",
+            failing_phases=("unit",),
+        phase_results=(),
         ),
     )
 
@@ -11060,12 +11063,12 @@ def test_execute_merge_action_isolated_candidate_verify_red_blocks_promotion(
 
     assert result.rc == 1
     assert result.status == "blocked_candidate_verify"
-    assert result.block_reason == "candidate verify red; refusing to promote while phase `unit` is failing"
+    assert result.block_reason == "candidate verify red; refusing to promote while phase unit is failing"
     promote.assert_not_called()
     refreshed = store.get(task.id)
     assert refreshed is not None
     assert refreshed.merge_status == "unmerged"
-    assert "candidate verify red; refusing to promote while phase `unit` is failing" in capsys.readouterr().out
+    assert "candidate verify red; refusing to promote while phase unit is failing" in capsys.readouterr().out
 
 
 def test_execute_merge_action_isolated_max_cycle_red_candidate_creates_no_debt(
@@ -11100,7 +11103,8 @@ def test_execute_merge_action_isolated_max_cycle_red_candidate_creates_no_debt(
             head_sha="isolated-merge-oid",
             tree_fingerprint="fp-candidate",
             failure="verify_command failed",
-            failing_phase="unit",
+            failing_phases=("unit",),
+        phase_results=(),
         ),
     )
 
@@ -11248,7 +11252,8 @@ def test_execute_merge_action_isolated_candidate_verify_unavailable_uses_distinc
             head_sha="isolated-merge-oid",
             tree_fingerprint="fp-candidate-unavailable",
             failure="verify command unavailable",
-            failing_phase=None,
+            failing_phases=(),
+        phase_results=(),
         ),
     )
 
@@ -11986,7 +11991,8 @@ def test_execute_merge_action_isolated_candidate_verify_red_defers_followup_crea
             head_sha="isolated-merge-oid",
             tree_fingerprint="fp-candidate",
             failure="verify_command failed",
-            failing_phase="unit",
+            failing_phases=("unit",),
+        phase_results=(),
         ),
     )
 
@@ -18094,7 +18100,7 @@ def test_advance_post_merge_red_main_skips_later_merges_and_surfaces_attention(
         merges_halted=True,
         state=SimpleNamespace(
             task=main_verify_task,
-            alert_message="main verify RED at `deadbeefcafe` - merges halted; phase `unit` failing",
+            alert_message="main verify RED at `deadbeefcafe` - merges halted; phase unit failing",
         ),
     )
     first_row = LineageOwnerRow(
@@ -18133,7 +18139,7 @@ def test_advance_post_merge_red_main_skips_later_merges_and_surfaces_attention(
     output = capsys.readouterr().out
     assert rc == 0
     assert merge_calls == [first.id]
-    assert "main verify RED at `deadbeefcafe` - merges halted; phase `unit` failing" in output
+    assert "main verify RED at `deadbeefcafe` - merges halted; phase unit failing" in output
     assert f"{second.id}" in output
     assert "1 advanced" in output
     assert "1 skipped" in output
@@ -18403,7 +18409,7 @@ def test_cmd_advance_blocked_candidate_verify_surfaces_attention_not_generic_mer
     blocked_result = SimpleNamespace(
         rc=1,
         status="blocked_candidate_verify",
-        block_reason="candidate verify red; refusing to promote while phase `unit` is failing",
+        block_reason="candidate verify red; refusing to promote while phase unit is failing",
         candidate_verify=CandidateIntegrationVerifyCheck(
             evidence=CandidateIntegrationVerifyEvidence(
                 gate_enabled=True,
@@ -18422,7 +18428,8 @@ def test_cmd_advance_blocked_candidate_verify_surfaces_attention_not_generic_mer
                 verify_status="failed",
                 verify_exit_status="1",
                 failure="worker died in host-only unit path",
-                failing_phase="unit",
+                failing_phases=("unit",),
+        phase_results=(),
                 reviewed_branch="main",
                 working_directory=str(tmp_path),
                 captured_at=datetime.now(UTC),
@@ -18453,7 +18460,7 @@ def test_cmd_advance_blocked_candidate_verify_surfaces_attention_not_generic_mer
     output = capsys.readouterr().out
     assert rc == 0
     assert (
-        "candidate verify blocked promotion on fp-advance-candidate-red; phase `unit` failed before main changed"
+        "candidate verify blocked promotion on fp-advance-candidate-red; phase unit failed before main changed"
         in output
     )
     assert "✗ Merge failed" not in output
@@ -18508,7 +18515,7 @@ def test_advance_refreshes_red_main_before_preview_and_skips_confirmation_prompt
         merges_halted=True,
         state=SimpleNamespace(
             task=main_verify_task,
-            alert_message="main verify RED at `cafebabe1234` - merges halted; phase `unit` failing",
+            alert_message="main verify RED at `cafebabe1234` - merges halted; phase unit failing",
         ),
     )
 
@@ -18527,7 +18534,7 @@ def test_advance_refreshes_red_main_before_preview_and_skips_confirmation_prompt
     assert rc == 0
     assert verify_check.call_args.kwargs["reason"] == "advance-pre-merge"
     assert "No eligible tasks to advance" in output
-    assert "main verify RED at `cafebabe1234` - merges halted; phase `unit` failing" in output
+    assert "main verify RED at `cafebabe1234` - merges halted; phase unit failing" in output
     assert "Will advance 1 task(s):" not in output
     assert "Proceed? [Y/n]" not in output
     execute_merge.assert_not_called()
@@ -18566,7 +18573,7 @@ def test_advance_dedupes_persisted_and_live_red_main_attention_in_final_output(
         lineage_status="needs_attention",
         next_action={
             "type": "needs_discussion",
-            "description": "SKIP: main verify RED at `facefeed9999` - merges halted; phase `unit` failing",
+            "description": "SKIP: main verify RED at `facefeed9999` - merges halted; phase unit failing",
             "needs_attention_reason": "main-integration-verify-red",
             "subject_task_id": main_verify_task.id,
         },
@@ -18601,7 +18608,7 @@ def test_advance_dedupes_persisted_and_live_red_main_attention_in_final_output(
         merges_halted=True,
         state=SimpleNamespace(
             task=main_verify_task,
-            alert_message="main verify RED at `facefeed9999` - merges halted; phase `unit` failing",
+            alert_message="main verify RED at `facefeed9999` - merges halted; phase unit failing",
         ),
     )
 
@@ -18653,7 +18660,7 @@ def test_advance_dedupes_persisted_and_live_red_main_attention_in_final_output(
     assert "Will advance 1 task(s):" in output
     final_attention = output[output.rfind("Needs attention") :]
     assert final_attention.startswith("Needs attention (1 task):")
-    assert final_attention.count("main verify RED at `facefeed9999` - merges halted; phase `unit` failing") == 1
+    assert final_attention.count("main verify RED at `facefeed9999` - merges halted; phase unit failing") == 1
     assert final_attention.count("main-integration-verify-red") == 1
 
 

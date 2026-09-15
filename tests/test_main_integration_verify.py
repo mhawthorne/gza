@@ -27,6 +27,8 @@ from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
     MAIN_INTEGRATION_VERIFY_SCHEMA_RUNTIME_SKEW_REASON,
+    MAIN_VERIFY_REMEDIATION_ARTIFACT_MAX_BYTES,
+    MAIN_VERIFY_REMEDIATION_PHASE_EXCERPT_MAX_CHARS,
     CandidateIntegrationVerifyCheck,
     CandidateIntegrationVerifyEvidence,
     MainIntegrationVerifyEnvironmentIdentity,
@@ -221,14 +223,13 @@ def test_main_verify_remediation_pending_reuse_requires_resolved_route_before_mu
     original = task.__dict__.copy()
     remediation = MainIntegrationVerifyRemediation(
         kind="fix",
-        signature="phase:unit",
+        signature="phases:unit",
         tree_fingerprint="fp-verified",
-        failing_phase="unit",
+        failing_phases=("unit",),
         failure="unit failed",
         observed_environment_identity=None,
         artifact_path=None,
-        failing_test_ids=(),
-        verify_excerpt=None,
+        phase_evidence=(),
     )
 
     with pytest.raises(ConfigError, match="'model' is required for task type 'implement'"):
@@ -249,7 +250,7 @@ def test_main_verify_remediation_pending_reuse_requires_resolved_route_before_mu
     assert len(store.get_all()) == 1
     assert (
         store.get_main_verify_remediation_attempt_state(
-            signature="phase:unit",
+            signature="phases:unit",
             tree_fingerprint="fp-verified",
         )
         is None
@@ -262,14 +263,13 @@ def test_main_verify_remediation_completed_unmerged_consumes_attempt_and_requeue
     store = make_store(tmp_path)
     remediation = MainIntegrationVerifyRemediation(
         kind="fix",
-        signature="phase:ruff",
+        signature="phases:ruff",
         tree_fingerprint=None,
-        failing_phase="ruff",
+        failing_phases=("ruff",),
         failure="ruff failed",
         observed_environment_identity=None,
         artifact_path=None,
-        failing_test_ids=(),
-        verify_excerpt=None,
+        phase_evidence=(),
     )
     task = store.add(
         _main_verify_remediation_prompt(
@@ -289,7 +289,7 @@ def test_main_verify_remediation_completed_unmerged_consumes_attempt_and_requeue
     task.has_commits = True
     store.update(task)
     store.record_main_verify_remediation_active_task(
-        signature="phase:ruff",
+        signature="phases:ruff",
         tree_fingerprint=None,
         task_id=task.id,
         last_observed_head_sha="deadbeefcafe",
@@ -317,7 +317,7 @@ def test_main_verify_remediation_completed_unmerged_consumes_attempt_and_requeue
     assert updated.queue_position == 1
     assert "Remediation attempts spent: 1/2" in updated.prompt
     attempt_state = store.get_main_verify_remediation_attempt_state(
-        signature="phase:ruff",
+        signature="phases:ruff",
         tree_fingerprint=None,
     )
     assert attempt_state is not None
@@ -335,14 +335,13 @@ def test_candidate_rework_reuse_requires_resolved_existing_route_before_pending_
     store.update(owner)
     remediation = MainIntegrationVerifyRemediation(
         kind="fix",
-        signature="phase:functional",
+        signature="phases:functional",
         tree_fingerprint="fp-candidate",
-        failing_phase="functional",
+        failing_phases=("functional",),
         failure="functional failed",
         observed_environment_identity=None,
         artifact_path=None,
-        failing_test_ids=(),
-        verify_excerpt=None,
+        phase_evidence=(),
     )
     evidence = CandidateIntegrationVerifyEvidence(
         gate_enabled=True,
@@ -355,7 +354,7 @@ def test_candidate_rework_reuse_requires_resolved_existing_route_before_pending_
         verify_status="failed",
         verify_exit_status="1",
         failure="functional failed",
-        failing_phase="functional",
+        failing_phases=("functional",),
         reviewed_branch="feature/owner",
         working_directory=str(tmp_path),
         captured_at=datetime(2026, 8, 18, 1, 5, tzinfo=UTC),
@@ -403,7 +402,7 @@ def _seed_main_verify_task(
     verify_exit_status: str,
     failure: str,
     alert_message: str,
-    failing_phase: str = "unit",
+    failing_phases: tuple[str, ...] = ("unit",),
     environment_identity: MainIntegrationVerifyEnvironmentIdentity | None = _current_host_identity(),
     failure_signature: str | None = None,
     pending_retirement_signatures: tuple[str, ...] = (),
@@ -423,7 +422,8 @@ def _seed_main_verify_task(
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": environment_identity.to_payload() if environment_identity is not None else None,
             "failure_signature": failure_signature,
-            "failing_phase": failing_phase,
+            "failing_phases": list(failing_phases),
+            "phase_results": [{"name": phase, "status": "failed"} for phase in failing_phases],
             "gate_enabled": True,
             "head_sha": "abc123",
             "pending_retirement_signatures": list(pending_retirement_signatures),
@@ -441,10 +441,10 @@ def _seed_main_verify_task(
 def test_format_main_integration_verify_attention_adds_sha_only_with_current_target_proof() -> None:
     state = SimpleNamespace(
         head_sha="abc123deadbeef",
-        failing_phase="unit",
+        failing_phases=("unit",),
         verify_status="failed",
         verify_exit_status="1",
-        alert_message="main verify RED - merges halted; phase `unit` failing",
+        alert_message="main verify RED - merges halted; phase unit failing",
         red_since=None,
     )
 
@@ -453,16 +453,16 @@ def test_format_main_integration_verify_attention_adds_sha_only_with_current_tar
         target_proof=MainIntegrationVerifyTargetProof("current"),
     )
 
-    assert rendered == "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing"
+    assert rendered == "main verify RED at `abc123deadbe` - merges halted; phase unit failing"
 
 
 def test_format_main_integration_verify_attention_keeps_unproven_target_non_sha_non_halt() -> None:
     state = SimpleNamespace(
         head_sha="abc123deadbeef",
-        failing_phase="unit",
+        failing_phases=("unit",),
         verify_status="failed",
         verify_exit_status="1",
-        alert_message="main verify RED - merges halted; phase `unit` failing",
+        alert_message="main verify RED - merges halted; phase unit failing",
         red_since=None,
     )
 
@@ -479,10 +479,10 @@ def test_format_main_integration_verify_attention_keeps_unproven_target_non_sha_
 def test_format_main_integration_verify_attention_keeps_stale_target_non_sha_non_halt() -> None:
     state = SimpleNamespace(
         head_sha="abc123deadbeef",
-        failing_phase="unit",
+        failing_phases=("unit",),
         verify_status="failed",
         verify_exit_status="1",
-        alert_message="main verify RED - merges halted; phase `unit` failing",
+        alert_message="main verify RED - merges halted; phase unit failing",
         red_since=None,
     )
 
@@ -499,7 +499,7 @@ def test_format_main_integration_verify_attention_keeps_stale_target_non_sha_non
 def test_format_main_integration_verify_attention_renders_freshness_sha_only_with_current_proof() -> None:
     state = SimpleNamespace(
         head_sha="abc123deadbeef",
-        failing_phase=None,
+        failing_phases=(),
         verify_status="unavailable",
         verify_exit_status=MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
         alert_message="main verify freshness unproven; exact tree fingerprint unavailable",
@@ -528,10 +528,10 @@ def test_format_main_integration_verify_attention_renders_current_unknown_status
     state = SimpleNamespace(
         gate_enabled=True,
         head_sha="abc123deadbeef",
-        failing_phase="unit",
+        failing_phases=("unit",),
         verify_status="mystery",
         verify_exit_status="42",
-        alert_message="main verify RED at `abc123deadbe` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123deadbe` - merges halted; phase unit failing",
         red_since=datetime(2026, 6, 24, 12, 5, tzinfo=UTC),
     )
 
@@ -568,11 +568,11 @@ def test_format_main_integration_verify_attention_suppresses_legacy_red_and_exha
 ) -> None:
     state = SimpleNamespace(
         head_sha="abc123deadbeef",
-        failing_phase="unit",
-        failure_signature="phase:unit",
+        failing_phases=("unit",),
+        failure_signature="phases:unit",
         alert_message=(
-            "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing; "
-            "automatic remediation exhausted after 2/2 attempts for phase:unit on fp-verified; "
+            "main verify RED at `abc123deadbe` - merges halted; phase unit failing; "
+            "automatic remediation exhausted after 2/2 attempts for phases:unit on fp-verified; "
             "human intervention required"
         ),
         red_since=None,
@@ -622,10 +622,10 @@ def test_format_main_integration_verify_attention_prefers_structured_special_sta
 ) -> None:
     state = SimpleNamespace(
         head_sha="abc123deadbeef",
-        failing_phase="unit",
+        failing_phases=("unit",),
         verify_status="unavailable",
         verify_exit_status=verify_exit_status,
-        alert_message="main verify RED at `abc123deadbe` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123deadbe` - merges halted; phase unit failing",
         red_since=None,
     )
 
@@ -668,13 +668,13 @@ def test_format_main_integration_verify_attention_prefers_structured_special_sta
     state = SimpleNamespace(
         gate_enabled=True,
         head_sha="abc123deadbeef",
-        failing_phase="unit",
-        failure_signature="phase:unit",
+        failing_phases=("unit",),
+        failure_signature="phases:unit",
         verify_status="unavailable",
         verify_exit_status=verify_exit_status,
         alert_message=(
-            "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing; "
-            "automatic remediation exhausted after 2/2 attempts for phase:unit on fp-verified; "
+            "main verify RED at `abc123deadbe` - merges halted; phase unit failing; "
+            "automatic remediation exhausted after 2/2 attempts for phases:unit on fp-verified; "
             "human intervention required"
         ),
         red_since=None,
@@ -699,7 +699,7 @@ def test_format_main_integration_verify_attention_sanitizes_legacy_launch_failur
 ) -> None:
     state = SimpleNamespace(
         head_sha="abc123deadbeef",
-        failing_phase="unit",
+        failing_phases=("unit",),
         verify_status="unavailable",
         verify_exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
         alert_message=(
@@ -723,7 +723,7 @@ def test_format_main_integration_verify_attention_sanitizes_legacy_launch_failur
 def test_format_main_integration_verify_attention_parses_canonical_launch_failure() -> None:
     state = SimpleNamespace(
         head_sha="abc123deadbeef",
-        failing_phase=None,
+        failing_phases=(),
         failure=(
             "verify_command environment error: could not launch `ruff` "
             "for phase `ruff` (not on PATH)"
@@ -786,7 +786,7 @@ def test_format_main_integration_verify_attention_fails_closed_for_unclassified_
 ) -> None:
     state = SimpleNamespace(
         head_sha="abc123deadbeef",
-        failing_phase=None,
+        failing_phases=(),
         verify_exit_status="1",
         red_since=None,
         **state_kwargs,
@@ -809,10 +809,10 @@ def test_format_main_integration_verify_attention_fails_closed_for_unclassified_
 @pytest.mark.parametrize(
     "alert_message",
     [
-        "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing",
+        "main verify RED at `abc123deadbe` - merges halted; phase unit failing",
         (
-            "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing; "
-            "automatic remediation exhausted after 2/2 attempts for phase:unit on fp-verified; "
+            "main verify RED at `abc123deadbe` - merges halted; phase unit failing; "
+            "automatic remediation exhausted after 2/2 attempts for phases:unit on fp-verified; "
             "human intervention required"
         ),
     ],
@@ -825,8 +825,8 @@ def test_format_main_integration_verify_attention_rejects_malformed_status_legac
     state = SimpleNamespace(
         gate_enabled=True,
         head_sha="abc123deadbeef",
-        failing_phase="unit",
-        failure_signature="phase:unit",
+        failing_phases=("unit",),
+        failure_signature="phases:unit",
         verify_status=verify_status,
         verify_exit_status="1",
         alert_message=alert_message,
@@ -853,7 +853,7 @@ def test_format_main_integration_verify_attention_keeps_configured_missing_evide
     state = SimpleNamespace(
         gate_enabled=True,
         head_sha="abc123deadbeef",
-        failing_phase=None,
+        failing_phases=(),
         verify_status=None,
         verify_exit_status="1",
         alert_message=None,
@@ -879,9 +879,9 @@ def test_format_main_integration_verify_attention_keeps_status_absent_legacy_red
     state = SimpleNamespace(
         gate_enabled=True,
         head_sha="abc123deadbeef",
-        failing_phase="unit",
+        failing_phases=("unit",),
         verify_exit_status="1",
-        alert_message="main verify RED at `abc123deadbe` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123deadbe` - merges halted; phase unit failing",
         red_since=None,
     )
 
@@ -892,19 +892,19 @@ def test_format_main_integration_verify_attention_keeps_status_absent_legacy_red
 
     assert main_integration_verify_state_halts_merges(state) is True
     assert main_integration_verify_state_is_red_verdict(state) is True
-    assert rendered == "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing"
+    assert rendered == "main verify RED at `abc123deadbe` - merges halted; phase unit failing"
 
 
 def test_format_main_integration_verify_attention_keeps_status_absent_legacy_exhaustion_compatible() -> None:
     state = SimpleNamespace(
         gate_enabled=True,
         head_sha="abc123deadbeef",
-        failing_phase="unit",
-        failure_signature="phase:unit",
+        failing_phases=("unit",),
+        failure_signature="phases:unit",
         verify_exit_status="1",
         alert_message=(
-            "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing; "
-            "automatic remediation exhausted after 2/2 attempts for phase:unit on fp-verified; "
+            "main verify RED at `abc123deadbe` - merges halted; phase unit failing; "
+            "automatic remediation exhausted after 2/2 attempts for phases:unit on fp-verified; "
             "human intervention required"
         ),
         red_since=None,
@@ -918,7 +918,7 @@ def test_format_main_integration_verify_attention_keeps_status_absent_legacy_exh
     assert main_integration_verify_state_halts_merges(state) is True
     assert main_integration_verify_state_has_exhausted_remediation_attention(state) is True
     assert rendered == (
-        "main verify remediation exhausted for phase:unit after 2/2 attempts; "
+        "main verify remediation exhausted for phases:unit after 2/2 attempts; "
         "human intervention required"
     )
 
@@ -962,7 +962,7 @@ def test_build_main_integration_verify_remediation_uses_preferred_verify_artifac
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
     )
     task = store.get(task_id)
     assert task is not None
@@ -1011,15 +1011,9 @@ def test_build_main_integration_verify_remediation_uses_preferred_verify_artifac
 
     assert remediation.artifact_path == older.path
     assert remediation.artifact_path != newer.path
-    assert remediation.failing_test_ids == (
-        "tests/test_alpha.py::test_one",
-        "tests/test_beta.py::test_two",
-    )
-    assert remediation.verify_excerpt is not None
-    assert "WORKER_DIED subprocess boundary failure" in remediation.verify_excerpt
-    assert "FAILED tests/test_alpha.py::test_one - AssertionError: boom" in remediation.verify_excerpt
-    assert "noise line 0" not in remediation.verify_excerpt
-    assert len(remediation.verify_excerpt.splitlines()) <= 24
+    assert remediation.phase_evidence[0].phase_name == "unit"
+    assert remediation.phase_evidence[0].failing_test_ids == ()
+    assert remediation.phase_evidence[0].excerpt is None
 
 
 def test_build_main_integration_verify_remediation_falls_back_to_newest_verify_artifact(tmp_path) -> None:
@@ -1030,7 +1024,7 @@ def test_build_main_integration_verify_remediation_falls_back_to_newest_verify_a
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
     )
     task = store.get(task_id)
     assert task is not None
@@ -1069,8 +1063,8 @@ def test_build_main_integration_verify_remediation_falls_back_to_newest_verify_a
     )
 
     assert remediation.artifact_path == newer.path
-    assert remediation.failing_test_ids == ()
-    assert remediation.verify_excerpt == "newest failure output"
+    assert remediation.phase_evidence[0].failing_test_ids == ()
+    assert remediation.phase_evidence[0].excerpt is None
 
 
 def test_build_main_integration_verify_remediation_skips_unreadable_preferred_artifact_for_newer_readable_evidence(
@@ -1083,7 +1077,7 @@ def test_build_main_integration_verify_remediation_skips_unreadable_preferred_ar
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
     )
     task = store.get(task_id)
     assert task is not None
@@ -1130,9 +1124,8 @@ def test_build_main_integration_verify_remediation_skips_unreadable_preferred_ar
     )
 
     assert remediation.artifact_path == newer.path
-    assert remediation.failing_test_ids == ("tests/test_newer.py::test_latest",)
-    assert remediation.verify_excerpt is not None
-    assert "WORKER_DIED subprocess boundary failure" in remediation.verify_excerpt
+    assert remediation.phase_evidence[0].failing_test_ids == ()
+    assert remediation.phase_evidence[0].excerpt is None
 
 
 def test_build_main_integration_verify_remediation_skips_whitespace_only_preferred_artifact_for_newer_readable_evidence(
@@ -1145,7 +1138,7 @@ def test_build_main_integration_verify_remediation_skips_whitespace_only_preferr
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
     )
     task = store.get(task_id)
     assert task is not None
@@ -1191,9 +1184,8 @@ def test_build_main_integration_verify_remediation_skips_whitespace_only_preferr
     )
 
     assert remediation.artifact_path == newer.path
-    assert remediation.failing_test_ids == ("tests/test_newer.py::test_latest",)
-    assert remediation.verify_excerpt is not None
-    assert "WORKER_DIED subprocess boundary failure" in remediation.verify_excerpt
+    assert remediation.phase_evidence[0].failing_test_ids == ()
+    assert remediation.phase_evidence[0].excerpt is None
 
 
 def test_build_main_integration_verify_remediation_omits_missing_artifact_evidence_and_prompt_line(
@@ -1206,7 +1198,7 @@ def test_build_main_integration_verify_remediation_omits_missing_artifact_eviden
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
     )
     task = store.get(task_id)
     assert task is not None
@@ -1247,8 +1239,8 @@ def test_build_main_integration_verify_remediation_omits_missing_artifact_eviden
     )
 
     assert remediation.artifact_path is None
-    assert remediation.failing_test_ids == ()
-    assert remediation.verify_excerpt is None
+    assert remediation.phase_evidence[0].failing_test_ids == ()
+    assert remediation.phase_evidence[0].excerpt is None
     prompt = _main_verify_remediation_prompt(remediation, head_sha=state.head_sha)
     assert "Verify artifact:" not in prompt
 
@@ -1263,7 +1255,7 @@ def test_build_main_integration_verify_remediation_omits_whitespace_only_artifac
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
     )
     task = store.get(task_id)
     assert task is not None
@@ -1302,8 +1294,8 @@ def test_build_main_integration_verify_remediation_omits_whitespace_only_artifac
     )
 
     assert remediation.artifact_path is None
-    assert remediation.failing_test_ids == ()
-    assert remediation.verify_excerpt is None
+    assert remediation.phase_evidence[0].failing_test_ids == ()
+    assert remediation.phase_evidence[0].excerpt is None
     prompt = _main_verify_remediation_prompt(remediation, head_sha=state.head_sha)
     assert "Verify artifact:" not in prompt
 
@@ -1316,8 +1308,8 @@ def test_build_main_integration_verify_remediation_preserves_ruff_failure_excerp
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `ruff` failing",
-        failing_phase="ruff",
+        alert_message="main verify RED at `abc123` - merges halted; phase ruff failing",
+        failing_phases=("ruff",),
     )
     task = store.get(task_id)
     assert task is not None
@@ -1352,13 +1344,157 @@ def test_build_main_integration_verify_remediation_preserves_ruff_failure_excerp
         state=state,
     )
 
-    assert remediation.signature == "phase:ruff"
-    assert remediation.failing_phase == "ruff"
+    assert remediation.signature == "phases:ruff"
+    assert remediation.failing_phases == ("ruff",)
     assert remediation.artifact_path == artifact.path
-    assert remediation.failing_test_ids == ()
-    assert remediation.verify_excerpt is not None
-    assert "src/gza/main_integration_verify.py:19:1: F401 [*] imported but unused" in remediation.verify_excerpt
-    assert "gza-verify phase=failed name=ruff duration_seconds=0.42" in remediation.verify_excerpt
+    assert remediation.phase_evidence[0].failing_test_ids == ()
+    assert remediation.phase_evidence[0].excerpt is not None
+    assert "src/gza/main_integration_verify.py:19:1: F401 [*] imported but unused" in remediation.phase_evidence[0].excerpt
+    assert "gza-verify phase=failed name=ruff duration_seconds=0.42" in remediation.phase_evidence[0].excerpt
+
+
+def test_build_main_integration_verify_remediation_groups_multiple_failed_phases(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task_id = _seed_main_verify_task(
+        store,
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="verify_command failed",
+        alert_message="main verify RED - merges halted; phases ruff, unit failing",
+        failing_phases=("ruff", "unit"),
+    )
+    task = store.get(task_id)
+    assert task is not None
+    config = Config.load(tmp_path)
+    artifact = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify output",
+        output="\n".join(
+            [
+                "gza-verify phase=start name=unit",
+                "=========================== short test summary info ============================",
+                "FAILED tests/test_red.py::test_one - AssertionError",
+                "============================== 1 failed in 0.20s ==============================",
+                "gza-verify phase=failed name=unit duration_seconds=1.0",
+                "gza-verify phase=start name=ruff",
+                "src/gza/example.py:1:1: F401 unused import",
+                "gza-verify phase=failed name=ruff duration_seconds=0.2",
+            ]
+        ),
+        created_at=datetime(2026, 6, 23, 0, 0, tzinfo=UTC),
+    )
+    task.review_verify_artifact_file = artifact.path
+    store.update(task)
+
+    state = load_main_integration_verify_state(store)
+    assert state is not None
+    remediation = _build_main_integration_verify_remediation(
+        kind="fix",
+        config=config,
+        store=store,
+        state=state,
+    )
+
+    assert remediation.failing_phases == ("ruff", "unit")
+    assert remediation.signature == "phases:ruff,unit"
+    assert [evidence.phase_name for evidence in remediation.phase_evidence] == ["ruff", "unit"]
+    ruff, unit = remediation.phase_evidence
+    assert ruff.failing_test_ids == ()
+    assert ruff.excerpt is not None
+    assert "F401 unused import" in ruff.excerpt
+    assert unit.failing_test_ids == ("tests/test_red.py::test_one",)
+    assert unit.excerpt is not None
+    assert "FAILED tests/test_red.py::test_one" in unit.excerpt
+
+
+def test_build_main_verify_remediation_streams_early_and_late_failed_phase_evidence(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task_id = _seed_main_verify_task(
+        store,
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="verify_command failed",
+        alert_message="main verify RED - merges halted; phases ruff, unit failing",
+        failing_phases=("ruff", "unit"),
+    )
+    task = store.get(task_id)
+    assert task is not None
+    config = Config.load(tmp_path)
+    large_middle = "\n".join(f"middle noise {index}" for index in range(3000))
+    complete_artifact = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify complete",
+        output="\n".join(
+            [
+                "gza-verify phase=start name=ruff",
+                "src/gza/early.py:1:1: F401 unused import",
+                "gza-verify phase=failed name=ruff duration_seconds=0.1",
+                large_middle,
+                "gza-verify phase=start name=unit",
+                "=========================== short test summary info ============================",
+                "FAILED tests/test_late.py::test_late - AssertionError",
+                "tests/test_late.py::test_late traceback stays in unit",
+                "============================== 1 failed in 0.20s ==============================",
+                "gza-verify phase=failed name=unit duration_seconds=2.0",
+            ]
+        ),
+        created_at=datetime(2026, 6, 23, 0, 2, tzinfo=UTC),
+    )
+    partial_artifact = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify partial",
+        output="\n".join(
+            [
+                "gza-verify phase=start name=unit",
+                "FAILED tests/test_newer_partial.py::test_partial - AssertionError",
+                "gza-verify phase=failed name=unit duration_seconds=1.0",
+            ]
+        ),
+        created_at=datetime(2026, 6, 23, 0, 3, tzinfo=UTC),
+    )
+    task.review_verify_artifact_file = complete_artifact.path
+    store.update(task)
+
+    state = load_main_integration_verify_state(store)
+    assert state is not None
+    remediation = _build_main_integration_verify_remediation(
+        kind="fix",
+        config=config,
+        store=store,
+        state=state,
+    )
+
+    assert remediation.artifact_path == complete_artifact.path
+    assert remediation.artifact_path != partial_artifact.path
+    assert sum(len(evidence.excerpt or "") for evidence in remediation.phase_evidence) <= (
+        MAIN_VERIFY_REMEDIATION_ARTIFACT_MAX_BYTES
+    )
+    by_phase = {evidence.phase_name: evidence for evidence in remediation.phase_evidence}
+    assert set(by_phase) == {"ruff", "unit"}
+    assert by_phase["ruff"].excerpt is not None
+    assert by_phase["unit"].excerpt is not None
+    assert len(by_phase["ruff"].excerpt) <= MAIN_VERIFY_REMEDIATION_PHASE_EXCERPT_MAX_CHARS + len("[...]\n")
+    assert len(by_phase["unit"].excerpt) <= MAIN_VERIFY_REMEDIATION_PHASE_EXCERPT_MAX_CHARS + len("[...]\n")
+    assert "src/gza/early.py:1:1: F401 unused import" in by_phase["ruff"].excerpt
+    assert "FAILED tests/test_late.py::test_late" in by_phase["unit"].excerpt
+    assert by_phase["ruff"].failing_test_ids == ()
+    assert by_phase["unit"].failing_test_ids == ("tests/test_late.py::test_late",)
+    assert "tests/test_late.py::test_late" not in by_phase["ruff"].excerpt
+    assert "src/gza/early.py" not in by_phase["unit"].excerpt
 
 
 def test_build_main_integration_verify_remediation_carries_observed_environment_identity(tmp_path) -> None:
@@ -1376,7 +1512,7 @@ def test_build_main_integration_verify_remediation_carries_observed_environment_
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
         environment_identity=identity,
     )
     task = store.get(task_id)
@@ -2282,7 +2418,7 @@ def test_check_candidate_integration_verify_creates_one_heartbeat_for_enabled_ch
     run_verify.assert_called_once()
     heartbeat_for_attempt.assert_called_once_with(1)
     assert check.evidence.verify_status == "passed"
-    assert check.evidence.failing_phase is None
+    assert check.evidence.failing_phases == ()
     assert load_main_integration_verify_state(store) is None
 
 
@@ -2558,9 +2694,9 @@ def test_check_candidate_integration_verify_red_rerun_classifies_flake(tmp_path)
     assert check.evidence.verify_status == "passed"
     assert check.remediation is not None
     assert check.remediation.kind == "deflake"
-    assert check.remediation.signature == "phase:functional"
+    assert check.remediation.signature == "phases:functional"
     assert check.remediation.tree_fingerprint == "fp-candidate"
-    assert check.remediation.failing_phase == "functional"
+    assert check.remediation.failing_phases == ("functional",)
     assert check.remediation.failure == "verify_command failed"
 
 
@@ -2606,7 +2742,7 @@ def test_check_candidate_integration_verify_single_red_without_rerun_stays_uncon
     assert check.verify_runs == 1
     assert check.merges_halted is True
     assert check.evidence.verify_status == "failed"
-    assert check.evidence.failing_phase == "functional"
+    assert check.evidence.failing_phases == ("functional",)
     assert check.remediation is None
 
 
@@ -2662,10 +2798,10 @@ def test_check_candidate_integration_verify_red_rerun_classifies_deterministic_r
     assert check.verify_runs == 2
     assert check.merges_halted is True
     assert check.evidence.verify_status == "failed"
-    assert check.evidence.failing_phase == "functional"
+    assert check.evidence.failing_phases == ("functional",)
     assert check.remediation is not None
     assert check.remediation.kind == "fix"
-    assert check.remediation.signature == "phase:functional"
+    assert check.remediation.signature == "phases:functional"
     assert check.remediation.tree_fingerprint == "fp-candidate"
     assert check.remediation.failure == "verify_command failed again"
 
@@ -2782,7 +2918,7 @@ def test_check_main_integration_verify_classifies_tool_launch_failure_as_attenti
     assert check.remediation is None
     assert check.state.verify_status == "unavailable"
     assert check.state.verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
-    assert check.state.failing_phase == "ruff"
+    assert check.state.failing_phases == ("ruff",)
     assert check.state.alert_message is not None
     assert "could not launch `ruff`" in check.state.alert_message
     assert "fix the environment, not the code" in check.state.alert_message
@@ -2816,7 +2952,7 @@ def test_check_main_integration_verify_green_does_not_resolve_launch_failure_sig
         verify_exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
         failure="verify tool launch failed",
         alert_message="main verify misconfigured - could not launch `ruff` (missing); fix the environment, not the code",
-        failing_phase="ruff",
+        failing_phases=("ruff",),
     )
 
     config = MagicMock(spec=Config)
@@ -2997,7 +3133,7 @@ def test_check_main_integration_verify_classifies_shell_not_found_phase_failure_
     assert check.remediation is None
     assert check.state.verify_status == "unavailable"
     assert check.state.verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
-    assert check.state.failing_phase == "ruff"
+    assert check.state.failing_phases == ("ruff",)
     assert check.state.alert_message is not None
     assert "could not launch `ruff`" in check.state.alert_message
     assert "fix the environment, not the code" in check.state.alert_message
@@ -3080,7 +3216,7 @@ def test_current_main_integration_verify_alert_surfaces_unproven_freshness_when_
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
     )
 
     config = MagicMock(spec=Config)
@@ -3112,7 +3248,7 @@ def test_current_main_integration_verify_alert_ignores_ambiguous_short_target_re
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
     )
 
     config = MagicMock(spec=Config)
@@ -3140,7 +3276,7 @@ def test_current_main_integration_verify_alert_omits_red_checkpoint_missing_envi
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
         environment_identity=None,
     )
 
@@ -3170,7 +3306,7 @@ def test_current_main_integration_verify_alert_omits_red_checkpoint_with_mismatc
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
         environment_identity=_linux_container_identity(),
     )
 
@@ -3198,8 +3334,8 @@ def test_persist_main_integration_verify_alert_message_preserves_existing_identi
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
-        pending_retirement_signatures=("phase:functional",),
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
+        pending_retirement_signatures=("phases:functional",),
     )
     task = store.get(task_id)
     assert task is not None
@@ -3210,8 +3346,8 @@ def test_persist_main_integration_verify_alert_message_preserves_existing_identi
         store,
         state=state,
         alert_message=(
-            "main verify RED at `abc123` - merges halted; phase `unit` failing; "
-            "automatic remediation exhausted after 2/2 attempts for phase:unit on fp-verified; "
+            "main verify RED at `abc123` - merges halted; phase unit failing; "
+            "automatic remediation exhausted after 2/2 attempts for phases:unit on fp-verified; "
             "human intervention required"
         ),
     )
@@ -3222,17 +3358,17 @@ def test_persist_main_integration_verify_alert_message_preserves_existing_identi
     assert updated.verify_timeout_grace_seconds == 5.0
     assert updated.tree_fingerprint == "fp-verified"
     assert updated.head_sha == "abc123"
-    assert updated.failing_phase == "unit"
-    assert updated.failure_signature == "phase:unit"
-    assert updated.pending_retirement_signatures == ("phase:functional",)
+    assert updated.failing_phases == ("unit",)
+    assert updated.failure_signature == "phases:unit"
+    assert updated.pending_retirement_signatures == ("phases:functional",)
     assert "automatic remediation exhausted after 2/2 attempts" in (updated.alert_message or "")
     reloaded = load_main_integration_verify_state(store)
     assert reloaded is not None
     assert reloaded.alert_message == updated.alert_message
     assert reloaded.tree_fingerprint == "fp-verified"
     assert reloaded.head_sha == "abc123"
-    assert reloaded.failure_signature == "phase:unit"
-    assert reloaded.pending_retirement_signatures == ("phase:functional",)
+    assert reloaded.failure_signature == "phases:unit"
+    assert reloaded.pending_retirement_signatures == ("phases:functional",)
 
 
 def test_check_main_integration_verify_preserves_pending_retirements_across_fresh_green_rerun(tmp_path) -> None:
@@ -3244,7 +3380,7 @@ def test_check_main_integration_verify_preserves_pending_retirements_across_fres
         verify_exit_status="0",
         failure="",
         alert_message="",
-        pending_retirement_signatures=("phase:functional",),
+        pending_retirement_signatures=("phases:functional",),
     )
 
     config = MagicMock(spec=Config)
@@ -3299,10 +3435,10 @@ def test_check_main_integration_verify_preserves_pending_retirements_across_fres
     assert check.merges_halted is False
     assert check.resolved_red_signature is None
     assert check.state.verify_status == "passed"
-    assert check.state.pending_retirement_signatures == ("phase:functional",)
+    assert check.state.pending_retirement_signatures == ("phases:functional",)
     reloaded = load_main_integration_verify_state(store)
     assert reloaded is not None
-    assert reloaded.pending_retirement_signatures == ("phase:functional",)
+    assert reloaded.pending_retirement_signatures == ("phases:functional",)
 
 
 def test_check_main_integration_verify_reuses_same_tree_green_checkpoint_without_rerun(tmp_path) -> None:
@@ -3353,7 +3489,7 @@ def test_check_main_integration_verify_reuses_fresh_same_tree_red_checkpoint_bef
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
     )
 
     config = MagicMock(spec=Config)
@@ -3398,7 +3534,7 @@ def test_check_main_integration_verify_reruns_expired_same_tree_red_checkpoint(t
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
     )
 
     config = MagicMock(spec=Config)
@@ -3464,7 +3600,7 @@ def test_check_main_integration_verify_watch_red_rerun_classifies_flake_without_
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
     )
 
     config = MagicMock(spec=Config)
@@ -3522,11 +3658,11 @@ def test_check_main_integration_verify_watch_red_rerun_classifies_flake_without_
     assert check.state.verify_status == "passed"
     assert check.remediation is not None
     assert check.remediation.kind == "deflake"
-    assert check.remediation.signature == "phase:unit"
-    assert check.resolved_red_signature == "phase:unit"
+    assert check.remediation.signature == "phases:unit"
+    assert check.resolved_red_signature == "phases:unit"
     assert check.remediation.tree_fingerprint == "fp-verified"
-    assert check.remediation.failing_phase == "unit"
-    assert check.resolved_signature == "phase:unit"
+    assert check.remediation.failing_phases == ("unit",)
+    assert check.resolved_signature == "phases:unit"
 
 
 def test_check_main_integration_verify_force_green_carries_resolved_signature_without_remediation(
@@ -3539,7 +3675,7 @@ def test_check_main_integration_verify_force_green_carries_resolved_signature_wi
         verify_status="failed",
         verify_exit_status="1",
         failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
     )
 
     config = MagicMock(spec=Config)
@@ -3595,7 +3731,7 @@ def test_check_main_integration_verify_force_green_carries_resolved_signature_wi
     assert check.performed_verify is True
     assert check.merges_halted is False
     assert check.remediation is None
-    assert check.resolved_signature == "phase:unit"
+    assert check.resolved_signature == "phases:unit"
 
 
 def test_check_main_integration_verify_watch_red_rerun_retries_fresh_red_and_classifies_flake(tmp_path) -> None:
@@ -3665,10 +3801,10 @@ def test_check_main_integration_verify_watch_red_rerun_retries_fresh_red_and_cla
     assert check.state.verify_status == "passed"
     assert check.remediation is not None
     assert check.remediation.kind == "deflake"
-    assert check.remediation.signature == "phase:functional"
-    assert check.resolved_red_signature == "phase:functional"
+    assert check.remediation.signature == "phases:functional"
+    assert check.resolved_red_signature == "phases:functional"
     assert check.remediation.tree_fingerprint == "fp-live"
-    assert check.remediation.failing_phase == "functional"
+    assert check.remediation.failing_phases == ("functional",)
 
 
 def test_check_main_integration_verify_watch_red_rerun_preserves_red_artifact_evidence_for_deflake(
@@ -3749,18 +3885,18 @@ def test_check_main_integration_verify_watch_red_rerun_preserves_red_artifact_ev
     assert check.state.verify_status == "passed"
     assert check.remediation is not None
     assert check.remediation.kind == "deflake"
-    assert check.remediation.signature == "phase:unit"
+    assert check.remediation.signature == "phases:unit"
     assert check.remediation.tree_fingerprint == tree_fingerprint
-    assert check.remediation.failing_phase == "unit"
+    assert check.remediation.failing_phases == ("unit",)
     assert check.remediation.failure == "verify_command failed"
-    assert check.remediation.failing_test_ids == (
+    assert check.remediation.phase_evidence[0].failing_test_ids == (
         "tests/test_red.py::test_first",
         "tests/test_red.py::test_second",
     )
-    assert check.remediation.verify_excerpt is not None
-    assert "WORKER_DIED subprocess boundary failure" in check.remediation.verify_excerpt
-    assert "FAILED tests/test_red.py::test_first - AssertionError: red one" in check.remediation.verify_excerpt
-    assert "GREEN RERUN MARKER" not in check.remediation.verify_excerpt
+    assert check.remediation.phase_evidence[0].excerpt is not None
+    assert "WORKER_DIED subprocess boundary failure" in check.remediation.phase_evidence[0].excerpt
+    assert "FAILED tests/test_red.py::test_first - AssertionError: red one" in check.remediation.phase_evidence[0].excerpt
+    assert "GREEN RERUN MARKER" not in check.remediation.phase_evidence[0].excerpt
 
     artifacts = store.list_artifacts(check.state.task.id, kind="verify_command_output")
     artifact_paths = [artifact.path for artifact in artifacts if artifact.path]
@@ -3845,9 +3981,9 @@ def test_check_main_integration_verify_watch_red_rerun_classifies_deterministic_
     assert check.state.verify_status == "failed"
     assert check.remediation is not None
     assert check.remediation.kind == "fix"
-    assert check.remediation.signature == "phase:functional"
+    assert check.remediation.signature == "phases:functional"
     assert check.remediation.tree_fingerprint == "fp-live"
-    assert check.remediation.failing_phase == "functional"
+    assert check.remediation.failing_phases == ("functional",)
 
 
 def test_check_main_integration_verify_watch_red_rerun_classifies_deterministic_ruff_red(tmp_path) -> None:
@@ -3926,9 +4062,9 @@ def test_check_main_integration_verify_watch_red_rerun_classifies_deterministic_
     assert check.state.verify_status == "failed"
     assert check.remediation is not None
     assert check.remediation.kind == "fix"
-    assert check.remediation.signature == "phase:ruff"
+    assert check.remediation.signature == "phases:ruff"
     assert check.remediation.tree_fingerprint == "fp-live"
-    assert check.remediation.failing_phase == "ruff"
+    assert check.remediation.failing_phases == ("ruff",)
     assert check.remediation.failure == "verify_command failed again"
 
 
@@ -3940,7 +4076,7 @@ def test_check_main_integration_verify_deterministic_red_uses_confirmed_current_
         verify_status="failed",
         verify_exit_status="1",
         failure="cached verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
     )
 
     config = MagicMock(spec=Config)
@@ -4009,9 +4145,9 @@ def test_check_main_integration_verify_deterministic_red_uses_confirmed_current_
     assert check.merges_halted is True
     assert check.remediation is not None
     assert check.remediation.kind == "fix"
-    assert check.remediation.signature == "phase:functional"
+    assert check.remediation.signature == "phases:functional"
     assert check.remediation.tree_fingerprint == "fp-verified"
-    assert check.remediation.failing_phase == "functional"
+    assert check.remediation.failing_phases == ("functional",)
     assert check.remediation.failure == "fresh verify_command failed again"
 
 

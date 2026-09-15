@@ -95,6 +95,7 @@ from ..main_integration_verify import (
     promote_candidate_integration_verify_evidence,
     verify_gate_enabled,
 )
+from ..main_verify_scope import normalize_verify_phase_names, verify_phase_label, verify_phase_value
 from ..merge_finalization_proof import (
     MergeFinalizationFamily,
     MergeFinalizationPromotionKind,
@@ -1345,10 +1346,12 @@ def _candidate_verify_promotion_proof(
     if candidate_verify.classification == "unavailable":
         message = "candidate verify unavailable; refusing to promote without exact host proof"
         blocked_status = "blocked_candidate_verify_unavailable"
-    elif candidate_verify.evidence.failing_phase:
+    elif normalize_verify_phase_names(getattr(candidate_verify.evidence, "failing_phases", ())):
+        phases = normalize_verify_phase_names(getattr(candidate_verify.evidence, "failing_phases", ()))
+        verb = "is" if len(phases) == 1 else "are"
         message = (
             "candidate verify red; refusing to promote "
-            f"while phase `{candidate_verify.evidence.failing_phase}` is failing"
+            f"while {verify_phase_label(phases)} {verb} failing"
         )
     elif candidate_verify.evidence.failure:
         message = f"candidate verify blocked isolated promotion: {candidate_verify.evidence.failure}"
@@ -3648,7 +3651,10 @@ def _blocked_candidate_verify_attention_key(task_id: str, check: CandidateIntegr
         fingerprint = remediation.tree_fingerprint or "unavailable"
         return f"merge-candidate-verify:{task_id}:{remediation.signature}:{fingerprint}"
     evidence = check.evidence
-    phase = evidence.failing_phase or evidence.verify_exit_status or evidence.verify_status or "unknown"
+    phase = verify_phase_value(
+        getattr(evidence, "failing_phases", ()),
+        fallback=evidence.verify_exit_status or evidence.verify_status or "unknown",
+    )
     fingerprint = evidence.tree_fingerprint or "unavailable"
     return f"merge-candidate-verify:{task_id}:{phase}:{fingerprint}"
 
@@ -3662,10 +3668,11 @@ def format_blocked_candidate_verify_message(task_id: str, merge_result: Any) -> 
     fingerprint = evidence.tree_fingerprint or "unavailable"
     if check.classification == "unavailable":
         return f"{task_id}: candidate verify unavailable on {fingerprint}; local main was left unchanged"
-    if evidence.failing_phase:
+    phases = normalize_verify_phase_names(getattr(evidence, "failing_phases", ()))
+    if phases:
         return (
             f"{task_id}: candidate verify blocked promotion on {fingerprint}; "
-            f"phase `{evidence.failing_phase}` failed before main changed"
+            f"{verify_phase_label(phases)} failed before main changed"
         )
     if evidence.failure:
         return f"{task_id}: candidate verify blocked promotion on {fingerprint}; {evidence.failure}"

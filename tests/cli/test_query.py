@@ -35,7 +35,7 @@ from gza.console import truncate
 from gza.db import MERGE_SOURCE_MAX_CYCLES_DEFERRED, SqliteTaskStore, Task
 from gza.dispatch_preview import DispatchPreview, build_dispatch_preview
 from gza.git import Git, GitError
-from gza.lineage_query import LineageOwnerRow
+from gza.lineage_query import LineageOwnerRow, StaleUnmergedSweepCandidate
 from gza.pr_ops import LookupTaskPrResult
 from gza.rebase_diff import parse_rebase_diff_provenance
 from gza.recovery_read_context import RecoveryReadContext
@@ -859,6 +859,53 @@ def test_stale_unmerged_execute_json_applies_drops_and_reports_them(tmp_path: Pa
     assert updated_stale_owner.status == "dropped"
     assert updated_stale_review.status == "dropped"
     assert updated_live_owner.status == "completed"
+
+
+def test_stale_unmerged_apply_reports_cascaded_ids_not_in_initial_candidate_tuple(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    stale_at = datetime.now(UTC) - timedelta(days=100)
+    owner = store.add("Old owner with hidden same-unit contributor", task_type="implement")
+    contributor = store.add("Hidden same-unit contributor", task_type="verify_fix", based_on=owner.id)
+    assert owner.id is not None
+    assert contributor.id is not None
+    owner.status = "completed"
+    owner.completed_at = stale_at
+    owner.branch = "feature/stale-hidden-cascade"
+    owner.has_commits = True
+    contributor.status = "completed"
+    contributor.completed_at = stale_at + timedelta(minutes=5)
+    contributor.branch = owner.branch
+    contributor.has_commits = True
+    store.update(owner)
+    store.update(contributor)
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(contributor.id, unit.id, "contributor")
+    candidate = StaleUnmergedSweepCandidate(
+        owner_task=owner,
+        merge_unit=unit,
+        drop_task_ids=(owner.id,),
+        member_task_ids=(owner.id,),
+        last_activity_at=stale_at,
+        stale_days=100,
+    )
+
+    applied = query_cli._apply_stale_unmerged_candidate_drops(  # noqa: SLF001
+        config=config,
+        store=store,
+        candidate=candidate,
+    )
+
+    assert applied == (owner.id, contributor.id)
+    assert store.get(owner.id).status == "dropped"  # type: ignore[union-attr]
+    assert store.get(contributor.id).status == "dropped"  # type: ignore[union-attr]
 
 
 def test_stale_unmerged_execute_json_drops_candidates_with_only_resolved_external_links(

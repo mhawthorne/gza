@@ -148,7 +148,14 @@ The repair path MUST distinguish flaky from deterministic verify failures:
 - A verdict that stays red across the full bounded rerun sequence is **deterministic**.
   Automation MUST halt merges for that failure, and the supervisor MUST create or reuse
   exactly one active remediation attempt for that failure identity, backed by a
-  remediation task that aims to fix the failing phase or gate.
+  remediation task that aims to fix every structured failed phase or, when no structured
+  phase failed, the unstructured gate failure.
+- Structured red-main evidence MUST collect every valid `phase=failed` terminal result,
+  deduplicate names in first-observed order for display, and use the canonical
+  sorted set identity `phases:<comma-separated names>` for remediation signatures.
+  Reordering phase records MUST NOT create another remediation lane. If no structured
+  failed phase exists, automation uses the existing `status:<status>:exit:<exit>`
+  fallback identity.
 - That deterministic-red hold applies to ordinary merge actions and, while the active
   non-exhausted fix remediation is pending or in progress, to new ordinary
   worker-consuming starts for the affected runtime. It MUST NOT suppress creation,
@@ -201,11 +208,16 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   worker-aware reconciliation can retire it. If the live row is the only same-signature
   match, watch MUST keep it as the signature-owned open row but limit any updates to
   safe freshness bookkeeping that does not misrepresent the running worker.
-  A post-merge verify rerun that turns green for the same remediation identity MUST clear
-  the active attempt without consuming the budget. A post-merge rerun that remains red
-  for the same identity MUST consume the merged remediation attempt. A post-merge rerun
-  that is red for a different identity or lacks a trustworthy identity match MUST fail
-  closed on reuse for the old task, but MUST NOT consume that old task's attempt budget.
+  A post-merge verify rerun that proves every covered phase green, or proves the full
+  configured gate passed, MUST clear the active attempt without consuming the budget.
+  A post-merge rerun that remains red for any covered phase MUST consume the merged
+  remediation attempt for the original covered set, even if another covered phase has
+  improved. A failed phase disappearing from a partial/aborted red stream is not green
+  proof; each covered phase needs a current structured pass record or a full-gate pass.
+  If fresh non-live evidence adds uncovered phases, watch MUST expand/rekey the
+  non-live remediation to the canonical union while preserving attempt counts. A live
+  in-progress worker keeps the prompt it received; uncovered phases are reconciled only
+  after that worker settles.
 - If the local-target checkpoint is red for a failure signature but the active same-
   signature remediation task has already completed its own verify run successfully for
   the same normalized verify command and the same exact local-target tree fingerprint,
@@ -264,18 +276,17 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   unrelated refactoring, renaming, restructuring, or scope expansion, and tell the worker
   to stop for human review when the fix must reach beyond the failure's direct cause.
 - Reused or newly created remediation tasks for this gate MUST include bounded rerun
-  evidence in the prompt: the failure signature, the observed tree fingerprint context,
-  the spent-attempt metadata line `Remediation attempts spent: N/2`,
-  a persisted verify artifact reference only when the referenced artifact file is still
-  readable and yields content-bearing output, parsed failing pytest node IDs when
-  available from existing verify evidence, and a trimmed verify-output excerpt. If the
-  preferred persisted artifact reference is missing, unreadable, invalid, empty, or
-  whitespace-only, the supervisor MUST keep scanning newer `verify_command_output`
-  artifacts newest-first and use the first readable content-bearing one; if no
-  content-bearing verify artifact exists, it MUST omit the artifact reference, parsed
-  node IDs, and excerpt instead of surfacing stale prompt evidence.
-  The prompt MUST keep that evidence bounded and deterministic; it MUST NOT embed an
-  unbounded verify log.
+  evidence in the prompt: the canonical failure signature, all failing phases, the
+  observed tree fingerprint context, the spent-attempt metadata line `Remediation
+  attempts spent: N/2`, and one labelled evidence section per failed phase. Artifact
+  evidence MUST be partitioned by structured phase boundaries and bounded per phase;
+  phase-local pytest node IDs may be shown only when parsed from that phase's section.
+  If a phase section is missing, truncated, unreadable, or otherwise unavailable, the
+  phase stays in scope and the prompt explicitly says its evidence is unavailable.
+  The prompt MUST require green proof for every listed phase, permit the minimal direct
+  changes needed across the listed failures, and continue to forbid unrelated refactors,
+  renames, restructuring, or work beyond the combined direct causes. It MUST NOT embed
+  an unbounded verify log.
 - Reusing the same remediation row after a failed automatic attempt MUST be bounded and
   sequential. Watch MUST track the consumed automatic attempts on that single row,
   increment that state before requeueing a failed remediation, before requeueing a
