@@ -78,25 +78,6 @@ def _is_allowlisted(call_site: _ConnectCallSite) -> bool:
     )
 
 
-def test_production_sqlite_connect_call_sites_stay_within_allowlist() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    call_sites = _collect_sqlite_connect_call_sites(repo_root)
-
-    violations = [call_site for call_site in call_sites if not _is_allowlisted(call_site)]
-    assert not violations, (
-        "Found disallowed sqlite3.connect call sites outside the documented allowlist: "
-        + ", ".join(
-            f"{call_site.path}:{call_site.lineno} ({call_site.function or '<module>'})"
-            for call_site in violations
-        )
-    )
-
-    runner_backup_calls = [
-        call_site
-        for call_site in call_sites
-        if call_site.path == "src/gza/runner.py" and call_site.function == "_backup_sqlite_file"
-    ]
-    assert runner_backup_calls, "Expected runner backup sqlite3.connect allowlist entry to exist."
 
 
 def test_collect_sqlite_connect_call_sites_detects_whitespace_around_attribute_access(

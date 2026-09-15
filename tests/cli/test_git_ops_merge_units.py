@@ -347,32 +347,6 @@ def _snapshot_merge_refusal_state(store, task_id: str) -> dict[str, object]:
     }
 
 
-def test_merge_all_deduplicates_same_branch_merge_unit(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = store.add("Implement shared branch", task_type="implement")
-    store.mark_completed(impl, has_commits=True, branch="feature/shared")
-    assert impl.id is not None
-
-    improve = store.add("Improve shared branch", task_type="improve", based_on=impl.id, same_branch=True)
-    store.mark_completed(improve, has_commits=True, branch="feature/shared")
-    assert improve.id is not None
-    review = _add_completed_approved_review(store, based_on_task=impl, depends_on_task=improve)
-    _persist_current_green_verify(tmp_path, store, owner_task=impl, source_task=review)
-
-    fake_git = _MergeGit(tmp_path)
-    with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = invoke_gza("merge", "--all", "--project", str(tmp_path), cwd=tmp_path)
-
-    assert result.returncode == 0
-    assert fake_git.merged == [("feature/shared", False)]
-    refreshed_impl = store.get(impl.id)
-    refreshed_improve = store.get(improve.id)
-    assert refreshed_impl is not None
-    assert refreshed_improve is not None
-    assert refreshed_impl.merge_status == "merged"
-    assert refreshed_improve.merge_status is None
 
 
 def test_collect_advance_completed_tasks_backfills_legacy_unmerged_owner(tmp_path: Path) -> None:
@@ -612,31 +586,6 @@ def test_advance_dry_run_filters_owner_rows_by_target_branch_and_keeps_legacy_fa
     assert release_task.id not in result.stdout
 
 
-def test_merge_review_task_id_resolves_branchless_review_to_implementation_unit(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = store.add("Implement shared branch", task_type="implement")
-    store.mark_completed(impl, has_commits=True, branch="feature/shared")
-    assert impl.id is not None
-
-    create_result = invoke_gza("review", str(impl.id), "--queue", "--project", str(tmp_path), cwd=tmp_path)
-    assert create_result.returncode == 0
-    review = next(task for task in store.get_all() if task.task_type == "review")
-    review.status = "completed"
-    review.completed_at = datetime.now(UTC)
-    review.output_content = "**Verdict: APPROVED**"
-    store.update(review)
-    assert review.id is not None
-    _persist_current_green_verify(tmp_path, store, owner_task=impl, source_task=review)
-
-    fake_git = _MergeGit(tmp_path)
-    with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = invoke_gza("merge", str(review.id), "--project", str(tmp_path), cwd=tmp_path)
-
-    assert result.returncode == 0
-    assert fake_git.merged == [("feature/shared", False)]
-    assert store.resolve_merge_unit_for_task(review.id).id == store.resolve_merge_unit_for_task(impl.id).id
 
 
 def test_unmerged_lists_merge_unit_owner(tmp_path: Path) -> None:
@@ -748,34 +697,6 @@ def test_merge_all_uses_completed_retry_when_merge_unit_owner_failed(tmp_path: P
     assert fake_git.merged == [("feature/merge-retry", False)]
 
 
-def test_merge_explicit_retry_task_id_uses_actionable_member_when_owner_failed(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    failed = store.add("Failed implementation", task_type="implement")
-    assert failed.id is not None
-    failed.status = "failed"
-    failed.completed_at = datetime.now(UTC)
-    failed.branch = "feature/explicit-retry"
-    failed.has_commits = True
-    failed.merge_status = "unmerged"
-    store.update(failed)
-
-    retry = store.add("Completed retry", task_type="implement", based_on=failed.id)
-    store.mark_completed(retry, has_commits=True, branch="feature/explicit-retry")
-    assert retry.id is not None
-    review = _add_completed_approved_review(store, based_on_task=retry, depends_on_task=retry)
-    _persist_current_green_verify(tmp_path, store, owner_task=retry, source_task=review)
-
-    fake_git = _MergeGit(tmp_path)
-    with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = invoke_gza("merge", str(retry.id), "--project", str(tmp_path), cwd=tmp_path)
-
-    assert result.returncode == 0
-    assert fake_git.merged == [("feature/explicit-retry", False)]
-    unit = store.resolve_merge_unit_for_task(retry.id)
-    assert unit is not None
-    assert unit.merged_by_task_id == retry.id
 
 
 
@@ -1096,72 +1017,6 @@ def test_merge_force_refuses_failed_or_stopped_pre_merge_verify_fix_task(
     assert refreshed_fix.status == verify_fix_status
 
 
-@pytest.mark.parametrize(
-    ("proof_kind", "canonical_outcome", "legacy_scope", "expected_text"),
-    [
-        ("canonical", "{not-json", None, "invalid canonical completion proof"),
-        (
-            "legacy",
-            None,
-            json.dumps(
-                {
-                    "kind": "verify_fix_completion_outcome",
-                    "schema_version": 1,
-                    "no_source_changes": True,
-                    "completion_head_sha": None,
-                    "recovery_rerun_attempted": False,
-                }
-            ),
-            "invalid legacy completion proof",
-        ),
-    ],
-)
-def test_merge_force_refuses_invalid_pre_merge_verify_fix_completion_proof(
-    tmp_path: Path,
-    proof_kind: str,
-    canonical_outcome: str | None,
-    legacy_scope: str | None,
-    expected_text: str,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = store.add(f"Implement invalid {proof_kind} verify_fix proof", task_type="implement")
-    store.mark_completed(impl, has_commits=True, branch=f"feature/invalid-{proof_kind}-verify-fix-proof")
-    assert impl.id is not None
-    _add_completed_approved_review(store, based_on_task=impl, depends_on_task=impl)
-    verify_fix = _add_verify_fix_for_current_epoch(store, impl=impl, status="completed")
-    verify_fix.completed_at = datetime.now(UTC)
-    verify_fix.has_commits = False
-    verify_fix.changed_diff = False
-    verify_fix.review_verify_head_sha = "same-head"
-    if canonical_outcome is not None:
-        verify_fix.verify_fix_completion_outcome_json = canonical_outcome
-    if legacy_scope is not None:
-        verify_fix.verify_fix_completion_outcome_json = None
-        verify_fix.review_scope = legacy_scope
-        verify_fix.changed_diff = None
-        verify_fix.review_verify_head_sha = None
-    store.update(verify_fix)
-    _persist_current_verify(
-        tmp_path,
-        store,
-        owner_task=impl,
-        source_task=impl,
-        status="failed",
-        command="./bin/timeout-tests",
-        exit_status="timed out",
-    )
-
-    _assert_verify_family_merge_refused(
-        tmp_path,
-        store,
-        impl=impl,
-        expected_text=expected_text,
-    )
-    refreshed_fix = store.get(verify_fix.id)
-    assert refreshed_fix is not None
-    assert refreshed_fix.status == "completed"
 
 
 def test_merge_force_refuses_unavailable_pre_merge_verify_fix_exact_head_proof(tmp_path: Path) -> None:

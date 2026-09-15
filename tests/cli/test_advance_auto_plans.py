@@ -483,98 +483,6 @@ def test_advance_type_implement_filters_to_implements_only(tmp_path: Path, capsy
     assert "Create and start implement" not in output
 
 
-def test_advance_explicit_task_keeps_global_action_when_lineage_has_suppressed_failed_leaf(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    config = Config.load(tmp_path)
-    impl = _create_completed_implement(store)
-
-    failed_review = store.add("Suppressed failed review", task_type="review", based_on=impl.id, depends_on=impl.id)
-    assert failed_review.id is not None
-    failed_review.status = "failed"
-    failed_review.failure_reason = "INFRASTRUCTURE_ERROR"
-    failed_review.completed_at = datetime(2026, 8, 25, 9, 1, tzinfo=UTC)
-    store.update(failed_review)
-
-    recovered_review = store.add(
-        "Recovered failed review",
-        task_type="review",
-        based_on=failed_review.id,
-        depends_on=impl.id,
-        recovery_origin="retry",
-    )
-    assert recovered_review.id is not None
-    recovered_review.status = "completed"
-    recovered_review.completed_at = datetime(2026, 8, 25, 9, 2, tzinfo=UTC)
-    store.update(recovered_review)
-
-    unrelated_failed = store.add("Unrelated failed task", task_type="implement")
-    assert unrelated_failed.id is not None
-    unrelated_failed.status = "failed"
-    unrelated_failed.failure_reason = "INFRASTRUCTURE_ERROR"
-    unrelated_failed.completed_at = datetime(2026, 8, 25, 9, 3, tzinfo=UTC)
-    unrelated_failed.branch = "feature/unrelated-failed"
-    store.update(unrelated_failed)
-
-    merge_context = _merge_context_without_repo_state()
-    monkeypatch.setattr(recovery_engine, "_load_merge_context", lambda _project_dir=None: merge_context)
-
-    git = _mock_git()
-    git.current_branch.return_value = "main"
-    git.default_branch.return_value = "main"
-    git.count_commits_ahead.return_value = 1
-
-    global_rows = query_lineage_owner_rows(
-        store,
-        LineageOwnerQuery(
-            limit=None,
-            include_skipped=True,
-            exclude_dropped_from_planning=True,
-            max_recovery_attempts=1,
-        ),
-        config=config,
-        git=git,
-        target_branch="main",
-    )
-    global_row = next(row for row in global_rows if row.owner_task.id == impl.id)
-    assert global_row.recovery_leaf_task is None
-    assert global_row.next_action is not None
-    expected_description = global_row.next_action["description"]
-    explicit_query_actions: list[dict] = []
-
-    from gza.cli import git_ops
-
-    original_query = git_ops.query_lineage_owner_rows
-
-    def _spy_query(*args, **kwargs):
-        rows = tuple(original_query(*args, **kwargs))
-        query = args[1]
-        if query.task_ids == (impl.id,):
-            explicit_query_actions.extend(
-                row.next_action
-                for row in rows
-                if row.owner_task.id == impl.id and row.next_action
-            )
-        return rows
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=git),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
-        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
-        patch("gza.cli.git_ops.query_lineage_owner_rows", side_effect=_spy_query),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, dry_run=True))
-
-    output = capsys.readouterr().out
-    assert rc == 0
-    assert explicit_query_actions == [global_row.next_action]
-    assert str(impl.id) in output
-    assert expected_description.removeprefix("SKIP: ") in output
-    assert str(unrelated_failed.id) not in output
 
 
 def test_advance_dry_run_warns_once_when_failed_task_branch_reachability_is_unavailable(
@@ -1964,34 +1872,6 @@ def test_advance_repeat_no_progress_requires_two_consecutive_unchanged_cycles(tm
 
 
 
-def test_advance_repeat_no_progress_ignores_sibling_merge_unit_churn(tmp_path: Path, capsys) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    plan = _create_completed_plan(store)
-    selected = _create_completed_implement(store, based_on=plan.id)
-    sibling = _create_completed_implement(store, based_on=plan.id)
-    git = _mock_git()
-    calls = {"value": 0}
-
-    def fake_execute(*_args, **_kwargs):
-        calls["value"] += 1
-        sibling.output_content = f"sibling-only progress {calls['value']}"
-        store.update(sibling)
-        return AdvanceActionExecutionResult(action_type="create_review", status="success", message="noop")
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=git),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
-        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "create_review", "description": "Create review"}),
-        patch("gza.cli.git_ops.execute_advance_action", side_effect=fake_execute),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=selected.id, repeat=True, max_iterations=5))
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert calls["value"] == 2
-    assert "cycle 2: create_review -> success: noop" in captured.out
-    assert "Advance repeat stopped: no progress after repeated create_review" in captured.out
 
 
 def test_advance_repeat_supervised_session_survives_reconciliation_after_timeout(

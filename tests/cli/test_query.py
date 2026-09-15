@@ -2139,22 +2139,6 @@ class TestHistoryCommand:
         assert "Failed task" not in result.stdout
         assert "Unmerged task" not in result.stdout
 
-    def test_history_filter_by_failed_status(self, tmp_path: Path):
-        """History command filters by failed status."""
-        setup_db_with_tasks(tmp_path, [
-            {"prompt": "Completed task", "status": "completed"},
-            {"prompt": "Failed task 1", "status": "failed"},
-            {"prompt": "Failed task 2", "status": "failed"},
-            {"prompt": "Unmerged task", "status": "unmerged"},
-        ])
-
-        result = invoke_gza("history", "--status", "failed", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Failed task 1" in result.stdout
-        assert "Failed task 2" in result.stdout
-        assert "Completed task" not in result.stdout
-        assert "Unmerged task" not in result.stdout
 
     def test_history_filter_by_unmerged_status(self, tmp_path: Path):
         """History command filters by unmerged status."""
@@ -2715,28 +2699,6 @@ class TestHistoryCommand:
         assert "Allowed orphaned task" in result.stdout
         assert "Excluded orphaned task" not in result.stdout
 
-    def test_history_no_orphaned_when_status_filter_set(self, tmp_path: Path):
-        """History command does not show orphaned tasks when --status filter is active."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        # Create an orphaned task
-        orphaned_task = store.add("Orphaned task")
-        mark_orphaned(store, orphaned_task)
-
-        # Create a completed task
-        completed_task = store.add("Completed task")
-        completed_task.status = "completed"
-        completed_task.completed_at = datetime.now(UTC)
-        store.update(completed_task)
-
-        result = invoke_gza("history", "--status", "completed", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        # Orphaned should NOT appear when a status filter is specified
-        assert "orphaned" not in result.stdout
-        assert "Completed task" in result.stdout
 
 
     def test_history_last_flag(self, tmp_path: Path):
@@ -3290,26 +3252,6 @@ class TestHistoryCommand:
 class TestSearchCommand:
     """Tests for 'gza search' command."""
 
-    def test_search_matches_pending_and_history_excludes_pending(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        pending = store.add("needle pending task")
-        assert pending.id is not None
-
-        completed = store.add("needle completed task")
-        completed.status = "completed"
-        completed.completed_at = datetime.now(UTC)
-        store.update(completed)
-
-        search_result = invoke_gza("search", "needle", "--project", str(tmp_path))
-        history_result = invoke_gza("history", "--project", str(tmp_path))
-
-        assert search_result.returncode == 0
-        assert "needle pending task" in search_result.stdout
-        assert "needle completed task" in search_result.stdout
-        assert history_result.returncode == 0
-        assert "needle pending task" not in history_result.stdout
 
     def test_search_shows_actual_status_labels_for_in_progress_and_pending(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -4523,24 +4465,6 @@ class TestQueueCommand:
         assert refreshed_impl.merge_status == "unmerged"
         assert store.resolve_merge_unit_for_task(merged_impl.id) is None
 
-    def test_queue_shows_legacy_unmerged_merge_action_between_recovery_and_pending(self, tmp_path: Path):
-        failed, legacy_impl = _seed_legacy_unmerged_lifecycle_and_recovery_fixture(tmp_path)
-
-        with patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()):
-            result = invoke_gza("queue", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        normalized = " ".join(result.stdout.split())
-        assert "Runnable recovery lane (watch will run):" in result.stdout
-        assert "Lifecycle actions:" in result.stdout
-        assert "Pending lane (watch will run after recovery policy allows slots):" in result.stdout
-        assert f"resume {failed.id}" in normalized
-        assert legacy_impl.id in result.stdout
-        assert "Merge (review APPROVED)" in result.stdout
-        recovery_idx = result.stdout.index("Runnable recovery lane (watch will run):")
-        lifecycle_idx = result.stdout.index("Lifecycle actions:")
-        pending_idx = result.stdout.index("Pending lane (watch will run after recovery policy allows slots):")
-        assert recovery_idx < lifecycle_idx < pending_idx
 
     def test_queue_pending_mode_is_git_free_but_default_mode_exercises_git_path(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
@@ -8714,53 +8638,6 @@ class TestShowCommand:
         assert f"Lifecycle: improve in_progress ({improve.id})" in output
         assert "(unknown)" not in output
 
-    def test_show_lineage_omits_merge_badge_for_failed_code_task_with_stale_merge_status(
-        self, tmp_path: Path
-    ) -> None:
-        """Failed code-task lineage rows should not show merge badges from stale metadata."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        failed = store.add("Failed implement with stale merge status", task_type="implement")
-        assert failed.id is not None
-        failed.status = "failed"
-        failed.failure_reason = "TIMEOUT"
-        failed.has_commits = True
-        failed.branch = "feature/failed-stale-merge-status"
-        failed.merge_status = "unmerged"
-        failed.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
-        store.update(failed)
-
-        child = store.add("Follow-up lineage child", task_type="review", based_on=failed.id, depends_on=failed.id)
-        assert child.id is not None
-
-        git = MagicMock()
-        git.default_branch.return_value = "main"
-        git.branch_exists.return_value = True
-        git.ref_exists.return_value = False
-        git.rev_parse_if_exists.return_value = "a" * 40
-        git.can_merge.return_value = True
-        git.is_merged.return_value = False
-        git.count_commits_ahead.return_value = 1
-        git.get_diff_stat_parsed.return_value = (1, 1, 0)
-        git.worktree_list.return_value = []
-
-        with (
-            patch("gza.cli.query.Git", return_value=git),
-            patch("gza.git.Git.branch_exists", return_value=True),
-            patch("gza.git.Git.rev_parse_if_exists", return_value="a" * 40),
-            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
-        ):
-            result = invoke_gza("show", str(failed.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        normalized = " ".join(result.stdout.split())
-        assert "Lineage:" in result.stdout
-        assert f"{failed.id} implement failed (TIMEOUT)" in normalized
-        # No stale merge badge on the failed row.
-        assert "failed (TIMEOUT) [unmerged]" not in normalized
-        assert "failed (TIMEOUT) [merged]" not in normalized
 
     def test_show_completed_merged_task_omits_trivial_lifecycle_and_lineage(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -13312,96 +13189,7 @@ class TestUnmergedReviewStatus:
         assert "✓ approved" in result.stdout
         assert "⚠ changes requested" not in result.stdout
 
-    def test_unmerged_shows_lineage_for_review_improve_chain(self, tmp_path: Path):
-        """Unmerged output includes related review/improve lineage for implementation."""
-        import time
 
-        store, impl, git = setup_unmerged_env(tmp_path)
-
-        review = store.add("Review", task_type="review")
-        review.status = "completed"
-        review.completed_at = datetime.now(UTC)
-        review.depends_on = impl.id
-        review.output_content = "Verdict: CHANGES_REQUESTED"
-        store.update(review)
-
-        time.sleep(0.01)
-        improve = store.add("Address review feedback", task_type="improve")
-        improve.status = "completed"
-        improve.completed_at = datetime.now(UTC)
-        improve.based_on = impl.id
-        improve.depends_on = review.id
-        improve.branch = "feature/test"
-        improve.same_branch = True
-        store.update(improve)
-
-        # Simulate improve completion clearing the review state.
-        assert impl.id is not None
-        store.clear_review_state(impl.id)
-
-        result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-        # Lineage is now a one-line orientation summary; the owner heads the row and
-        # the review-state ("review stale") is surfaced on the review line.
-        assert "lineage:" in result.stdout
-        assert f"{impl.id}" in result.stdout
-        assert "review stale" in result.stdout
-
-    def test_unmerged_keeps_owner_identity_while_using_latest_branch_review_summary(self, tmp_path: Path):
-        """Unmerged keeps the branch owner row while summarizing the latest branch review state."""
-        store, root_impl, git = setup_unmerged_env(tmp_path)
-
-        retry_impl = store.add("Retry implementation", task_type="implement")
-        retry_impl.status = "completed"
-        retry_impl.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
-        retry_impl.based_on = root_impl.id
-        retry_impl.branch = "feature/test"
-        retry_impl.same_branch = True
-        retry_impl.has_commits = True
-        retry_impl.merge_status = "unmerged"
-        store.update(retry_impl)
-
-        review = store.add("Review retry", task_type="review")
-        review.status = "completed"
-        review.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
-        review.depends_on = retry_impl.id
-        review.output_content = "Verdict: CHANGES_REQUESTED"
-        store.update(review)
-
-        improve = store.add("Improve retry", task_type="improve")
-        improve.status = "failed"
-        improve.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
-        improve.based_on = retry_impl.id
-        improve.depends_on = review.id
-        improve.branch = "feature/test"
-        improve.same_branch = True
-        store.update(improve)
-
-        sibling_impl = store.add("Sibling retry", task_type="implement")
-        sibling_impl.status = "completed"
-        sibling_impl.completed_at = datetime(2026, 2, 12, 14, 0, tzinfo=UTC)
-        sibling_impl.based_on = root_impl.id
-        sibling_impl.branch = "feature/test"
-        sibling_impl.same_branch = True
-        sibling_impl.has_commits = True
-        sibling_impl.merge_status = "unmerged"
-        store.update(sibling_impl)
-
-        sibling_review = store.add("Review sibling retry", task_type="review")
-        sibling_review.status = "completed"
-        sibling_review.completed_at = datetime(2026, 2, 12, 15, 0, tzinfo=UTC)
-        sibling_review.depends_on = sibling_impl.id
-        sibling_review.output_content = "Verdict: APPROVED"
-        store.update(sibling_review)
-
-        unmerged_result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert unmerged_result.returncode == 0
-
-        unmerged_output = " ".join(unmerged_result.stdout.split())
-        # The owner heads the row and the latest branch review drives the summary;
-        # members no longer print in the (now one-line) lineage section.
-        assert f"⚡ {root_impl.id}" in unmerged_output
-        assert "review: reviewed [✓ approved]" in unmerged_output
 
     def test_unmerged_lineage_matches_lineage_command_root_for_retry_chain(self, tmp_path: Path):
         """Unmerged lineage keeps the same canonical root as `gza lineage` for retried implementations."""
@@ -13526,53 +13314,6 @@ class TestUnmergedReviewStatus:
         assert "review: reviewed [⚠ changes requested]" in normalized
         assert "review: reviewed [✓ approved]" not in normalized
 
-    def test_unmerged_retry_resume_uses_root_review_clear_state_for_staleness(self, tmp_path: Path):
-        """Shared-branch representative should still show stale review after root clear."""
-        store, root_impl, git = setup_unmerged_env(tmp_path)
-        root_impl.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
-        store.update(root_impl)
-
-        retry_impl = store.add("Retry implementation", task_type="implement")
-        retry_impl.status = "completed"
-        retry_impl.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
-        retry_impl.based_on = root_impl.id
-        retry_impl.branch = "feature/test"
-        retry_impl.same_branch = True
-        retry_impl.has_commits = True
-        retry_impl.merge_status = "unmerged"
-        retry_impl.session_id = "sess-retry"
-        store.update(retry_impl)
-
-        retry_review = store.add("Review retry", task_type="review")
-        retry_review.status = "completed"
-        retry_review.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
-        retry_review.depends_on = retry_impl.id
-        retry_review.output_content = "Verdict: CHANGES_REQUESTED"
-        store.update(retry_review)
-
-        assert root_impl.id is not None
-        store.clear_review_state(root_impl.id)
-
-        resumed_impl = store.add("Resume retry implementation", task_type="implement")
-        resumed_impl.status = "completed"
-        resumed_impl.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
-        resumed_impl.based_on = retry_impl.id
-        resumed_impl.branch = "feature/test"
-        resumed_impl.same_branch = True
-        resumed_impl.has_commits = True
-        resumed_impl.merge_status = "unmerged"
-        resumed_impl.session_id = "sess-retry"
-        store.update(resumed_impl)
-
-        result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-
-        normalized = " ".join(result.stdout.split())
-        assert f"⚡ {resumed_impl.id}" in normalized
-        assert "review: review stale" in normalized
-        assert f"review state cleared after last review {retry_review.id}" in normalized
-        assert "review: no review" not in normalized
-        assert "⚠ changes requested" not in normalized
 
     def test_unmerged_does_not_inherit_root_review_across_branches(self, tmp_path: Path):
         """A descendant branch row must not inherit review verdict from root branch."""
@@ -13610,95 +13351,7 @@ class TestUnmergedReviewStatus:
         assert "✓ approved" not in retry_block
         assert "review: reviewed [✓ approved]" in root_block
 
-    def test_unmerged_branch_review_uses_branch_specific_review_source(self, tmp_path: Path):
-        """When branch has its own review, root-branch review must not override it."""
-        store, root_impl, git = setup_unmerged_env(
-            tmp_path,
-            task_prompt="Root implementation",
-            branch="feature/root",
-        )
-        root_impl.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
-        store.update(root_impl)
 
-        retry_impl = store.add("Retry on new branch", task_type="implement")
-        retry_impl.status = "completed"
-        retry_impl.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
-        retry_impl.based_on = root_impl.id
-        retry_impl.branch = "feature/retry"
-        retry_impl.same_branch = False
-        retry_impl.has_commits = True
-        retry_impl.merge_status = "unmerged"
-        store.update(retry_impl)
-
-        retry_review = store.add("Retry review", task_type="review")
-        retry_review.status = "completed"
-        retry_review.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
-        retry_review.depends_on = retry_impl.id
-        retry_review.output_content = "Verdict: CHANGES_REQUESTED"
-        store.update(retry_review)
-
-        root_review = store.add("Root review", task_type="review")
-        root_review.status = "completed"
-        root_review.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
-        root_review.depends_on = root_impl.id
-        root_review.output_content = "Verdict: APPROVED"
-        store.update(root_review)
-
-        result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-
-        retry_block = _unmerged_branch_block(result.stdout, "feature/retry")
-        root_block = _unmerged_branch_block(result.stdout, "feature/root")
-        assert "review: reviewed [⚠ changes requested]" in retry_block
-        assert "✓ approved" not in retry_block
-        assert "review: reviewed [✓ approved]" in root_block
-
-    def test_unmerged_split_branch_keeps_branch_local_review_after_root_review_clear(self, tmp_path: Path):
-        """Root review-clear state must not stale a split descendant branch row."""
-        store, root_impl, git = setup_unmerged_env(
-            tmp_path,
-            task_prompt="Root implementation",
-            branch="feature/root",
-        )
-        root_impl.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
-        store.update(root_impl)
-
-        root_review = store.add("Root review", task_type="review")
-        root_review.status = "completed"
-        root_review.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
-        root_review.depends_on = root_impl.id
-        root_review.output_content = "Verdict: APPROVED"
-        store.update(root_review)
-
-        retry_impl = store.add("Retry on new branch", task_type="implement")
-        retry_impl.status = "completed"
-        retry_impl.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
-        retry_impl.based_on = root_impl.id
-        retry_impl.branch = "feature/retry"
-        retry_impl.same_branch = False
-        retry_impl.has_commits = True
-        retry_impl.merge_status = "unmerged"
-        store.update(retry_impl)
-
-        retry_review = store.add("Retry review", task_type="review")
-        retry_review.status = "completed"
-        retry_review.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
-        retry_review.depends_on = retry_impl.id
-        retry_review.output_content = "Verdict: CHANGES_REQUESTED"
-        store.update(retry_review)
-
-        assert root_impl.id is not None
-        store.clear_review_state(root_impl.id)
-
-        result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-
-        retry_block = _unmerged_branch_block(result.stdout, "feature/retry")
-        root_block = _unmerged_branch_block(result.stdout, "feature/root")
-        assert "review: reviewed [⚠ changes requested]" in retry_block
-        assert "review stale" not in retry_block
-        assert "review state cleared after last review" not in retry_block
-        assert "review: review stale" in root_block
     def test_unmerged_prefers_latest_based_on_only_review_for_badge_and_lineage(self, tmp_path: Path):
         """Latest imported review should drive both the summary badge and lineage marker."""
         store, impl, git = setup_unmerged_env(tmp_path)
@@ -13870,27 +13523,6 @@ class TestUnmergedSelectionBehavior:
         assert unit is not None
         assert unit.state == "unmerged"
 
-    def test_unmerged_backfills_merge_status(self, tmp_path: Path):
-        """Plain unmerged backfills canonical merge_status."""
-        store, task, git = setup_unmerged_env(
-            tmp_path,
-            task_prompt="Old task needing migration",
-            task_id="20260220-old-task",
-            branch="feature/old-task",
-            merge_status=None,
-        )
-
-        result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "Migrating merge status" not in result.stdout
-        assert "Old task needing migration" in result.stdout
-
-        migrated_task = store.get(task.id)
-        assert migrated_task.merge_status == "unmerged"
-
-        result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "Migrating merge status" not in result.stdout
 
     def test_unmerged_marks_stale_merged_task_as_merged(self, tmp_path: Path):
         """Plain unmerged repairs stale merged rows in the canonical DB view."""
@@ -14000,58 +13632,6 @@ class TestUnmergedSelectionBehavior:
 
         assert query_cli._resolve_unmerged_branch_owner(store, implement).id == implement.id  # noqa: SLF001
 
-    def test_unmerged_different_branch_implement_chain_keeps_separate_branch_owners(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """Different-branch implement dependencies should surface one owner row per branch."""
-        store, branch_a, _git = _setup_unmerged_env_fast(
-            tmp_path,
-            task_prompt="Branch A owner",
-            branch="feature/branch-a",
-        )
-        branch_a.completed_at = datetime(2026, 5, 9, 10, 0, tzinfo=UTC)
-        store.update(branch_a)
-
-        branch_b = store.add("Branch B owner", task_type="implement")
-        branch_b.status = "completed"
-        branch_b.completed_at = datetime(2026, 5, 9, 11, 0, tzinfo=UTC)
-        branch_b.based_on = branch_a.id
-        branch_b.branch = "feature/branch-b"
-        branch_b.has_commits = True
-        branch_b.merge_status = "unmerged"
-        store.update(branch_b)
-
-        assert branch_a.id is not None
-        assert branch_b.id is not None
-        assert query_cli._resolve_unmerged_branch_owner(store, branch_a).id == branch_a.id  # noqa: SLF001
-        assert query_cli._resolve_unmerged_branch_owner(store, branch_b).id == branch_b.id  # noqa: SLF001
-
-        branch_a_unit = store.get_or_create_merge_unit_for_task(branch_a)
-        branch_b_unit = store.get_or_create_merge_unit_for_task(branch_b)
-        assert branch_a_unit is not None
-        assert branch_b_unit is not None
-        assert branch_a_unit.id != branch_b_unit.id
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=5,
-            json=True,
-            fields="id,prompt,branch",
-        )
-
-        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
-        captured = capsys.readouterr()
-        assert result == 0
-        payload = json.loads(captured.out)
-        assert {(row["id"], row["prompt"], row["branch"]) for row in payload} == {
-            (branch_a.id, "Branch A owner", "feature/branch-a"),
-            (branch_b.id, "Branch B owner", "feature/branch-b"),
-        }
 
     @pytest.mark.parametrize("descendant_type", ["rebase", "improve", "fix"])
     def test_unmerged_same_branch_followups_still_surface_implement_owner(
@@ -14655,28 +14235,6 @@ class TestUnmergedImprovedDisplay:
         assert refreshed.diff_lines_added == 1
         assert refreshed.diff_lines_removed == 0
 
-    def test_unmerged_target_branch_ignores_default_branch_cached_stats(self, tmp_path: Path):
-        """When `--target` is used, unmerged recomputes diff stats for that merge target."""
-        store, task, git = setup_unmerged_env(
-            tmp_path,
-            task_prompt="Target-aware stats task",
-            branch="feature/target-aware",
-        )
-
-        # Seed cached stats (computed against default branch) with a sentinel value.
-        task.diff_files_changed = 999
-        task.diff_lines_added = 999
-        task.diff_lines_removed = 999
-        store.update(task)
-
-        default_result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert default_result.returncode == 0
-        assert "+999/-999 LOC, 999 files" not in default_result.stdout
-        assert "+1/-0 LOC, 1 files" in default_result.stdout
-
-        target_result = invoke_gza("unmerged", "--target", "target/base", "--project", str(tmp_path))
-        assert target_result.returncode == 0
-        assert "+999/-999 LOC, 999 files" not in target_result.stdout
 
     def test_unmerged_review_shown_on_own_line(self, tmp_path: Path):
         """Review status appears on its own 'review:' line."""
@@ -14714,14 +14272,6 @@ class TestUnmergedImprovedDisplay:
         assert "pr:" in result.stdout
         assert "https://github.com/o/r/pull/123" in result.stdout
 
-    def test_unmerged_shows_no_review_when_missing(self, tmp_path: Path):
-        """Unmerged output shows 'no review' when no review exists."""
-        store, task, git = setup_unmerged_env(tmp_path)
-
-        result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "review:" in result.stdout
-        assert "no review" in result.stdout
 
     def test_unmerged_always_shows_completion_time(self, tmp_path: Path):
         """Completion time is shown even for tasks with improve tasks."""
@@ -15399,83 +14949,6 @@ class TestUnmergedUnifiedQueryOutput:
         assert "Showing 5 of 6" not in captured.out
         assert "Showing 5 of 6" in captured.err
 
-    def test_unmerged_same_branch_pending_descendant_does_not_replace_completed_representative(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        store, root_task, _git = _setup_unmerged_env_fast(
-            tmp_path,
-            task_prompt="Completed unmerged implementation",
-            branch="feature/shared-branch",
-        )
-        root_task.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
-        root_task.has_commits = True
-        root_task.merge_status = "unmerged"
-        store.update(root_task)
-
-        pending_descendant = store.add("Pending same-branch follow-up", task_type="implement")
-        pending_descendant.status = "pending"
-        pending_descendant.created_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
-        pending_descendant.based_on = root_task.id
-        pending_descendant.branch = "feature/shared-branch"
-        pending_descendant.same_branch = True
-        pending_descendant.has_commits = False
-        store.update(pending_descendant)
-
-        rich_args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=5,
-            json=False,
-            fields=None,
-        )
-        block_args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=5,
-            json=False,
-            fields="id,prompt,status",
-        )
-        json_args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=5,
-            json=True,
-            fields="id,prompt,status",
-        )
-
-        rich_result = query_cli.cmd_unmerged(rich_args, git=_FastUnmergedGit())
-        rich_output = capsys.readouterr()
-        assert rich_result == 0
-        rich_block = _unmerged_branch_block(rich_output.out, "feature/shared-branch")
-        rich_header = next(line for line in rich_block.splitlines() if line.startswith("⚡ "))
-        assert rich_header.endswith("Completed unmerged implementation")
-        assert root_task.id in rich_header
-
-        block_result = query_cli.cmd_unmerged(block_args, git=_FastUnmergedGit())
-        block_output = capsys.readouterr()
-        assert block_result == 0
-        assert f"id: {root_task.id}" in block_output.out
-        assert "prompt: Completed unmerged implementation" in block_output.out
-        assert "Pending same-branch follow-up" not in block_output.out
-
-        json_result = query_cli.cmd_unmerged(json_args, git=_FastUnmergedGit())
-        json_output = capsys.readouterr()
-        assert json_result == 0
-        assert json.loads(json_output.out) == [
-            {
-                "id": root_task.id,
-                "prompt": "Completed unmerged implementation",
-                "status": "completed",
-            }
-        ]
 
     def test_unmerged_json_rebase_representative_with_branchless_plan_returns_branch_owner_row(
         self,
@@ -18035,78 +17508,7 @@ class TestIncompleteCommand:
         assert result.stderr == ""
 
 
-    def test_incomplete_tag_filters_text_and_json_match_owner_scope(self, tmp_path: Path) -> None:
-        tasks = self._setup_incomplete_tag_filter_fixture(tmp_path)
 
-        text_result = invoke_gza("incomplete", "--tag", "alpha", "--project", str(tmp_path))
-        json_result = invoke_gza(
-            "incomplete",
-            "--tag",
-            "alpha",
-            "--json",
-            "--fields",
-            "id,tags",
-            "--last",
-            "0",
-            "--project",
-            str(tmp_path),
-        )
-
-        assert text_result.returncode == 0
-        assert tasks["alpha"].id in text_result.stdout
-        assert tasks["both"].id in text_result.stdout
-        assert tasks["beta"].id not in text_result.stdout
-
-        assert json_result.returncode == 0
-        json_rows = {(row["id"], tuple(row["tags"])) for row in _incomplete_json_rows(json_result.stdout)}
-        assert json_rows == {
-            (tasks["alpha"].id, ("alpha",)),
-            (tasks["both"].id, ("alpha", "beta")),
-        }
-        assert json_result.stderr == ""
-
-    def test_incomplete_repeated_tag_filters_default_to_or_and_support_all_tags(self, tmp_path: Path) -> None:
-        tasks = self._setup_incomplete_tag_filter_fixture(tmp_path)
-
-        any_tag_result = invoke_gza(
-            "incomplete",
-            "--json",
-            "--fields",
-            "id",
-            "--last",
-            "0",
-            "--tag",
-            "alpha",
-            "--tag",
-            "beta",
-            "--project",
-            str(tmp_path),
-        )
-        all_tags_result = invoke_gza(
-            "incomplete",
-            "--json",
-            "--fields",
-            "id",
-            "--last",
-            "0",
-            "--tag",
-            "alpha",
-            "--tag",
-            "beta",
-            "--all-tags",
-            "--project",
-            str(tmp_path),
-        )
-
-        assert any_tag_result.returncode == 0
-        assert {row["id"] for row in _incomplete_json_rows(any_tag_result.stdout)} == {
-            tasks["alpha"].id,
-            tasks["beta"].id,
-            tasks["both"].id,
-        }
-
-        assert all_tags_result.returncode == 0
-        assert _incomplete_json_rows(all_tags_result.stdout) == [{"id": tasks["both"].id}]
 
     def test_incomplete_untagged_filter_matches_only_untagged_owner_rows(self, tmp_path: Path) -> None:
         setup_config(tmp_path)

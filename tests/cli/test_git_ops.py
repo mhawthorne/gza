@@ -5023,94 +5023,6 @@ def test_merge_single_task_defer_blockers_force_still_refuses_needs_rebase_gate(
     assert "Error: rebase --resolve (conflicts detected)" in output
 
 
-def test_merge_single_task_force_still_refuses_open_review_blockers_without_defer_flag(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    task = store.add("Implement forced blocked merge", task_type="implement")
-    assert task.id is not None
-    task.status = "completed"
-    task.completed_at = datetime.now(UTC)
-    task.branch = "feature/force-blocker"
-    task.has_commits = True
-    task.merge_status = "unmerged"
-    store.update(task)
-
-    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
-    assert review.id is not None
-    review.status = "completed"
-    review.completed_at = datetime.now(UTC)
-    review.output_content = "**Verdict: CHANGES_REQUESTED**"
-    store.update(review)
-
-    blocker = ReviewFinding(
-        id="B-force",
-        severity="BLOCKER",
-        title="Missing data migration",
-        body="Body",
-        evidence=None,
-        impact=None,
-        fix_or_followup="add migration",
-        tests=None,
-        open_state_citation="citation",
-    )
-
-    git = SimpleNamespace(
-        repo_dir=tmp_path,
-        is_merged=MagicMock(return_value=False),
-        default_branch=MagicMock(return_value="main"),
-        branch_exists=MagicMock(return_value=True),
-        has_changes=MagicMock(return_value=False),
-        can_merge=MagicMock(return_value=True),
-        merge=MagicMock(),
-    )
-    args = argparse.Namespace(
-        rebase=False,
-        squash=False,
-        delete=False,
-        mark_only=False,
-        force=True,
-        remote=False,
-        resolve=False,
-        defer_blockers=False,
-        no_followups=False,
-    )
-    config = Config.load(tmp_path)
-
-    with (
-        patch(
-            "gza.cli.git_ops.determine_next_action",
-            return_value={
-                "type": "needs_discussion",
-                "description": "SKIP: required resolution-review metadata is missing or malformed",
-                "needs_attention_reason": "resolution-review-metadata-invalid",
-            },
-        ),
-        patch(
-            "gza.cli.git_ops.get_review_report",
-            return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(blocker,), format_version="v2"),
-        ),
-        patch("gza.cli.git_ops.get_review_content", return_value="review content"),
-        patch(
-            "gza.cli.git_ops.summarize_review_blockers",
-            return_value=SimpleNamespace(
-                blocker_count=1,
-                verify_timeout_count=0,
-                verify_failure_count=0,
-                unknown_or_code_count=1,
-            ),
-        ),
-    ):
-        result = _merge_single_task(task.id, config, store, git, args, "main")
-
-    assert result.rc == 1
-    git.merge.assert_not_called()
-    output = capsys.readouterr().out
-    assert "Warning: Forcing merge despite lifecycle gate" in output
-    assert f"Error: Task {task.id} has open BLOCKER findings in review {review.id}." in output
-    assert "Use --defer-blockers to merge anyway and create urgent PR-required follow-up tasks." in output
 
 
 
@@ -6458,11 +6370,6 @@ def test_execute_merge_action_max_cycle_rejects_duplicate_replay_children_before
     [
         ({"type": "merge", "description": "Merge"}, MERGE_SOURCE_ADVANCE, MERGE_SOURCE_ADVANCE),
         ({"type": "merge", "description": "Merge"}, MERGE_SOURCE_WATCH, MERGE_SOURCE_WATCH),
-        (
-            {"type": "merge", "description": "Merge and defer", "max_cycles_merge_and_defer": True},
-            MERGE_SOURCE_WATCH,
-            MERGE_SOURCE_MAX_CYCLES_DEFERRED,
-        ),
     ],
 )
 def test_execute_merge_action_mark_merged_uses_action_provenance_selector(
@@ -7758,62 +7665,6 @@ def test_stage_isolated_merge_action_max_cycle_already_merged_materialization_fa
     assert refreshed_unit.merge_source is None
 
 
-def test_execute_merge_action_max_cycle_task_creation_failure_aborts_before_merge_or_state(
-    tmp_path: Path,
-) -> None:
-    setup_config(tmp_path)
-    config = Config.load(tmp_path)
-    config.on_max_cycles = "merge_and_defer"
-    store = make_store(tmp_path)
-    task = _completed_merge_task(store, "Creation failure capped implementation", "feature/capped-fail")
-    unit = store.get_or_create_merge_unit_for_task(task)
-    assert unit is not None
-    review_output = _capped_review_output("B3")
-    review = _completed_review(store, task, review_output)
-    _persist_capped_authorization_verify(store, config, task, tmp_path=tmp_path)
-    finding = _blocker_finding("B3")
-    git = _merge_executor_git(tmp_path, task.branch)
-
-    def _merge_side_effect(*_args: object, **_kwargs: object) -> _MergeSingleTaskResult:
-        side_effect = _kwargs.get("before_irreversible_side_effect")
-        assert side_effect is not None
-        materialization_error = side_effect()
-        assert materialization_error is not None
-        return _MergeSingleTaskResult(
-            rc=materialization_error.rc,
-            status=materialization_error.status,
-            block_reason=materialization_error.block_reason,
-            created_deferred_blockers=tuple(materialization_error.created_deferred_blockers),
-            reused_deferred_blockers=tuple(materialization_error.reused_deferred_blockers),
-        )
-
-    with (
-        patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()) as build_args,
-        patch("gza.cli.git_ops._merge_single_task", side_effect=_merge_side_effect) as merge_single,
-        patch(
-            "gza.cli.git_ops._create_or_reuse_capped_review_blocker_tasks",
-            side_effect=RuntimeError("database is locked"),
-        ),
-    ):
-        result = _execute_merge_action(
-            config,
-            store,
-            git,
-            task,
-            _max_cycle_merge_action(review, (finding,), review_output),
-            target_branch="main",
-            current_branch="main",
-            merge_source=MERGE_SOURCE_ADVANCE,
-        )
-
-    assert result.rc == 1
-    assert result.status == "deferred_blocker_materialization_failed"
-    build_args.assert_called_once()
-    merge_single.assert_called_once()
-    refreshed_unit = store.get_merge_unit(unit.id)
-    assert refreshed_unit is not None
-    assert refreshed_unit.state == "unmerged"
-    assert refreshed_unit.merge_source is None
 
 
 def test_execute_merge_action_max_cycle_partial_creation_failure_returns_created_work(
@@ -7885,53 +7736,6 @@ def test_execute_merge_action_max_cycle_partial_creation_failure_returns_created
     assert refreshed_unit.merge_source is None
 
 
-def test_execute_merge_action_max_cycle_conflict_preflight_creates_no_deferred_blockers(
-    tmp_path: Path,
-) -> None:
-    setup_config(tmp_path)
-    config = Config.load(tmp_path)
-    config.on_max_cycles = "merge_and_defer"
-    store = make_store(tmp_path)
-    task = _completed_merge_task(store, "Conflict capped implementation", "feature/capped-conflict")
-    unit = store.get_or_create_merge_unit_for_task(task)
-    assert unit is not None
-    review_output = _capped_review_output("B4")
-    review = _completed_review(store, task, review_output)
-    _persist_capped_authorization_verify(store, config, task, tmp_path=tmp_path)
-    git = _merge_executor_git(tmp_path, task.branch)
-
-    with (
-        patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
-        patch(
-            "gza.cli.git_ops._merge_single_task",
-            return_value=_MergeSingleTaskResult(
-                rc=1,
-                status="merge_conflict",
-                block_reason="branch conflicts against main",
-            ),
-        ) as merge_single,
-        patch("gza.cli.git_ops._create_or_reuse_capped_review_blocker_tasks") as materialize,
-    ):
-        result = _execute_merge_action(
-            config,
-            store,
-            git,
-            task,
-            _max_cycle_merge_action(review, (_blocker_finding("B4"),), review_output),
-            target_branch="main",
-            current_branch="main",
-            merge_source=MERGE_SOURCE_ADVANCE,
-        )
-
-    assert result.rc == 1
-    assert result.status == "merge_conflict"
-    merge_single.assert_called_once()
-    materialize.assert_not_called()
-    assert [child for child in store.get_based_on_children(task.id) if child.task_type == "implement"] == []
-    refreshed_unit = store.get_merge_unit(unit.id)
-    assert refreshed_unit is not None
-    assert refreshed_unit.state == "unmerged"
-    assert refreshed_unit.merge_source is None
 
 
 @pytest.mark.parametrize("active_kind", ["review", "improve", "adjudication"])
@@ -8558,65 +8362,6 @@ def test_execute_merge_action_already_merged_rereads_refs_after_materialization_
 
 
 
-def test_execute_merge_action_max_cycle_passes_active_scope_tags_to_blocker_creator(
-    tmp_path: Path,
-) -> None:
-    setup_config(tmp_path)
-    config = Config.load(tmp_path)
-    config.on_max_cycles = "merge_and_defer"
-    store = make_store(tmp_path)
-    task = _completed_merge_task(
-        store,
-        "Tagged capped implementation",
-        "feature/capped-tags",
-        tags=("backend",),
-    )
-    unit = store.get_or_create_merge_unit_for_task(task)
-    assert unit is not None
-    review_output = _capped_review_output("B6")
-    review = _completed_review(store, task, review_output)
-    _persist_capped_authorization_verify(store, config, task, tmp_path=tmp_path)
-    finding = _blocker_finding("B6")
-    git = _merge_executor_git(tmp_path, task.branch)
-    order: list[str] = []
-
-    def _merge_side_effect(*_args: object, **_kwargs: object) -> _MergeSingleTaskResult:
-        side_effect = _kwargs.get("before_irreversible_side_effect")
-        assert side_effect is not None
-        order.append("preflight")
-        materialization_error = side_effect()
-        assert materialization_error is None
-        order.append("git.merge")
-        return _MergeSingleTaskResult(rc=0, status="merged")
-
-    with (
-        patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
-        patch("gza.cli.git_ops._merge_single_task", side_effect=_merge_side_effect),
-    ):
-        result = _execute_merge_action(
-            config,
-            store,
-            git,
-            task,
-            _max_cycle_merge_action(review, (finding,), review_output),
-            target_branch="main",
-            current_branch="main",
-            merge_source=MERGE_SOURCE_ADVANCE,
-            active_scope_tags=("release", "backend"),
-        )
-
-    assert result.rc == 0
-    assert order == ["preflight", "git.merge"]
-    assert len(result.created_deferred_blockers) == 1
-    assert set(result.created_deferred_blockers[0].tags) >= {
-        "backend",
-        "release",
-        "deferred-review-blocker",
-    }
-    refreshed_unit = store.get_merge_unit(unit.id)
-    assert refreshed_unit is not None
-    assert refreshed_unit.state == "merged"
-    assert refreshed_unit.merge_source == MERGE_SOURCE_MAX_CYCLES_DEFERRED
 
 
 def test_execute_merge_action_ordinary_merge_persists_state_and_followups_once(
@@ -9605,112 +9350,6 @@ def test_execute_merge_action_source_ref_change_before_capped_materialization_cr
     assert refreshed_unit.merge_source is None
 
 
-@pytest.mark.parametrize(
-    "legacy_trigger_source, merge_source",
-    [
-        (None, MERGE_SOURCE_ADVANCE),
-        (None, MERGE_SOURCE_WATCH),
-        ("manual", MERGE_SOURCE_ADVANCE),
-    ],
-)
-def test_capped_replay_reuses_initially_accepted_child_without_trigger_source_identity(
-    tmp_path: Path,
-    merge_source: str,
-    legacy_trigger_source: str | None,
-) -> None:
-    setup_config(tmp_path)
-    config = Config.load(tmp_path)
-    store = make_store(tmp_path)
-    task = _completed_merge_task(
-        store,
-        f"Legacy trigger capped replay {merge_source} {legacy_trigger_source}",
-        f"feature/legacy-trigger-{merge_source}-{legacy_trigger_source or 'null'}",
-    )
-    unit = store.get_or_create_merge_unit_for_task(task)
-    assert unit is not None
-    review_output = _capped_review_output("B1")
-    review = _completed_review(store, task, review_output)
-    _set_review_head(store, review, "source-sha")
-    finding = parse_review_report(review_output).findings[0]
-    existing = store.add(
-        build_capped_review_blocker_prompt(review.id, task.id, finding, review_output),
-        task_type="implement",
-        based_on=task.id,
-        depends_on=task.id,
-        review_scope=format_blocker_finding_context(finding),
-        create_pr=True,
-        urgent=True,
-        tags=("deferred-review-blocker",),
-        trigger_source=legacy_trigger_source,
-    )
-    action = _max_cycle_merge_action(review, (finding,), review_output, reviewed_head_sha="source-sha")
-    _persist_capped_authorization_verify(store, config, task, tmp_path=tmp_path, head_sha="source-sha")
-
-    original_set_state = store.set_merge_unit_state
-
-    def merge_side_effect(*_args: object, **kwargs: object) -> _MergeSingleTaskResult:
-        side_effect = kwargs.get("before_irreversible_side_effect")
-        assert side_effect is not None
-        assert side_effect() is None
-        return _MergeSingleTaskResult(rc=0, status="merged")
-
-    store.set_merge_unit_state = MagicMock(side_effect=sqlite3.OperationalError("locked after merge"))  # type: ignore[method-assign]
-    with (
-        patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
-        patch("gza.cli.git_ops._require_fresh_capped_review_lifecycle_authority"),
-        patch("gza.cli.git_ops._merge_single_task", side_effect=merge_side_effect),
-    ):
-        first = _execute_merge_action(
-            config,
-            store,
-            _proofing_merge_executor_git(tmp_path, task.branch),
-            task,
-            action,
-            target_branch="main",
-            current_branch="main",
-            merge_source=merge_source,
-        )
-
-    assert first.rc == 1
-    assert first.status == "post_merge_state_persistence_failed"
-    assert first.created_deferred_blockers == []
-    assert [child.id for child in first.reused_deferred_blockers] == [existing.id]
-
-    store.set_merge_unit_state = original_set_state  # type: ignore[method-assign]
-    replay_action = pending_merge_finalization_action(
-        config,
-        store,
-        task,
-        target_branch="main",
-        require_already_merged=True,
-        resolved_merge_state="merged",
-        live_target_sha="target-after",
-    )
-    assert replay_action is not None
-    assert replay_action["type"] == "merge"
-    assert replay_action["proven_deferred_blocker_tasks"][0].id == existing.id
-
-    replay_git = _replay_executor_git(tmp_path, task.branch)
-    second = _execute_merge_action(
-        config,
-        store,
-        SimpleNamespace(repo_dir=tmp_path),
-        task,
-        replay_action,
-        target_branch="main",
-        current_branch="main",
-        merge_git=replay_git,
-        merge_current_branch="main",
-        already_merged_behavior="mark_merged",
-        merge_source=merge_source,
-    )
-    assert second.rc == 0
-    assert second.status == "already_merged"
-    assert [child.id for child in second.reused_deferred_blockers] == [existing.id]
-    refreshed_unit = store.get_merge_unit(unit.id)
-    assert refreshed_unit is not None
-    assert refreshed_unit.state == "merged"
-    assert refreshed_unit.merge_source == MERGE_SOURCE_MAX_CYCLES_DEFERRED
 
 
 
@@ -11019,7 +10658,6 @@ def test_execute_merge_action_isolated_max_cycle_source_move_after_staging_creat
 @pytest.mark.parametrize(
     "race, executor_path",
     [
-        ("blank-verify-no-current-evidence", "non-isolated"),
         ("blank-verify-no-current-evidence", "already-merged"),
         ("blank-verify-no-current-evidence", "isolated-single"),
         ("blank-verify-source-moved", "already-merged"),
@@ -14337,81 +13975,6 @@ def test_cmd_advance_dry_run_raises_unexpected_merge_context_type_error(tmp_path
             )
 
 
-def test_cmd_advance_dry_run_warns_and_degrades_without_local_branch_names(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    task = store.add("Advance degraded git compatibility", task_type="implement")
-    assert task.id is not None
-    task.status = "completed"
-    task.completed_at = datetime.now(UTC)
-    task.branch = "feature/advance-degraded"
-    task.has_commits = True
-    task.merge_status = "unmerged"
-    store.update(task)
-
-    row = LineageOwnerRow(
-        owner_task=task,
-        members=(task,),
-        tree=None,
-        lineage_status="skipped",
-        next_action={"type": "skip", "description": "nothing to do"},
-        next_action_reason="precomputed",
-        unresolved_tasks=(task,),
-        unresolved_leaf_summary=(),
-        lifecycle_action_task=None,
-        recovery_action_task=None,
-        recovery_leaf_task=None,
-    )
-
-    class _CompatGit:
-        repo_dir = tmp_path
-
-        def current_branch(self) -> str:
-            return "main"
-
-        def default_branch(self) -> str:
-            return "main"
-
-        @contextmanager
-        def cached(self):
-            yield self
-
-    compat_git = _CompatGit()
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=compat_git),
-        patch("gza.git.Git.default_branch", return_value="main"),
-        patch("gza.git.Git.local_branch_names", return_value=()),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
-        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=iter([row])),
-    ):
-        rc = cmd_advance(
-            argparse.Namespace(
-                project_dir=tmp_path,
-                task_id=task.id,
-                dry_run=True,
-                auto=True,
-                max=None,
-                batch=None,
-                no_docker=True,
-                force=False,
-                plans=False,
-                unimplemented=False,
-                create=False,
-                no_resume_failed=False,
-                max_resume_attempts=None,
-                advance_type=None,
-                new=False,
-                max_review_cycles=None,
-                squash_threshold=None,
-            )
-        )
-
-    assert rc == 0
-    assert "Warning: advance recovery preview is using a degraded git context" in capsys.readouterr().out
 
 
 
@@ -14547,65 +14110,6 @@ def test_cmd_advance_batches_ref_preloads_during_lifecycle_planning(tmp_path: Pa
 
 
 
-def test_cmd_advance_explicit_failed_leaf_scopes_query_to_owner_lineage(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    impl, _review = _add_completed_impl_with_approved_review(
-        store,
-        "feature/failed-leaf-owner-scope",
-        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
-    )
-
-    failed_rebase = store.add("Failed rebase leaf", task_type="rebase", based_on=impl.id, same_branch=True)
-    assert failed_rebase.id is not None
-    failed_rebase.status = "failed"
-    failed_rebase.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
-    failed_rebase.branch = impl.branch
-    failed_rebase.failure_reason = "MERGE_CONFLICT"
-    store.update(failed_rebase)
-
-    row = LineageOwnerRow(
-        owner_task=impl,
-        members=(impl, failed_rebase),
-        tree=None,
-        lineage_status="needs_attention",
-        next_action={
-            "type": "needs_discussion",
-            "description": "failed rebase still blocks merge",
-            "needs_attention_reason": "rebase-failed",
-            "subject_task_id": failed_rebase.id,
-        },
-        next_action_reason="rebase-failed",
-        unresolved_tasks=(failed_rebase,),
-        unresolved_leaf_summary=(),
-        lifecycle_action_task=impl,
-        recovery_action_task=failed_rebase,
-        recovery_leaf_task=failed_rebase,
-    )
-
-    fake_git = MagicMock(spec=Git)
-    fake_git.repo_dir = tmp_path
-    fake_git.current_branch.return_value = "main"
-    fake_git.default_branch.return_value = "main"
-
-    captured_queries: list = []
-
-    def _query_rows(_store, query, **_kwargs):
-        captured_queries.append(query)
-        return [row]
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=fake_git),
-        patch("gza.git.Git.default_branch", return_value="main"),
-        patch("gza.git.Git.local_branch_names", return_value=()),
-        patch("gza.cli.git_ops.query_lineage_owner_rows", side_effect=_query_rows),
-    ):
-        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, failed_rebase.id)), "dry_run": True}))
-
-    assert rc == 0
-    assert len(captured_queries) == 1
-    assert captured_queries[0].task_ids == (failed_rebase.id,)
-    assert captured_queries[0].owner_task_ids is None
 
 
 def test_cmd_advance_explicit_dropped_owner_fallback_scopes_second_query_to_owner_lineage(

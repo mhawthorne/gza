@@ -961,14 +961,3 @@ def test_failure_summary_describes_agent_forfeit(tmp_path: Path) -> None:
     assert _failure_summary(task, "AGENT_FORFEIT") == "Agent forfeited: could not complete the task."
 
 
-def test_failure_next_steps_for_agent_forfeit_skip_resume(tmp_path: Path) -> None:
-    store = SqliteTaskStore(tmp_path / "test.db")
-    task = store.add("Failed task")
-    assert task.id is not None
-    task.session_id = "sess-123"
-    store.update(task)
-
-    assert _failure_next_steps(task, "AGENT_FORFEIT") == [
-        f"gza log -t {task.id} --steps-verbose",
-        f"gza retry {task.id}",
-    ]

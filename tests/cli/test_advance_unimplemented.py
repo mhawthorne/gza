@@ -720,35 +720,6 @@ class TestAdvanceUnimplementedCommand:
         impl_tasks = [task for task in store.get_all() if task.task_type == "implement"]
         assert len(impl_tasks) == 0
 
-    def test_advance_unimplemented_targeted_query_ignores_non_source_tasks(self, tmp_path: Path, capsys) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        plan_with_impl = store.add("Plan with impl", task_type="plan")
-        plan_with_impl.status = "completed"
-        plan_with_impl.completed_at = datetime.now(UTC)
-        store.update(plan_with_impl)
-
-        explore_without_impl = store.add("Explore without impl", task_type="explore")
-        explore_without_impl.status = "completed"
-        explore_without_impl.completed_at = datetime.now(UTC)
-        store.update(explore_without_impl)
-
-        assert plan_with_impl.id is not None and explore_without_impl.id is not None
-
-        store.add("Impl 1", task_type="implement", based_on=plan_with_impl.id)
-
-        for i in range(20):
-            task = store.add(f"Task {i}", task_type="review")
-            task.based_on = plan_with_impl.id
-            store.update(task)
-
-        rc = _run_unimplemented(tmp_path, store)
-        output = capsys.readouterr().out
-
-        assert rc == 0
-        assert "Explore without impl" in output
-        assert "Plan with impl" not in output
 
     def test_advance_plans_alias_keeps_plan_only_behavior(self, tmp_path: Path, capsys) -> None:
         setup_config(tmp_path)

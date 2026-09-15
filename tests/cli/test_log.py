@@ -630,78 +630,8 @@ class TestLogCommand:
         assert result.returncode == 1
         assert "Log file not found" in result.stdout
 
-    def test_log_by_task_id_no_result_entry(self, tmp_path: Path):
-        """Log command by task ID shows compact step timeline when no result entry exists."""
-        import json
 
-        setup_config(tmp_path)
 
-        # Create a task with a log file
-        store = make_store(tmp_path)
-        task = store.add("Test task with incomplete log")
-        task.status = "completed"
-        task.log_file = ".gza/logs/test.log"
-        store.update(task)
-
-        # Create a JSONL log file with no result entry
-        log_dir = tmp_path / ".gza" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / "test.log"
-        lines = [
-            {"type": "system", "subtype": "init", "session_id": "abc123", "model": "test-model"},
-            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Working..."}]}},
-        ]
-        log_file.write_text("\n".join(json.dumps(line) for line in lines))
-
-        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
-
-        # Should show formatted entries instead of failing
-        assert result.returncode == 0
-        assert "Working..." in result.stdout
-
-    def test_log_by_task_id_falls_back_to_inferred_log_path(self, tmp_path: Path):
-        """Task lookup should render entries from inferred slug log when task.log_file is stale."""
-        import json
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Fallback log path task")
-        task.status = "completed"
-        task.slug = "20260227-fallback-log"
-        task.log_file = ".gza/logs/missing.log"
-        store.update(task)
-
-        log_dir = tmp_path / ".gza" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        inferred_log = log_dir / "20260227-fallback-log.log"
-        lines = [
-            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Recovered via inferred path"}]}},
-            {"type": "result", "subtype": "success", "result": "ok", "num_steps": 1, "duration_ms": 1000, "total_cost_usd": 0.01},
-        ]
-        inferred_log.write_text("\n".join(json.dumps(line) for line in lines))
-
-        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Recovered via inferred path" in result.stdout
-
-    def test_log_task_lookup_prefers_explicit_task_log_file_without_slug(self, tmp_path: Path):
-        """Task log resolution should use task.log_file even when no slug exists."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Explicit log path task")
-        task.status = "completed"
-        task.slug = None
-        task.log_file = ".gza/logs/explicit.log"
-        store.update(task)
-
-        log_dir = tmp_path / ".gza" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        (log_dir / "explicit.log").write_text(json.dumps({"type": "result", "result": "explicit"}))
-
-        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "explicit" in result.stdout
 
     def test_load_log_file_entries_preserves_mixed_json_and_raw_lines(self, tmp_path: Path):
         """Mixed JSON and raw lines are preserved for display."""

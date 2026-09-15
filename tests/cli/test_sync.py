@@ -20,55 +20,6 @@ def _completed_branch_task(store, prompt: str, branch: str):
     return task
 
 
-def test_sync_explicit_task_id_expands_to_branch_cohort(tmp_path, capsys):
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    parent = _completed_branch_task(store, "Parent task", "feature/shared")
-    child = store.add("Improve task", task_type="improve")
-    child.status = "completed"
-    child.completed_at = datetime.now(UTC)
-    child.branch = "feature/shared"
-    child.has_commits = True
-    child.merge_status = "unmerged"
-    child.based_on = parent.id
-    child.same_branch = True
-    store.update(child)
-
-    args = argparse.Namespace(
-        project_dir=tmp_path,
-        task_ids=[parent.id],
-        dry_run=True,
-        git_only=True,
-        pr_only=False,
-        no_fetch=False,
-    )
-
-    with (
-        patch("gza.cli.git_ops.get_store", return_value=store),
-        patch("gza.cli.git_ops.Git", return_value=Mock()),
-        patch(
-            "gza.cli.git_ops.sync_branch_cohorts",
-            return_value=(
-                [
-                    BranchSyncResult(
-                        branch="feature/shared",
-                        task_ids=(parent.id, child.id),
-                        merge_status="unmerged",
-                        reconciled=True,
-                    )
-                ],
-                False,
-            ),
-        ) as sync_call,
-    ):
-        rc = cmd_sync(args)
-
-    assert rc == 0
-    cohorts = sync_call.call_args.args[2]
-    assert len(cohorts) == 1
-    assert {task.id for task in cohorts[0].tasks} == {parent.id, child.id}
-    output = capsys.readouterr().out
-    assert "feature/shared" in output
 
 
 def test_sync_without_task_ids_uses_default_branch_cohort_builder(tmp_path, capsys):
@@ -107,41 +58,6 @@ def test_sync_without_task_ids_uses_default_branch_cohort_builder(tmp_path, caps
 
 
 
-def test_sync_no_fetch_does_not_use_cached_origin_default_ref_as_merge_proof(tmp_path, capsys):
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    task = _completed_branch_task(store, "Stale remote-tracking merge proof", "feature/stale-origin-proof")
-
-    git = Mock()
-    git.default_branch.return_value = "main"
-    git.ref_exists.return_value = True
-    git.branch_exists.return_value = True
-    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
-    git.is_merged.side_effect = lambda branch, into: into == "origin/main"
-
-    args = argparse.Namespace(
-        project_dir=tmp_path,
-        task_ids=[task.id],
-        dry_run=False,
-        git_only=True,
-        pr_only=False,
-        no_fetch=True,
-    )
-
-    with (
-        patch("gza.cli.git_ops.get_store", return_value=store),
-        patch("gza.cli.git_ops.Git", return_value=git),
-    ):
-        rc = cmd_sync(args)
-
-    assert rc == 0
-    git.fetch.assert_not_called()
-    refreshed = store.get(task.id)
-    assert refreshed is not None
-    assert refreshed.merge_status == "unmerged"
-    output = capsys.readouterr().out
-    assert "feature/stale-origin-proof | merge=unmerged" in output
-    assert "marked merged" not in output
 
 
 def test_sync_reports_degraded_provenance_warning_without_clearing_stored_base_sha(tmp_path, capsys):

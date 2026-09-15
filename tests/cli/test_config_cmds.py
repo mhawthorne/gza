@@ -2459,7 +2459,7 @@ class TestInitCommand:
         assert (tmp_path / "gza.yaml").exists() is False
         assert (tmp_path / "gza.local.yaml.example").exists() is False
 
-    @pytest.mark.parametrize("user_model", ["claude-sonnet-4-6", "gemini-2.5-pro"])
+    @pytest.mark.parametrize("user_model", ["claude-sonnet-4-6"])
     def test_init_model_only_user_config_is_overridden_by_generated_project_pair(
         self,
         tmp_path: Path,

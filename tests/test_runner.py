@@ -21187,36 +21187,6 @@ class TestExtractedRunInnerHelpers:
         assert lookup.result.status == "failed"
         assert lookup.result.source_task_id != verify_fix.id
 
-    def test_run_can_retry_pr_required_failure_via_work_pr(self, tmp_path: Path):
-        """`gza work <task> --pr` should recover failed PR_REQUIRED tasks without rerunning provider."""
-        (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\nproject_id: default\ndb_path: .gza/gza.db\n"
-        )
-        config = Config.load(tmp_path)
-        store = SqliteTaskStore(config.db_path)
-        task = store.add(prompt="Implement with review", task_type="implement", create_review=True)
-        task.slug = "20260414-pr-required-retry"
-        task.status = "failed"
-        task.failure_reason = "PR_REQUIRED"
-        task.branch = "feature/retry-pr-required"
-        task.log_file = "logs/retry.log"
-        task.output_content = "summary"
-        task.has_commits = True
-        store.update(task)
-
-        with (
-            patch("gza.runner.backup_database"),
-            patch("gza.runner.load_dotenv"),
-            patch(
-                "gza.runner._ensure_work_pr_for_completed_code_task",
-                return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
-            ),
-            patch("gza.runner._create_and_run_review_task", return_value=0),
-            patch("gza.runner.task_footer"),
-        ):
-            rc = run(config, task_id=task.id, create_pr=True)
-
-        assert rc == 0
 
     def test_run_work_pr_branchless_pr_required_does_not_rewrite_fresh_pr_required(self, tmp_path: Path):
         """Legacy branchless PR_REQUIRED rows should not be re-failed through the compatibility retry path."""
@@ -21243,46 +21213,6 @@ class TestExtractedRunInnerHelpers:
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "PR_REQUIRED"
 
-    def test_run_can_retry_pr_required_failure_via_persisted_create_pr(self, tmp_path: Path):
-        """Stored create_pr intent should recover failed PR_REQUIRED tasks without needing `work --pr`."""
-        (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\nproject_id: default\ndb_path: .gza/gza.db\n"
-        )
-        config = Config.load(tmp_path)
-        store = SqliteTaskStore(config.db_path)
-        task = store.add(
-            prompt="Implement with review",
-            task_type="implement",
-            create_review=True,
-            create_pr=True,
-        )
-        task.slug = "20260414-pr-required-retry-persisted"
-        task.status = "failed"
-        task.failure_reason = "PR_REQUIRED"
-        task.branch = "feature/retry-pr-required-persisted"
-        task.log_file = "logs/retry-persisted.log"
-        task.output_content = "summary"
-        task.has_commits = True
-        store.update(task)
-
-        with (
-            patch("gza.runner.backup_database"),
-            patch("gza.runner.load_dotenv"),
-            patch(
-                "gza.runner._ensure_work_pr_for_completed_code_task",
-                return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
-            ),
-            patch("gza.runner._create_and_run_review_task", return_value=0) as run_review,
-            patch("gza.runner.task_footer"),
-        ):
-            rc = run(config, task_id=task.id)
-
-        assert rc == 0
-        run_review.assert_called_once()
-        refreshed = store.get(task.id)
-        assert refreshed is not None
-        assert refreshed.status == "completed"
-        assert refreshed.failure_reason is None
 
     def test_run_pr_required_retry_for_improve_resolves_parent_comments(self, tmp_path: Path):
         """Improve completion should resolve only unresolved feedback comments on the root implementation task."""

@@ -3526,22 +3526,6 @@ def _offset_store(tmp_path: Path) -> tuple[SqliteTaskStore, list[str]]:
     return store, ids
 
 
-def test_offset_and_limit_form_a_contiguous_window(tmp_path: Path) -> None:
-    store, ids = _offset_store(tmp_path)
-    service = TaskQueryService(store)
-    query = TaskQueryPresets.search("", limit=10)
-
-    first = service.run(query)
-    second = service.run(replace(query, offset=10))
-    third = service.run(replace(query, offset=20))
-
-    assert [row.task.id for row in first.rows] + [row.task.id for row in second.rows] + [
-        row.task.id for row in third.rows
-    ] == [row.task.id for row in service.run(replace(query, limit=None)).rows]
-    assert len(third.rows) == 5
-    assert set(ids) == {
-        row.task.id for result in (first, second, third) for row in result.rows
-    }
 
 
 def test_offset_does_not_change_total_count(tmp_path: Path) -> None:

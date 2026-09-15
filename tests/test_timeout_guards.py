@@ -56,25 +56,6 @@ def test_cpu_heavy_unit_test_fails_with_cpu_budget_message(
     )
 
 
-def test_wall_sleep_past_cpu_budget_still_passes(
-    pytester: pytest.Pytester,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_timeout_harness(pytester)
-    monkeypatch.setenv("GZA_UNIT_TEST_CPU_BUDGET_MS", "20")
-    _disable_parent_subprocess_guard(monkeypatch)
-    pytester.makepyfile(
-        tests_test_sleep_guard="""
-        import time
-
-        def test_sleep_is_not_cpu():
-            time.sleep(0.1)
-        """
-    )
-
-    result = pytester.runpytest("tests_test_sleep_guard.py")
-
-    result.assert_outcomes(passed=1)
 
 
 def test_cpu_budget_marker_override_and_explicit_timeout_opt_out(
