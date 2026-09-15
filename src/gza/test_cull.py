@@ -41,6 +41,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pytest
+
 DEFAULT_PACKAGE_MARKER = "/src/gza/"
 DEFAULT_SPEC_DIR = Path("specs/behavior")
 # A term must appear this often in the specs before its absence means anything;
@@ -82,6 +84,7 @@ TIMINGS_ENV = "GZA_TEST_CULL_TIMINGS"
 _records: list[tuple[str, float]] = []
 
 
+@pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):  # noqa: ANN001, ANN201 - pytest hook
     if not os.environ.get(TIMINGS_ENV):
         yield
@@ -89,9 +92,6 @@ def pytest_runtest_call(item):  # noqa: ANN001, ANN201 - pytest hook
     start = time.perf_counter()
     yield
     _records.append((item.nodeid, time.perf_counter() - start))
-
-
-pytest_runtest_call.hookwrapper = True  # type: ignore[attr-defined]
 
 
 def pytest_sessionfinish(session, exitstatus):  # noqa: ANN001, ANN201 - pytest hook

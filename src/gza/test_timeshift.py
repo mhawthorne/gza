@@ -54,7 +54,7 @@ class ShiftedDateTime(_real_datetime):
 
     @classmethod
     def utcnow(cls):  # noqa: ANN206
-        return _real_datetime.utcnow() + cls._offset
+        return _real_datetime.now(_dt.UTC).replace(tzinfo=None) + cls._offset
 
     @classmethod
     def today(cls):  # noqa: ANN206
