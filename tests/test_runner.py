@@ -12962,9 +12962,19 @@ class TestPersistResolvedConfig:
 class TestBackupDatabase:
     """Tests for backup_database function."""
 
-    def test_creates_backup_when_none_exists(self, tmp_path: Path):
+    def test_creates_backup_when_none_exists(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """backup_database creates a backup file for the current hour."""
         import sqlite3
+        from datetime import datetime
+
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 6, 24, 12, 13)
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current if tz is None else cls.current.astimezone(tz)
+
+        monkeypatch.setattr("gza.runner.datetime", FrozenDateTime)
 
         # Create a source database
         db_path = tmp_path / ".gza" / "gza.db"
@@ -12978,9 +12988,7 @@ class TestBackupDatabase:
         backup_dir = tmp_path / BACKUP_DIR
         assert backup_dir.exists()
 
-        from datetime import datetime
-
-        hour_stamp = datetime.now().strftime("%Y%m%d%H")
+        hour_stamp = FrozenDateTime.current.strftime("%Y%m%d%H")
         backup_file = backup_dir / f"gza-{hour_stamp}.db.zst"
         assert backup_file.exists()
         assert backup_file.stat().st_size > 0
@@ -13020,10 +13028,19 @@ class TestBackupDatabase:
         backup_dir = tmp_path / BACKUP_DIR
         assert not backup_dir.exists()
 
-    def test_backup_is_valid_sqlite_database(self, tmp_path: Path):
+    def test_backup_is_valid_sqlite_database(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """The created backup is a valid SQLite database with the same content."""
         import sqlite3
         from datetime import datetime
+
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 6, 24, 12, 13)
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current if tz is None else cls.current.astimezone(tz)
+
+        monkeypatch.setattr("gza.runner.datetime", FrozenDateTime)
 
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -13035,7 +13052,7 @@ class TestBackupDatabase:
 
         backup_database(db_path, tmp_path)
 
-        hour_stamp = datetime.now().strftime("%Y%m%d%H")
+        hour_stamp = FrozenDateTime.current.strftime("%Y%m%d%H")
         packed_path = tmp_path / BACKUP_DIR / f"gza-{hour_stamp}.db.zst"
         assert packed_path.exists()
 
@@ -13048,10 +13065,21 @@ class TestBackupDatabase:
 
         assert rows == [(1, "hello")]
 
-    def test_shared_db_writes_backups_next_to_shared_database(self, tmp_path: Path):
+    def test_shared_db_writes_backups_next_to_shared_database(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Shared DB mode stores backups under <shared-db-dir>/backups."""
         import sqlite3
         from datetime import datetime
+
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 6, 24, 12, 13)
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current if tz is None else cls.current.astimezone(tz)
+
+        monkeypatch.setattr("gza.runner.datetime", FrozenDateTime)
 
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
@@ -13064,7 +13092,7 @@ class TestBackupDatabase:
 
         backup_database(shared_db, project_dir)
 
-        hour_stamp = datetime.now().strftime("%Y%m%d%H")
+        hour_stamp = FrozenDateTime.current.strftime("%Y%m%d%H")
         shared_backup = shared_db.parent / "backups" / f"gza-{hour_stamp}.db.zst"
         project_backup_dir = project_dir / BACKUP_DIR
 
@@ -34597,13 +34625,22 @@ def test_backup_database_roundtrips_through_decompress(tmp_path):
     conn.close()
 
 
-def test_backup_database_skips_hour_already_stored_uncompressed(tmp_path):
+def test_backup_database_skips_hour_already_stored_uncompressed(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 12, 13)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current if tz is None else cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.runner.datetime", FrozenDateTime)
+
     db = tmp_path / ".gza" / "gza.db"
     db.parent.mkdir(parents=True)
     _sqlite_with_rows(db)
     backups = tmp_path / ".gza" / "backups"
     backups.mkdir(parents=True)
-    stamp = datetime.now().strftime("%Y%m%d%H")
+    stamp = FrozenDateTime.current.strftime("%Y%m%d%H")
     (backups / f"gza-{stamp}.db").write_bytes(b"existing")
     runner.backup_database(db, tmp_path)
     assert list(backups.glob("gza-*.db.zst")) == []

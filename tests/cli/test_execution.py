@@ -6854,12 +6854,26 @@ class TestReconciliation:
         assert "Warning: Failed to write worker-death diagnostics for task" in captured.err
         assert "disk-full" in captured.err
 
-    def test_reconciliation_skips_recent_live_task(self, tmp_path: Path):
+    def test_reconciliation_skips_recent_live_task(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """A live task under the threshold should NOT be marked NO_ACTIVITY."""
         from datetime import UTC, datetime, timedelta
 
         from gza.cli._common import reconcile_in_progress_tasks
         from gza.config import Config
+
+        # Reconciliation compares production's `datetime.now(UTC)` against task.started_at
+        # to compute age vs. the no-activity threshold. Freeze production's clock to a fixed
+        # instant and derive started_at from that same instant so both sides of the
+        # comparison move together under bin/test-timebombs' date-shift.
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                assert tz is not None
+                return cls.current.astimezone(tz)
+
+        monkeypatch.setattr("gza.cli._common.datetime", FrozenDateTime)
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -6869,7 +6883,7 @@ class TestReconciliation:
         task = store.get(task.id)
         assert task is not None
         task.running_pid = os.getpid()
-        task.started_at = datetime.now(UTC) - timedelta(seconds=5)
+        task.started_at = FrozenDateTime.current - timedelta(seconds=5)
         store.update(task)
 
         config = Config.load(tmp_path)
@@ -6879,12 +6893,26 @@ class TestReconciliation:
         assert refreshed is not None
         assert refreshed.status == "in_progress"
 
-    def test_reconciliation_uses_configured_no_activity_timeout(self, tmp_path: Path):
+    def test_reconciliation_uses_configured_no_activity_timeout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
         """A non-default watch.no_activity_timeout should control silent-worker reconciliation."""
         from datetime import UTC, datetime, timedelta
 
         from gza.cli._common import reconcile_in_progress_tasks
         from gza.config import Config
+
+        # See test_reconciliation_skips_recent_live_task: freeze production's clock and
+        # derive started_at from the same fixed instant to decouple from wall-clock shift.
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                assert tz is not None
+                return cls.current.astimezone(tz)
+
+        monkeypatch.setattr("gza.cli._common.datetime", FrozenDateTime)
 
         setup_config(tmp_path)
         (tmp_path / "gza.yaml").write_text(
@@ -6899,7 +6927,7 @@ class TestReconciliation:
         task = store.get(task.id)
         assert task is not None
         task.running_pid = os.getpid()
-        task.started_at = datetime.now(UTC) - timedelta(seconds=90)
+        task.started_at = FrozenDateTime.current - timedelta(seconds=90)
         store.update(task)
 
         config = Config.load(tmp_path)
@@ -6909,7 +6937,9 @@ class TestReconciliation:
         assert refreshed is not None
         assert refreshed.status == "in_progress"
 
-    def test_reconciliation_skips_live_task_with_recent_log_writes(self, tmp_path: Path):
+    def test_reconciliation_skips_live_task_with_recent_log_writes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
         """A live task whose log was written recently should NOT be marked NO_ACTIVITY."""
         from datetime import UTC, datetime, timedelta
 
@@ -6925,12 +6955,29 @@ class TestReconciliation:
         log_abs.write_text('{"subtype":"info","message":"hi"}\n')
         # Ensure mtime is now (write_text already does this)
 
+        # The log's mtime comes from the real OS clock and can't be shifted, so anchor
+        # production's `datetime.now(UTC)` to the actual wall-clock instant captured here
+        # (rather than to whatever the timeshift plugin has patched it to). That keeps
+        # "now" close to the log's real mtime under bin/test-timebombs while still letting
+        # started_at be computed as an offset from the same instant.
+        real_now = datetime.now(UTC)
+
+        class FrozenDateTime(datetime):
+            current = real_now
+
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                assert tz is not None
+                return cls.current.astimezone(tz)
+
+        monkeypatch.setattr("gza.cli._common.datetime", FrozenDateTime)
+
         task = store.add("Active task")
         store.mark_in_progress(task)
         task = store.get(task.id)
         assert task is not None
         task.running_pid = os.getpid()
-        task.started_at = datetime.now(UTC) - timedelta(minutes=5)
+        task.started_at = real_now - timedelta(minutes=5)
         task.log_file = log_rel
         store.update(task)
 
@@ -21367,12 +21414,27 @@ class TestIterateCommand:
         assert "Latest failed improve" in output
 
     def test_iterate_max_cycles_reached_reports_cycle_accounting(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
     ):
         import argparse
         from unittest.mock import MagicMock, patch
 
         from gza.cli import cmd_iterate
+
+        # Production compares wall-clock `datetime.now(UTC)` (captured once as
+        # `iterate_invocation_started_at`) against these tasks' completed_at/created_at
+        # timestamps to bucket review cycles into "this invocation" vs historical. Freeze
+        # gza.cli.execution's clock to a fixed instant so both sides of that comparison
+        # move together under bin/test-timebombs' date-shift, instead of drifting apart.
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 8, 1, 14, 0, tzinfo=UTC)
+
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                assert tz is not None
+                return cls.current.astimezone(tz)
+
+        monkeypatch.setattr("gza.cli.execution.datetime", FrozenDateTime)
 
         setup_config(tmp_path)
         store = make_store(tmp_path)

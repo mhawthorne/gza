@@ -12275,14 +12275,27 @@ def _register_watch_worker(
     )
 
 
-def test_watch_worker_heartbeat_emits_rebase_start_and_elapsed_busy(tmp_path: Path) -> None:
+def test_watch_worker_heartbeat_emits_rebase_start_and_elapsed_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
     store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
     task = store.add("Rebase task", task_type="rebase")
     assert task.id is not None
     task.status = "in_progress"
-    task.started_at = datetime.now(UTC) - timedelta(seconds=70)
+    task.started_at = FrozenDateTime.current - timedelta(seconds=70)
     task.running_pid = os.getpid()
     task.log_file = ".gza/logs/rebase.log"
     store.update(task)
@@ -12319,14 +12332,27 @@ def test_watch_worker_heartbeat_emits_rebase_start_and_elapsed_busy(tmp_path: Pa
     assert "cpu +2s" in log_text
 
 
-def test_watch_worker_heartbeat_emits_agent_specific_elapsed_output(tmp_path: Path) -> None:
+def test_watch_worker_heartbeat_emits_agent_specific_elapsed_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
     store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
     task = store.add("Implementation task", task_type="implement")
     assert task.id is not None
     task.status = "in_progress"
-    task.started_at = datetime.now(UTC) - timedelta(seconds=30)
+    task.started_at = FrozenDateTime.current - timedelta(seconds=30)
     task.running_pid = os.getpid()
     task.log_file = ".gza/logs/agent.log"
     store.update(task)
@@ -12426,14 +12452,27 @@ def test_watch_worker_heartbeat_first_busy_respects_threshold(tmp_path: Path) ->
     assert "BUSY" not in log_text
 
 
-def test_watch_worker_heartbeat_frames_already_running_worker_after_watch_start(tmp_path: Path) -> None:
+def test_watch_worker_heartbeat_frames_already_running_worker_after_watch_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
     store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
     task = store.add("Existing worker task", task_type="implement")
     assert task.id is not None
     task.status = "in_progress"
-    task.started_at = datetime.now(UTC) - timedelta(seconds=120)
+    task.started_at = FrozenDateTime.current - timedelta(seconds=120)
     task.running_pid = os.getpid()
     store.update(task)
     _register_watch_worker(config, worker_id="w-existing", task_id=str(task.id), started_at=task.started_at)
@@ -14857,7 +14896,18 @@ def test_watch_project_runtime_recovery_dispatch_rejects_stale_head_before_permi
 def test_watch_supervisor_recovery_preflight_rejects_parked_head_and_reuses_slot_until_gate_clears(
     tmp_path: Path,
     gate: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
     runtime_a = _make_aggregate_runtime(tmp_path / f"project-a-{gate}", project_name="a")
     runtime_b = _make_aggregate_runtime(tmp_path / f"project-b-{gate}", project_name="b")
     failed_a = _add_failed_resume_row(runtime_a, f"A gated recovery {gate}")
@@ -14908,8 +14958,8 @@ def test_watch_supervisor_recovery_preflight_rejects_parked_head_and_reuses_slot
                 last_failure_reason="PROVIDER_UNAVAILABLE",
                 last_failure_fingerprint="transient:retry:PROVIDER_UNAVAILABLE",
                 streak=1,
-                next_retry_at=datetime.now(UTC) + timedelta(minutes=10),
-                updated_at=datetime.now(UTC),
+                next_retry_at=FrozenDateTime.current + timedelta(minutes=10),
+                updated_at=FrozenDateTime.current,
             )
         )
     else:
@@ -14932,7 +14982,7 @@ def test_watch_supervisor_recovery_preflight_rejects_parked_head_and_reuses_slot
                 evidence_fingerprint=progress_candidate.evidence_fingerprint,
                 streak=2,
                 parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
-                observed_at=datetime.now(UTC),
+                observed_at=FrozenDateTime.current,
             )
         )
 
@@ -14989,8 +15039,8 @@ def test_watch_supervisor_recovery_preflight_rejects_parked_head_and_reuses_slot
                 last_failure_reason="PROVIDER_UNAVAILABLE",
                 last_failure_fingerprint="transient:retry:PROVIDER_UNAVAILABLE",
                 streak=1,
-                next_retry_at=datetime.now(UTC) - timedelta(seconds=1),
-                updated_at=datetime.now(UTC),
+                next_retry_at=FrozenDateTime.current - timedelta(seconds=1),
+                updated_at=FrozenDateTime.current,
             )
         )
     else:
@@ -48602,11 +48652,24 @@ def _assert_pending_candidate_rejected_without_dispatch_side_effects(
     assert not log_path.exists() or "[dry-run]" not in log_path.read_text()
 
 
-def test_watch_project_runtime_pending_head_preserves_local_order_quiet_and_dependencies(tmp_path: Path) -> None:
+def test_watch_project_runtime_pending_head_preserves_local_order_quiet_and_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "quiet_period_seconds: 300\n")
     store = make_store(tmp_path)
-    now = datetime.now(UTC)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.db.datetime", FrozenDateTime)
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+    now = FrozenDateTime.current
 
     quiet = store.add("Quiet pending", task_type="plan")
     blocked_parent = store.add("Blocked parent", task_type="plan")
@@ -59211,7 +59274,9 @@ def test_main_verify_attention_summary_clears_exhausted_key_after_green_resoluti
     assert "remediation exhausted" not in summary_text
 
 
-def test_watch_cycle_logs_one_quiet_skip_per_stable_hold_window(tmp_path: Path) -> None:
+def test_watch_cycle_logs_one_quiet_skip_per_stable_hold_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     setup_config(tmp_path)
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(config_path.read_text() + "quiet_period_seconds: 300\n")
@@ -59220,12 +59285,23 @@ def test_watch_cycle_logs_one_quiet_skip_per_stable_hold_window(tmp_path: Path) 
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
 
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.db.datetime", FrozenDateTime)
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
     older_quiet = store.add("Older quiet task", task_type="implement")
     newer_quiet = store.add("Newer quiet task", task_type="implement")
     assert older_quiet.id is not None
     assert newer_quiet.id is not None
-    older_quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=45)
-    newer_quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=30)
+    older_quiet.last_edited_at = FrozenDateTime.current - timedelta(seconds=45)
+    newer_quiet.last_edited_at = FrozenDateTime.current - timedelta(seconds=30)
     store.update(older_quiet)
     store.update(newer_quiet)
 
@@ -59321,7 +59397,9 @@ def test_watch_cycle_dispatches_expired_or_quiet_exempt_pending_task(tmp_path: P
     spawn_iterate.assert_not_called()
 
 
-def test_watch_cycle_reemits_quiet_skip_after_edit_moves_hold_window(tmp_path: Path) -> None:
+def test_watch_cycle_reemits_quiet_skip_after_edit_moves_hold_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     setup_config(tmp_path)
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(config_path.read_text() + "quiet_period_seconds: 300\n")
@@ -59330,9 +59408,20 @@ def test_watch_cycle_reemits_quiet_skip_after_edit_moves_hold_window(tmp_path: P
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
 
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.db.datetime", FrozenDateTime)
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
     quiet_task = store.add("Quiet task with moving hold window", task_type="implement")
     assert quiet_task.id is not None
-    quiet_task.last_edited_at = datetime.now(UTC) - timedelta(seconds=295)
+    quiet_task.last_edited_at = FrozenDateTime.current - timedelta(seconds=295)
     store.update(quiet_task)
 
     with (
@@ -59359,7 +59448,7 @@ def test_watch_cycle_reemits_quiet_skip_after_edit_moves_hold_window(tmp_path: P
 
         updated_task = store.get(quiet_task.id)
         assert updated_task is not None
-        updated_task.last_edited_at = datetime.now(UTC) - timedelta(seconds=30)
+        updated_task.last_edited_at = FrozenDateTime.current - timedelta(seconds=30)
         store.update(updated_task)
 
         _run_cycle(

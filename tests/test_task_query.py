@@ -3039,14 +3039,27 @@ def test_queue_listing_preset_includes_blocked_tasks_after_runnable_rows(tmp_pat
     assert blocked_flags == [False, False, True]
 
 
-def test_queue_listing_projects_quiet_fields_from_shared_projection(tmp_path: Path) -> None:
+def test_queue_listing_projects_quiet_fields_from_shared_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.task_query.datetime", FrozenDateTime)
+    now = FrozenDateTime.current
+
     store = _store(tmp_path)
     quiet = store.add("Fresh quiet task")
     runnable = store.add("Older runnable task")
     assert quiet.id is not None
     assert runnable.id is not None
-    quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=30)
-    runnable.last_edited_at = datetime.now(UTC) - timedelta(minutes=10)
+    quiet.last_edited_at = now - timedelta(seconds=30)
+    runnable.last_edited_at = now - timedelta(minutes=10)
     store.update(quiet)
     store.update(runnable)
 

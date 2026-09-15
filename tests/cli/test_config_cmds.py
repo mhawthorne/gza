@@ -41,6 +41,70 @@ def write_user_config(home_dir: Path, content: str) -> Path:
     return user_config_path
 
 
+def _install_frozen_clean_clock(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    """Freeze ``config_cmds.datetime.now()`` and return the fixed instant.
+
+    ``gza clean``/``gza clean --archive`` compute their staleness cutoff from
+    ``datetime.now(UTC)`` inside ``config_cmds``. Tests build fixture file
+    mtimes as offsets from "now" too, so both sides of the comparison must be
+    anchored to the same fixed instant -- otherwise the two only agree while
+    the test happens to run close to the real wall clock.
+    """
+    fixed_now = datetime(2026, 6, 15, 12, 0, tzinfo=UTC)
+
+    class _FrozenCleanDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return fixed_now.replace(tzinfo=None)
+            return fixed_now.astimezone(tz)
+
+    monkeypatch.setattr(config_cmds_module, "datetime", _FrozenCleanDateTime)
+    return fixed_now
+
+
+def _install_frozen_stats_clock(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    """Freeze the clock used by ``gza stats`` and by task creation/completion.
+
+    ``gza stats reviews``/``gza stats iterations`` default to a window ending
+    at ``date.today()`` in ``config_cmds``, while ``SqliteTaskStore`` stamps
+    ``created_at``/``completed_at`` from ``datetime.now(UTC)`` in ``gza.db``.
+    Those are two different clock reads in two different modules; freezing
+    only one leaves the other free to drift away under a wall-clock shift and
+    push fixture tasks outside (or a "today" string outside) the window the
+    test asserts on. Freeze both to the same instant.
+    """
+    import gza.db as db_module
+
+    fixed_now = datetime(2026, 6, 15, 12, 0, tzinfo=UTC)
+
+    class _FrozenStatsDateTime(datetime):
+        # A plain fixed instant makes every task creation/completion collide
+        # on the same timestamp, which breaks "most recent" ordering the same
+        # way two real calls a microsecond apart wouldn't. Advance a few
+        # seconds on every read so relative ordering between fixture tasks
+        # created in sequence is preserved, same as the real clock would.
+        _current = fixed_now
+
+        @classmethod
+        def now(cls, tz=None):
+            current = cls._current
+            cls._current = cls._current + timedelta(seconds=1)
+            if tz is None:
+                return current.replace(tzinfo=None)
+            return current.astimezone(tz)
+
+    class _FrozenStatsDate(date):
+        @classmethod
+        def today(cls):
+            return fixed_now.date()
+
+    monkeypatch.setattr(config_cmds_module, "datetime", _FrozenStatsDateTime)
+    monkeypatch.setattr(config_cmds_module, "date", _FrozenStatsDate)
+    monkeypatch.setattr(db_module, "datetime", _FrozenStatsDateTime)
+    return fixed_now
+
+
 def _shared_db_sidecar_snapshot(db_path: Path) -> dict[str, int]:
     sidecars: dict[str, int] = {}
     for suffix in ("-wal", "-shm", "-journal"):
@@ -2620,9 +2684,11 @@ class TestInitCommand:
 class TestCleanCommand:
     """Tests for 'gza clean' command (default mode)."""
 
-    def test_clean_logs_only(self, tmp_path: Path):
+    def test_clean_logs_only(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Clean command with --logs flag works."""
         from gza.config import Config
+
+        fixed_now = _install_frozen_clean_clock(monkeypatch)
 
         setup_config(tmp_path)
         config = Config.load(tmp_path)
@@ -2635,10 +2701,12 @@ class TestCleanCommand:
         new_log = log_dir / "20260101-new-task.log"
         new_log.write_text("new log content")
 
-        # Set modification time for old log to 60 days ago
-        import time
-        old_time = time.time() - (60 * 24 * 60 * 60)
+        # Set modification time for old log to 60 days ago, and the new log to
+        # "now" -- both relative to the frozen clock production compares against.
+        old_time = (fixed_now - timedelta(days=60)).timestamp()
         os.utime(old_log, (old_time, old_time))
+        new_time = fixed_now.timestamp()
+        os.utime(new_log, (new_time, new_time))
 
         result = invoke_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
 
@@ -2928,9 +2996,9 @@ class TestCleanCommand:
 class TestCleanArchiveCommand:
     """Tests for 'gza clean --archive' command."""
 
-    def test_clean_archive_default_behavior(self, tmp_path: Path):
+    def test_clean_archive_default_behavior(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Clean --archive archives files older than 30 days by default."""
-        from datetime import datetime
+        fixed_now = _install_frozen_clean_clock(monkeypatch)
 
         setup_config(tmp_path)
 
@@ -2946,8 +3014,8 @@ class TestCleanArchiveCommand:
         old_log.write_text("old log content")
         old_worker.write_text("old worker content")
 
-        # Set mtime to 35 days ago
-        old_time = (datetime.now(UTC) - timedelta(days=35)).timestamp()
+        # Set mtime to 35 days ago (relative to the frozen clock)
+        old_time = (fixed_now - timedelta(days=35)).timestamp()
         old_log.touch()
         old_worker.touch()
         old_log.chmod(0o644)
@@ -2963,7 +3031,7 @@ class TestCleanArchiveCommand:
         recent_log.write_text("recent log content")
         recent_worker.write_text("recent worker content")
 
-        recent_time = (datetime.now(UTC) - timedelta(days=10)).timestamp()
+        recent_time = (fixed_now - timedelta(days=10)).timestamp()
         recent_log.touch()
         recent_worker.touch()
         os.utime(recent_log, (recent_time, recent_time))
@@ -3450,9 +3518,9 @@ class TestCleanArchiveCommand:
         assert "Logs: 0 files" in result.stdout
         assert "Workers: 0 files" in result.stdout
 
-    def test_clean_mixed_old_and_new_files(self, tmp_path: Path):
+    def test_clean_mixed_old_and_new_files(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Clean command correctly handles mixed old and new files."""
-        from datetime import datetime, timedelta
+        fixed_now = _install_frozen_clean_clock(monkeypatch)
 
         setup_config(tmp_path)
 
@@ -3463,12 +3531,12 @@ class TestCleanArchiveCommand:
         for i in range(3):
             old_file = logs_dir / f"old_{i}.txt"
             old_file.write_text(f"old content {i}")
-            old_time = (datetime.now(UTC) - timedelta(days=35 + i)).timestamp()
+            old_time = (fixed_now - timedelta(days=35 + i)).timestamp()
             os.utime(old_file, (old_time, old_time))
 
             new_file = logs_dir / f"new_{i}.txt"
             new_file.write_text(f"new content {i}")
-            new_time = (datetime.now(UTC) - timedelta(days=5 + i)).timestamp()
+            new_time = (fixed_now - timedelta(days=5 + i)).timestamp()
             os.utime(new_file, (new_time, new_time))
 
         result = invoke_gza("clean", "--archive", "--project", str(tmp_path))
@@ -3532,9 +3600,9 @@ class TestCleanArchiveCommand:
         assert result2.returncode == 0
         assert "Logs: 0 files" in result2.stdout
 
-    def test_clean_purge_mode(self, tmp_path: Path):
+    def test_clean_purge_mode(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Clean with --purge deletes archived files older than N days."""
-        from datetime import datetime, timedelta
+        fixed_now = _install_frozen_clean_clock(monkeypatch)
 
         setup_config(tmp_path)
 
@@ -3550,14 +3618,14 @@ class TestCleanArchiveCommand:
         old_archived_log.write_text("old archived content")
         old_archived_worker.write_text("old archived content")
 
-        very_old_time = (datetime.now(UTC) - timedelta(days=400)).timestamp()
+        very_old_time = (fixed_now - timedelta(days=400)).timestamp()
         os.utime(old_archived_log, (very_old_time, very_old_time))
         os.utime(old_archived_worker, (very_old_time, very_old_time))
 
         # Create recent archived files (100 days old)
         recent_archived_log = archives_logs_dir / "recent_archived.txt"
         recent_archived_log.write_text("recent archived content")
-        recent_time = (datetime.now(UTC) - timedelta(days=100)).timestamp()
+        recent_time = (fixed_now - timedelta(days=100)).timestamp()
         os.utime(recent_archived_log, (recent_time, recent_time))
 
         # Run purge with default days (365)
@@ -3650,9 +3718,9 @@ class TestCleanArchiveCommand:
         assert result2.returncode == 0
         assert "Archived logs: 0 files" in result2.stdout
 
-    def test_clean_deletes_old_backups(self, tmp_path: Path):
+    def test_clean_deletes_old_backups(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Clean command deletes old backup files from .gza/backups/."""
-        from datetime import datetime, timedelta
+        fixed_now = _install_frozen_clean_clock(monkeypatch)
 
         setup_config(tmp_path)
 
@@ -3662,13 +3730,13 @@ class TestCleanArchiveCommand:
         # Create an old backup file (35 days old)
         old_backup = backups_dir / "gza-2026011400.db"
         old_backup.write_bytes(b"old backup data")
-        old_time = (datetime.now(UTC) - timedelta(days=35)).timestamp()
+        old_time = (fixed_now - timedelta(days=35)).timestamp()
         os.utime(old_backup, (old_time, old_time))
 
         # Create a recent backup file (1 day old)
         recent_backup = backups_dir / "gza-2026021900.db"
         recent_backup.write_bytes(b"recent backup data")
-        recent_time = (datetime.now(UTC) - timedelta(days=1)).timestamp()
+        recent_time = (fixed_now - timedelta(days=1)).timestamp()
         os.utime(recent_backup, (recent_time, recent_time))
 
         result = invoke_gza("clean", "--archive", "--project", str(tmp_path))
@@ -3814,9 +3882,11 @@ class TestStatsReviewsCommand:
         assert "Impls" in result.stdout
         assert "Rvws" in result.stdout
 
-    def test_stats_reviews_with_reviewed_impl(self, tmp_path: Path):
+    def test_stats_reviews_with_reviewed_impl(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """gza stats reviews shows iteration stats for a reviewed implementation task."""
         from gza.db import TaskStats
+
+        _install_frozen_stats_clock(monkeypatch)
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -3836,9 +3906,11 @@ class TestStatsReviewsCommand:
         assert "Review tasks:    1" in result.stdout
         assert "Reviewed:        1/1" in result.stdout
 
-    def test_stats_reviews_unreviewed_impl(self, tmp_path: Path):
+    def test_stats_reviews_unreviewed_impl(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """gza stats reviews shows impl count but no iteration stats for unreviewed impls."""
         from gza.db import TaskStats
+
+        _install_frozen_stats_clock(monkeypatch)
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -3854,9 +3926,11 @@ class TestStatsReviewsCommand:
         assert "Review tasks:    0" in result.stdout
         assert "Reviewed:        0/1" in result.stdout
 
-    def test_stats_reviews_failed_review_not_counted_as_reviewed(self, tmp_path: Path):
+    def test_stats_reviews_failed_review_not_counted_as_reviewed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Failed reviews should not contribute to reviewed implementation counts."""
         from gza.db import TaskStats
+
+        fixed_now = _install_frozen_stats_clock(monkeypatch)
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -3867,7 +3941,7 @@ class TestStatsReviewsCommand:
 
         failed_review = store.add("Failed review", task_type="review", depends_on=impl.id)
         failed_review.status = "failed"
-        failed_review.completed_at = datetime.now(UTC)
+        failed_review.completed_at = fixed_now
         store.update(failed_review)
 
         result = invoke_gza("stats", "reviews", "--project", str(tmp_path))
@@ -3877,9 +3951,11 @@ class TestStatsReviewsCommand:
         assert "Review tasks:    0" in result.stdout
         assert "Reviewed:        0/1" in result.stdout
 
-    def test_stats_reviews_cycle_distribution(self, tmp_path: Path):
+    def test_stats_reviews_cycle_distribution(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """gza stats reviews shows iteration distribution for reviewed impls."""
         from gza.db import TaskStats
+
+        _install_frozen_stats_clock(monkeypatch)
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -3925,9 +4001,11 @@ class TestStatsReviewsCommand:
         assert str(start) in result.stdout
         assert str(today) in result.stdout
 
-    def test_stats_reviews_text_includes_score_sections(self, tmp_path: Path):
+    def test_stats_reviews_text_includes_score_sections(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Text mode includes score sections using label/value-style summary rows."""
         from gza.db import TaskStats
+
+        _install_frozen_stats_clock(monkeypatch)
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -3961,9 +4039,11 @@ class TestStatsReviewsCommand:
         assert "Score trend (last 8 weeks):" in result.stdout
         assert re.search(r"\d{4}-W\d{2}: n=1  mean=88\.0", result.stdout)
 
-    def test_stats_reviews_json_outputs_score_breakdowns_and_filters_null_scores(self, tmp_path: Path):
+    def test_stats_reviews_json_outputs_score_breakdowns_and_filters_null_scores(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """JSON output includes score analytics and excludes reviews with null scores."""
         from gza.db import TaskStats
+
+        _install_frozen_stats_clock(monkeypatch)
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -4048,9 +4128,11 @@ class TestStatsIterationsCommand:
         assert "Iterations" in result.stdout
         assert "0 tasks" in result.stdout
 
-    def test_stats_iterations_rolls_up_reviews_improves_verdict_and_cost(self, tmp_path: Path):
+    def test_stats_iterations_rolls_up_reviews_improves_verdict_and_cost(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Iterations output should roll up child tasks and show latest run date/verdict/cost."""
         from gza.db import TaskStats
+
+        fixed_now = _install_frozen_stats_clock(monkeypatch)
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -4085,7 +4167,7 @@ class TestStatsIterationsCommand:
         assert "Last Run Date" in result.stdout
         assert "APPROVED" in result.stdout
         assert "$   0.19" in result.stdout
-        assert f"{date.today():%Y-%m-%d}" in result.stdout
+        assert f"{fixed_now.date():%Y-%m-%d}" in result.stdout
         assert "1 tasks  |  2 iterations  |  1 improves  |  1/1 approved  |  $0.19 total" in result.stdout
         assert "Iteration count stats: min 2  |  p10 2  |  p25 2  |  p50 2  |  p75 2  |  p90 2  |  p99 2  |  max 2" in result.stdout
 

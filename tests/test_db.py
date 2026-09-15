@@ -2271,8 +2271,19 @@ class TestTaskChaining:
         assert blocked.id not in pickup_ids
         assert all(task.task_type != "internal" for task in pickup)
 
-    def test_get_pending_pickup_respects_quiet_period_and_exemptions(self, tmp_path: Path):
+    def test_get_pending_pickup_respects_quiet_period_and_exemptions(self, tmp_path: Path, monkeypatch):
         """Pickup listing excludes quiet-held tasks while preserving bypass signals."""
+
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+            @classmethod
+            def now(cls, tz=None):
+                assert tz is not None
+                return cls.current.astimezone(tz)
+
+        monkeypatch.setattr("gza.db.datetime", FrozenDateTime)
+
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -2287,9 +2298,9 @@ class TestTaskChaining:
         assert explicit.id is not None
         assert disabled.id is not None
 
-        now = datetime.now(UTC)
+        now = FrozenDateTime.now(UTC)
         quiet.last_edited_at = now - timedelta(seconds=30)
-        expired.last_edited_at = now - timedelta(seconds=300)
+        expired.last_edited_at = now - timedelta(seconds=310)
         urgent.last_edited_at = now - timedelta(seconds=30)
         explicit.last_edited_at = now - timedelta(seconds=30)
         disabled.last_edited_at = now - timedelta(seconds=30)
@@ -4042,7 +4053,17 @@ class TestTaskComments:
         with pytest.raises(KeyError, match="Task gza-9999 not found"):
             store.add_comment("gza-9999", "orphan?")
 
-    def test_get_and_resolve_comments_can_be_scoped_by_created_at(self, tmp_path: Path):
+    def test_get_and_resolve_comments_can_be_scoped_by_created_at(self, tmp_path: Path, monkeypatch):
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+            @classmethod
+            def now(cls, tz=None):
+                assert tz is not None
+                return cls.current.astimezone(tz)
+
+        monkeypatch.setattr("gza.db.datetime", FrozenDateTime)
+
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -4050,7 +4071,8 @@ class TestTaskComments:
         assert task.id is not None
 
         store.add_comment(task.id, "Old comment", source="direct")
-        snapshot = datetime.now(UTC)
+        snapshot = FrozenDateTime.now(UTC)
+        FrozenDateTime.current = FrozenDateTime.current + timedelta(seconds=1)
         store.add_comment(task.id, "New comment", source="direct")
 
         scoped_unresolved = store.get_comments(
@@ -17926,15 +17948,27 @@ class TestExecutionProjectResolver:
         assert any("task_comments" in warning for warning in query_store.startup_warnings())
 
     def test_query_only_open_current_db_missing_task_comments_kind_warns_and_reads_comments(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch
     ) -> None:
         """Query-only open should default missing task_comments.kind to feedback."""
+
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+            @classmethod
+            def now(cls, tz=None):
+                assert tz is not None
+                return cls.current.astimezone(tz)
+
+        monkeypatch.setattr("gza.db.datetime", FrozenDateTime)
+
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path, prefix="gza")
         task = store.add("Task with query-only comment kind damage")
         assert task.id is not None
         store.add_comment(task.id, "Resolved legacy comment", source="direct")
-        snapshot = datetime.now(UTC)
+        snapshot = FrozenDateTime.now(UTC)
+        FrozenDateTime.current = FrozenDateTime.current + timedelta(seconds=1)
         store.add_comment(task.id, "Unresolved legacy comment", source="direct")
         store.resolve_comments(
             task.id,
@@ -18245,9 +18279,21 @@ class TestExecutionProjectResolver:
 class TestSyncCandidates:
     """Tests for bounded sync candidate selection."""
 
-    def test_get_sync_candidates_includes_unmerged_open_pr_and_recent_pr_intent(self, tmp_path: Path) -> None:
+    def test_get_sync_candidates_includes_unmerged_open_pr_and_recent_pr_intent(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+            @classmethod
+            def now(cls, tz=None):
+                assert tz is not None
+                return cls.current.astimezone(tz)
+
+        monkeypatch.setattr("gza.db.datetime", FrozenDateTime)
+
         store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-        now = datetime.now(UTC)
+        now = FrozenDateTime.now(UTC)
         old = now - timedelta(days=90)
 
         unmerged = store.add("Unmerged task", task_type="implement")
@@ -18333,9 +18379,21 @@ class TestSyncCandidates:
         candidate_ids = {candidate.id for candidate in store.get_sync_candidates(recent_days=30)}
         assert task.id not in candidate_ids
 
-    def test_get_sync_candidates_skips_recently_synced_branch_until_cooldown_expires(self, tmp_path: Path) -> None:
+    def test_get_sync_candidates_skips_recently_synced_branch_until_cooldown_expires(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+            @classmethod
+            def now(cls, tz=None):
+                assert tz is not None
+                return cls.current.astimezone(tz)
+
+        monkeypatch.setattr("gza.db.datetime", FrozenDateTime)
+
         store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-        now = datetime.now(UTC)
+        now = FrozenDateTime.now(UTC)
 
         task = store.add("Recently synced task", task_type="implement")
         task.status = "completed"

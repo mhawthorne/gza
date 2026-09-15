@@ -531,6 +531,20 @@ def _set_task_created_at(store: SqliteTaskStore, task: DbTask, when: datetime) -
     task.created_at = when
 
 
+def _set_task_completed_at(store: SqliteTaskStore, task: DbTask, when: datetime) -> None:
+    """Pin completed_at to a fixed instant, overriding production's real-clock stamp.
+
+    ``store.mark_completed`` stamps ``completed_at`` with ``datetime.now(UTC)``, which
+    the timebomb probe shifts along with the rest of gza's production clock. Ordering
+    checks that compare completed_at across tasks must not depend on that real clock,
+    so fixtures pin it explicitly to a literal instant instead.
+    """
+    assert task.id is not None
+    with store._connect() as conn:  # noqa: SLF001 - targeted historical fixture setup
+        conn.execute("UPDATE tasks SET completed_at = ? WHERE id = ?", (when.isoformat(), task.id))
+    task.completed_at = when
+
+
 def _add_completed_unlinked_slug_review(
     store: SqliteTaskStore,
     impl: DbTask,
@@ -9260,6 +9274,10 @@ def test_changed_rebase_in_progress_invalid_resolution_review_waits_before_full_
         output_content="## Verdict\n\nVerdict: APPROVED\n",
         has_commits=False,
     )
+    # mark_completed stamps completed_at from the real clock, which the timebomb
+    # probe shifts independently of this test's literal fixture dates. Pin it to a
+    # fixed instant after the rebase so ordering stays deterministic under any shift.
+    _set_task_completed_at(store, reloaded_running_review, datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
 
     with patch(
         "gza.advance_engine.resolve_verify_gate_decision",
@@ -9274,7 +9292,7 @@ def test_changed_rebase_in_progress_invalid_resolution_review_waits_before_full_
     assert second_action.get("review_task") is None
     assert second_action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
-    full_review = _add_completed_review(store, impl, when=datetime.now(UTC) + timedelta(seconds=1))
+    full_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 14, 0, tzinfo=UTC))
     full_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
     full_review.review_scope = None
     full_review.review_verify_head_sha = "rebased-live-head"

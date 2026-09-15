@@ -252,12 +252,26 @@ def test_sync_reports_live_progress_messages(tmp_path, capsys):
     assert "[sync] [1/1] feature/progress" in output
 
 
-def test_sync_reports_when_default_candidates_are_cache_filtered(tmp_path, capsys):
+def test_sync_reports_when_default_candidates_are_cache_filtered(tmp_path, capsys, monkeypatch):
     setup_config(tmp_path)
     store = make_store(tmp_path)
     task = _completed_branch_task(store, "Cached task", "feature/cached")
-    task.completed_at = datetime.now(UTC) - timedelta(minutes=10)
-    task.sync_last_synced_at = datetime.now(UTC) - timedelta(seconds=10)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    # `get_sync_candidates` decides cache-filtering via `datetime.now()` inside
+    # gza.db; freeze that clock and derive the fixture timestamps from the
+    # same fixed instant so both sides move together under a shifted clock.
+    monkeypatch.setattr("gza.db.datetime", FrozenDateTime)
+
+    task.completed_at = FrozenDateTime.current - timedelta(minutes=10)
+    task.sync_last_synced_at = FrozenDateTime.current - timedelta(seconds=10)
     store.update(task)
 
     args = argparse.Namespace(

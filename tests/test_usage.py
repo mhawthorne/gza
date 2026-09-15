@@ -159,7 +159,26 @@ def test_format_duration_short(delta: timedelta, expected: str) -> None:
     assert format_duration_short(delta) == expected
 
 
-def test_store_round_trips_all_windows(tmp_path: Path) -> None:
+class _FrozenDbDateTime(datetime):
+    """Anchors gza.db's retention-pruning clock to FETCHED_AT.
+
+    record_provider_usage() prunes fetches older than retention_days using a
+    live gza.db.datetime.now(UTC) call. Without freezing it, a fixture with a
+    fixed fetched_at (like FETCHED_AT) eventually falls outside the default
+    30-day retention window purely because real time passed -- and any
+    GZA_TIMESHIFT_DAYS shift makes that happen immediately.
+    """
+
+    current = FETCHED_AT
+
+    @classmethod
+    def now(cls, tz=None):
+        assert tz is not None
+        return cls.current.astimezone(tz)
+
+
+def test_store_round_trips_all_windows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("gza.db.datetime", _FrozenDbDateTime)
     store = SqliteTaskStore(tmp_path / "test.db")
     usage = _parse()
     store.record_provider_usage(usage)
@@ -187,17 +206,28 @@ def test_recording_success_clears_a_standing_failure(tmp_path: Path) -> None:
     assert store.get_provider_usage_failure("codex") is None
 
 
-def test_retention_prunes_old_fetches(tmp_path: Path) -> None:
+def test_retention_prunes_old_fetches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.db.datetime", FrozenDateTime)
+    now = FrozenDateTime.current
+
     store = SqliteTaskStore(tmp_path / "test.db")
     old = ProviderUsage(
         provider="codex",
-        fetched_at=datetime.now(UTC) - timedelta(days=90),
+        fetched_at=now - timedelta(days=90),
         windows=(UsageWindow("codex", None, "primary", 10.0, 10080, FETCHED_AT),),
     )
     store.record_provider_usage(old, retention_days=30)
     fresh = ProviderUsage(
         provider="codex",
-        fetched_at=datetime.now(UTC),
+        fetched_at=now,
         windows=(UsageWindow("codex", None, "primary", 20.0, 10080, FETCHED_AT),),
     )
     store.record_provider_usage(fresh, retention_days=30)
@@ -210,11 +240,12 @@ def test_retention_prunes_old_fetches(tmp_path: Path) -> None:
 
 
 def test_get_usage_serves_cache_without_fetching(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("gza.db.datetime", _FrozenDbDateTime)
     store = SqliteTaskStore(tmp_path / "test.db")
     store.record_provider_usage(
         ProviderUsage(
             provider="codex",
-            fetched_at=datetime.now(UTC),
+            fetched_at=FETCHED_AT,
             windows=(UsageWindow("codex", None, "primary", 45.0, 10080, FETCHED_AT),),
         )
     )
@@ -223,7 +254,10 @@ def test_get_usage_serves_cache_without_fetching(tmp_path: Path, monkeypatch) ->
         raise AssertionError("a fresh cache must not spawn a provider process")
 
     monkeypatch.setattr("gza.usage_service._fetch_usage", _explode)
-    snapshot = get_usage(store, "codex", max_age=timedelta(minutes=15))
+    # Explicit `now` keeps the cache-freshness comparison independent of the
+    # real wall clock (get_usage compares `now` against the fixture's
+    # fetched_at, so both sides are test-controlled).
+    snapshot = get_usage(store, "codex", max_age=timedelta(minutes=15), now=FETCHED_AT)
     assert snapshot.source == "cache"
     assert snapshot.stale is False
 
@@ -249,6 +283,7 @@ def test_get_usage_fetch_uses_selected_runtime_context_and_store(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("gza.db.datetime", _FrozenDbDateTime)
     store_a = SqliteTaskStore(tmp_path / "runtime-a" / "test.db")
     store_b = SqliteTaskStore(tmp_path / "runtime-b" / "test.db")
     env_a = {
@@ -273,8 +308,8 @@ def test_get_usage_fetch_uses_selected_runtime_context_and_store(
         return _parse()
 
     monkeypatch.setattr("gza.usage_service._fetch_usage", fetch_spy)
-    snapshot_a = get_usage(store_a, "codex", max_age=timedelta(0), env=env_a, cwd=cwd_a)
-    snapshot_b = get_usage(store_b, "codex", max_age=timedelta(0), env=env_b, cwd=cwd_b)
+    snapshot_a = get_usage(store_a, "codex", max_age=timedelta(0), env=env_a, cwd=cwd_a, now=FETCHED_AT)
+    snapshot_b = get_usage(store_b, "codex", max_age=timedelta(0), env=env_b, cwd=cwd_b, now=FETCHED_AT)
 
     assert snapshot_a.source == "fetch"
     assert snapshot_b.source == "fetch"
@@ -286,11 +321,12 @@ def test_get_usage_fetch_uses_selected_runtime_context_and_store(
 
 def test_failed_fetch_serves_the_last_good_value_as_stale(tmp_path: Path, monkeypatch) -> None:
     """A failure must never read as zero usage."""
+    monkeypatch.setattr("gza.db.datetime", _FrozenDbDateTime)
     store = SqliteTaskStore(tmp_path / "test.db")
     store.record_provider_usage(
         ProviderUsage(
             provider="codex",
-            fetched_at=datetime.now(UTC) - timedelta(hours=2),
+            fetched_at=FETCHED_AT - timedelta(hours=2),
             windows=(UsageWindow("codex", None, "primary", 45.0, 10080, FETCHED_AT),),
         )
     )
@@ -299,7 +335,7 @@ def test_failed_fetch_serves_the_last_good_value_as_stale(tmp_path: Path, monkey
         raise UsageTimeout("codex app-server did not respond within 10s")
 
     monkeypatch.setattr("gza.usage_service._fetch_usage", _fail)
-    snapshot = get_usage(store, "codex", max_age=timedelta(minutes=15))
+    snapshot = get_usage(store, "codex", max_age=timedelta(minutes=15), now=FETCHED_AT)
     assert snapshot.stale is True
     assert snapshot.error_reason == "timeout"
     assert snapshot.primary_window is not None

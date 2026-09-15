@@ -33,7 +33,10 @@ from gza.cli._common import clear_task_queue_position_scoped, set_task_queue_pos
 from gza.config import Config
 from gza.console import truncate
 from gza.db import MERGE_SOURCE_MAX_CYCLES_DEFERRED, SqliteTaskStore, Task
+from gza import db as db_module
 from gza.dispatch_preview import DispatchPreview, build_dispatch_preview
+from gza import lineage_query as lineage_query_module
+from gza import task_query as task_query_module
 from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerRow, StaleUnmergedSweepCandidate
 from gza.pr_ops import LookupTaskPrResult
@@ -529,14 +532,15 @@ def _set_task_created_at(store, task_id: str, *, when: datetime) -> None:
         )
 
 
-def _seed_stale_unmerged_cli_cases(tmp_path: Path) -> tuple[Task, Task, Task]:
+def _seed_stale_unmerged_cli_cases(tmp_path: Path, *, now: datetime | None = None) -> tuple[Task, Task, Task]:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
-    # Anchor activity relative to now so the fresh/stale split holds no matter
-    # when the suite runs. A fixed "recent" date eventually ages past --days and
-    # the live unit starts getting flagged as stale.
-    now = datetime.now(UTC)
+    # Anchor activity relative to `now` so the fresh/stale split holds no matter
+    # when the suite runs. Callers that need production's staleness comparison
+    # to use the same instant (e.g. under a timeshifted clock) should pass a
+    # fixed `now` and patch gza.lineage_query.datetime to match.
+    now = now or datetime.now(UTC)
     stale_ts = now - timedelta(days=100)  # comfortably past any --days window the tests use
     fresh_ts = now - timedelta(days=10)  # comfortably within a 45-day window
 
@@ -783,8 +787,19 @@ def _approved_plan_review_manifest(source_task_id: str) -> dict[str, object]:
     }
 
 
-def test_stale_unmerged_dry_run_reports_only_old_abandoned_units(tmp_path: Path) -> None:
-    merged_owner, live_owner, stale_owner = _seed_stale_unmerged_cli_cases(tmp_path)
+def test_stale_unmerged_dry_run_reports_only_old_abandoned_units(tmp_path: Path, monkeypatch) -> None:
+    fixed_now = datetime(2026, 1, 8, 0, 2, 30, tzinfo=UTC)
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return fixed_now.replace(tzinfo=None)
+            return fixed_now.astimezone(tz)
+
+    monkeypatch.setattr(lineage_query_module, "datetime", _FixedDateTime)
+
+    merged_owner, live_owner, stale_owner = _seed_stale_unmerged_cli_cases(tmp_path, now=fixed_now)
 
     with patch("gza.cli.query.Git", return_value=_FastUnmergedGit()):
         result = invoke_gza("stale-unmerged", "--days", "45", "--project", str(tmp_path))
@@ -801,8 +816,21 @@ def test_stale_unmerged_dry_run_reports_only_old_abandoned_units(tmp_path: Path)
     assert stale_task.status == "completed"
 
 
-def test_stale_unmerged_execute_drops_only_selected_tasks_and_keeps_branch_history(tmp_path: Path) -> None:
-    _merged_owner, live_owner, stale_owner = _seed_stale_unmerged_cli_cases(tmp_path)
+def test_stale_unmerged_execute_drops_only_selected_tasks_and_keeps_branch_history(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fixed_now = datetime(2026, 1, 8, 0, 2, 30, tzinfo=UTC)
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return fixed_now.replace(tzinfo=None)
+            return fixed_now.astimezone(tz)
+
+    monkeypatch.setattr(lineage_query_module, "datetime", _FixedDateTime)
+
+    _merged_owner, live_owner, stale_owner = _seed_stale_unmerged_cli_cases(tmp_path, now=fixed_now)
     store = make_store(tmp_path)
     stale_review = next(task for task in store.get_lineage_children(stale_owner.id) if task.task_type == "review")
     stale_unit = store.resolve_merge_unit_for_task(stale_owner.id)
@@ -831,8 +859,19 @@ def test_stale_unmerged_execute_drops_only_selected_tasks_and_keeps_branch_histo
     assert tombstoned.state == "dropped"
 
 
-def test_stale_unmerged_execute_json_applies_drops_and_reports_them(tmp_path: Path) -> None:
-    _merged_owner, live_owner, stale_owner = _seed_stale_unmerged_cli_cases(tmp_path)
+def test_stale_unmerged_execute_json_applies_drops_and_reports_them(tmp_path: Path, monkeypatch) -> None:
+    fixed_now = datetime(2026, 1, 8, 0, 2, 30, tzinfo=UTC)
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return fixed_now.replace(tzinfo=None)
+            return fixed_now.astimezone(tz)
+
+    monkeypatch.setattr(lineage_query_module, "datetime", _FixedDateTime)
+
+    _merged_owner, live_owner, stale_owner = _seed_stale_unmerged_cli_cases(tmp_path, now=fixed_now)
     store = make_store(tmp_path)
     stale_review = next(task for task in store.get_lineage_children(stale_owner.id) if task.task_type == "review")
 
@@ -935,9 +974,20 @@ def test_stale_unmerged_execute_json_drops_candidates_with_only_resolved_externa
 
 
 def test_stale_unmerged_skips_cached_unmerged_unit_proven_merged_into_canonical_target(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
-    _merged_owner, live_owner, stale_owner = _seed_stale_unmerged_cli_cases(tmp_path)
+    fixed_now = datetime(2026, 1, 8, 0, 2, 30, tzinfo=UTC)
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return fixed_now.replace(tzinfo=None)
+            return fixed_now.astimezone(tz)
+
+    monkeypatch.setattr(lineage_query_module, "datetime", _FixedDateTime)
+
+    _merged_owner, live_owner, stale_owner = _seed_stale_unmerged_cli_cases(tmp_path, now=fixed_now)
     git = _FastUnmergedGit()
     git._merged[("feature/stale", "main")] = True
 
@@ -4657,17 +4707,30 @@ class TestQueueCommand:
         assert "Runnable recovery lane (watch will run): 1 shown / all shown" in result.stdout
         assert "Pending lane (watch will run after recovery policy allows slots): 1 shown / 1 more" in result.stdout
 
-    def test_queue_shows_quiet_lane_without_numbering_quiet_tasks(self, tmp_path: Path) -> None:
+    def test_queue_shows_quiet_lane_without_numbering_quiet_tasks(self, tmp_path: Path, monkeypatch) -> None:
         setup_config(tmp_path)
         (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "quiet_period_seconds: 300\n")
         store = make_store(tmp_path)
+
+        fixed_now = datetime(2026, 1, 8, 0, 2, 30, tzinfo=UTC)
+
+        class _FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return fixed_now.replace(tzinfo=None)
+                return fixed_now.astimezone(tz)
+
+        monkeypatch.setattr(task_query_module, "datetime", _FixedDateTime)
+        monkeypatch.setattr(db_module, "datetime", _FixedDateTime)
+        monkeypatch.setattr(queue_render_cli, "datetime", _FixedDateTime)
 
         runnable = store.add("Older runnable task")
         quiet = store.add("Fresh quiet task")
         assert runnable.id is not None
         assert quiet.id is not None
-        runnable.last_edited_at = datetime.now(UTC) - timedelta(minutes=10)
-        quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=45)
+        runnable.last_edited_at = fixed_now - timedelta(minutes=10)
+        quiet.last_edited_at = fixed_now - timedelta(seconds=45)
         store.update(runnable)
         store.update(quiet)
 
@@ -4689,18 +4752,33 @@ class TestQueueCommand:
         assert quiet_line.lstrip().startswith("-")
         assert "held until" in result.stdout
 
-    def test_queue_pending_shows_quiet_lane_without_consuming_runnable_limit(self, tmp_path: Path) -> None:
+    def test_queue_pending_shows_quiet_lane_without_consuming_runnable_limit(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
         setup_config(tmp_path)
         (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "quiet_period_seconds: 300\n")
         store = make_store(tmp_path)
+
+        fixed_now = datetime(2026, 1, 8, 0, 2, 30, tzinfo=UTC)
+
+        class _FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return fixed_now.replace(tzinfo=None)
+                return fixed_now.astimezone(tz)
+
+        monkeypatch.setattr(task_query_module, "datetime", _FixedDateTime)
+        monkeypatch.setattr(db_module, "datetime", _FixedDateTime)
+        monkeypatch.setattr(queue_render_cli, "datetime", _FixedDateTime)
 
         runnable = store.add("Older scoped runnable task", tags=("release",))
         quiet = store.add("Fresh scoped quiet task", tags=("release",))
         store.add("Other tag task", tags=("backlog",))
         assert runnable.id is not None
         assert quiet.id is not None
-        runnable.last_edited_at = datetime.now(UTC) - timedelta(minutes=10)
-        quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=45)
+        runnable.last_edited_at = fixed_now - timedelta(minutes=10)
+        quiet.last_edited_at = fixed_now - timedelta(seconds=45)
         store.update(runnable)
         store.update(quiet)
 
@@ -6082,17 +6160,32 @@ class TestQueueCommand:
         assert _span_styles(blocked_line) == ["green", "cyan", "magenta", "white"]
         assert _span_styles(blocked_meta) == ["blue"]
 
-    def test_next_shows_quiet_lane_and_excludes_quiet_tasks_from_runnable_positions(self, tmp_path: Path) -> None:
+    def test_next_shows_quiet_lane_and_excludes_quiet_tasks_from_runnable_positions(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
         setup_config(tmp_path)
         (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "quiet_period_seconds: 300\n")
         store = make_store(tmp_path)
+
+        fixed_now = datetime(2026, 1, 8, 0, 2, 30, tzinfo=UTC)
+
+        class _FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return fixed_now.replace(tzinfo=None)
+                return fixed_now.astimezone(tz)
+
+        monkeypatch.setattr(task_query_module, "datetime", _FixedDateTime)
+        monkeypatch.setattr(db_module, "datetime", _FixedDateTime)
+        monkeypatch.setattr(queue_render_cli, "datetime", _FixedDateTime)
 
         runnable = store.add("Older next task")
         quiet = store.add("Fresh quiet next task")
         assert runnable.id is not None
         assert quiet.id is not None
-        runnable.last_edited_at = datetime.now(UTC) - timedelta(minutes=15)
-        quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=20)
+        runnable.last_edited_at = fixed_now - timedelta(minutes=15)
+        quiet.last_edited_at = fixed_now - timedelta(seconds=20)
         store.update(runnable)
         store.update(quiet)
 
@@ -12928,28 +13021,42 @@ class TestUnmergedReviewStatus:
 
 
 
-    def test_unmerged_does_not_use_older_stale_verdict_when_latest_review_has_no_output(self, tmp_path: Path):
+    def test_unmerged_does_not_use_older_stale_verdict_when_latest_review_has_no_output(
+        self, tmp_path: Path, monkeypatch
+    ):
         """Staleness via review_cleared_at still suppresses older verdicts."""
-        import time
+        # `store.clear_review_state` stamps `review_cleared_at` using production's
+        # own clock (gza.db.datetime.now()). Anchor it to a fixed instant that
+        # sits strictly between the two review completion times below, so the
+        # ordering this test depends on holds under any clock shift instead of
+        # relying on real wall-clock sleeps.
+        fixed_now = datetime(2026, 1, 8, 0, 2, 30, tzinfo=UTC)
+
+        class _FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                moment = fixed_now + timedelta(seconds=1)
+                if tz is None:
+                    return moment.replace(tzinfo=None)
+                return moment.astimezone(tz)
 
         store, task, git = setup_unmerged_env(tmp_path)
 
         older_review = store.add("Older review", task_type="review")
         older_review.status = "completed"
-        older_review.completed_at = datetime.now(UTC)
+        older_review.completed_at = fixed_now
         older_review.depends_on = task.id
         older_review.slug = "20260212-older-review"
         older_review.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(older_review)
 
-        time.sleep(0.01)
         assert task.id is not None
+        monkeypatch.setattr(db_module, "datetime", _FixedDateTime)
         store.clear_review_state(task.id)
 
-        time.sleep(0.01)
         latest_review = store.add("Latest review", task_type="review")
         latest_review.status = "completed"
-        latest_review.completed_at = datetime.now(UTC)
+        latest_review.completed_at = fixed_now + timedelta(seconds=2)
         latest_review.depends_on = task.id
         latest_review.slug = "20260212-latest-review"
         latest_review.output_content = None
@@ -13152,31 +13259,43 @@ class TestUnmergedReviewStatus:
         assert "review: review stale" in normalized
         assert "latest improve" not in normalized
         assert "review state cleared after last review" in normalized
-    def test_unmerged_shows_new_review_status_after_improve_and_re_review(self, tmp_path: Path):
+    def test_unmerged_shows_new_review_status_after_improve_and_re_review(self, tmp_path: Path, monkeypatch):
         """After improve clears review state, a newer review's verdict is shown."""
-        import time
+        # `store.clear_review_state` stamps `review_cleared_at` using production's
+        # own clock (gza.db.datetime.now()). Anchor it to a fixed instant that
+        # sits strictly between the two review completion times below, so the
+        # ordering this test depends on holds under any clock shift instead of
+        # relying on real wall-clock sleeps.
+        fixed_now = datetime(2026, 1, 8, 0, 2, 30, tzinfo=UTC)
+
+        class _FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                moment = fixed_now + timedelta(seconds=1)
+                if tz is None:
+                    return moment.replace(tzinfo=None)
+                return moment.astimezone(tz)
 
         store, task, git = setup_unmerged_env(tmp_path)
 
         # Create first review (changes requested)
         review1 = store.add("Review", task_type="review")
         review1.status = "completed"
-        review1.completed_at = datetime.now(UTC)
+        review1.completed_at = fixed_now
         review1.depends_on = task.id
         review1.slug = "20260212-review"
         review1.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(review1)
 
         # Improve task runs, clearing the review state
-        time.sleep(0.01)
         assert task.id is not None
+        monkeypatch.setattr(db_module, "datetime", _FixedDateTime)
         store.clear_review_state(task.id)
 
         # A new review runs after the improve, resulting in approved
-        time.sleep(0.01)
         review2 = store.add("Second review", task_type="review")
         review2.status = "completed"
-        review2.completed_at = datetime.now(UTC)
+        review2.completed_at = fixed_now + timedelta(seconds=2)
         review2.depends_on = task.id
         review2.slug = "20260212-second-review"
         review2.output_content = "**Verdict: APPROVED**"
@@ -14584,9 +14703,26 @@ class TestUnmergedUnifiedQueryOutput:
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
+        monkeypatch,
     ) -> None:
         setup_config(tmp_path)
         store = make_store(tmp_path)
+
+        # cmd_merged's default/--last-days windows compare merged_at against
+        # gza.cli.query's own now(). Freeze it so the fixture's merged_at offsets
+        # and the production comparison move together under any clock shift.
+        # Anchored well after --since=2026-01-01 so the oldest fixture (10 days
+        # back) still lands after that literal --since boundary.
+        fixed_now = datetime(2026, 2, 8, 0, 2, 30, tzinfo=UTC)
+
+        class _FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return fixed_now.replace(tzinfo=None)
+                return fixed_now.astimezone(tz)
+
+        monkeypatch.setattr(query_cli, "datetime", _FixedDateTime)
 
         manual = store.add("Manual merged", task_type="implement")
         store.mark_completed(manual, has_commits=True, branch="feature/manual-merged")
@@ -14597,7 +14733,7 @@ class TestUnmergedUnifiedQueryOutput:
             manual_unit.id,
             "merged",
             merge_source="manual",
-            merged_at=datetime.now(UTC) - timedelta(days=2),
+            merged_at=fixed_now - timedelta(days=2),
         )
 
         advance = store.add("Advance merged", task_type="implement")
@@ -14609,7 +14745,7 @@ class TestUnmergedUnifiedQueryOutput:
             advance_unit.id,
             "merged",
             merge_source="advance",
-            merged_at=datetime.now(UTC) - timedelta(days=10),
+            merged_at=fixed_now - timedelta(days=10),
         )
 
         recent = store.add("Recent merged", task_type="implement")
@@ -14621,7 +14757,7 @@ class TestUnmergedUnifiedQueryOutput:
             recent_unit.id,
             "merged",
             merge_source="watch",
-            merged_at=datetime.now(UTC) - timedelta(hours=12),
+            merged_at=fixed_now - timedelta(hours=12),
         )
 
         default_args = argparse.Namespace(

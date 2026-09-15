@@ -1980,12 +1980,24 @@ def test_plan_watch_dispatch_entries_exact_main_verify_remediation_fails_closed_
     assert plan.pending_slots == 0
 
 
-def test_build_dispatch_preview_filters_quiet_pending_but_keeps_exempt_tasks(tmp_path: Path) -> None:
+def test_build_dispatch_preview_filters_quiet_pending_but_keeps_exempt_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     setup_config(tmp_path)
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(config_path.read_text() + "quiet_period_seconds: 300\n")
     config = Config.load(tmp_path)
     store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.db.datetime", FrozenDateTime)
 
     quiet = store.add("Fresh quiet pending", task_type="plan")
     expired = store.add("Expired pending", task_type="plan")
@@ -1996,9 +2008,9 @@ def test_build_dispatch_preview_filters_quiet_pending_but_keeps_exempt_tasks(tmp
     assert urgent.id is not None
     assert explicit.id is not None
 
-    now = datetime.now(UTC)
+    now = FrozenDateTime.current
     quiet.last_edited_at = now - timedelta(seconds=30)
-    expired.last_edited_at = now - timedelta(seconds=300)
+    expired.last_edited_at = now - timedelta(seconds=600)
     urgent.last_edited_at = now - timedelta(seconds=30)
     explicit.last_edited_at = now - timedelta(seconds=30)
     store.update(quiet)

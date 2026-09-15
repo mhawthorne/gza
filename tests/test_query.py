@@ -230,12 +230,13 @@ class TestQueryHistory:
         merge_status: str | None = None,
         has_commits: bool = False,
         days_ago: int = 0,
+        now: datetime | None = None,
     ) -> Task:
         task = store.add(prompt, task_type=task_type)
         task.status = "completed"
         task.merge_status = merge_status
         task.has_commits = has_commits
-        now = datetime.now(UTC)
+        now = now if now is not None else datetime.now(UTC)
         task.completed_at = now - timedelta(days=days_ago)
         task.created_at = now - timedelta(days=days_ago)
         store.update(task)
@@ -246,19 +247,31 @@ class TestQueryHistory:
         store: SqliteTaskStore,
         prompt: str,
         days_ago: int = 0,
+        now: datetime | None = None,
     ) -> Task:
         task = store.add(prompt, task_type="task")
         task.status = "failed"
-        now = datetime.now(UTC)
+        now = now if now is not None else datetime.now(UTC)
         task.completed_at = now - timedelta(days=days_ago)
         task.created_at = now - timedelta(days=days_ago)
         store.update(task)
         return task
 
-    def test_days_excludes_old_tasks(self, tmp_path: Path):
+    def test_days_excludes_old_tasks(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+            @classmethod
+            def now(cls, tz=None):
+                assert tz is not None
+                return cls.current.astimezone(tz)
+
+        monkeypatch.setattr("gza.task_query.datetime", FrozenDateTime)
+        now = FrozenDateTime.current
+
         store = self._make_store(tmp_path)
-        self._add_completed(store, "old task", days_ago=10)
-        self._add_completed(store, "recent task", days_ago=1)
+        self._add_completed(store, "old task", days_ago=10, now=now)
+        self._add_completed(store, "recent task", days_ago=1, now=now)
 
         f = HistoryFilter(days=5, limit=None)
         results = query_history(store, f)
@@ -266,10 +279,21 @@ class TestQueryHistory:
         assert "recent task" in prompts
         assert "old task" not in prompts
 
-    def test_days_includes_recent_tasks(self, tmp_path: Path):
+    def test_days_includes_recent_tasks(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+            @classmethod
+            def now(cls, tz=None):
+                assert tz is not None
+                return cls.current.astimezone(tz)
+
+        monkeypatch.setattr("gza.task_query.datetime", FrozenDateTime)
+        now = FrozenDateTime.current
+
         store = self._make_store(tmp_path)
-        self._add_completed(store, "today task", days_ago=0)
-        self._add_completed(store, "week ago task", days_ago=7)
+        self._add_completed(store, "today task", days_ago=0, now=now)
+        self._add_completed(store, "week ago task", days_ago=7, now=now)
 
         f = HistoryFilter(days=3, limit=None)
         results = query_history(store, f)
@@ -277,14 +301,25 @@ class TestQueryHistory:
         assert "today task" in prompts
         assert "week ago task" not in prompts
 
-    def test_failed_status_and_lookback_combined(self, tmp_path: Path):
+    def test_failed_status_and_lookback_combined(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+            @classmethod
+            def now(cls, tz=None):
+                assert tz is not None
+                return cls.current.astimezone(tz)
+
+        monkeypatch.setattr("gza.task_query.datetime", FrozenDateTime)
+        now = FrozenDateTime.current
+
         store = self._make_store(tmp_path)
         # recent + failed
-        self._add_failed(store, "recent failed", days_ago=1)
+        self._add_failed(store, "recent failed", days_ago=1, now=now)
         # old + failed (excluded by lookback)
-        self._add_failed(store, "old failed", days_ago=30)
+        self._add_failed(store, "old failed", days_ago=30, now=now)
         # recent + completed (excluded by failed status filter)
-        self._add_completed(store, "recent merged", merge_status="merged")
+        self._add_completed(store, "recent merged", merge_status="merged", now=now)
 
         f = HistoryFilter(status="failed", days=7, limit=None)
         results = query_history(store, f)
