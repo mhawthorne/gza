@@ -31,6 +31,7 @@ from gza.db import (
     ForwardSchemaMigrationDeferred,
     MainVerifyRemediationAttemptState,
     ManualMigrationRequired,
+    MigrationAuthorityProof,
     MergeTargetResolutionError,
     NewTaskParams,
     ParkedTaskRearmState,
@@ -60,6 +61,7 @@ from gza.db import (
     task_owns_merge_status,
     task_updated_at,
 )
+from gza.migration_authority import resolve_canonical_migration_authority
 from gza.advance_engine import resolve_review_cycle_boundary
 from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance, parse_rebase_diff_provenance
 from gza.review_tasks import build_auto_review_prompt
@@ -100,6 +102,62 @@ def _write_project_config(
     lines.append(f"provider: {provider}")
     lines.append(f"model: {model}")
     (project_dir / "gza.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class _FakeMigrationAuthorityGit:
+    observations: list[dict[str, Any]] = []
+
+    def __init__(self, _repo_dir: Path):
+        if not self.observations:
+            raise RuntimeError("no fake Git observation available")
+        self.observation = self.observations.pop(0)
+
+    def toplevel(self) -> Path:
+        return Path(self.observation["canonical_root"])
+
+    def worktree_list(self) -> list[dict[str, str]]:
+        return [{"path": str(self.observation["primary_root"])}]
+
+    def default_branch(self) -> str:
+        return str(self.observation["default_branch"])
+
+    def current_branch(self) -> str:
+        return str(self.observation["current_branch"])
+
+    def rev_parse_if_exists(self, ref: str) -> str | None:
+        if ref == "HEAD":
+            return self.observation["head_sha"]
+        if ref == f"refs/heads/{self.observation['default_branch']}":
+            return self.observation["branch_sha"]
+        return None
+
+
+def _migration_authority_observation(
+    root: Path,
+    *,
+    current_branch: str = "main",
+    head_sha: str = "1" * 40,
+    branch_sha: str | None = None,
+    primary_root: Path | None = None,
+) -> dict[str, Any]:
+    return {
+        "canonical_root": root,
+        "primary_root": primary_root or root,
+        "default_branch": "main",
+        "current_branch": current_branch,
+        "head_sha": head_sha,
+        "branch_sha": branch_sha or head_sha,
+    }
+
+
+def _canonical_migration_authority_for_test(project_dir: Path, *observations: dict[str, Any]) -> MigrationAuthorityProof:
+    from gza.config import Config
+
+    _FakeMigrationAuthorityGit.observations = list(observations)
+    with patch("gza.migration_authority.Git", _FakeMigrationAuthorityGit):
+        proof = resolve_canonical_migration_authority(Config.load(project_dir))
+    assert proof is not None
+    return proof
 
 
 def test_generate_project_id_normalizes_readable_names(tmp_path: Path) -> None:
@@ -9786,6 +9844,13 @@ class TestMigrationUtilityFunctions:
 
 @pytest.mark.timeout(4, method="signal")
 class TestSharedDbIsolationAndImportGating:
+    def _bootstrap_shared_fixture(self, config):
+        return SqliteTaskStore.from_config(
+            config,
+            allow_legacy_local_db=True,
+            migration_policy="auto_private",
+        )
+
     def test_explicit_project_id_is_honored_unchanged(self, tmp_path: Path) -> None:
         from gza.config import Config
 
@@ -9904,6 +9969,7 @@ class TestSharedDbIsolationAndImportGating:
         legacy_store.add("legacy task")
 
         config = Config.load(project_dir)
+        self._bootstrap_shared_fixture(config)
         result = import_legacy_local_db(config)
         assert result["status"] == "imported"
 
@@ -9936,6 +10002,7 @@ class TestSharedDbIsolationAndImportGating:
         legacy_store.add("legacy task")
 
         config = Config.load(project_dir)
+        self._bootstrap_shared_fixture(config)
         result = import_legacy_local_db(config)
         assert result["status"] == "imported"
 
@@ -9971,6 +10038,7 @@ class TestSharedDbIsolationAndImportGating:
         legacy_store.add("legacy task")
 
         config = Config.load(project_dir)
+        self._bootstrap_shared_fixture(config)
         result = import_legacy_local_db(config)
         assert result["status"] == "imported"
 
@@ -10009,6 +10077,7 @@ class TestSharedDbIsolationAndImportGating:
         legacy_store.add("legacy task")
 
         config = Config.load(project_dir)
+        self._bootstrap_shared_fixture(config)
         result = import_legacy_local_db(config)
         assert result["status"] == "imported"
 
@@ -10120,10 +10189,11 @@ class TestSharedDbIsolationAndImportGating:
         _drop_tasks_column(local_db, "create_pr")
 
         config = Config.load(project_dir)
+        self._bootstrap_shared_fixture(config)
         result = import_legacy_local_db(config)
         assert result["status"] == "imported"
 
-        shared_store = SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
+        shared_store = self._bootstrap_shared_fixture(config)
         imported = shared_store.get(legacy_task.id)
         assert imported is not None
         assert imported.create_pr is False
@@ -10152,10 +10222,11 @@ class TestSharedDbIsolationAndImportGating:
         _drop_tasks_column(local_db, "completion_reason")
 
         config = Config.load(project_dir)
+        self._bootstrap_shared_fixture(config)
         result = import_legacy_local_db(config)
         assert result["status"] == "imported"
 
-        shared_store = SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
+        shared_store = self._bootstrap_shared_fixture(config)
         imported = shared_store.get(legacy_task.id)
         assert imported is not None
         assert imported.completion_reason is None
@@ -10181,10 +10252,11 @@ class TestSharedDbIsolationAndImportGating:
         legacy_store.add("legacy-2")
 
         config = Config.load(project_dir)
+        self._bootstrap_shared_fixture(config)
         result = import_legacy_local_db(config)
         assert result["status"] == "imported"
 
-        shared_store = SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
+        shared_store = self._bootstrap_shared_fixture(config)
         created = shared_store.add("post-import")
         assert created.id == "demo-3"
 
@@ -10203,7 +10275,7 @@ class TestSharedDbIsolationAndImportGating:
         )
 
         config = Config.load(project_dir)
-        shared_store = SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
+        shared_store = self._bootstrap_shared_fixture(config)
         with sqlite3.connect(shared_db) as conn:
             conn.execute(
                 """
@@ -10251,10 +10323,11 @@ class TestSharedDbIsolationAndImportGating:
         legacy_store.emit_substep(step, "tool_call", {"ok": True}, source="assistant")
 
         config = Config.load(project_dir)
+        self._bootstrap_shared_fixture(config)
         result = import_legacy_local_db(config)
         assert result["status"] == "imported"
 
-        shared_store = SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
+        shared_store = self._bootstrap_shared_fixture(config)
         imported_steps = shared_store.get_run_steps(task.id)
         assert len(imported_steps) == 1
         imported_step = imported_steps[0]
@@ -10299,6 +10372,7 @@ class TestSharedDbIsolationAndImportGating:
         legacy_store.emit_substep(step, "tool_call", {"ok": True}, source="assistant")
 
         config = Config.load(project_dir)
+        self._bootstrap_shared_fixture(config)
         result = import_legacy_local_db(config)
         assert result["status"] == "imported"
 
@@ -10338,7 +10412,7 @@ class TestSharedDbIsolationAndImportGating:
         )
 
         config = Config.load(project_dir)
-        shared_store = SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
+        shared_store = self._bootstrap_shared_fixture(config)
         shared_task = shared_store.add("same task")
         shared_step = shared_store.emit_step(shared_task.id, "same step", provider="codex")
         shared_store.emit_substep(shared_step, "tool_call", {"ok": True}, source="assistant")
@@ -10413,7 +10487,7 @@ class TestSharedDbIsolationAndImportGating:
         assert result["status"] == "imported"
         assert result["tasks_imported"] == 0
 
-        refreshed = SqliteTaskStore.from_config(config)
+        refreshed = self._bootstrap_shared_fixture(config)
         comments = refreshed.get_comments(shared_task.id)
         steps = refreshed.get_run_steps(shared_task.id)
         assert len(comments) == 1
@@ -10813,11 +10887,11 @@ class TestExecutionProjectResolver:
         _write_project_config(beta_dir, project_name="Beta", project_id="beta", db_path=shared_db)
         alpha_store = SqliteTaskStore.from_config(
             Config.load(alpha_dir),
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
         SqliteTaskStore.from_config(
             Config.load(beta_dir),
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
 
         results = resolve_execution_projects(
@@ -10848,7 +10922,7 @@ class TestExecutionProjectResolver:
 
         store = SqliteTaskStore.from_config(
             Config.load(project_dir),
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
 
         entry = store.get_project_registry_entry("ambient")
@@ -10892,7 +10966,7 @@ class TestExecutionProjectResolver:
         monkeypatch.setenv("GZA_DB_PATH", str(shared_db))
         anchor_store = SqliteTaskStore.from_config(
             Config.load(project_dir),
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
         before_anchor = self._sqlite_user_schema_and_rows(shared_db)
 
@@ -10955,7 +11029,7 @@ class TestExecutionProjectResolver:
         monkeypatch.setenv("GZA_DB_PATH", str(shared_db))
         anchor_store = SqliteTaskStore.from_config(
             Config.load(project_dir),
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
 
         monkeypatch.delenv("GZA_DB_PATH", raising=False)
@@ -11076,7 +11150,7 @@ class TestExecutionProjectResolver:
             anchor_config = Config.load(anchor_dir)
             anchor_store = SqliteTaskStore.from_config(
                 anchor_config,
-                migration_policy="auto_canonical_shared",
+                migration_policy="auto_private",
             )
             SqliteTaskStore(beta_db, prefix="bet", project_id="beta")
             assert colors.TASK_COLORS.task_id == "#010203"
@@ -11152,7 +11226,7 @@ class TestExecutionProjectResolver:
 
         canonical_store = SqliteTaskStore.from_config(
             Config.load(canonical_dir),
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
         canonical_task = canonical_store.add("canonical task")
         assert canonical_task.id is not None
@@ -11337,7 +11411,7 @@ class TestExecutionProjectResolver:
 
         SqliteTaskStore.from_config(
             Config.load(project_dir),
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
 
         with sqlite3.connect(shared_db) as conn:
@@ -11378,11 +11452,11 @@ class TestExecutionProjectResolver:
 
         submodule_store = SqliteTaskStore.from_config(
             Config.load(submodule),
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
         SqliteTaskStore.from_config(
             Config.load(nested),
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
         SqliteTaskStore.from_config(Config.load(linked))
 
@@ -11562,7 +11636,7 @@ class TestExecutionProjectResolver:
 
         SqliteTaskStore.from_config(
             Config.load(canonical_dir),
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
         with sqlite3.connect(shared_db) as conn:
             first = conn.execute(
@@ -11585,7 +11659,7 @@ class TestExecutionProjectResolver:
         )
         SqliteTaskStore.from_config(
             Config.load(canonical_dir),
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
 
         with sqlite3.connect(shared_db) as conn:
@@ -11638,7 +11712,7 @@ class TestExecutionProjectResolver:
 
         store = SqliteTaskStore.from_config(
             Config.load(checkout_b),
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
 
         with sqlite3.connect(shared_db) as conn:
@@ -11667,14 +11741,14 @@ class TestExecutionProjectResolver:
 
         SqliteTaskStore.from_config(
             Config.load(canonical_a),
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
         canonical_root = str(canonical_a.resolve())
         canonical_config = str((canonical_a / "gza.yaml").resolve())
 
         conflicting_store = SqliteTaskStore.from_config(
             Config.load(canonical_b),
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
         linked_store = SqliteTaskStore.from_config(Config.load(linked))
 
@@ -12059,6 +12133,8 @@ class TestExecutionProjectResolver:
             store = SqliteTaskStore.from_config(Config.load(project_dir))
 
         assert store.project_id == "shared"
+        assert store.shared_initialization_deferred() is True
+        assert store.shared_migration_deferred() is None
         assert self._sqlite_user_schema_and_rows(project_db) == before
         with sqlite3.connect(project_db) as conn:
             assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
@@ -12118,6 +12194,504 @@ class TestExecutionProjectResolver:
         with sqlite3.connect(shared_db) as conn:
             version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
         assert version == SCHEMA_VERSION
+
+    def test_shared_config_with_canonical_authority_auto_migrates_existing_schema(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "project"
+        shared_db = tmp_path / "canonical-authority.db"
+        _write_project_config(project_dir, project_name="Canonical", project_id="canonical", db_path=shared_db)
+        (project_dir / ".git").mkdir()
+        (project_dir / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (project_dir / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+        SqliteTaskStore(shared_db, prefix="gza", project_id="seed")
+        with sqlite3.connect(shared_db) as conn:
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,))
+
+        _FakeMigrationAuthorityGit.observations = [
+            _migration_authority_observation(project_dir),
+            _migration_authority_observation(project_dir),
+            _migration_authority_observation(project_dir),
+            _migration_authority_observation(project_dir),
+        ]
+        with patch("gza.migration_authority.Git", _FakeMigrationAuthorityGit):
+            proof = resolve_canonical_migration_authority(Config.load(project_dir))
+            assert proof is not None
+            SqliteTaskStore.from_config(
+                Config.load(project_dir),
+                migration_policy="auto_canonical_shared",
+                migration_authority=proof,
+                require_migration_authority=True,
+            )
+
+        with sqlite3.connect(shared_db) as conn:
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
+
+    def test_shared_config_without_authority_defers_feature_branch_before_migration(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "feature"
+        shared_db = tmp_path / "feature-refusal.db"
+        _write_project_config(project_dir, project_name="Feature", project_id="feature", db_path=shared_db)
+        (project_dir / ".git").mkdir()
+        (project_dir / ".git" / "HEAD").write_text("ref: refs/heads/topic\n", encoding="utf-8")
+        (project_dir / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+        SqliteTaskStore(shared_db, prefix="gza", project_id="seed")
+        with sqlite3.connect(shared_db) as conn:
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,))
+        before = self._sqlite_user_schema_and_rows(shared_db)
+
+        _FakeMigrationAuthorityGit.observations = [_migration_authority_observation(project_dir, current_branch="topic")]
+        with patch("gza.migration_authority.Git", _FakeMigrationAuthorityGit):
+            proof = resolve_canonical_migration_authority(Config.load(project_dir))
+
+        assert proof is None
+        SqliteTaskStore.from_config(
+            Config.load(project_dir),
+            migration_policy="auto_canonical_shared",
+            migration_authority=proof,
+            require_migration_authority=True,
+        )
+
+        with sqlite3.connect(shared_db) as conn:
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION - 1
+        assert self._sqlite_user_schema_and_rows(shared_db) == before
+
+    def test_shared_config_without_required_flag_still_defers_before_migration(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "unproven"
+        shared_db = tmp_path / "unproven-shared.db"
+        _write_project_config(project_dir, project_name="Unproven", project_id="unproven", db_path=shared_db)
+        SqliteTaskStore(shared_db, prefix="gza", project_id="seed")
+        with sqlite3.connect(shared_db) as conn:
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,))
+        before = self._sqlite_user_schema_and_rows(shared_db)
+
+        SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_canonical_shared")
+
+        with sqlite3.connect(shared_db) as conn:
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION - 1
+        assert self._sqlite_user_schema_and_rows(shared_db) == before
+
+    def test_project_backed_constructor_defers_shared_migration_without_authority(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "direct"
+        shared_db = tmp_path / "direct-shared.db"
+        _write_project_config(project_dir, project_name="Direct", project_id="direct", db_path=shared_db)
+        SqliteTaskStore(shared_db, prefix="gza", project_id="seed")
+        with sqlite3.connect(shared_db) as conn:
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,))
+        before = self._sqlite_user_schema_and_rows(shared_db)
+
+        SqliteTaskStore(
+            shared_db,
+            prefix="dir",
+            project_id="direct",
+            project_root=project_dir,
+            migration_policy="auto_canonical_shared",
+        )
+
+        with sqlite3.connect(shared_db) as conn:
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION - 1
+        assert self._sqlite_user_schema_and_rows(shared_db) == before
+
+    def test_default_store_defers_configured_shared_migration_without_authority(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        project_dir = tmp_path / "default"
+        shared_db = tmp_path / "default-shared.db"
+        _write_project_config(project_dir, project_name="Default", project_id="defaultshared", db_path=shared_db)
+        SqliteTaskStore(shared_db, prefix="gza", project_id="seed")
+        with sqlite3.connect(shared_db) as conn:
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,))
+        before = self._sqlite_user_schema_and_rows(shared_db)
+
+        monkeypatch.chdir(project_dir)
+        SqliteTaskStore.default()
+
+        with sqlite3.connect(shared_db) as conn:
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION - 1
+        assert self._sqlite_user_schema_and_rows(shared_db) == before
+
+    def test_nonexistent_env_db_path_defers_shared_bootstrap(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "env-db"
+        env_db = tmp_path / "external" / "env.db"
+        _write_project_config(project_dir, project_name="Env", project_id="envdb")
+
+        with patch.dict(os.environ, {"GZA_DB_PATH": str(env_db)}, clear=False):
+            with pytest.raises(ForwardSchemaMigrationDeferred):
+                SqliteTaskStore.from_config(Config.load(project_dir))
+
+        assert not env_db.exists()
+
+    def test_detached_checkout_cannot_construct_shared_migration_authority(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "detached"
+        shared_db = tmp_path / "detached-refusal.db"
+        _write_project_config(project_dir, project_name="Detached", project_id="detached", db_path=shared_db)
+        (project_dir / ".git").mkdir()
+        (project_dir / ".git" / "HEAD").write_text("1" * 40 + "\n", encoding="utf-8")
+        (project_dir / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+
+        _FakeMigrationAuthorityGit.observations = [_migration_authority_observation(project_dir, current_branch="HEAD")]
+        with patch("gza.migration_authority.Git", _FakeMigrationAuthorityGit):
+            assert resolve_canonical_migration_authority(Config.load(project_dir)) is None
+
+        with pytest.raises(ForwardSchemaMigrationDeferred):
+            SqliteTaskStore.from_config(
+                Config.load(project_dir),
+                migration_policy="auto_canonical_shared",
+                migration_authority=None,
+                require_migration_authority=True,
+            )
+        assert not shared_db.exists()
+
+    def test_linked_worktree_cannot_construct_shared_migration_authority(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        primary_dir = tmp_path / "primary"
+        linked_dir = tmp_path / "linked"
+        shared_db = tmp_path / "linked-refusal.db"
+        _write_project_config(linked_dir, project_name="Linked", project_id="linked", db_path=shared_db)
+        (linked_dir / ".git").mkdir()
+        (linked_dir / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (linked_dir / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+
+        _FakeMigrationAuthorityGit.observations = [
+            _migration_authority_observation(linked_dir, primary_root=primary_dir)
+        ]
+        with patch("gza.migration_authority.Git", _FakeMigrationAuthorityGit):
+            assert resolve_canonical_migration_authority(Config.load(linked_dir)) is None
+
+        with pytest.raises(ForwardSchemaMigrationDeferred):
+            SqliteTaskStore.from_config(
+                Config.load(linked_dir),
+                migration_policy="auto_canonical_shared",
+                migration_authority=None,
+                require_migration_authority=True,
+            )
+        assert not shared_db.exists()
+
+    def test_stale_shared_migration_authority_refuses_without_partial_writes(self, tmp_path: Path) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "stale"
+        shared_db = tmp_path / "stale-proof.db"
+        _write_project_config(project_dir, project_name="Stale", project_id="stale", db_path=shared_db)
+        (project_dir / ".git").mkdir()
+        (project_dir / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (project_dir / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+        SqliteTaskStore(shared_db, prefix="gza", project_id="seed")
+        with sqlite3.connect(shared_db) as conn:
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,))
+        before = self._sqlite_user_schema_and_rows(shared_db)
+
+        _FakeMigrationAuthorityGit.observations = [
+            _migration_authority_observation(project_dir, head_sha="1" * 40),
+            _migration_authority_observation(project_dir, head_sha="2" * 40),
+        ]
+        with patch("gza.migration_authority.Git", _FakeMigrationAuthorityGit):
+            proof = resolve_canonical_migration_authority(Config.load(project_dir))
+            assert proof is not None
+            with pytest.raises(SchemaIntegrityError, match="proof became stale"):
+                SqliteTaskStore.from_config(
+                    Config.load(project_dir),
+                    migration_policy="auto_canonical_shared",
+                    migration_authority=proof,
+                    require_migration_authority=True,
+                )
+
+        with sqlite3.connect(shared_db) as conn:
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION - 1
+        assert self._sqlite_user_schema_and_rows(shared_db) == before
+
+    def test_shared_migration_authority_race_inside_bootstrap_lock_fails_before_migration_writes(
+        self, tmp_path: Path
+    ) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "race"
+        shared_db = tmp_path / "authority-race.db"
+        _write_project_config(project_dir, project_name="Race", project_id="race", db_path=shared_db)
+        SqliteTaskStore(shared_db, prefix="gza", project_id="seed")
+        with sqlite3.connect(shared_db) as conn:
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,))
+        before = self._sqlite_user_schema_and_rows(shared_db)
+
+        calls = 0
+
+        def revalidate() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise SchemaIntegrityError("authority race")
+
+        proof = MigrationAuthorityProof(
+            canonical_root=project_dir.resolve(),
+            default_branch="main",
+            head_sha="1" * 40,
+            revalidate=revalidate,
+        )
+
+        with pytest.raises(SchemaIntegrityError, match="authority race"):
+            SqliteTaskStore.from_config(
+                Config.load(project_dir),
+                migration_policy="auto_canonical_shared",
+                migration_authority=proof,
+                require_migration_authority=True,
+            )
+
+        assert calls == 2
+        with sqlite3.connect(shared_db) as conn:
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION - 1
+        assert self._sqlite_user_schema_and_rows(shared_db) == before
+
+    def test_registry_bootstrap_revalidates_canonical_authority_before_publication(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "registry-bootstrap-race"
+        shared_db = tmp_path / "registry-bootstrap-race.db"
+        _write_project_config(
+            project_dir,
+            project_name="RegistryBootstrapRace",
+            project_id="registry",
+            project_prefix="reg",
+            db_path=shared_db,
+        )
+        (project_dir / ".git").mkdir()
+        (project_dir / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (project_dir / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+        _FakeMigrationAuthorityGit.observations = [
+            _migration_authority_observation(project_dir, head_sha="1" * 40),
+            _migration_authority_observation(project_dir, head_sha="1" * 40),
+            _migration_authority_observation(project_dir, head_sha="2" * 40),
+        ]
+
+        with patch("gza.migration_authority.Git", _FakeMigrationAuthorityGit):
+            proof = resolve_canonical_migration_authority(Config.load(project_dir))
+            assert proof is not None
+            with pytest.raises(SchemaIntegrityError, match="proof became stale"):
+                SqliteTaskStore.from_config(
+                    Config.load(project_dir),
+                    open_mode="registry_mutation",
+                    migration_policy="auto_canonical_shared",
+                    migration_authority=proof,
+                    require_migration_authority=True,
+                )
+
+        assert not shared_db.exists()
+
+    def test_registry_register_transaction_revalidates_canonical_authority_before_mutation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "registry-register-race"
+        original_dir = tmp_path / "registry-original"
+        shared_db = tmp_path / "registry-register-race.db"
+        _write_project_config(
+            original_dir,
+            project_name="RegistryOriginal",
+            project_id="registry",
+            project_prefix="reg",
+            db_path=shared_db,
+        )
+        SqliteTaskStore(shared_db, prefix="reg", project_id="registry", project_root=original_dir)
+        before = self._sqlite_user_schema_and_rows(shared_db)
+        _write_project_config(
+            project_dir,
+            project_name="RegistryRegisterRace",
+            project_id="registry",
+            project_prefix="reg",
+            db_path=shared_db,
+        )
+        (project_dir / ".git").mkdir()
+        (project_dir / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (project_dir / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+        _FakeMigrationAuthorityGit.observations = [
+            _migration_authority_observation(project_dir, head_sha="1" * 40),
+            _migration_authority_observation(project_dir, head_sha="1" * 40),
+            _migration_authority_observation(project_dir, branch_sha="2" * 40),
+        ]
+
+        with patch("gza.migration_authority.Git", _FakeMigrationAuthorityGit):
+            proof = resolve_canonical_migration_authority(Config.load(project_dir))
+            assert proof is not None
+            store = SqliteTaskStore.from_config(
+                Config.load(project_dir),
+                open_mode="registry_mutation_existing",
+                migration_policy="auto_canonical_shared",
+                migration_authority=proof,
+                require_migration_authority=True,
+            )
+            with pytest.raises(SchemaIntegrityError, match="HEAD to equal"):
+                store.register_project_paths_for_identity(
+                    project_id="registry",
+                    project_name="RegistryRegisterRace",
+                    project_prefix="reg",
+                    root_path=project_dir,
+                    config_path=project_dir / "gza.yaml",
+                    replace=True,
+                )
+
+        assert self._sqlite_user_schema_and_rows(shared_db) == before
+
+    def _seed_authority_revalidation_startup_rows(
+        self,
+        db_path: Path,
+        *,
+        project_id: str,
+        prefix: str,
+    ) -> tuple[tuple[list[tuple[str, str, str | None]], dict[str, list[tuple]]], str]:
+        store = SqliteTaskStore(db_path, prefix=prefix, project_id=project_id)
+        inconsistent = store.add(prompt="Inconsistent", task_type="implement")
+        store.mark_completed(inconsistent, has_commits=True, branch="feature/inconsistent")
+        assert inconsistent.id is not None
+        inconsistent_unit = store.resolve_merge_unit_for_task(inconsistent.id)
+        assert inconsistent_unit is not None
+
+        first = store.add(prompt="First slice", task_type="implement")
+        store.mark_completed(first, has_commits=True, branch="feature/stale-owner")
+        assert first.id is not None
+        second = store.add(prompt="Second slice", task_type="implement", based_on=first.id)
+        store.mark_completed(second, has_commits=True, branch="feature/stale-owner")
+        assert second.id is not None
+        stale_owner_unit = store.resolve_merge_unit_for_task(second.id)
+        assert stale_owner_unit is not None
+
+        seeded_at = "2026-09-15T00:00:00+00:00"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                UPDATE merge_units
+                SET state = 'unmerged',
+                    merged_at = ?,
+                    merged_by_task_id = ?,
+                    merge_source = ?,
+                    updated_at = ?
+                WHERE project_id = ? AND id = ?
+                """,
+                (seeded_at, inconsistent.id, MERGE_SOURCE_MANUAL_LAND, seeded_at, project_id, inconsistent_unit.id),
+            )
+            conn.execute(
+                """
+                UPDATE merge_units
+                SET owner_task_id = ?, updated_at = ?
+                WHERE project_id = ? AND id = ?
+                """,
+                (first.id, seeded_at, project_id, stale_owner_unit.id),
+            )
+            conn.execute(
+                """
+                UPDATE merge_unit_tasks
+                SET role = CASE task_id
+                    WHEN ? THEN 'owner'
+                    WHEN ? THEN 'contributor'
+                    ELSE role
+                END
+                WHERE project_id = ? AND merge_unit_id = ? AND task_id IN (?, ?)
+                """,
+                (first.id, second.id, project_id, stale_owner_unit.id, first.id, second.id),
+            )
+        return self._sqlite_user_schema_and_rows(db_path), stale_owner_unit.id
+
+    def test_stale_authority_after_schema_bootstrap_aborts_constructor_repairs_and_registration(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza.config import Config
+
+        project_dir = tmp_path / "startup-race"
+        shared_db = tmp_path / "startup-race.db"
+        _write_project_config(
+            project_dir,
+            project_name="StartupRace",
+            project_id="race",
+            project_prefix="race",
+            db_path=shared_db,
+        )
+        before, _stale_owner_unit_id = self._seed_authority_revalidation_startup_rows(
+            shared_db,
+            project_id="race",
+            prefix="race",
+        )
+        calls = 0
+
+        def revalidate() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise SchemaIntegrityError("authority stale before startup writes")
+
+        proof = MigrationAuthorityProof(
+            canonical_root=project_dir.resolve(),
+            default_branch="main",
+            head_sha="1" * 40,
+            revalidate=revalidate,
+        )
+
+        with pytest.raises(SchemaIntegrityError, match="authority stale before startup writes"):
+            SqliteTaskStore.from_config(
+                Config.load(project_dir),
+                migration_policy="auto_canonical_shared",
+                migration_authority=proof,
+                require_migration_authority=True,
+            )
+
+        assert calls == 3
+        assert self._sqlite_user_schema_and_rows(shared_db) == before
+
+    def test_runtime_store_stale_authority_after_schema_bootstrap_aborts_startup_writes(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        project_dir = tmp_path / "runtime-startup-race"
+        shared_db = tmp_path / "runtime-startup-race.db"
+        _write_project_config(
+            project_dir,
+            project_name="RuntimeStartupRace",
+            project_id="runtime",
+            project_prefix="run",
+            db_path=shared_db,
+        )
+        before, _stale_owner_unit_id = self._seed_authority_revalidation_startup_rows(
+            shared_db,
+            project_id="runtime",
+            prefix="run",
+        )
+        anchor = SqliteTaskStore(tmp_path / "anchor.db", prefix="gza", project_id="anchor")
+        calls = 0
+
+        def revalidate() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise SchemaIntegrityError("runtime authority stale before startup writes")
+
+        proof = MigrationAuthorityProof(
+            canonical_root=project_dir.resolve(),
+            default_branch="main",
+            head_sha="1" * 40,
+            revalidate=revalidate,
+        )
+        with patch("gza.migration_authority.resolve_canonical_migration_authority", return_value=proof):
+            (result,) = resolve_execution_projects(anchor, (ExecutionProjectSelector("runtime", "path", project_dir),))
+
+        assert isinstance(result, ExecutionProjectResolved)
+        with pytest.raises(SchemaIntegrityError, match="runtime authority stale before startup writes"):
+            result.open_runtime_store()
+
+        assert calls == 3
+        assert self._sqlite_user_schema_and_rows(shared_db) == before
 
     def test_deferred_shared_open_preserves_future_schema_fail_closed(self, tmp_path: Path) -> None:
         shared_db = tmp_path / "future-shared.db"
@@ -12487,6 +13061,43 @@ class TestExecutionProjectResolver:
 
         assert not project_db.exists()
 
+    def test_execution_runtime_store_open_carries_owning_project_migration_authority(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "owned"
+        project_db = tmp_path / "owned-shared.db"
+        _write_project_config(
+            project_dir,
+            project_name="Owned",
+            project_id="owned",
+            project_prefix="own",
+            db_path=project_db,
+        )
+        (project_dir / ".git").mkdir()
+        (project_dir / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (project_dir / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+        anchor = SqliteTaskStore(tmp_path / "anchor.db", prefix="gza", project_id="anchor")
+        SqliteTaskStore(project_db, prefix="own", project_id="owned")
+        with sqlite3.connect(project_db) as conn:
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,))
+
+        _FakeMigrationAuthorityGit.observations = [
+            _migration_authority_observation(project_dir),
+            _migration_authority_observation(project_dir),
+            _migration_authority_observation(project_dir),
+            _migration_authority_observation(project_dir),
+        ]
+        with patch("gza.migration_authority.Git", _FakeMigrationAuthorityGit):
+            (result,) = resolve_execution_projects(
+                anchor,
+                (ExecutionProjectSelector("owned-runtime", "path", project_dir),),
+            )
+            assert isinstance(result, ExecutionProjectResolved)
+            assert result.migration_authority is not None
+            runtime = result.open_runtime_store()
+
+        assert isinstance(runtime, ExecutionProjectRuntime)
+        with sqlite3.connect(project_db) as conn:
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
+
     def test_concurrent_first_registration_creates_one_project_row(self, tmp_path: Path) -> None:
         from gza.config import Config
 
@@ -12495,25 +13106,17 @@ class TestExecutionProjectResolver:
         _write_project_config(project_dir, project_name="Concurrent", project_id="shared", project_prefix="gza", db_path=shared_db)
         (project_dir / ".git").mkdir()
         config = Config.load(project_dir)
-        barrier = threading.Barrier(2)
-        original = SqliteTaskStore._observed_project_paths_for_registration
 
-        def synchronized_observed(self: SqliteTaskStore) -> tuple[str, str]:
-            if self._project_id == "shared":
-                barrier.wait(timeout=2)
-            return original(self)
-
-        with patch.object(SqliteTaskStore, "_observed_project_paths_for_registration", synchronized_observed):
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                stores = list(
-                    executor.map(
-                        lambda _: SqliteTaskStore.from_config(
-                            config,
-                            migration_policy="auto_canonical_shared",
-                        ),
-                        range(2),
-                    )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            stores = list(
+                executor.map(
+                    lambda _: SqliteTaskStore.from_config(
+                        config,
+                        migration_policy="auto_private",
+                    ),
+                    range(2),
                 )
+            )
 
         assert [store.project_id for store in stores] == ["shared", "shared"]
         with sqlite3.connect(shared_db) as conn:
@@ -12544,25 +13147,16 @@ class TestExecutionProjectResolver:
                 """,
                 ("shared", "", "", "Empty", "gza", SCHEMA_VERSION, now, now),
             )
-        barrier = threading.Barrier(2)
-        original = SqliteTaskStore._observed_project_paths_for_registration
-
-        def synchronized_observed(self: SqliteTaskStore) -> tuple[str, str]:
-            if self._project_id == "shared":
-                barrier.wait(timeout=2)
-            return original(self)
-
-        with patch.object(SqliteTaskStore, "_observed_project_paths_for_registration", synchronized_observed):
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                stores = list(
-                    executor.map(
-                        lambda config: SqliteTaskStore.from_config(
-                            config,
-                            migration_policy="auto_canonical_shared",
-                        ),
-                        (Config.load(canonical_a), Config.load(canonical_b)),
-                    )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            stores = list(
+                executor.map(
+                    lambda config: SqliteTaskStore.from_config(
+                        config,
+                        migration_policy="auto_private",
+                    ),
+                    (Config.load(canonical_a), Config.load(canonical_b)),
                 )
+            )
 
         with sqlite3.connect(shared_db) as conn:
             row = conn.execute("SELECT root_path, config_path FROM projects WHERE id = ?", ("shared",)).fetchone()
@@ -12603,7 +13197,7 @@ class TestExecutionProjectResolver:
         linked_store = SqliteTaskStore.from_config(Config.load(linked))
         canonical_store = SqliteTaskStore.from_config(
             Config.load(canonical),
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
 
         with sqlite3.connect(shared_db) as conn:
@@ -13217,7 +13811,7 @@ class TestExecutionProjectResolver:
             with pytest.raises(type(exc), match="config invariant failed"):
                 SqliteTaskStore.from_config(
                     config,
-                    migration_policy="auto_canonical_shared",
+                    migration_policy="auto_private",
                 )
 
         with sqlite3.connect(shared_db) as conn:
@@ -13239,7 +13833,7 @@ class TestExecutionProjectResolver:
 
         SqliteTaskStore.from_config(
             config,
-            migration_policy="auto_canonical_shared",
+            migration_policy="auto_private",
         )
 
         with sqlite3.connect(project_db) as conn:

@@ -26,7 +26,7 @@ from gza.cli.config_cmds import (
     resolve_preflight_targets,
 )
 from gza.config import Config, ConfigError, ProviderConfig, TaskTypeConfig
-from gza.db import SqliteTaskStore
+from gza.db import SCHEMA_VERSION, MigrationAuthorityProof, SqliteTaskStore
 from gza.providers.base import PreflightCheckResult, RunResult
 from gza.report_sync import ReportSyncResult, synchronize_task_report
 
@@ -39,6 +39,48 @@ def write_user_config(home_dir: Path, content: str) -> Path:
     user_config_path.parent.mkdir(parents=True, exist_ok=True)
     user_config_path.write_text(content, encoding="utf-8")
     return user_config_path
+
+
+def _shared_db_sidecar_snapshot(db_path: Path) -> dict[str, int]:
+    sidecars: dict[str, int] = {}
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = Path(f"{db_path}{suffix}")
+        if sidecar.exists():
+            sidecars[suffix] = sidecar.stat().st_size
+    return sidecars
+
+
+def _shared_db_state_snapshot(db_path: Path) -> dict[str, object]:
+    with sqlite3.connect(db_path) as conn:
+        tables = [
+            str(row[0])
+            for row in conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                ORDER BY name
+                """
+            )
+        ]
+        rows = {
+            table: sorted(tuple(row) for row in conn.execute(f'SELECT * FROM "{table}"').fetchall())
+            for table in tables
+        }
+        journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    return {
+        "rows": rows,
+        "journal_mode": journal_mode,
+        "sidecars": _shared_db_sidecar_snapshot(db_path),
+    }
+
+
+def _prepare_shared_db_delete_journal(db_path: Path) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("PRAGMA journal_mode=DELETE")
+    for suffix in ("-wal", "-shm", "-journal"):
+        Path(f"{db_path}{suffix}").unlink(missing_ok=True)
 
 
 class TestConfigRequirements:
@@ -2093,11 +2135,10 @@ class TestInitCommand:
 
     def test_init_project_id_remains_stable_after_move_and_clone(self, tmp_path: Path):
         """Init writes project_id once and moved/cloned projects keep that identity."""
-        shared_db = tmp_path / "shared" / "gza.db"
+        shared_db = tmp_path / ".gza" / "gza.db"
         _home_dir, env = self._home_env(tmp_path)
-        env["GZA_DB_PATH"] = str(shared_db)
 
-        result = invoke_gza("init", "--db", "shared", "--project", str(tmp_path), env=env)
+        result = invoke_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
         assert result.returncode == 0
 
         config_path = tmp_path / "gza.yaml"
@@ -2124,13 +2165,14 @@ class TestInitCommand:
         assert f"project_id: {project_id}" in moved_content
         assert f"project_id: {project_id}" in clone_content
 
-        with sqlite3.connect(shared_db) as conn:
-            ids = conn.execute(
-                "SELECT DISTINCT project_id FROM tasks WHERE prompt LIKE 'task in %' ORDER BY project_id"
-            ).fetchall()
-        assert ids == [(project_id,)]
+        for local_db in (moved_dir / ".gza" / "gza.db", clone_dir / ".gza" / "gza.db"):
+            with sqlite3.connect(local_db) as conn:
+                ids = conn.execute(
+                    "SELECT DISTINCT project_id FROM tasks WHERE prompt LIKE 'task in %' ORDER BY project_id"
+                ).fetchall()
+            assert ids == [(project_id,)]
 
-    def test_init_with_user_db_path_keeps_project_id_and_initializes_shared_db(self, tmp_path: Path):
+    def test_init_with_user_db_path_keeps_project_id_and_defers_shared_db_bootstrap(self, tmp_path: Path):
         """Init should honor user-level shared DB defaults without writing an active project db_path."""
         from gza.config import Config
 
@@ -2145,11 +2187,12 @@ class TestInitCommand:
         assert re.search(r"^project_id:\s*([a-z0-9]{1,64})\s*$", content, re.MULTILINE)
         assert self._active_db_path_line(content) is None
         assert "# db_path: .gza/gza.db" in content
+        assert "Database initialization deferred" in result.stdout
 
         with patch.dict(os.environ, env, clear=False):
             config = Config.load(tmp_path)
         assert config.db_path == shared_db.resolve()
-        assert shared_db.exists()
+        assert not shared_db.exists()
 
     def test_init_local_writes_explicit_db_path_even_with_global_shared_default(self, tmp_path: Path):
         """Local mode must opt out explicitly when a user-level shared default exists."""
@@ -2183,10 +2226,11 @@ class TestInitCommand:
         with patch.dict(os.environ, env, clear=False):
             config = Config.load(tmp_path)
         assert config.db_path == (home_dir / ".gza" / "gza.db").resolve()
-        assert (home_dir / ".gza" / "gza.db").exists()
+        assert "Database initialization deferred" in result.stdout
+        assert not (home_dir / ".gza" / "gza.db").exists()
 
     def test_init_db_path_flag_implies_shared_and_overrides_default(self, tmp_path: Path):
-        """--db-path should imply shared mode and drive the initialized database path."""
+        """--db-path should imply shared mode and drive the configured database path."""
         from gza.config import Config
 
         _home_dir, env = self._home_env(tmp_path)
@@ -2200,7 +2244,8 @@ class TestInitCommand:
         with patch.dict(os.environ, env, clear=False):
             config = Config.load(tmp_path)
         assert config.db_path == shared_db.resolve()
-        assert shared_db.exists()
+        assert "Database initialization deferred" in result.stdout
+        assert not shared_db.exists()
 
     def test_init_rejects_local_db_with_db_path_flag(self, tmp_path: Path):
         """Conflicting local mode and explicit shared path should fail."""
@@ -2291,7 +2336,8 @@ class TestInitCommand:
         with patch.dict(os.environ, env, clear=False):
             config = Config.load(tmp_path)
         assert config.db_path == (home_dir / ".gza" / "gza.db").resolve()
-        assert (home_dir / ".gza" / "gza.db").exists()
+        assert "Database initialization deferred" in result.stdout
+        assert not (home_dir / ".gza" / "gza.db").exists()
 
     def test_init_interactive_default_db_prompt_selects_shared(self, tmp_path: Path):
         """Bare Enter on the DB prompt should choose shared mode."""
@@ -2311,8 +2357,111 @@ class TestInitCommand:
         content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
         assert "Task database:" in result.stdout
         assert self._active_db_path_line(content) == "~/.gza/gza.db"
+        assert "Database initialization deferred" in result.stdout
         with patch.dict(os.environ, env, clear=False):
             assert Config.load(tmp_path).db_path == (home_dir / ".gza" / "gza.db").resolve()
+
+    @pytest.mark.parametrize(
+        "checkout_kind",
+        ["feature", "linked", "detached"],
+    )
+    def test_init_shared_unproven_checkouts_do_not_create_shared_db(
+        self,
+        tmp_path: Path,
+        checkout_kind: str,
+    ) -> None:
+        _home_dir, env = self._home_env(tmp_path)
+        shared_db = tmp_path / "shared" / f"{checkout_kind}.db"
+        env["GZA_DB_PATH"] = str(shared_db)
+        if checkout_kind == "feature":
+            (tmp_path / ".git").mkdir()
+            (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/topic\n", encoding="utf-8")
+        elif checkout_kind == "linked":
+            (tmp_path / ".git").write_text("gitdir: ../primary/.git/worktrees/linked\n", encoding="utf-8")
+        else:
+            (tmp_path / ".git").mkdir()
+            (tmp_path / ".git" / "HEAD").write_text("1" * 40 + "\n", encoding="utf-8")
+
+        result = invoke_gza("init", "--db", "shared", "--project", str(tmp_path), env=env)
+
+        assert result.returncode == 0
+        assert "Database initialization deferred" in result.stdout
+        assert (tmp_path / "gza.yaml").exists()
+        assert not shared_db.exists()
+
+    def test_init_shared_unproven_checkout_does_not_migrate_existing_shared_db(self, tmp_path: Path) -> None:
+        _home_dir, env = self._home_env(tmp_path)
+        shared_db = tmp_path / "shared" / "existing.db"
+        env["GZA_DB_PATH"] = str(shared_db)
+        SqliteTaskStore(shared_db, prefix="gza", project_id="seed")
+        with sqlite3.connect(shared_db) as conn:
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,))
+
+        result = invoke_gza("init", "--db", "shared", "--project", str(tmp_path), env=env)
+
+        assert result.returncode == 0
+        assert "Database initialization deferred" in result.stdout
+        with sqlite3.connect(shared_db) as conn:
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION - 1
+
+    def test_init_shared_unproven_current_schema_db_reports_deferred_without_registration(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _home_dir, env = self._home_env(tmp_path)
+        shared_db = tmp_path / "shared" / "current.db"
+        env["GZA_DB_PATH"] = str(shared_db)
+        SqliteTaskStore(shared_db, prefix="seed", project_id="seed")
+        _prepare_shared_db_delete_journal(shared_db)
+        before = _shared_db_state_snapshot(shared_db)
+        monkeypatch.setattr(config_cmds_module, "resolve_canonical_migration_authority", lambda _config: None)
+
+        result = invoke_gza("init", "--db", "shared", "--project", str(tmp_path), env=env)
+
+        assert result.returncode == 0
+        assert "Database initialization deferred" in result.stdout
+        assert "Initialized database" not in result.stdout
+        assert _shared_db_state_snapshot(shared_db) == before
+        config = Config.load(tmp_path)
+        with sqlite3.connect(shared_db) as conn:
+            assert conn.execute("SELECT id FROM projects WHERE id = ?", (config.project_id,)).fetchone() is None
+
+    def test_init_shared_canonical_authorized_current_schema_db_registers_project(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _home_dir, env = self._home_env(tmp_path)
+        shared_db = tmp_path / "shared" / "canonical.db"
+        env["GZA_DB_PATH"] = str(shared_db)
+        SqliteTaskStore(shared_db, prefix="seed", project_id="seed")
+
+        def resolve(config: Config) -> MigrationAuthorityProof:
+            return MigrationAuthorityProof(
+                canonical_root=Path(config.project_dir).resolve(),
+                default_branch="main",
+                head_sha="1" * 40,
+                revalidate=lambda: None,
+            )
+
+        monkeypatch.setattr(config_cmds_module, "resolve_canonical_migration_authority", resolve)
+
+        result = invoke_gza("init", "--db", "shared", "--project", str(tmp_path), env=env)
+
+        assert result.returncode == 0
+        assert "✓ Initialized database" in result.stdout
+        assert "Database initialization deferred" not in result.stdout
+        config = Config.load(tmp_path)
+        with sqlite3.connect(shared_db) as conn:
+            row = conn.execute(
+                "SELECT root_path, config_path FROM projects WHERE id = ?",
+                (config.project_id,),
+            ).fetchone()
+        assert row == (
+            str(tmp_path.resolve()),
+            str((tmp_path / "gza.yaml").resolve()),
+        )
 
     def test_init_rejects_semantically_invalid_user_config_before_writing_project_file(self, tmp_path: Path):
         """Init should fail before writing gza.yaml when user config passes schema but fails runtime validation."""

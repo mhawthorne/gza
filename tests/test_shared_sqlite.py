@@ -55,7 +55,7 @@ def test_store_default_uses_discovered_project_dir(tmp_path: Path) -> None:
     project = tmp_path / "project"
     nested = project / "a" / "b"
     nested.mkdir(parents=True)
-    db_path = project / "shared.db"
+    db_path = project / ".gza" / "gza.db"
     (project / "gza.yaml").write_text(
         f"project_name: demo\nprovider: codex\nmodel: gpt-5.5\nproject_id: demo\ndb_path: {db_path}\n"
     )

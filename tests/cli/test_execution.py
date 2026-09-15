@@ -5386,7 +5386,7 @@ class TestBackgroundWorkerCommand:
         monkeypatch.delenv("GZA_DB_PATH", raising=False)
         config = Config.load(project)
         config.tmux.enabled = True
-        store = SqliteTaskStore.from_config(config)
+        store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
         task = store.add("tmux candidate")
         task.provider = "codex"
         store.update(task)

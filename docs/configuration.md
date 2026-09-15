@@ -972,8 +972,11 @@ If a row already has non-empty canonical paths, relocation is refused unless
 that the target config resolves to the intended project.
 For an existing DB, registry writes require the current schema and do not run
 automatic migrations or task/artifact backfills; upgrade the DB intentionally
-before retrying a refused registry repair. A missing DB is initialized only for
-first registration.
+before retrying a refused registry repair. For shared DBs, register/deactivate
+also require the canonical default-branch checkout proof used by shared-schema
+migrations, and stale proof is rechecked at the registry write transaction. A
+missing shared DB is initialized only for first registration from that proven
+canonical checkout.
 
 `uv run gza projects diagnose` is non-destructive. It reports executable rows and
 invalid rows such as empty paths, missing roots/configs, project-ID mismatches,

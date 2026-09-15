@@ -68,6 +68,7 @@ from ..lifecycle_completion import (
 from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
 from ..merge_state import effective_no_work_merge_state
+from ..migration_authority import resolve_canonical_migration_authority
 from ..operator_state import blocked_dependency_error_message, inspect_empty_merge_unit
 from ..plan_review_materialization import (
     PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
@@ -267,8 +268,21 @@ def get_store(config: Config, *, open_mode: StoreOpenMode = "readwrite") -> Sqli
         ManualMigrationRequired: If the DB needs a manual schema upgrade.
             Callers should run ``gza migrate`` to fix this.
     """
-    migration_policy: MigrationPolicy | None = "auto_canonical_shared" if open_mode == "readwrite" else None
-    store = SqliteTaskStore.from_config(config, open_mode=open_mode, migration_policy=migration_policy)
+    migration_policy: MigrationPolicy | None = (
+        "auto_canonical_shared" if open_mode in {"readwrite", "watch_lease_activation"} else None
+    )
+    migration_authority = (
+        resolve_canonical_migration_authority(config)
+        if open_mode in {"readwrite", "watch_lease_activation"}
+        else None
+    )
+    store = SqliteTaskStore.from_config(
+        config,
+        open_mode=open_mode,
+        migration_policy=migration_policy,
+        migration_authority=migration_authority,
+        require_migration_authority=open_mode in {"readwrite", "watch_lease_activation"},
+    )
     for warning in store.startup_warnings():
         print(f"Warning: {warning}", file=sys.stderr)
     return store

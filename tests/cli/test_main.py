@@ -18,7 +18,7 @@ import pytest
 from gza.cli._common import get_store
 from gza.cli.advance_executor import AdvanceActionExecutionResult
 from gza.config import Config
-from gza.db import SqliteTaskStore
+from gza.db import MigrationAuthorityProof, SqliteTaskStore
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
@@ -54,6 +54,15 @@ def _write_project_config(
         )
         + "\n",
         encoding="utf-8",
+    )
+
+
+def _test_migration_authority(root: Path) -> MigrationAuthorityProof:
+    return MigrationAuthorityProof(
+        canonical_root=root.resolve(),
+        default_branch="main",
+        head_sha="1" * 40,
+        revalidate=lambda: None,
     )
 
 
@@ -292,9 +301,13 @@ def test_get_store_warns_for_readwrite_canonical_registry_conflict(
     (canonical_a / ".git").mkdir()
     (canonical_b / ".git").mkdir()
 
-    get_store(Config.load(canonical_a))
-    capsys.readouterr()
-    get_store(Config.load(canonical_b))
+    with patch(
+        "gza.cli._common.resolve_canonical_migration_authority",
+        side_effect=lambda config: _test_migration_authority(Path(config.project_dir)),
+    ):
+        get_store(Config.load(canonical_a))
+        capsys.readouterr()
+        get_store(Config.load(canonical_b))
 
     captured = capsys.readouterr()
     assert "Warning: Project registry path conflict for shared" in captured.err
@@ -318,9 +331,13 @@ def test_get_store_warns_for_readwrite_linked_registry_conflict_without_promotin
     (canonical / ".git").mkdir()
     (linked / ".git").write_text("gitdir: ../canonical/.git/worktrees/linked\n", encoding="utf-8")
 
-    get_store(Config.load(canonical))
-    capsys.readouterr()
-    get_store(Config.load(linked))
+    with patch(
+        "gza.cli._common.resolve_canonical_migration_authority",
+        side_effect=lambda config: _test_migration_authority(Path(config.project_dir)),
+    ):
+        get_store(Config.load(canonical))
+        capsys.readouterr()
+        get_store(Config.load(linked))
 
     captured = capsys.readouterr()
     assert "Warning: Project registry path conflict for shared" in captured.err
@@ -346,9 +363,13 @@ def test_get_store_warns_for_canonical_registry_conflict_with_shell_quoted_path(
     (canonical_a / ".git").mkdir()
     (canonical_b / ".git").mkdir()
 
-    get_store(Config.load(canonical_a))
-    capsys.readouterr()
-    get_store(Config.load(canonical_b))
+    with patch(
+        "gza.cli._common.resolve_canonical_migration_authority",
+        side_effect=lambda config: _test_migration_authority(Path(config.project_dir)),
+    ):
+        get_store(Config.load(canonical_a))
+        capsys.readouterr()
+        get_store(Config.load(canonical_b))
 
     captured = capsys.readouterr()
     assert "Warning: Project registry path conflict for shared" in captured.err
@@ -381,10 +402,10 @@ class TestHelpOutput:
         assert "project_id: p" in result.stdout
         assert "project_id:" not in config_path.read_text(encoding="utf-8")
 
-    def test_migrate_import_local_db_yes_bootstraps_missing_shared_project_id_from_user_config(
+    def test_migrate_import_local_db_yes_defers_missing_shared_project_id_from_user_config_without_authority(
         self, tmp_path: Path
     ) -> None:
-        """Real import should persist legacy project_id before importing when shared DB comes from user config."""
+        """Real import should persist legacy project_id but not bootstrap shared DB without authority."""
         home_dir = Path(os.environ["HOME"])
         shared_db = home_dir / ".gza" / "shared.db"
         user_config = home_dir / ".gza" / "config.yaml"
@@ -398,15 +419,13 @@ class TestHelpOutput:
 
         result = invoke_gza("migrate", "--import-local-db", "--yes", "--project", str(tmp_path))
 
-        assert result.returncode == 0
+        assert result.returncode == 1
         assert "Persisted project_id" in result.stdout
-        assert "Imported legacy local DB into shared DB." in result.stdout
-        assert "tasks_imported: 1" in result.stdout
+        assert "Forward schema migration deferred" in result.stderr
+        assert not shared_db.exists()
 
         config = Config.load(tmp_path)
         assert f"project_id: {config.project_id}" in config_path.read_text(encoding="utf-8")
-        shared_store = SqliteTaskStore(shared_db, prefix=config.project_prefix, project_id=config.project_id)
-        assert [task.prompt for task in shared_store.get_all()] == ["legacy task"]
 
     def test_migrate_import_local_db_yes_reports_persist_os_error_without_traceback(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

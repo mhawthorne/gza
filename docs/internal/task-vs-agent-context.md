@@ -40,6 +40,17 @@ In Docker, the worktree is mounted as `/workspace`. So any file copied into the 
 
 ## Task DB snapshot model
 
+Live shared task databases may auto-migrate only from the canonical project checkout on
+the configured default branch. Runtime bootstrap proves the checkout is the repository's
+primary worktree, the current branch is the default branch, and `HEAD` is the local
+`refs/heads/<default>` tip before opening a shared store in a mode that could migrate it.
+That proof is rechecked while the schema bootstrap lock is held before migration,
+bootstrap, repair, or project-registration writes. Feature worktrees, linked worktrees,
+detached checkouts, and stale proofs defer shared migrations before mutating the live DB;
+on already-current shared DBs they also defer project registration and report that
+initialization was deferred instead of claiming a completed `init`.
+local project DBs and isolated snapshots keep their ordinary private migration behavior.
+
 Before provider launch, the host runner copies the live task DB into the worktree as `.gza/gza.db` under the scoped project root using SQLite's backup API. This gives agents a consistent point-in-time view of task state.
 
 Provider child environments set `GZA_DB_PATH` to that staged snapshot, so nested `uv run gza ...` commands open the worktree-local copy rather than the host control-plane database. In Docker, `GZA_DB_PATH` is translated to the container-visible `/workspace/.../.gza/gza.db` path and passed into the container environment.

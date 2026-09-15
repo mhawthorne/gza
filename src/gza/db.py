@@ -15,7 +15,7 @@ import time
 from _thread import RLock as RLockType
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -68,6 +68,7 @@ __all__ = [
     "ForwardSchemaMigrationDeferred",
     "InvalidTaskIdError",
     "ManualMigrationRequired",
+    "MigrationAuthorityProof",
     "MigrationPolicy",
     "MergeTargetResolutionError",
     "NewTaskParams",
@@ -159,6 +160,16 @@ _DEFERABLE_SHARED_MIGRATION_VERSIONS: frozenset[int] = frozenset(_DEFERABLE_SHAR
 _SCHEMA_CAPABILITY_MIN_VERSION: Mapping[str, int] = {
     "watch_failed_recovery_scan_unit_fingerprint": 71,
 }
+
+
+@dataclass(frozen=True)
+class MigrationAuthorityProof:
+    """Proof that shared DB migration authority was resolved before store construction."""
+
+    canonical_root: Path
+    default_branch: str
+    head_sha: str
+    revalidate: Callable[[], None] = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -381,6 +392,7 @@ class ExecutionProjectResolved:
     db_path: Path
     config: "Config"
     db_path_override: Path | None = None
+    migration_authority: MigrationAuthorityProof | None = None
 
     def open_lease_store(self) -> "SqliteTaskStore":
         """Open a non-mutating store handle used only to acquire the watch lease."""
@@ -388,6 +400,8 @@ class ExecutionProjectResolved:
             self.config,
             open_mode="watch_lease_acquisition",
             migration_policy="auto_canonical_shared",
+            migration_authority=self.migration_authority,
+            require_migration_authority=True,
         )
 
     def open_runtime_store(self) -> ExecutionProjectRuntime:
@@ -512,7 +526,13 @@ class ExecutionProjectResolved:
             raise ExecutionProjectActivationError(reason, message)
         runtime_context = RuntimeExecutionContext.from_config(current_config)
         try:
-            store = SqliteTaskStore.from_config(current_config, open_mode="watch_lease_activation")
+            store = SqliteTaskStore.from_config(
+                current_config,
+                open_mode="watch_lease_activation",
+                migration_policy="auto_canonical_shared",
+                migration_authority=self.migration_authority,
+                require_migration_authority=True,
+            )
         except ConfigError as exc:
             raise ExecutionProjectActivationError(
                 "config_invalid", f"Execution project config is invalid at activation: {exc}"
@@ -1395,6 +1415,8 @@ def _preflight_execution_project(
 def _resolve_preflighted_execution_project(
     candidate: _ExecutionProjectCandidate,
 ) -> ExecutionProjectResolved | ExecutionProjectDisabled:
+    from .migration_authority import resolve_canonical_migration_authority
+
     selector = candidate.selector
     config = candidate.config
     resolved_db_path = candidate.db_path
@@ -1421,6 +1443,7 @@ def _resolve_preflighted_execution_project(
         db_path=resolved_db_path,
         config=config,
         db_path_override=candidate.db_path_override,
+        migration_authority=resolve_canonical_migration_authority(config),
     )
 
 
@@ -5918,11 +5941,6 @@ def _migration_policy_from_config(config: "Config") -> MigrationPolicy:
             return "auto_private"
     except (OSError, RuntimeError, ValueError):
         return "defer_shared"
-    source_map = getattr(config, "source_map", {})
-    if not config.db_path.exists() and (
-        source_map.get("db_path") == "env" or source_map.get("worktree_dir") in {"base", "explicit"}
-    ):
-        return "auto_private"
     return "defer_shared"
 
 
@@ -6028,6 +6046,7 @@ class SqliteTaskStore:
         registration_db_path_override: Path | None = None,
         open_mode: StoreOpenMode = "readwrite",
         migration_policy: MigrationPolicy = "auto_private",
+        migration_authority: MigrationAuthorityProof | None = None,
     ):
         self.db_path = db_path
         self._prefix = prefix
@@ -6037,11 +6056,24 @@ class SqliteTaskStore:
         self._project_name = project_name
         self._registration_db_path_override = registration_db_path_override
         self._open_mode = open_mode
-        self._migration_policy = migration_policy
+        if (
+            project_root is not None
+            and migration_policy == "auto_canonical_shared"
+            and migration_authority is None
+        ):
+            try:
+                project_backed_local = db_path.resolve() == _legacy_local_db_path(project_root).resolve()
+            except (OSError, RuntimeError, ValueError):
+                project_backed_local = False
+            self._migration_policy = "auto_private" if project_backed_local else "defer_shared"
+        else:
+            self._migration_policy = migration_policy
+        self._migration_authority = migration_authority
         if self._migration_policy not in _MIGRATION_POLICY_VALUES:
             allowed = ", ".join(sorted(_MIGRATION_POLICY_VALUES))
             raise ValueError(f"Unsupported migration_policy {self._migration_policy!r}; expected one of: {allowed}")
         self._shared_migration_deferred: ForwardSchemaMigrationDeferred | None = None
+        self._shared_initialization_deferred = False
         self._startup_warnings: list[str] = []
         self._query_only_empty_db = False
         self._existing_db_uri_mode: Literal["ro", "rw"] | None = None
@@ -6063,22 +6095,25 @@ class SqliteTaskStore:
         if self._open_mode == "query_only":
             self._ensure_db_query_only()
         elif self._open_mode == "registry_mutation":
+            self._require_registry_mutation_authority()
             self._ensure_db_registry_mutation_bootstrap()
         elif self._open_mode == "registry_mutation_existing":
+            self._require_registry_mutation_authority()
             self._ensure_db_registry_mutation_existing()
         elif self._open_mode == "watch_lease_acquisition":
             pass
         elif self._open_mode == "watch_lease_activation":
             self._ensure_db()
-            if self._startup_mutations_allowed():
-                self._ensure_project_row()
+            self._run_authority_validated_startup_mutations(
+                repair_merge_units=False,
+                ensure_project=True,
+            )
         else:
             self._ensure_db()
-            if not self._created_empty_db and self._startup_mutations_allowed():
-                self.repair_inconsistent_unmerged_merge_units()
-                self.repair_stale_unmerged_merge_unit_owners()
-            if self._startup_mutations_allowed():
-                self._ensure_project_row()
+            self._run_authority_validated_startup_mutations(
+                repair_merge_units=not self._created_empty_db,
+                ensure_project=True,
+            )
 
     @classmethod
     def default(cls, project_dir: Path | None = None) -> "SqliteTaskStore":
@@ -6088,9 +6123,15 @@ class SqliteTaskStore:
             project_dir: Project root. Defaults to cwd.
         """
         from .config import Config
+        from .migration_authority import resolve_canonical_migration_authority
 
         config = Config.load(project_dir or Path.cwd(), discover=True)
-        return cls.from_config(config, migration_policy="auto_canonical_shared")
+        return cls.from_config(
+            config,
+            migration_policy="auto_canonical_shared",
+            migration_authority=resolve_canonical_migration_authority(config),
+            require_migration_authority=True,
+        )
 
     @classmethod
     def from_config(
@@ -6100,6 +6141,8 @@ class SqliteTaskStore:
         allow_legacy_local_db: bool = False,
         open_mode: StoreOpenMode = "readwrite",
         migration_policy: MigrationPolicy | None = None,
+        migration_authority: MigrationAuthorityProof | None = None,
+        require_migration_authority: bool = False,
     ) -> "SqliteTaskStore":
         """Create a store from a loaded Config instance."""
         project_id, project_prefix = _project_identity_from_config(config)
@@ -6131,7 +6174,14 @@ class SqliteTaskStore:
         registration_db_path_override = None
         if getattr(config, "source_map", {}).get("db_path") in {"env", "explicit"}:
             registration_db_path_override = config.db_path
-        resolved_migration_policy = migration_policy or _migration_policy_from_config(config)
+        inferred_migration_policy = _migration_policy_from_config(config)
+        resolved_migration_policy = migration_policy or inferred_migration_policy
+        if (
+            resolved_migration_policy == "auto_canonical_shared"
+            and migration_authority is None
+            and inferred_migration_policy != "auto_private"
+        ):
+            resolved_migration_policy = "defer_shared"
         return cls(
             config.db_path,
             prefix=project_prefix,
@@ -6142,11 +6192,20 @@ class SqliteTaskStore:
             registration_db_path_override=registration_db_path_override,
             open_mode=open_mode,
             migration_policy=resolved_migration_policy,
+            migration_authority=migration_authority,
         )
 
     def startup_warnings(self) -> tuple[str, ...]:
         """Return deterministic startup warnings collected during store open."""
         return tuple(self._startup_warnings)
+
+    def shared_migration_deferred(self) -> ForwardSchemaMigrationDeferred | None:
+        """Return deferred shared migration state observed during startup, if any."""
+        return self._shared_migration_deferred
+
+    def shared_initialization_deferred(self) -> bool:
+        """Return whether shared startup writes were skipped for lack of authority."""
+        return self._shared_initialization_deferred
 
     @property
     def project_id(self) -> str:
@@ -6612,11 +6671,15 @@ class SqliteTaskStore:
             if self._migration_policy == "defer_shared":
                 self._ensure_db_without_shared_migration_authority(allow_bootstrap=allow_bootstrap)
                 return
+            if self._migration_authority is not None:
+                self._migration_authority.revalidate()
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             with self._connect() as conn:
                 inspection = self._inspect_schema(conn, db_exists=True)
                 artifacts_verified_at_current_schema = self._validate_schema_compatibility(inspection)
+                if self._migration_authority is not None:
+                    self._migration_authority.revalidate()
                 if inspection.is_fresh_database:
                     self._bootstrap_current_schema(conn)
                     artifacts_verified_at_current_schema = True
@@ -6637,8 +6700,29 @@ class SqliteTaskStore:
         """Return whether constructor startup may repair/register durable shared state."""
         return self._migration_policy != "defer_shared" and self._shared_migration_deferred is None
 
+    def _run_authority_validated_startup_mutations(
+        self,
+        *,
+        repair_merge_units: bool,
+        ensure_project: bool,
+    ) -> None:
+        """Run constructor startup writes only after a fresh lock-held authority check."""
+        if not self._startup_mutations_allowed():
+            return
+        if not repair_merge_units and not ensure_project:
+            return
+        with _schema_bootstrap_lock(self.db_path):
+            if self._migration_authority is not None:
+                self._migration_authority.revalidate()
+            if repair_merge_units:
+                self.repair_inconsistent_unmerged_merge_units()
+                self.repair_stale_unmerged_merge_unit_owners()
+            if ensure_project:
+                self._ensure_project_row()
+
     def _ensure_db_without_shared_migration_authority(self, *, allow_bootstrap: bool) -> None:
         """Inspect and validate a shared DB without schema repair or migration writes."""
+        self._shared_initialization_deferred = True
         if not self.db_path.exists():
             if not allow_bootstrap:
                 raise SchemaIntegrityError(f"Registry DB disappeared before mutation: {self.db_path}")
@@ -6926,9 +7010,42 @@ class SqliteTaskStore:
                 "Run 'uv run gza migrate' from the project root, then retry."
             )
 
+    def _require_registry_mutation_authority(self) -> None:
+        """Refuse shared registry writes unless canonical migration authority was supplied."""
+        if self._migration_policy == "defer_shared":
+            if not self.db_path.exists():
+                raise ForwardSchemaMigrationDeferred(
+                    current_version=0,
+                    target_version=SCHEMA_VERSION,
+                    pending_versions=[version for version, _migration_sql in _MIGRATIONS],
+                )
+            raise SchemaIntegrityError(
+                "Shared database registry mutation requires canonical migration authority. "
+                "Run the registry command from the canonical default-branch checkout after the code has landed."
+            )
+        if self._migration_policy == "auto_canonical_shared" and self._migration_authority is None:
+            raise SchemaIntegrityError(
+                "Shared database registry mutation requires canonical migration authority. "
+                "Run the registry command from the canonical default-branch checkout after the code has landed."
+            )
+
+    def _revalidate_registry_mutation_authority(self) -> None:
+        if self._open_mode not in {"registry_mutation", "registry_mutation_existing"}:
+            return
+        if self._migration_policy != "auto_canonical_shared":
+            return
+        authority = self._migration_authority
+        if authority is None:
+            raise SchemaIntegrityError(
+                "Shared database registry mutation requires canonical migration authority. "
+                "Run the registry command from the canonical default-branch checkout after the code has landed."
+            )
+        authority.revalidate()
+
     def _ensure_db_registry_mutation_bootstrap(self) -> None:
         """Create a first registry DB without writing bootstrap state at the public path."""
         with _schema_bootstrap_lock(self.db_path):
+            self._revalidate_registry_mutation_authority()
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             fd, temp_name = tempfile.mkstemp(
                 prefix=f".{self.db_path.name}.",
@@ -6941,17 +7058,21 @@ class SqliteTaskStore:
             try:
                 self.db_path = temp_path
                 original_migration_policy = self._migration_policy
+                original_migration_authority = self._migration_authority
                 self._migration_policy = "auto_private"
+                self._migration_authority = None
                 created_identity = self._db_file_identity()
                 self._registry_mutation_validated_identity = created_identity
                 try:
                     self._ensure_db(allow_bootstrap=False)
                 finally:
                     self._migration_policy = original_migration_policy
+                    self._migration_authority = original_migration_authority
 
                 self._checkpoint_private_registry_bootstrap(temp_path)
                 self._registry_mutation_validated_identity = None
                 self.db_path = public_path
+                self._revalidate_registry_mutation_authority()
                 try:
                     os.link(temp_path, public_path)
                 except FileExistsError as exc:
@@ -6992,6 +7113,7 @@ class SqliteTaskStore:
     def _ensure_db_registry_mutation_existing(self) -> None:
         """Validate an existing DB for registry-only writes without startup repairs."""
         with _schema_bootstrap_lock(self.db_path):
+            self._revalidate_registry_mutation_authority()
             if not self.db_path.exists():
                 raise SchemaIntegrityError(f"Registry DB disappeared before mutation: {self.db_path}")
             validated_identity = self._db_file_identity()
@@ -7830,6 +7952,7 @@ class SqliteTaskStore:
                 "registry_mutation",
                 "registry_mutation_existing",
             }:
+                self._revalidate_registry_mutation_authority()
                 self._validate_registry_mutation_identity()
 
         conn = _timed_sqlite_connect(
@@ -7891,6 +8014,7 @@ class SqliteTaskStore:
     def _validate_registry_mutation_transaction(self, conn: sqlite3.Connection) -> None:
         if self._open_mode not in {"registry_mutation", "registry_mutation_existing"}:
             return
+        self._revalidate_registry_mutation_authority()
         self._validate_registry_mutation_identity()
         self._validate_registry_mutation_schema(conn)
 

@@ -40,6 +40,7 @@ from ..db import (
     ExecutionProjectDisabled,
     ExecutionProjectResolved,
     ExecutionProjectSelector,
+    ForwardSchemaMigrationDeferred,
     ManualMigrationRequired,
     ProjectRegistryEntry,
     SchemaIntegrityError,
@@ -55,6 +56,7 @@ from ..git import Git
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from ..log_paths import paired_log_paths, slug_from_log_path
 from ..merge_state import resolve_task_merge_state_for_target
+from ..migration_authority import resolve_canonical_migration_authority
 from ..report_sync import ReportSyncResult, synchronize_task_report
 from ..runtime_context import RuntimeExecutionContext
 from ..task_slug import get_slug_display_text
@@ -239,7 +241,13 @@ def _registry_mutation_store(config: Config, *, allow_bootstrap: bool = True) ->
     open_mode: Literal["registry_mutation", "registry_mutation_existing"] = (
         "registry_mutation" if allow_bootstrap else "registry_mutation_existing"
     )
-    return SqliteTaskStore.from_config(config, open_mode=open_mode)
+    return SqliteTaskStore.from_config(
+        config,
+        open_mode=open_mode,
+        migration_policy="auto_canonical_shared",
+        migration_authority=resolve_canonical_migration_authority(config),
+        require_migration_authority=True,
+    )
 
 
 def _precheck_register_conflict(
@@ -3313,10 +3321,30 @@ def cmd_init(args: argparse.Namespace) -> int:
         local_example_path.write_text(render_config_example(local=True), encoding="utf-8")
         print(f"✓ Created {local_example_path}")
 
-    # Initialize the database (Config.load will now work since we have project_name)
+    # Initialize the database (Config.load will now work since we have project_name).
+    # Shared DB bootstrap is merge-gated; feature, linked, and detached checkouts
+    # leave initialization to the canonical default-branch checkout.
     config = Config.load(args.project_dir)
-    get_store(config)
-    print(f"✓ Initialized database at {config.db_path}")
+    try:
+        store = SqliteTaskStore.from_config(
+            config,
+            migration_policy="auto_canonical_shared",
+            migration_authority=resolve_canonical_migration_authority(config),
+            require_migration_authority=True,
+        )
+    except ForwardSchemaMigrationDeferred as exc:
+        print(f"Database initialization deferred: {exc}")
+    else:
+        deferred = store.shared_migration_deferred()
+        if deferred is not None:
+            print(f"Database initialization deferred: {deferred}")
+        elif store.shared_initialization_deferred():
+            print(
+                "Database initialization deferred: shared database registration requires canonical migration "
+                "authority. Run from the canonical default-branch checkout after the code has landed."
+            )
+        else:
+            print(f"✓ Initialized database at {config.db_path}")
 
     return 0
 

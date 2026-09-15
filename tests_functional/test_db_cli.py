@@ -11,6 +11,9 @@ from tests_functional.helpers.cli import run_gza_subprocess
 
 
 class TestSharedDbImportCli:
+    def _bootstrap_shared_fixture(self, shared_db: Path) -> None:
+        SqliteTaskStore(shared_db, prefix="fixture", project_id="fixture")
+
     def test_local_default_with_legacy_local_db_does_not_require_import(self, tmp_path: Path) -> None:
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
@@ -79,6 +82,7 @@ class TestSharedDbImportCli:
         legacy_store = SqliteTaskStore(local_db, prefix="gated")
         legacy_task = legacy_store.add("legacy pending")
         assert legacy_task.id is not None
+        self._bootstrap_shared_fixture(shared_db)
 
         first = run_gza_subprocess(
             "migrate",
@@ -141,6 +145,7 @@ class TestSharedDbImportCli:
         legacy_store = SqliteTaskStore(local_db, prefix="gated")
         legacy_task = legacy_store.add("legacy pending")
         assert legacy_task.id is not None
+        self._bootstrap_shared_fixture(shared_db)
 
         first = run_gza_subprocess(
             "migrate",
@@ -190,6 +195,7 @@ class TestSharedDbImportCli:
         legacy_store = SqliteTaskStore(local_db, prefix="demo")
         task = legacy_store.add("legacy task")
         legacy_store.emit_step(task.id, "local message", provider="codex")
+        self._bootstrap_shared_fixture(shared_db)
 
         first = run_gza_subprocess(
             "migrate",
@@ -256,6 +262,7 @@ class TestSharedDbImportCli:
         task = legacy_store.add("legacy task")
         step = legacy_store.emit_step(task.id, "local message", provider="codex")
         legacy_store.emit_substep(step, "tool_call", {"ok": True}, source="assistant")
+        self._bootstrap_shared_fixture(shared_db)
 
         first = run_gza_subprocess(
             "migrate",
@@ -325,6 +332,7 @@ class TestSharedDbImportCli:
         local_db.parent.mkdir(parents=True, exist_ok=True)
         legacy_store = SqliteTaskStore(local_db, prefix="demo")
         legacy_store.add("legacy task")
+        self._bootstrap_shared_fixture(shared_db)
 
         first = run_gza_subprocess(
             "migrate",
@@ -501,6 +509,7 @@ class TestSharedDbImportCli:
         local_db.parent.mkdir(parents=True, exist_ok=True)
         legacy_store = SqliteTaskStore(local_db, prefix="demo")
         legacy_store.add("legacy task")
+        self._bootstrap_shared_fixture(shared_db)
 
         first = run_gza_subprocess(
             "migrate",
@@ -584,6 +593,7 @@ class TestSharedDbImportCli:
         local_db.parent.mkdir(parents=True, exist_ok=True)
         legacy_store = SqliteTaskStore(local_db, prefix="demo")
         legacy_store.add("legacy task")
+        self._bootstrap_shared_fixture(shared_db)
 
         first = run_gza_subprocess(
             "migrate",

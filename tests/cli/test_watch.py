@@ -4052,7 +4052,7 @@ def test_cmd_watch_single_manifest_path_selector_accepts_matching_project_id(tmp
     selected_dir.mkdir()
     setup_config(selected_dir, project_name="selected-project")
     _append_watch_config(selected_dir, "project_id: selectedproject\n")
-    store = SqliteTaskStore.from_config(Config.load(selected_dir), migration_policy="auto_canonical_shared")
+    store = SqliteTaskStore.from_config(Config.load(selected_dir), migration_policy="auto_private")
     manifest_path = manifest_dir / "watch.yaml"
     manifest_path.write_text(
         "\n".join(
@@ -4156,8 +4156,8 @@ def test_cmd_watch_multi_project_registry_id_selector_reaches_runtime_constructi
         project_prefix="registry",
         db_path=shared_db,
     )
-    SqliteTaskStore.from_config(Config.load(anchor_dir), migration_policy="auto_canonical_shared")
-    SqliteTaskStore.from_config(Config.load(registry_dir), migration_policy="auto_canonical_shared")
+    SqliteTaskStore.from_config(Config.load(anchor_dir), migration_policy="auto_private")
+    SqliteTaskStore.from_config(Config.load(registry_dir), migration_policy="auto_private")
     args = _watch_args(
         anchor_dir,
         [],
@@ -4212,6 +4212,7 @@ def _write_watch_runtime_project_config(
     verify_command: str | None = None,
     theme: str | None = None,
     color_overrides: Mapping[str, str] | None = None,
+    bootstrap_db: bool = True,
 ) -> None:
     project_dir.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -4233,6 +4234,8 @@ def _write_watch_runtime_project_config(
         lines.append("colors:")
         lines.extend(f"  {key}: {value}" for key, value in color_overrides.items())
     (project_dir / "gza.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if bootstrap_db:
+        SqliteTaskStore(db_path, prefix=project_prefix, project_id=project_id)
 
 
 def _watch_runtime_selection(
@@ -4266,7 +4269,7 @@ def test_construct_watch_project_runtimes_builds_ordered_shared_db_runtimes_with
         verify_command="./bin/server-verify",
     )
     anchor_config = Config.load(root_dir)
-    anchor_store = SqliteTaskStore.from_config(anchor_config, migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(anchor_config, migration_policy="auto_private")
     SqliteTaskStore(shared_db, prefix="server", project_id="server")
     selection = _watch_runtime_selection(
         (
@@ -4349,7 +4352,7 @@ def test_construct_watch_project_runtimes_builds_unrelated_db_runtimes_in_select
         project_prefix="second",
         db_path=second_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_private")
     SqliteTaskStore(second_db, prefix="second", project_id="second")
     selection = _watch_runtime_selection(
         (
@@ -4384,7 +4387,7 @@ def test_construct_watch_project_runtimes_disables_invalid_config_and_missing_pa
     )
     bad_dir.mkdir()
     (bad_dir / "gza.yaml").write_text("project_name: Bad\nprovider: [\n", encoding="utf-8")
-    anchor_store = SqliteTaskStore.from_config(Config.load(anchor_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(anchor_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
@@ -4413,7 +4416,7 @@ def test_construct_watch_project_runtimes_rejects_duplicate_alias_before_activat
         project_prefix="project",
         db_path=tmp_path / "project.db",
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="dup", ref=str(project_dir), path=project_dir),
@@ -4441,7 +4444,7 @@ def test_construct_watch_project_runtimes_rejects_duplicate_project_identity_bef
         project_prefix="project",
         db_path=tmp_path / "project.db",
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="one", ref=str(project_dir), path=project_dir),
@@ -4477,7 +4480,7 @@ def test_construct_watch_project_runtimes_rejects_unique_then_duplicate_identity
         project_prefix="duplicate",
         db_path=tmp_path / "duplicate.db",
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(unique_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(unique_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="unique", ref=str(unique_dir), path=unique_dir),
@@ -4514,7 +4517,7 @@ def test_construct_watch_project_runtimes_rejects_duplicate_then_unique_identity
         project_prefix="duplicate",
         db_path=tmp_path / "duplicate.db",
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(unique_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(unique_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="one", ref=str(duplicate_dir), path=duplicate_dir),
@@ -4543,7 +4546,7 @@ def test_construct_watch_project_runtimes_disables_project_id_assertion_mismatch
         project_prefix="actual",
         db_path=tmp_path / "project.db",
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(
@@ -4588,7 +4591,7 @@ def test_construct_watch_project_runtimes_keeps_anchor_presentation_while_loadin
     )
     anchor_config = Config.load(anchor_dir)
     assert colors.TASK_COLORS.task_id == "bold red"
-    anchor_store = SqliteTaskStore.from_config(anchor_config, migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(anchor_config, migration_policy="auto_private")
     SqliteTaskStore(tmp_path / "selected.db", prefix="selected", project_id="selected")
     selection = _watch_runtime_selection(
         (WatchSupervisorProjectSelector(key="selected", ref=str(selected_dir), path=selected_dir),)
@@ -4670,7 +4673,7 @@ def test_construct_watch_project_runtimes_defers_merge_unit_repairs_until_enable
         db_path=tmp_path / "project.db",
     )
     config = Config.load(project_dir)
-    store = SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
+    store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
     unit_id = _seed_inconsistent_unmerged_unit(store)
     selection = _watch_runtime_selection(
         (WatchSupervisorProjectSelector(key="project", ref=str(project_dir), path=project_dir),)
@@ -4720,7 +4723,7 @@ def test_construct_watch_project_runtimes_lease_conflict_leaves_inconsistent_mer
         db_path=tmp_path / "project.db",
     )
     config = Config.load(project_dir)
-    store = SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
+    store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
     unit_id = _seed_inconsistent_unmerged_unit(store)
     assert (
         store.try_acquire_project_lease(
@@ -4762,8 +4765,8 @@ def test_watch_supervisor_docker_held_runtime_preserves_occupancy_without_repair
         project_prefix="healthy",
         db_path=tmp_path / "healthy.db",
     )
-    held_store = SqliteTaskStore.from_config(Config.load(held_dir), migration_policy="auto_canonical_shared")
-    healthy_store = SqliteTaskStore.from_config(Config.load(healthy_dir), migration_policy="auto_canonical_shared")
+    held_store = SqliteTaskStore.from_config(Config.load(held_dir), migration_policy="auto_private")
+    healthy_store = SqliteTaskStore.from_config(Config.load(healthy_dir), migration_policy="auto_private")
     unit_id = _seed_inconsistent_unmerged_unit(held_store)
     held_task = held_store.add("Held live worker occupies batch", task_type="plan")
     healthy_task = healthy_store.add("Healthy pending must not exceed fleet batch", task_type="plan")
@@ -4822,7 +4825,7 @@ def test_construct_watch_project_runtimes_lease_conflict_does_not_mutate_schema_
         db_path=tmp_path / "project.db",
     )
     config = Config.load(project_dir)
-    store = SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
+    store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
     before = _schema_version_and_project_row(store.db_path, "project")
     assert before[1] is not None
     assert (
@@ -4862,7 +4865,7 @@ def test_construct_watch_project_runtimes_activation_invalid_utf8_disables_one_p
         project_prefix="good",
         db_path=tmp_path / "good.db",
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     SqliteTaskStore(tmp_path / "bad.db", prefix="bad", project_id="bad")
     selection = _watch_runtime_selection(
         (
@@ -5523,7 +5526,7 @@ def test_cmd_watch_multi_project_path_resolution_conflict_does_not_mutate_anchor
         project_prefix="second",
         db_path=second_db,
     )
-    SqliteTaskStore.from_config(Config.load(anchor_dir), migration_policy="auto_canonical_shared")
+    SqliteTaskStore.from_config(Config.load(anchor_dir), migration_policy="auto_private")
     with sqlite3.connect(anchor_db) as conn:
         conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,))
     before = _schema_version_and_project_row(anchor_db, "anchor")
@@ -5680,6 +5683,7 @@ def test_construct_watch_project_runtimes_preserves_post_preflight_db_failure_re
         project_id="unavailable",
         project_prefix="unavail",
         db_path=unavailable_db,
+        bootstrap_db=False,
     )
     _write_watch_runtime_project_config(
         incompatible_dir,
@@ -5687,6 +5691,7 @@ def test_construct_watch_project_runtimes_preserves_post_preflight_db_failure_re
         project_id="incompatible",
         project_prefix="incompat",
         db_path=incompatible_db,
+        bootstrap_db=False,
     )
     _write_watch_runtime_project_config(
         good_dir,
@@ -5695,7 +5700,7 @@ def test_construct_watch_project_runtimes_preserves_post_preflight_db_failure_re
         project_prefix="good",
         db_path=tmp_path / "good.db",
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="unavailable", ref=str(unavailable_dir), path=unavailable_dir),
@@ -5755,6 +5760,7 @@ def test_construct_watch_project_runtimes_lease_store_construction_errors_disabl
         project_id="bad",
         project_prefix="bad",
         db_path=bad_db,
+        bootstrap_db=False,
     )
     _write_watch_runtime_project_config(
         good_dir,
@@ -5763,7 +5769,7 @@ def test_construct_watch_project_runtimes_lease_store_construction_errors_disabl
         project_prefix="good",
         db_path=good_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
@@ -5854,7 +5860,7 @@ def test_construct_watch_project_runtimes_invalid_project_later_valid_acquires_b
     )
     bad_dir.mkdir()
     (bad_dir / "gza.yaml").write_text("project_name: Bad\nprovider: [\n", encoding="utf-8")
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
@@ -5981,7 +5987,7 @@ def test_construct_watch_project_runtimes_refresh_releases_one_config_invalid_pr
         project_prefix="good",
         db_path=good_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
@@ -6059,7 +6065,7 @@ def test_construct_watch_project_runtimes_refresh_requires_prior_runtime_state(
         project_prefix="good",
         db_path=good_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
@@ -6113,7 +6119,7 @@ def test_construct_watch_project_runtimes_refresh_config_invalid_partial_prior_s
         db_path=good_db,
         max_concurrent=4,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
@@ -6202,7 +6208,7 @@ def test_construct_watch_project_runtimes_refresh_later_lease_conflict_partial_p
         db_path=good_db,
         max_concurrent=4,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
@@ -6312,7 +6318,7 @@ def test_construct_watch_project_runtimes_refresh_duplicate_prior_key_rejects_be
         project_prefix="second",
         db_path=second_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_private")
     SqliteTaskStore(second_db, prefix="second", project_id="second")
     selection = _watch_runtime_selection(
         (
@@ -6376,7 +6382,7 @@ def test_construct_watch_project_runtimes_refresh_extra_prior_key_rejects_before
         project_prefix="second",
         db_path=second_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_private")
     SqliteTaskStore(second_db, prefix="second", project_id="second")
     initial_selection = _watch_runtime_selection(
         (
@@ -6442,7 +6448,7 @@ def test_construct_watch_project_runtimes_refresh_wrong_runtime_identity_rejects
         project_prefix="second",
         db_path=second_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_private")
     SqliteTaskStore(second_db, prefix="second", project_id="second")
     selection = _watch_runtime_selection(
         (
@@ -6633,7 +6639,7 @@ def test_construct_watch_project_runtimes_refresh_preserves_config_invalid_runti
         db_path=good_db,
         max_concurrent=4,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
@@ -6795,7 +6801,7 @@ def test_construct_watch_project_runtimes_releases_disabled_subset_in_reverse_ac
         project_prefix="third",
         db_path=third_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(middle_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(middle_dir), migration_policy="auto_private")
     SqliteTaskStore(first_db, prefix="first", project_id="first")
     SqliteTaskStore(third_db, prefix="third", project_id="third")
     selection = _watch_runtime_selection(
@@ -6879,7 +6885,7 @@ def test_construct_watch_project_runtimes_disabled_subset_release_failure_contin
         project_prefix="third",
         db_path=tmp_path / "third.db",
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(middle_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(middle_dir), migration_policy="auto_private")
     SqliteTaskStore(tmp_path / "first.db", prefix="first", project_id="first")
     SqliteTaskStore(tmp_path / "third.db", prefix="third", project_id="third")
     selection = _watch_runtime_selection(
@@ -6957,7 +6963,7 @@ def test_construct_watch_project_runtimes_refresh_preserves_enabled_invalid_enab
         project_prefix="third",
         db_path=third_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_private")
     SqliteTaskStore(middle_db, prefix="middle", project_id="middle")
     SqliteTaskStore(third_db, prefix="third", project_id="third")
     selection = _watch_runtime_selection(
@@ -7038,7 +7044,7 @@ def test_construct_watch_project_runtimes_refresh_preserves_invalid_enabled_inva
         project_prefix="third",
         db_path=third_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(middle_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(middle_dir), migration_policy="auto_private")
     SqliteTaskStore(first_db, prefix="first", project_id="first")
     SqliteTaskStore(third_db, prefix="third", project_id="third")
     selection = _watch_runtime_selection(
@@ -7119,7 +7125,7 @@ def test_construct_watch_project_runtimes_refresh_releases_all_leases_when_all_p
         project_prefix="second",
         db_path=second_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_private")
     SqliteTaskStore(second_db, prefix="second", project_id="second")
     selection = _watch_runtime_selection(
         (
@@ -7198,7 +7204,7 @@ def test_construct_watch_project_runtimes_refresh_conflict_releases_old_same_key
         project_prefix="healthy",
         db_path=healthy_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(healthy_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(healthy_dir), migration_policy="auto_private")
     SqliteTaskStore(old_core_db, prefix="core", project_id="core")
     selection = _watch_runtime_selection(
         (
@@ -7377,7 +7383,7 @@ def test_acquire_watch_supervisor_selection_leases_refresh_preserves_authoritati
             project_prefix=key.replace("-", ""),
             db_path=db_path,
         )
-    anchor_store = SqliteTaskStore.from_config(Config.load(project_dirs[initial_keys[0]]), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dirs[initial_keys[0]]), migration_policy="auto_private")
     initial_selection = _watch_runtime_selection(
         tuple(
             WatchSupervisorProjectSelector(key=key, ref=str(project_dirs[key]), path=project_dirs[key])
@@ -7470,7 +7476,7 @@ def test_construct_watch_project_runtimes_refresh_preserves_lease_conflict_runti
         db_path=good_db,
         max_concurrent=4,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
@@ -7641,7 +7647,7 @@ def test_construct_watch_project_runtimes_empty_lease_refresh_requires_prior_run
         db_path=project_db,
         max_concurrent=4,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(
@@ -7799,7 +7805,7 @@ def test_construct_watch_project_runtimes_refresh_owner_token_mismatch_rejects_n
         project_prefix="second",
         db_path=second_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_private")
     SqliteTaskStore(second_db, prefix="second", project_id="second")
     initial_selection = _watch_runtime_selection(
         (
@@ -7875,7 +7881,7 @@ def test_construct_watch_project_runtimes_refresh_owner_token_mismatch_rejects_e
         project_prefix="second",
         db_path=second_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_private")
     SqliteTaskStore(second_db, prefix="second", project_id="second")
     selection = _watch_runtime_selection(
         (
@@ -7951,7 +7957,7 @@ def test_construct_watch_project_runtimes_db_path_drift_is_typed_before_drifted_
         project_prefix="race",
         db_path=original_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (WatchSupervisorProjectSelector(key="race", ref=str(project_dir), path=project_dir),)
     )
@@ -7976,6 +7982,7 @@ def test_construct_watch_project_runtimes_db_path_drift_is_typed_before_drifted_
         project_id="race",
         project_prefix="race",
         db_path=drift_db,
+        bootstrap_db=False,
     )
 
     with patch("gza.cli.watch.resolve_execution_projects", return_value=resolved):
@@ -8020,7 +8027,7 @@ def test_construct_watch_project_runtimes_refresh_post_acquire_activation_failur
         project_prefix="good",
         db_path=good_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
@@ -8111,7 +8118,7 @@ def test_watch_supervisor_repair_failure_disables_runtime_during_reconcile(
         project_prefix="good",
         db_path=tmp_path / "good.db",
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="repair", ref=str(repair_fail_dir), path=repair_fail_dir),
@@ -8191,7 +8198,7 @@ def test_construct_watch_project_runtimes_isolates_log_and_worker_registry_initi
         project_prefix="good",
         db_path=tmp_path / "good.db",
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="log", ref=str(log_fail_dir), path=log_fail_dir),
@@ -8270,7 +8277,7 @@ def test_construct_watch_project_runtimes_retains_leases_for_held_runtimes(
         project_prefix="active",
         db_path=active_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(active_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(active_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="held", ref=str(held_dir), path=held_dir),
@@ -8337,7 +8344,7 @@ def test_construct_watch_project_runtimes_releases_all_leases_on_runtime_constru
         project_prefix="second",
         db_path=second_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="first", ref=str(first_dir), path=first_dir),
@@ -8393,7 +8400,7 @@ def test_construct_watch_project_runtimes_groups_runtime_construction_and_releas
         project_prefix="project",
         db_path=tmp_path / "project.db",
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (WatchSupervisorProjectSelector(key="project", ref=str(project_dir), path=project_dir),)
     )
@@ -8431,7 +8438,7 @@ def test_construct_watch_project_runtimes_groups_disabled_release_and_aggregate_
         project_prefix="good",
         db_path=tmp_path / "good.db",
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="worker", ref=str(worker_fail_dir), path=worker_fail_dir),
@@ -8513,7 +8520,7 @@ def test_watch_project_runtime_rejects_unrelated_db_store_swap(tmp_path: Path) -
     setup_config(beta_dir, project_name="beta")
     alpha_config = Config.load(alpha_dir)
     beta_config = Config.load(beta_dir)
-    alpha_store = SqliteTaskStore.from_config(alpha_config, migration_policy="auto_canonical_shared")
+    alpha_store = SqliteTaskStore.from_config(alpha_config, migration_policy="auto_private")
     beta_store = SqliteTaskStore.from_config(beta_config)
 
     with pytest.raises(ValueError, match="ownership mismatch"):
@@ -8550,7 +8557,7 @@ def test_watch_project_runtime_rejects_shared_db_context_project_swap(tmp_path: 
     )
     alpha_config = Config.load(alpha_dir)
     beta_config = Config.load(beta_dir)
-    alpha_store = SqliteTaskStore.from_config(alpha_config, migration_policy="auto_canonical_shared")
+    alpha_store = SqliteTaskStore.from_config(alpha_config, migration_policy="auto_private")
 
     with pytest.raises(ValueError, match="context project_id"):
         WatchProjectRuntime.create(
@@ -8656,7 +8663,7 @@ def test_watch_project_runtime_rejects_worker_registry_from_unrelated_project_ro
 def test_watch_project_runtime_live_worker_exclusion_uses_owned_worker_registry(tmp_path: Path) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
-    store = SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
+    store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
     task = store.add("Owned registry task", task_type="implement")
     assert task.id is not None
     spy_registry = MagicMock()
@@ -8999,7 +9006,7 @@ def _make_aggregate_runtime(
     return WatchProjectRuntime.create(
         key=project_name,
         config=config,
-        store=SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared"),
+        store=SqliteTaskStore.from_config(config, migration_policy="auto_private"),
         log=_WatchLog(project_dir / ".gza" / "watch.log", quiet=True),
         tags=None,
         any_tag=False,
@@ -16758,7 +16765,7 @@ def test_watch_supervisor_fleet_cycle_config_invalid_refresh_is_read_only_and_ke
         db_path=good_db,
         max_concurrent=4,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
@@ -16909,7 +16916,7 @@ def test_watch_supervisor_fleet_cycle_lease_loss_refresh_is_read_only_and_keeps_
         db_path=good_db,
         max_concurrent=4,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (
             WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
@@ -17472,7 +17479,7 @@ def test_construct_watch_project_runtimes_rotates_each_selected_detail_log_once_
     log_path.parent.mkdir(parents=True, exist_ok=True)
     original = b"pre-existing supervisor invocation detail log\n"
     log_path.write_bytes(original)
-    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (WatchSupervisorProjectSelector(key="selected", ref=str(project_dir), path=project_dir),)
     )
@@ -17533,7 +17540,7 @@ def test_construct_watch_project_runtimes_project_log_failure_preserves_aggregat
         project_prefix="good",
         db_path=good_db,
     )
-    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir), migration_policy="auto_private")
     aggregate_log = tmp_path / ".gza" / "watch-supervisor.log"
     selection = _watch_runtime_selection(
         (
@@ -17667,7 +17674,7 @@ def test_construct_watch_project_runtimes_retries_log_rotation_after_transient_i
     log_path.parent.mkdir(parents=True, exist_ok=True)
     original = b"old invocation bytes\n"
     log_path.write_bytes(original)
-    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_canonical_shared")
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     selection = _watch_runtime_selection(
         (WatchSupervisorProjectSelector(key="selected", ref=str(project_dir), path=project_dir),)
     )
@@ -53146,7 +53153,7 @@ def test_watch_project_runtime_dispatch_uses_activation_snapshot_after_env_mutat
     )
     (tmp_path / ".env").write_text("PATH=/activated/bin\nTOKEN=activated\n", encoding="utf-8")
     config = Config.load(tmp_path)
-    store = SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
+    store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
     pending = store.add("Pending implement dispatch", task_type="implement")
     assert pending.id is not None
     runtime = WatchProjectRuntime.create(

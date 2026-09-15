@@ -3967,12 +3967,18 @@ class TestReviewContextFromChain:
             scope_root=Path("services/foo"),
             local_dependencies=(),
         )
-        store = SqliteTaskStore.from_config(config)
-        sibling_store = SqliteTaskStore.from_config(Config.load_execution(sibling_dir))
+        store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
+        sibling_store = SqliteTaskStore.from_config(Config.load_execution(sibling_dir), migration_policy="auto_private")
         _add_verify_marker(store.db_path, "canonical-foo")
         _add_verify_marker(sibling_store.db_path, "canonical-bar")
-        worktree_foo_store = SqliteTaskStore.from_config(Config.load_execution(worktree_project_dir))
-        worktree_bar_store = SqliteTaskStore.from_config(Config.load_execution(worktree_sibling_dir))
+        worktree_foo_store = SqliteTaskStore.from_config(
+            Config.load_execution(worktree_project_dir),
+            migration_policy="auto_private",
+        )
+        worktree_bar_store = SqliteTaskStore.from_config(
+            Config.load_execution(worktree_sibling_dir),
+            migration_policy="auto_private",
+        )
         _add_verify_marker(worktree_foo_store.db_path, "worktree-foo")
         _add_verify_marker(worktree_bar_store.db_path, "worktree-bar")
 
@@ -4075,9 +4081,9 @@ class TestReviewContextFromChain:
             scope_root=Path("services/foo"),
             local_dependencies=(),
         )
-        store = SqliteTaskStore.from_config(config)
+        store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
         child_config = Config.load(sibling_dir)
-        child_store = SqliteTaskStore.from_config(child_config)
+        child_store = SqliteTaskStore.from_config(child_config, migration_policy="auto_private")
         task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
         task.branch = "feature/cross-project"
         store.update(task)
@@ -4193,7 +4199,7 @@ class TestReviewContextFromChain:
             scope_root=Path("services/foo"),
             local_dependencies=(),
         )
-        store = SqliteTaskStore.from_config(config)
+        store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
         store.register_project_paths_for_identity(
             project_id="bar",
             project_name="bar",
@@ -4282,7 +4288,7 @@ class TestReviewContextFromChain:
             scope_root=Path("services/foo"),
             local_dependencies=(),
         )
-        store = SqliteTaskStore.from_config(config)
+        store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
         with store._write_transaction() as conn:  # noqa: SLF001 - corrupt registry fixture.
             conn.execute(
                 """
@@ -4419,8 +4425,8 @@ class TestReviewContextFromChain:
             scope_root=Path("services/foo"),
             local_dependencies=(),
         )
-        store = SqliteTaskStore.from_config(config)
-        child_store = SqliteTaskStore.from_config(Config.load_execution(sibling_dir))
+        store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
+        child_store = SqliteTaskStore.from_config(Config.load_execution(sibling_dir), migration_policy="auto_private")
         task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
@@ -4483,7 +4489,7 @@ class TestReviewContextFromChain:
             scope_root=Path("services/foo"),
             local_dependencies=(),
         )
-        store = SqliteTaskStore.from_config(config)
+        store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
         task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
@@ -4546,8 +4552,8 @@ class TestReviewContextFromChain:
             scope_root=Path("services/foo"),
             local_dependencies=(),
         )
-        store = SqliteTaskStore.from_config(config)
-        SqliteTaskStore.from_config(Config.load_execution(child_dir))
+        store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
+        SqliteTaskStore.from_config(Config.load_execution(child_dir), migration_policy="auto_private")
         task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
@@ -4617,8 +4623,8 @@ class TestReviewContextFromChain:
             scope_root=Path("services/foo"),
             local_dependencies=(),
         )
-        store = SqliteTaskStore.from_config(config)
-        child_store = SqliteTaskStore.from_config(Config.load_execution(child_dir))
+        store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
+        child_store = SqliteTaskStore.from_config(Config.load_execution(child_dir), migration_policy="auto_private")
         task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
@@ -4780,9 +4786,9 @@ class TestReviewContextFromChain:
             scope_root=Path("services/foo"),
             local_dependencies=(),
         )
-        store = SqliteTaskStore.from_config(config)
-        SqliteTaskStore.from_config(Config.load_execution(child_dir))
-        SqliteTaskStore.from_config(Config.load_execution(sibling_dir))
+        store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
+        SqliteTaskStore.from_config(Config.load_execution(child_dir), migration_policy="auto_private")
+        SqliteTaskStore.from_config(Config.load_execution(sibling_dir), migration_policy="auto_private")
         task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
@@ -4894,8 +4900,8 @@ class TestReviewContextFromChain:
             scope_root=Path("services/foo"),
             local_dependencies=(),
         )
-        store = SqliteTaskStore.from_config(config)
-        SqliteTaskStore.from_config(Config.load_execution(child_dir))
+        store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
+        SqliteTaskStore.from_config(Config.load_execution(child_dir), migration_policy="auto_private")
         task = store.add("Review cross-project", task_type="review", tags=("cross-project",))
         source = store.add("Successful root verify source", task_type="review", depends_on=task.id)
         assert source.id is not None
@@ -11054,7 +11060,7 @@ class TestFailureReasonGroundTruth:
             "    timeout_minutes: 25\n"
         )
         config = Config.load(tmp_path)
-        store = SqliteTaskStore.from_config(config)
+        store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
         task = store.add(prompt="Implement feature", task_type="implement")
         task.slug = "20260601-implement-timeout-handoff"
         store.update(task)
@@ -13110,7 +13116,7 @@ class TestNoChangesWithExistingCommits:
         )
         (project / ".env").write_text("PATH=/captured/bin\nPROJECT_TOKEN=captured-token\n", encoding="utf-8")
         config = Config.load(project)
-        store = SqliteTaskStore.from_config(config)
+        store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
         task = store.add(prompt="Implement with captured runtime", task_type="implement")
         task.slug = "20260824-scoped-captured-runtime"
         store.update(task)
@@ -26788,7 +26794,7 @@ class TestLoadDotenv:
         )
         runtime_context = RuntimeExecutionContext.from_config(config)
         monkeypatch.setenv("PROJECT_VERIFY_TOKEN", "ambient-after-capture")
-        store = SqliteTaskStore.from_config(config)
+        store = SqliteTaskStore.from_config(config, migration_policy="auto_private")
         task = store.add("verify env", task_type="implement")
         worktree_git = Mock(spec=Git)
 
@@ -27921,7 +27927,7 @@ class TestRunnerStoreMetadata:
         )
 
         config = Config.load(project_dir)
-        SqliteTaskStore.from_config(config, migration_policy="auto_canonical_shared")
+        SqliteTaskStore.from_config(config, migration_policy="auto_private")
 
         conn = sqlite3.connect(db_path)
         before = conn.execute(

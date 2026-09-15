@@ -14,7 +14,13 @@ import pytest
 
 from gza.cli import config_cmds
 from gza.config import Config
-from gza.db import _QUERY_ONLY_REQUIRED_TASK_COLUMNS, SCHEMA_VERSION, SchemaIntegrityError, SqliteTaskStore
+from gza.db import (
+    _QUERY_ONLY_REQUIRED_TASK_COLUMNS,
+    SCHEMA_VERSION,
+    MigrationAuthorityProof,
+    SchemaIntegrityError,
+    SqliteTaskStore,
+)
 
 from .conftest import invoke_gza
 
@@ -47,6 +53,39 @@ def _write_project_config(
         + "\n",
         encoding="utf-8",
     )
+
+
+def _test_migration_authority(
+    root: Path,
+    *,
+    fail_on_call: int | None = None,
+    message: str = "registry authority became stale",
+) -> tuple[MigrationAuthorityProof, list[int]]:
+    calls: list[int] = []
+
+    def revalidate() -> None:
+        calls.append(len(calls) + 1)
+        if fail_on_call is not None and len(calls) == fail_on_call:
+            raise SchemaIntegrityError(message)
+
+    return (
+        MigrationAuthorityProof(
+            canonical_root=root.resolve(),
+            default_branch="main",
+            head_sha="1" * 40,
+            revalidate=revalidate,
+        ),
+        calls,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _default_registry_migration_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolve(config: Config) -> MigrationAuthorityProof:
+        proof, _calls = _test_migration_authority(Path(config.project_dir))
+        return proof
+
+    monkeypatch.setattr(config_cmds, "resolve_canonical_migration_authority", resolve)
 
 
 def _registry_row(db_path: Path, project_id: str) -> tuple[str, str] | None:
@@ -158,7 +197,7 @@ def _write_future_db(db_path: Path) -> None:
 def _write_current_registry_db(db_path: Path, *, project_id: str) -> None:
     project_dir = db_path.parent / f"{project_id}-project"
     _write_project_config(project_dir, project_name=project_id.title(), project_id=project_id, db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
 
 
 def _changed_tables(before: dict[str, Any], after: dict[str, Any]) -> set[str]:
@@ -279,7 +318,7 @@ def test_projects_register_refuses_relocation_without_replace(tmp_path: Path) ->
     new_dir = tmp_path / "new"
     _write_project_config(old_dir, project_name="Moved", project_id="moved", db_path=db_path)
     _write_project_config(new_dir, project_name="Moved", project_id="moved", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(old_dir))
+    SqliteTaskStore.from_config(Config.load(old_dir), migration_policy="auto_private")
 
     before = _db_snapshot(db_path)
 
@@ -300,7 +339,7 @@ def test_projects_register_replaces_relocated_project_with_explicit_flag(tmp_pat
     new_dir = tmp_path / "new"
     _write_project_config(old_dir, project_name="Moved", project_id="moved", db_path=db_path)
     _write_project_config(new_dir, project_name="Moved", project_id="moved", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(old_dir))
+    SqliteTaskStore.from_config(Config.load(old_dir), migration_policy="auto_private")
 
     before = _db_snapshot(db_path)
     assert before is not None
@@ -321,7 +360,7 @@ def test_projects_diagnose_reports_invalid_and_duplicate_rows(tmp_path: Path) ->
     db_path = tmp_path / "shared.db"
     anchor_dir = tmp_path / "anchor"
     _write_project_config(anchor_dir, project_name="Anchor", project_id="anchor", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(anchor_dir))
+    SqliteTaskStore.from_config(Config.load(anchor_dir), migration_policy="auto_private")
     _insert_registry_row(db_path, project_id="emptyroot", root_path="", config_path="")
     _insert_registry_row(
         db_path,
@@ -352,7 +391,7 @@ def test_projects_diagnose_preserves_alias_mismatch_while_reporting_duplicate_pa
     db_path = tmp_path / "shared.db"
     anchor_dir = tmp_path / "anchor"
     _write_project_config(anchor_dir, project_name="Anchor", project_id="anchor", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(anchor_dir))
+    SqliteTaskStore.from_config(Config.load(anchor_dir), migration_policy="auto_private")
     _insert_registry_row(
         db_path,
         project_id="alias",
@@ -372,7 +411,7 @@ def test_projects_diagnose_preserves_distinct_row_mismatches_while_reporting_dup
     db_path = tmp_path / "shared.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="real", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     with sqlite3.connect(db_path) as conn:
         conn.execute("DELETE FROM projects WHERE id = 'real'")
     for project_id in ("deadone", "deadtwo"):
@@ -395,7 +434,7 @@ def test_projects_deactivate_blanks_named_alias_without_deleting_row(tmp_path: P
     db_path = tmp_path / "shared.db"
     anchor_dir = tmp_path / "anchor"
     _write_project_config(anchor_dir, project_name="Anchor", project_id="anchor", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(anchor_dir))
+    SqliteTaskStore.from_config(Config.load(anchor_dir), migration_policy="auto_private")
     _insert_registry_row(
         db_path,
         project_id="alias",
@@ -469,7 +508,7 @@ def test_projects_diagnose_existing_db_deleted_after_query_store_fails_cleanly_w
     db_path = tmp_path / "shared.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     original = SqliteTaskStore.list_project_registry_entries
 
     def delete_before_listing(self: SqliteTaskStore) -> Any:
@@ -502,7 +541,7 @@ def test_projects_deactivate_unknown_row_preserves_existing_db(tmp_path: Path) -
     db_path = tmp_path / "shared.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     before = _db_snapshot(db_path)
 
     result = invoke_gza("projects", "deactivate", "unknown", "--project", str(project_dir))
@@ -516,7 +555,7 @@ def test_projects_deactivate_current_without_force_preserves_empty_current_row(t
     db_path = tmp_path / "shared.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     with sqlite3.connect(db_path) as conn:
         conn.execute("UPDATE projects SET root_path = '', config_path = '' WHERE id = 'project'")
     before = _db_snapshot(db_path)
@@ -534,7 +573,7 @@ def test_projects_register_default_refuses_config_drift_after_precheck(tmp_path:
     db_path = tmp_path / "shared.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     before = _db_snapshot(db_path)
     original = config_cmds._precheck_register_conflict
 
@@ -563,7 +602,7 @@ def test_projects_register_path_refuses_target_db_redirect_after_precheck(tmp_pa
     target_dir = tmp_path / "target"
     _write_project_config(anchor_dir, project_name="Anchor", project_id="anchor", db_path=anchor_db)
     _write_project_config(target_dir, project_name="Target", project_id="target", db_path=anchor_db)
-    SqliteTaskStore.from_config(Config.load(anchor_dir))
+    SqliteTaskStore.from_config(Config.load(anchor_dir), migration_policy="auto_private")
     before = _db_snapshot(anchor_db)
     original = config_cmds._precheck_register_conflict
 
@@ -584,7 +623,7 @@ def test_projects_register_refuses_future_db_replacement_before_writable_open(tm
     db_path = tmp_path / "shared.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     original = config_cmds._registry_mutation_store
 
     def replace_before_open(config: Config, *, allow_bootstrap: bool = True) -> SqliteTaskStore:
@@ -628,7 +667,7 @@ def test_projects_register_refuses_missing_existing_db_before_writable_open(tmp_
     db_path = tmp_path / "shared.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     original = config_cmds._registry_mutation_store
 
     def remove_before_open(config: Config, *, allow_bootstrap: bool = True) -> SqliteTaskStore:
@@ -649,7 +688,7 @@ def test_projects_register_existing_db_deleted_after_activation_refuses_without_
     db_path = tmp_path / "shared.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     original = SqliteTaskStore.register_project_paths_for_identity
 
     def delete_before_mutation(self: SqliteTaskStore, *args: Any, **kwargs: Any) -> Any:
@@ -728,7 +767,7 @@ def test_projects_deactivate_refuses_current_project_id_drift_before_activation(
     db_path = tmp_path / "shared.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="current", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     _insert_registry_row(db_path, project_id="alias", root_path="", config_path="")
     before = _db_snapshot(db_path)
     original = SqliteTaskStore.get_project_registry_entry
@@ -752,7 +791,7 @@ def test_projects_deactivate_refuses_db_redirect_before_activation(tmp_path: Pat
     redirected_db = tmp_path / "redirected.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     _insert_registry_row(db_path, project_id="alias", root_path="", config_path="")
     before = _db_snapshot(db_path)
     original = SqliteTaskStore.get_project_registry_entry
@@ -776,7 +815,7 @@ def test_projects_deactivate_refuses_db_replacement_before_writable_open(tmp_pat
     db_path = tmp_path / "shared.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     _insert_registry_row(db_path, project_id="alias", root_path="", config_path="")
     original = config_cmds._registry_mutation_store
 
@@ -800,7 +839,7 @@ def test_projects_deactivate_existing_db_deleted_after_activation_refuses_withou
     db_path = tmp_path / "shared.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     _insert_registry_row(db_path, project_id="alias", root_path="", config_path="")
     original = SqliteTaskStore.deactivate_project_registry_row
 
@@ -826,7 +865,7 @@ def test_projects_deactivate_refuses_future_db_replacement_after_activation_with
     original_db = tmp_path / "original.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     _insert_registry_row(
         db_path,
         project_id="alias",
@@ -860,7 +899,7 @@ def test_projects_deactivate_refuses_current_db_replacement_after_activation_wit
     replacement_db = tmp_path / "replacement.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     _insert_registry_row(
         db_path,
         project_id="alias",
@@ -906,7 +945,7 @@ def test_projects_deactivate_refuses_current_db_replacement_before_writable_conn
     replacement_db = tmp_path / "replacement.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     _insert_registry_row(db_path, project_id="alias", root_path="", config_path="")
     _write_current_registry_db(replacement_db, project_id="replacement")
     _insert_registry_row(
@@ -951,7 +990,7 @@ def test_projects_deactivate_refuses_current_db_replacement_after_transaction_ch
     replacement_db = tmp_path / "replacement.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     _insert_registry_row(
         db_path,
         project_id="alias",
@@ -1007,7 +1046,7 @@ def test_projects_register_refuses_future_db_replacement_after_activation_withou
     original_db = tmp_path / "original.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     before_original = _db_snapshot(db_path)
     original = SqliteTaskStore.register_project_paths_for_identity
 
@@ -1035,7 +1074,7 @@ def test_projects_register_refuses_current_db_replacement_after_activation_witho
     replacement_db = tmp_path / "replacement.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     _write_current_registry_db(replacement_db, project_id="replacement")
     _prepare_replacement_db_for_pragma_guard(replacement_db)
     replacement_before = _db_snapshot(replacement_db)
@@ -1066,7 +1105,7 @@ def test_projects_register_refuses_current_db_replacement_before_writable_connec
     replacement_db = tmp_path / "replacement.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     _write_current_registry_db(replacement_db, project_id="replacement")
     _prepare_replacement_db_for_pragma_guard(replacement_db)
     replacement_before = _db_snapshot(replacement_db)
@@ -1101,7 +1140,7 @@ def test_projects_register_refuses_current_db_replacement_after_transaction_chec
     replacement_db = tmp_path / "replacement.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     _write_current_registry_db(replacement_db, project_id="replacement")
     replacement_before = _db_snapshot(replacement_db)
     before_original = _db_snapshot(db_path)
@@ -1135,7 +1174,7 @@ def test_projects_register_failure_after_activation_does_not_backfill_task_table
     db_path = tmp_path / "shared.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    store = SqliteTaskStore.from_config(Config.load(project_dir))
+    store = SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     task = store.add("legacy grouped task")
     assert task.id is not None
     with sqlite3.connect(db_path) as conn:
@@ -1179,7 +1218,7 @@ def test_projects_register_path_reports_malformed_target_yaml_without_db_mutatio
     _write_project_config(anchor_dir, project_name="Anchor", project_id="anchor", db_path=db_path)
     target_dir.mkdir()
     (target_dir / "gza.yaml").write_text("project_name: [unterminated\n", encoding="utf-8")
-    SqliteTaskStore.from_config(Config.load(anchor_dir))
+    SqliteTaskStore.from_config(Config.load(anchor_dir), migration_policy="auto_private")
     before = _db_snapshot(db_path)
 
     result = invoke_gza("projects", "register", "--project", str(anchor_dir), "--path", str(target_dir))
@@ -1231,7 +1270,7 @@ def test_projects_register_rejects_symlink_loop_target_path_without_traceback_or
     anchor_dir = tmp_path / "anchor"
     target_loop = _make_symlink_loop(tmp_path, "loop-target")
     _write_project_config(anchor_dir, project_name="Anchor", project_id="anchor", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(anchor_dir))
+    SqliteTaskStore.from_config(Config.load(anchor_dir), migration_policy="auto_private")
     before = _db_snapshot(db_path)
 
     result = invoke_gza("projects", "register", "--project", str(anchor_dir), "--path", str(target_loop))
@@ -1246,7 +1285,7 @@ def test_projects_deactivate_current_with_force_is_rejected_without_mutation(tmp
     db_path = tmp_path / "shared.db"
     project_dir = tmp_path / "project"
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     before = _db_snapshot(db_path)
     assert before is not None
 
@@ -1277,7 +1316,7 @@ def test_projects_deactivate_current_refusal_quotes_register_repair_command(
     db_path = tmp_path / "shared.db"
     project_dir = tmp_path / path_name
     _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir))
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
     expected_command = f"uv run gza projects register --project {shlex.quote(str(project_dir.resolve()))} --replace"
 
     result = invoke_gza("projects", "deactivate", "project", "--project", str(project_dir))
@@ -1299,8 +1338,8 @@ def test_projects_deactivate_current_refusal_scopes_all_repair_commands_to_expli
     target_db = tmp_path / "target.db"
     _write_project_config(cwd_project, project_name="A", project_id="a", db_path=cwd_db)
     _write_project_config(target_project, project_name="B", project_id="b", db_path=target_db)
-    SqliteTaskStore.from_config(Config.load(cwd_project))
-    SqliteTaskStore.from_config(Config.load(target_project))
+    SqliteTaskStore.from_config(Config.load(cwd_project), migration_policy="auto_private")
+    SqliteTaskStore.from_config(Config.load(target_project), migration_policy="auto_private")
     before_cwd = _db_snapshot(cwd_db)
     before_target = _db_snapshot(target_db)
     expected_project = shlex.quote(str(target_project.resolve()))
@@ -1325,7 +1364,7 @@ def test_projects_register_anchor_path_writes_target_to_anchor_registry(tmp_path
     target_dir = tmp_path / "anchor" / "server"
     _write_project_config(anchor_dir, project_name="Anchor", project_id="anchor", db_path=db_path)
     _write_project_config(target_dir, project_name="Server", project_id="server", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(anchor_dir))
+    SqliteTaskStore.from_config(Config.load(anchor_dir), migration_policy="auto_private")
     before = _db_snapshot(db_path)
     assert before is not None
 
@@ -1357,7 +1396,7 @@ def test_projects_register_anchor_path_rejects_unrelated_target_db_without_mutat
     target_dir = tmp_path / "target"
     _write_project_config(anchor_dir, project_name="Anchor", project_id="anchor", db_path=anchor_db_path)
     _write_project_config(target_dir, project_name="Target", project_id="target", db_path=target_db_path)
-    SqliteTaskStore.from_config(Config.load(anchor_dir))
+    SqliteTaskStore.from_config(Config.load(anchor_dir), migration_policy="auto_private")
     before = _db_snapshot(anchor_db_path)
 
     result = invoke_gza(
@@ -1404,7 +1443,7 @@ def test_projects_register_rejects_linked_worktree_without_replacing_prior_row(t
     linked_dir = tmp_path / "linked"
     linked_git_dir = tmp_path / "canonical" / ".git" / "worktrees" / "linked"
     _write_project_config(canonical_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(canonical_dir))
+    SqliteTaskStore.from_config(Config.load(canonical_dir), migration_policy="auto_private")
     linked_git_dir.mkdir(parents=True)
     (linked_git_dir / "commondir").write_text("../..", encoding="utf-8")
     linked_dir.mkdir()
@@ -1440,6 +1479,89 @@ def test_projects_register_rejects_linked_worktree_first_registration_without_cr
     _assert_db_and_sidecars_absent(db_path)
 
 
+@pytest.mark.parametrize(
+    "checkout_kind",
+    [
+        "feature",
+        "detached",
+        "linked",
+    ],
+)
+def test_projects_register_without_shared_authority_cannot_create_missing_shared_db(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkout_kind: str,
+) -> None:
+    db_path = tmp_path / f"{checkout_kind}.db"
+    project_dir = tmp_path / checkout_kind
+    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
+    if checkout_kind == "linked":
+        linked_git_dir = tmp_path / "main" / ".git" / "worktrees" / checkout_kind
+        linked_git_dir.mkdir(parents=True)
+        (linked_git_dir / "commondir").write_text("../..", encoding="utf-8")
+        (project_dir / ".git").write_text(f"gitdir: {linked_git_dir}\n", encoding="utf-8")
+    else:
+        (project_dir / ".git").mkdir()
+        head = "ref: refs/heads/topic\n" if checkout_kind == "feature" else "1" * 40 + "\n"
+        (project_dir / ".git" / "HEAD").write_text(head, encoding="utf-8")
+        (project_dir / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+
+    monkeypatch.setattr(config_cmds, "resolve_canonical_migration_authority", lambda _config: None)
+
+    result = invoke_gza("projects", "register", "--project", str(project_dir), "--replace")
+
+    assert result.returncode == 1
+    assert "Project project registered" not in result.stdout
+    _assert_no_traceback(result)
+    _assert_db_and_sidecars_absent(db_path)
+
+
+@pytest.mark.parametrize(
+    "checkout_kind",
+    [
+        "feature",
+        "detached",
+        "linked",
+    ],
+)
+def test_projects_register_without_shared_authority_cannot_change_existing_registry_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkout_kind: str,
+) -> None:
+    db_path = tmp_path / f"{checkout_kind}.db"
+    canonical_dir = tmp_path / "canonical"
+    project_dir = tmp_path / checkout_kind
+    _write_project_config(canonical_dir, project_name="Project", project_id="project", db_path=db_path)
+    SqliteTaskStore.from_config(Config.load(canonical_dir), migration_policy="auto_private")
+    before = _db_snapshot(db_path)
+    assert before is not None
+    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
+    if checkout_kind == "linked":
+        linked_git_dir = tmp_path / "canonical" / ".git" / "worktrees" / checkout_kind
+        linked_git_dir.mkdir(parents=True)
+        (linked_git_dir / "commondir").write_text("../..", encoding="utf-8")
+        (project_dir / ".git").write_text(f"gitdir: {linked_git_dir}\n", encoding="utf-8")
+    else:
+        (project_dir / ".git").mkdir()
+        head = "ref: refs/heads/topic\n" if checkout_kind == "feature" else "1" * 40 + "\n"
+        (project_dir / ".git" / "HEAD").write_text(head, encoding="utf-8")
+        (project_dir / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+
+    monkeypatch.setattr(config_cmds, "resolve_canonical_migration_authority", lambda _config: None)
+
+    result = invoke_gza("projects", "register", "--project", str(project_dir), "--replace")
+
+    assert result.returncode == 1
+    assert "Project project updated" not in result.stdout
+    _assert_no_traceback(result)
+    assert _db_snapshot(db_path) == before
+    assert _registry_row(db_path, "project") == (
+        str(canonical_dir.resolve()),
+        str((canonical_dir / "gza.yaml").resolve()),
+    )
+
+
 def test_projects_register_resolves_relative_db_against_target_project(tmp_path: Path) -> None:
     project_dir = tmp_path / "project"
     relative_db = Path(".gza") / "shared.db"
@@ -1466,6 +1588,127 @@ def test_projects_register_succeeds_for_canonical_git_checkout(tmp_path: Path) -
     assert _registry_row(db_path, "project") == (
         str(project_dir.resolve()),
         str((project_dir / "gza.yaml").resolve()),
+    )
+
+
+def test_projects_register_local_db_succeeds_without_shared_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir = tmp_path / "project"
+    local_db = project_dir / ".gza" / "gza.db"
+    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=Path(".gza/gza.db"))
+    monkeypatch.setattr(config_cmds, "resolve_canonical_migration_authority", lambda _config: None)
+
+    result = invoke_gza("projects", "register", "--project", str(project_dir))
+
+    assert result.returncode == 0
+    assert _registry_row(local_db, "project") == (
+        str(project_dir.resolve()),
+        str((project_dir / "gza.yaml").resolve()),
+    )
+
+
+def test_projects_register_stale_authority_before_bootstrap_publication_leaves_shared_db_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "shared.db"
+    project_dir = tmp_path / "project"
+    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
+    phases: list[str] = []
+    original_checkpoint = SqliteTaskStore._checkpoint_private_registry_bootstrap
+
+    def record_private_bootstrap_checkpoint(self: SqliteTaskStore, temp_path: Path) -> None:
+        phases.append("private-bootstrap-complete")
+        original_checkpoint(self, temp_path)
+
+    proof, calls = _test_migration_authority(
+        project_dir,
+        fail_on_call=2,
+        message="registry authority stale before publication",
+    )
+    monkeypatch.setattr(config_cmds, "resolve_canonical_migration_authority", lambda _config: proof)
+
+    with patch.object(
+        SqliteTaskStore,
+        "_checkpoint_private_registry_bootstrap",
+        record_private_bootstrap_checkpoint,
+    ):
+        result = invoke_gza("projects", "register", "--project", str(project_dir))
+
+    assert result.returncode == 1
+    assert "registry authority stale before publication" in result.stdout
+    assert calls == [1, 2]
+    assert phases == ["private-bootstrap-complete"]
+    _assert_db_and_sidecars_absent(db_path)
+
+
+def test_projects_register_stale_authority_before_transaction_leaves_registry_row_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "shared.db"
+    original_dir = tmp_path / "original"
+    project_dir = tmp_path / "project"
+    _write_project_config(original_dir, project_name="Project", project_id="project", db_path=db_path)
+    SqliteTaskStore.from_config(Config.load(original_dir), migration_policy="auto_private")
+    _prepare_replacement_db_for_pragma_guard(db_path)
+    before = _db_file_state_snapshot(db_path)
+    assert before is not None
+    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
+    proof, calls = _test_migration_authority(
+        project_dir,
+        fail_on_call=2,
+        message="registry authority stale before register writable open",
+    )
+    monkeypatch.setattr(config_cmds, "resolve_canonical_migration_authority", lambda _config: proof)
+
+    result = invoke_gza("projects", "register", "--project", str(project_dir), "--replace")
+
+    assert result.returncode == 1
+    assert "registry authority stale before register writable open" in result.stdout
+    assert calls == [1, 2]
+    _assert_db_file_state_unchanged(db_path, before)
+    assert _registry_row(db_path, "project") == (
+        str(original_dir.resolve()),
+        str((original_dir / "gza.yaml").resolve()),
+    )
+
+
+def test_projects_deactivate_stale_authority_before_transaction_leaves_registry_row_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "shared.db"
+    project_dir = tmp_path / "project"
+    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
+    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
+    _insert_registry_row(
+        db_path,
+        project_id="alias",
+        root_path=str((tmp_path / "alias").resolve()),
+        config_path=str((tmp_path / "alias" / "gza.yaml").resolve()),
+    )
+    _prepare_replacement_db_for_pragma_guard(db_path)
+    before = _db_file_state_snapshot(db_path)
+    assert before is not None
+    proof, calls = _test_migration_authority(
+        project_dir,
+        fail_on_call=2,
+        message="registry authority stale before deactivate writable open",
+    )
+    monkeypatch.setattr(config_cmds, "resolve_canonical_migration_authority", lambda _config: proof)
+
+    result = invoke_gza("projects", "deactivate", "alias", "--project", str(project_dir))
+
+    assert result.returncode == 1
+    assert "registry authority stale before deactivate writable open" in result.stdout
+    assert calls == [1, 2]
+    _assert_db_file_state_unchanged(db_path, before)
+    assert _registry_row(db_path, "alias") == (
+        str((tmp_path / "alias").resolve()),
+        str((tmp_path / "alias" / "gza.yaml").resolve()),
     )
 
 
@@ -1686,7 +1929,7 @@ def test_projects_manual_migration_refusal_keeps_explicit_target_project_in_comm
     target_db = tmp_path / "manual.db"
     _write_project_config(cwd_project, project_name="A", project_id="a", db_path=cwd_db)
     _write_project_config(target_project, project_name="B", project_id="b", db_path=target_db)
-    SqliteTaskStore.from_config(Config.load(cwd_project))
+    SqliteTaskStore.from_config(Config.load(cwd_project), migration_policy="auto_private")
     with sqlite3.connect(target_db) as conn:
         conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
         conn.execute("INSERT INTO schema_version (version) VALUES (24)")
@@ -1722,7 +1965,7 @@ def test_projects_current_schema_refusal_keeps_explicit_target_project_in_comman
     target_db = tmp_path / "old.db"
     _write_project_config(cwd_project, project_name="A", project_id="a", db_path=cwd_db)
     _write_project_config(target_project, project_name="B", project_id="b", db_path=target_db)
-    SqliteTaskStore.from_config(Config.load(cwd_project))
+    SqliteTaskStore.from_config(Config.load(cwd_project), migration_policy="auto_private")
     _write_auto_migration_pending_registry_db(
         target_db,
         project_id="b",
@@ -1763,7 +2006,7 @@ def test_global_migration_refusals_scope_migrate_command_to_explicit_project_wit
     target_db = tmp_path / "target.db"
     _write_project_config(cwd_project, project_name="A", project_id="a", db_path=cwd_db)
     _write_project_config(target_project, project_name="B", project_id="b", db_path=target_db)
-    SqliteTaskStore.from_config(Config.load(cwd_project))
+    SqliteTaskStore.from_config(Config.load(cwd_project), migration_policy="auto_private")
     with sqlite3.connect(target_db) as conn:
         conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
         conn.execute("INSERT INTO schema_version (version) VALUES (?)", (schema_version,))
@@ -1796,8 +2039,8 @@ def test_global_schema_integrity_handler_suppresses_embedded_bare_migrate_guidan
     target_db = tmp_path / "target.db"
     _write_project_config(cwd_project, project_name="A", project_id="a", db_path=cwd_db)
     _write_project_config(target_project, project_name="B", project_id="b", db_path=target_db)
-    SqliteTaskStore.from_config(Config.load(cwd_project))
-    SqliteTaskStore.from_config(Config.load(target_project))
+    SqliteTaskStore.from_config(Config.load(cwd_project), migration_policy="auto_private")
+    SqliteTaskStore.from_config(Config.load(target_project), migration_policy="auto_private")
     before_cwd = _db_snapshot(cwd_db)
     before_target = _db_snapshot(target_db)
     expected = f"uv run gza migrate --project {shlex.quote(str(target_project.resolve()))}"
@@ -1830,8 +2073,8 @@ def test_global_schema_integrity_handler_neutralizes_generic_only_migrate_guidan
     target_db = tmp_path / "target.db"
     _write_project_config(cwd_project, project_name="A", project_id="a", db_path=cwd_db)
     _write_project_config(target_project, project_name="B", project_id="b", db_path=target_db)
-    SqliteTaskStore.from_config(Config.load(cwd_project))
-    SqliteTaskStore.from_config(Config.load(target_project))
+    SqliteTaskStore.from_config(Config.load(cwd_project), migration_policy="auto_private")
+    SqliteTaskStore.from_config(Config.load(target_project), migration_policy="auto_private")
     before_cwd = _db_snapshot(cwd_db)
     before_target = _db_snapshot(target_db)
     expected = f"uv run gza migrate --project {shlex.quote(str(target_project.resolve()))}"

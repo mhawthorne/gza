@@ -71,6 +71,14 @@ unsafe migration. A branch merely named like the default branch, a detached chec
 matching commit, an unmerged task worktree, or a caller that has not supplied proof MUST
 NOT be treated as migration-authorized.
 
+The proof MUST bind the canonical checkout root, configured default branch, and observed
+local `HEAD`. It MUST prove all of the following before a potentially migrating shared
+store is constructed: the checkout is the primary worktree for the repository, the current
+branch equals the configured default branch, and `HEAD` equals
+`refs/heads/<default-branch>`. The same proof MUST be revalidated after the shared schema
+bootstrap lock is acquired and before any migration, bootstrap, repair, or registration
+write occurs.
+
 Explicit operator migration commands are subject to the same shared-database authority
 rule. Manual confirmation MAY still be required by an individual migration, but manual
 confirmation is not a substitute for migration authority.
