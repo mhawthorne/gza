@@ -185,7 +185,9 @@ def test_unstick_run_reports_started_cleared_only_and_capacity_blocked(tmp_path,
         patch(
             "gza.cli.unstick.select_and_clear_parked_tasks",
             return_value=SimpleNamespace(
-                selected=(object(), object(), object()), outcomes=outcomes, stale_backstop_cleared=0
+                selected=tuple(SimpleNamespace(current_candidate=object()) for _ in range(3)),
+                outcomes=outcomes,
+                stale_backstop_cleared=0,
             ),
         ),
         patch(
@@ -221,6 +223,46 @@ def test_unstick_run_reports_started_cleared_only_and_capacity_blocked(tmp_path,
     assert "Capacity Blocked:" in result.stdout
     assert f"{third.id} [backstop] Blocked owner" in result.stdout
 
+
+def test_unstick_headline_separates_parked_owners_from_total_selection(tmp_path, monkeypatch):
+    """The headline must not claim every selected owner is parked.
+
+    ``select_and_clear_parked_tasks`` keeps an explicitly named owner in ``selected``
+    even when it has no current park. Such an owner is not a no-op -- unstick can still
+    rearm and re-verify it -- so it stays in the total, but calling it parked misreports
+    what unstick found.
+    """
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    parked = store.add("Parked owner", task_type="implement")
+    unparked = store.add("Unparked owner", task_type="implement")
+    assert parked.id is not None
+    assert unparked.id is not None
+
+    monkeypatch.setattr("gza.cli.unstick.Git", _UnstickGitDouble)
+
+    outcomes = (
+        UnstickOutcome(
+            owner_task=parked, reason_class="retry-limit", status="rearmed", detail="cleared retry-limit-reached"
+        ),
+        UnstickOutcome(owner_task=unparked, reason_class=None, status="skipped", detail="not currently parked"),
+    )
+
+    with patch(
+        "gza.cli.unstick.select_and_clear_parked_tasks",
+        return_value=SimpleNamespace(
+            selected=(
+                SimpleNamespace(current_candidate=object()),
+                SimpleNamespace(current_candidate=None),
+            ),
+            outcomes=outcomes,
+            stale_backstop_cleared=0,
+        ),
+    ):
+        result = invoke_gza("unstick", str(parked.id), str(unparked.id), "--project", str(tmp_path))
+
+    assert result.returncode == 0
+    assert "Selected 2 owner(s) (1 currently parked)" in result.stdout
 
 def test_dispatch_rearmed_owners_treats_limit_as_new_start_cap(tmp_path):
     setup_config(tmp_path)
@@ -642,7 +684,7 @@ def test_unstick_run_reports_zero_slot_retry_owner_as_capacity_blocked(tmp_path,
     with (
         patch(
             "gza.cli.unstick.select_and_clear_parked_tasks",
-            return_value=SimpleNamespace(selected=(object(),), outcomes=outcomes, stale_backstop_cleared=0),
+            return_value=SimpleNamespace(selected=(SimpleNamespace(current_candidate=object()),), outcomes=outcomes, stale_backstop_cleared=0),
         ),
         patch(
             "gza.cli.unstick.get_concurrency_snapshot",
@@ -788,7 +830,7 @@ def _invoke_unstick_run_for_lifecycle_action(
         stack.enter_context(
             patch(
                 "gza.cli.unstick.select_and_clear_parked_tasks",
-                return_value=SimpleNamespace(selected=(object(),), outcomes=outcomes, stale_backstop_cleared=0),
+                return_value=SimpleNamespace(selected=(SimpleNamespace(current_candidate=object()),), outcomes=outcomes, stale_backstop_cleared=0),
             )
         )
         stack.enter_context(
@@ -1121,7 +1163,7 @@ def _invoke_unstick_run_for_inline_recovery_launch(
         stack.enter_context(
             patch(
                 "gza.cli.unstick.select_and_clear_parked_tasks",
-                return_value=SimpleNamespace(selected=(object(),), outcomes=outcomes, stale_backstop_cleared=0),
+                return_value=SimpleNamespace(selected=(SimpleNamespace(current_candidate=object()),), outcomes=outcomes, stale_backstop_cleared=0),
             )
         )
         stack.enter_context(
@@ -1440,7 +1482,7 @@ def _invoke_unstick_run_for_reconcile_recovery(
         stack.enter_context(
             patch(
                 "gza.cli.unstick.select_and_clear_parked_tasks",
-                return_value=SimpleNamespace(selected=(object(),), outcomes=outcomes, stale_backstop_cleared=0),
+                return_value=SimpleNamespace(selected=(SimpleNamespace(current_candidate=object()),), outcomes=outcomes, stale_backstop_cleared=0),
             )
         )
         stack.enter_context(
@@ -1649,7 +1691,7 @@ def _invoke_unstick_run_for_needs_rebase_recovery(tmp_path):
         stack.enter_context(
             patch(
                 "gza.cli.unstick.select_and_clear_parked_tasks",
-                return_value=SimpleNamespace(selected=(object(),), outcomes=outcomes, stale_backstop_cleared=0),
+                return_value=SimpleNamespace(selected=(SimpleNamespace(current_candidate=object()),), outcomes=outcomes, stale_backstop_cleared=0),
             )
         )
         stack.enter_context(
@@ -2092,7 +2134,7 @@ def _invoke_unstick_run_for_isolated_merge_conflict_rebase(
         stack.enter_context(
             patch(
                 "gza.cli.unstick.select_and_clear_parked_tasks",
-                return_value=SimpleNamespace(selected=(object(),), outcomes=outcomes, stale_backstop_cleared=0),
+                return_value=SimpleNamespace(selected=(SimpleNamespace(current_candidate=object()),), outcomes=outcomes, stale_backstop_cleared=0),
             )
         )
         stack.enter_context(
@@ -2317,7 +2359,7 @@ def test_unstick_run_reports_zero_slot_lifecycle_owner_as_capacity_blocked(tmp_p
     with (
         patch(
             "gza.cli.unstick.select_and_clear_parked_tasks",
-            return_value=SimpleNamespace(selected=(object(),), outcomes=outcomes, stale_backstop_cleared=0),
+            return_value=SimpleNamespace(selected=(SimpleNamespace(current_candidate=object()),), outcomes=outcomes, stale_backstop_cleared=0),
         ),
         patch(
             "gza.cli.unstick.get_concurrency_snapshot",
@@ -2461,7 +2503,7 @@ def test_unstick_cli_rearms_real_retry_limit_failed_owner_by_retry_id(tmp_path, 
 
     assert result.returncode == 0
     assert "No parked owners matched" not in result.stdout
-    assert "Selected 1 parked owner(s)" in result.stdout
+    assert "Selected 1 owner(s) (1 currently parked)" in result.stdout
     assert f"{impl.id} [retry-limit] CLI retry limit owner" in result.stdout
 
     rearm = store.get_parked_task_rearm(

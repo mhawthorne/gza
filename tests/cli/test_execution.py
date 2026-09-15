@@ -18046,7 +18046,7 @@ class TestIterateCommand:
         assert result == 0
         assert len(verify_calls) == 1
         assert decision.state == "passed"
-        assert "Selected 1 parked owner(s)" in output
+        assert "Selected 1 owner(s) (1 currently parked)" in output
         assert "Run summary: 0 started, 1 direct, 0 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked" in output
         assert "Direct:" in output
         assert f"{impl.id} [verify-fix-failed] verify_gate success" in output
@@ -18187,7 +18187,7 @@ class TestIterateCommand:
         assert result == 0
         assert len(verify_calls) == 1
         assert decision.state == "passed"
-        assert "Selected 1 parked owner(s)" in output
+        assert "Selected 1 owner(s) (1 currently parked)" in output
         assert "Run summary: 0 started, 1 direct, 0 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked" in output
         assert "Direct:" in output
         assert f"{impl.id} [verify-fix-failed] verify_gate success" in output
@@ -18239,7 +18239,7 @@ class TestIterateCommand:
         assert result == 0
         assert len(verify_calls) == 1
         assert decision.state == "failed"
-        assert "Selected 1 parked owner(s)" in output
+        assert "Selected 1 owner(s) (1 currently parked)" in output
         assert "Run summary: 0 started, 0 direct, 1 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked" in output
         assert "Direct Blocked:" in output
         assert f"{impl.id} [verify-fix-failed] verify_gate blocked" in output
@@ -18445,7 +18445,7 @@ class TestIterateCommand:
         assert head_artifacts[0].status == "failed"
         assert head_artifacts[0].metadata["source_task_id"] == head.id
         assert head_artifacts[0].head_sha == f"unstick-recovered-{selection_mode}-head"
-        assert "Selected 1 parked owner(s)" in output
+        assert "Selected 1 owner(s) (0 currently parked)" in output
         assert "Run summary: 0 started, 0 direct, 1 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked" in output
         assert f"{head.id} [verify-fix-failed] verify_gate blocked" in output
         assert "Started:" not in output
