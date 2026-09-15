@@ -939,6 +939,59 @@ def test_run_local_target_baseline_plan_uses_immutable_target_sha(tmp_path: Path
     ]
 
 
+def test_run_local_target_baseline_threads_verify_heartbeat_kwargs(tmp_path: Path) -> None:
+    _RecordingGit.reset()
+    repo_git = _RecordingGit(tmp_path / "repo")
+    live_db = tmp_path / "project" / ".gza" / "gza.db"
+    live_db.parent.mkdir(parents=True)
+    live_db.write_text("", encoding="utf-8")
+    plan = LocalTargetBaselinePlan(
+        mode="deterministic_once",
+        command="uv run pytest -q --maxfail=0 tests/test_example.py::test_parse",
+        nodeids=("tests/test_example.py::test_parse",),
+        target_branch="main",
+        target_head_sha="abc123def456",
+        target_tree_fingerprint="f" * 64,
+        run_count=1,
+        relative_cwd=".",
+    )
+    runtime_context = RuntimeExecutionContext(
+        cwd=tmp_path / "project",
+        env={"GZA_DB_PATH": str(live_db), "PATH": os.environ.get("PATH", "")},
+        project_id="project",
+        db_path=live_db,
+    )
+
+    def heartbeat(_progress: object) -> None:
+        return None
+
+    verify_result = ReviewVerifyResult(
+        command=plan.command,
+        status="failed",
+        exit_status="1",
+        captured_at=datetime.now(UTC),
+        output="",
+    )
+
+    with patch("gza.runner._run_review_verify_command", return_value=verify_result) as run_verify:
+        run = run_local_target_baseline_plan(
+            plan,
+            repo_git=repo_git,
+            worktree_root=tmp_path / "worktrees",
+            timeout_seconds=30,
+            timeout_grace_seconds=5.0,
+            runtime_context=runtime_context,
+            heartbeat_threshold_seconds=7,
+            heartbeat_interval_seconds=11,
+            on_heartbeat=heartbeat,
+        )
+
+    assert run.results == (verify_result,)
+    assert run_verify.call_args.kwargs["heartbeat_threshold_seconds"] == 7
+    assert run_verify.call_args.kwargs["heartbeat_interval_seconds"] == 11
+    assert run_verify.call_args.kwargs["on_heartbeat"] is heartbeat
+
+
 def test_run_local_target_baseline_plan_isolates_each_attempt_db(tmp_path: Path) -> None:
     _RecordingGit.reset()
     repo_git = _RecordingGit(tmp_path / "repo")

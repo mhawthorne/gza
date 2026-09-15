@@ -496,6 +496,61 @@ def test_run_flaky_reproduction_plan_persists_attempts_and_inconclusive_record(t
     assert len(inconclusive_artifacts[0].metadata["attempt_artifact_ids"]) == 2
 
 
+def test_run_flaky_reproduction_threads_verify_heartbeat_kwargs(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = store.add("Investigate flaky verify", task_type="implement")
+    assert task.id is not None
+    plan = FlakyReproductionPlan(
+        task_id=task.id,
+        dedup_key="flaky-key",
+        nodeid="tests/test_example.py::test_flaky",
+        assertion_signature="assert actual == expected",
+        command="pytest tests/test_example.py::test_flaky",
+        working_directory=tmp_path,
+        runs=1,
+        reviewed_head_sha="deadbeef",
+        tree_fingerprint="f" * 64,
+    )
+    runtime_context = RuntimeExecutionContext(
+        cwd=tmp_path,
+        env={"PATH": os.environ.get("PATH", "")},
+        project_id="project",
+        db_path=tmp_path / "test.db",
+    )
+
+    def heartbeat(_progress: object) -> None:
+        return None
+
+    verify_result = _make_review_verify_result(
+        plan.command,
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 25, tzinfo=UTC),
+        reviewed_head_sha=plan.reviewed_head_sha,
+        working_directory=str(tmp_path),
+        output="== 1 passed in 1.00s ==",
+    )
+
+    with patch("gza.runner._run_review_verify_command", return_value=verify_result) as run_verify:
+        run = run_flaky_reproduction_plan(
+            store,
+            project_dir=tmp_path,
+            task_id=task.id,
+            plan=plan,
+            timeout_seconds=120,
+            timeout_grace_seconds=5.0,
+            runtime_context=runtime_context,
+            heartbeat_threshold_seconds=7,
+            heartbeat_interval_seconds=11,
+            on_heartbeat=heartbeat,
+        )
+
+    assert run.reproduced is False
+    assert run_verify.call_args.kwargs["heartbeat_threshold_seconds"] == 7
+    assert run_verify.call_args.kwargs["heartbeat_interval_seconds"] == 11
+    assert run_verify.call_args.kwargs["on_heartbeat"] is heartbeat
+
+
 def test_run_flaky_reproduction_plan_isolates_each_attempt_db_and_persists_artifacts(
     tmp_path: Path,
 ) -> None:

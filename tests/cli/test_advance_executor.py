@@ -1136,6 +1136,7 @@ def test_clear_off_topic_verify_blocker_fails_closed_when_evidence_cannot_build_
 
 def test_recover_verify_only_noop_review_persists_clearance_without_creating_review(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -1180,6 +1181,15 @@ def test_recover_verify_only_noop_review_persists_clearance_without_creating_rev
     store.update(improve)
 
     git = _VerifyOnlyNoopGit(impl.branch or "", "same-head")
+    heartbeat_calls: list[tuple[str, str]] = []
+
+    def heartbeat(_progress: object) -> None:
+        return None
+
+    def heartbeat_for_phase(phase: str, task: DbTask):
+        heartbeat_calls.append((phase, str(task.id)))
+        return heartbeat
+
     context = AdvanceActionExecutionContext(
         store=store,
         trigger_source="advance",
@@ -1198,6 +1208,7 @@ def test_recover_verify_only_noop_review_persists_clearance_without_creating_rev
         config=config,
         git=git,
         runtime_context=RuntimeExecutionContext.from_config(config),
+        heartbeat_for_lifecycle_phase=heartbeat_for_phase,
     )
 
     with (
@@ -1215,7 +1226,7 @@ def test_recover_verify_only_noop_review_persists_clearance_without_creating_rev
                 reviewed_base_sha="base-sha",
                 working_directory=str(tmp_path),
             ),
-        ),
+        ) as run_verify,
     ):
         result = execute_advance_action(
             task=impl,
@@ -1245,6 +1256,11 @@ def test_recover_verify_only_noop_review_persists_clearance_without_creating_rev
     assert artifacts[0].metadata["review_task_id"] == review.id
     assert len(verify_gate_artifacts) == 1
     assert store.list_artifacts(improve.id, kind=VERIFY_GATE_ARTIFACT_KIND) == []
+    assert "Running verify gate (uv run pytest tests/unit -q) before verify-only no-op recovery..." in capsys.readouterr().out
+    assert heartbeat_calls == [("verify", str(impl.id))]
+    assert run_verify.call_args.kwargs["heartbeat_threshold_seconds"] == config.watch.long_phase_threshold_seconds
+    assert run_verify.call_args.kwargs["heartbeat_interval_seconds"] == config.watch.heartbeat_interval_seconds
+    assert run_verify.call_args.kwargs["on_heartbeat"] is heartbeat
 
     lookup = latest_verify_result_for_epoch(
         store,
@@ -1406,6 +1422,7 @@ def test_recover_verify_only_noop_review_uses_runtime_env_for_direct_verify(
 def test_recover_verify_only_noop_review_passes_runtime_context_to_cross_project_verify(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -1450,12 +1467,22 @@ def test_recover_verify_only_noop_review_passes_runtime_context_to_cross_project
     store.update(improve)
 
     git = _VerifyOnlyNoopGit(impl.branch or "", "same-head")
+    heartbeat_calls: list[tuple[str, str]] = []
+
+    def heartbeat(_progress: object) -> None:
+        return None
+
+    def heartbeat_for_phase(phase: str, task: DbTask):
+        heartbeat_calls.append((phase, str(task.id)))
+        return heartbeat
+
     context = _base_executor_context(
         store=store,
         config=config,
         trigger_source="advance",
         git=git,
         runtime_context=runtime_context,
+        heartbeat_for_lifecycle_phase=heartbeat_for_phase,
     )
     cross_result = _make_review_verify_result(
         "(per-project verify_command)",
@@ -1501,6 +1528,12 @@ def test_recover_verify_only_noop_review_passes_runtime_context_to_cross_project
 
     assert result.status == "success"
     assert cross_verify.call_args.kwargs["runtime_context"] is runtime_context
+    assert "Running verify gate (uv run pytest tests/unit -q) before verify-only no-op recovery..." in capsys.readouterr().out
+    assert cross_verify.call_args.kwargs["heartbeat_threshold_seconds"] == config.watch.long_phase_threshold_seconds
+    assert cross_verify.call_args.kwargs["heartbeat_interval_seconds"] == config.watch.heartbeat_interval_seconds
+    heartbeat_for_project = cross_verify.call_args.kwargs["heartbeat_for_project"]
+    assert heartbeat_for_project("pkg-a") is heartbeat
+    assert heartbeat_calls == [("pkg-a", str(impl.id))]
     assert os.environ["PWD"] == str(supervisor_cwd)
     assert os.environ["GZA_DB_PATH"] == str(tmp_path / "ambient-cross.db")
     assert os.environ["PROJECT_ONLY_TOKEN"] == "ambient-cross-token"

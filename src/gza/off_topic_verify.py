@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
     from gza.config import Config
     from gza.git import Git
-    from gza.runner import ReviewVerifyResult
+    from gza.runner import LongPhaseHeartbeat, ReviewVerifyResult
     from gza.runtime_context import RuntimeExecutionContext
 
 
@@ -652,6 +652,9 @@ def run_local_target_baseline_plan(
     runtime_context: RuntimeExecutionContext | None = None,
     config: Config | object | None = None,
     run_verify_command: Callable[..., ReviewVerifyResult] | None = None,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    on_heartbeat: LongPhaseHeartbeat | None = None,
 ) -> LocalTargetBaselineRun:
     """Execute a previously planned local-target rerun inside a detached target worktree."""
     from gza.runner import _run_review_verify_command
@@ -684,6 +687,9 @@ def run_local_target_baseline_plan(
                     reviewed_head_sha=plan.target_head_sha,
                     timeout_seconds=timeout_seconds,
                     timeout_grace_seconds=timeout_grace_seconds,
+                    heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                    on_heartbeat=on_heartbeat,
                 )
                 for _ in range(plan.run_count)
             )

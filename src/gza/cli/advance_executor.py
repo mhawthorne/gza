@@ -2167,6 +2167,10 @@ def _execute_recover_verify_only_noop_review(
             if isinstance(getattr(context.config, "verify_command", None), str)
             else ""
         )
+        heartbeat_for_phase = context.heartbeat_for_lifecycle_phase
+        if heartbeat_for_phase is not None:
+            _verify_command_label = verify_command or "verify"
+            print(f"Running verify gate ({_verify_command_label}) before verify-only no-op recovery...", flush=True)
         reviewed_base_sha: str | None = None
         reviewed_head_sha: str | None = None
         reviewed_tree_sha: str | None = None
@@ -2209,6 +2213,13 @@ def _execute_recover_verify_only_noop_review(
                     reviewed_head_sha=reviewed_head_sha,
                     reviewed_tree_sha=reviewed_tree_sha,
                     reviewed_base_sha=reviewed_base_sha,
+                    heartbeat_threshold_seconds=context.config.watch.long_phase_threshold_seconds,
+                    heartbeat_interval_seconds=context.config.watch.heartbeat_interval_seconds,
+                    heartbeat_for_project=(
+                        (lambda phase: heartbeat_for_phase(phase, task))
+                        if heartbeat_for_phase is not None
+                        else None
+                    ),
                 )
                 if cross_project_verify is None:
                     deferred_attention_message = (
@@ -2243,6 +2254,9 @@ def _execute_recover_verify_only_noop_review(
                     reviewed_base_sha=reviewed_base_sha,
                     timeout_seconds=timeout_seconds,
                     timeout_grace_seconds=timeout_grace_seconds,
+                    heartbeat_threshold_seconds=context.config.watch.long_phase_threshold_seconds,
+                    heartbeat_interval_seconds=context.config.watch.heartbeat_interval_seconds,
+                    on_heartbeat=heartbeat_for_phase("verify", task) if heartbeat_for_phase is not None else None,
                 )
         except (GitError, OSError, RuntimeError, ValueError) as exc:
             result = _make_review_verify_result(

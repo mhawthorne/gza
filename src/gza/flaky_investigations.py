@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
     from .config import Config
     from .off_topic_verify import FailingNode, PytestPassFailCounts, PytestXdistMetadata
-    from .runner import ReviewVerifyResult
+    from .runner import LongPhaseHeartbeat, ReviewVerifyResult
     from .runtime_context import RuntimeExecutionContext
 
 FLAKY_VERIFY_INVESTIGATION_ARTIFACT_KIND = "flaky_verify_investigation"
@@ -292,6 +292,9 @@ def run_flaky_reproduction_plan(
     runtime_context: RuntimeExecutionContext | None = None,
     config: Config | object | None = None,
     run_verify_command: Callable[..., ReviewVerifyResult] | None = None,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    on_heartbeat: LongPhaseHeartbeat | None = None,
 ) -> FlakyReproductionRun:
     """Execute the bounded harness and persist attempt/inconclusive artifacts."""
     from .runner import _run_review_verify_command
@@ -311,6 +314,9 @@ def run_flaky_reproduction_plan(
                 reviewed_head_sha=plan.reviewed_head_sha,
                 timeout_seconds=timeout_seconds,
                 timeout_grace_seconds=timeout_grace_seconds,
+                heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+                on_heartbeat=on_heartbeat,
             )
         else:
             result = verify_runner(
