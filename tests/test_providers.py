@@ -957,6 +957,71 @@ class TestBuildDockerCmd:
         assert group_ids == sorted({str(extra_gid), str(docker_env_gid)}, key=int)
         assert "invalid" not in group_ids
 
+    def test_docker_run_mounts_verify_snapshot_and_translates_db_path_from_env(self, tmp_path):
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+        host_snapshot_dir = tmp_path / ".gza" / "tmp" / "verify-db-abc"
+        container_db_path = "/gza-verify-db-snapshots/verify-db-abc/gza.db"
+        host_env = {
+            "GZA_DB_PATH": str(host_snapshot_dir / "gza.db"),
+            "GZA_DOCKER_VERIFY_DB_PATH": container_db_path,
+            "GZA_DOCKER_VERIFY_DB_VOLUME": f"{host_snapshot_dir}:/gza-verify-db-snapshots/verify-db-abc",
+        }
+
+        cmd = build_docker_cmd(
+            docker_config,
+            tmp_path,
+            timeout_minutes=10,
+            docker_volumes=["/host/cache:/cache:ro"],
+            docker_env=["GZA_DB_PATH=/workspace/.gza/gza.db", "TOKEN=runtime"],
+            host_env=host_env,
+        )
+
+        mounts = [cmd[index + 1] for index, value in enumerate(cmd) if value == "-v"]
+        env_values = [cmd[index + 1] for index, value in enumerate(cmd) if value == "-e"]
+        assert "/host/cache:/cache:ro" in mounts
+        assert host_env["GZA_DOCKER_VERIFY_DB_VOLUME"] in mounts
+        assert f"GZA_DB_PATH={container_db_path}" in env_values
+        assert "GZA_DB_PATH=/workspace/.gza/gza.db" not in env_values
+        assert "TOKEN=runtime" in env_values
+
+    def test_docker_run_ignores_ambient_verify_snapshot_routing_without_host_env(self, tmp_path):
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+        host_snapshot_dir = tmp_path / ".gza" / "tmp" / "verify-db-ambient"
+        container_db_path = "/gza-verify-db-snapshots/verify-db-ambient/gza.db"
+        ambient_env = {
+            "GZA_DOCKER_VERIFY_DB_PATH": container_db_path,
+            "GZA_DOCKER_VERIFY_DB_VOLUME": f"{host_snapshot_dir}:/gza-verify-db-snapshots/verify-db-ambient",
+        }
+
+        with patch.dict(os.environ, ambient_env, clear=False):
+            cmd = build_docker_cmd(
+                docker_config,
+                tmp_path,
+                timeout_minutes=10,
+                docker_volumes=["/host/cache:/cache:ro"],
+                docker_env=["GZA_DB_PATH=/workspace/.gza/gza.db", "TOKEN=runtime"],
+                host_env=None,
+            )
+
+        mounts = [cmd[index + 1] for index, value in enumerate(cmd) if value == "-v"]
+        env_values = [cmd[index + 1] for index, value in enumerate(cmd) if value == "-e"]
+        assert ambient_env["GZA_DOCKER_VERIFY_DB_VOLUME"] not in mounts
+        assert f"GZA_DB_PATH={container_db_path}" not in env_values
+        assert "GZA_DB_PATH=/workspace/.gza/gza.db" in env_values
+        assert "TOKEN=runtime" in env_values
+
     def test_git_identity_is_read_from_work_dir_with_runtime_env(self, tmp_path):
         """Host git identity for container env must use the owning work directory/env."""
         docker_config = DockerConfig(

@@ -1,5 +1,6 @@
 """Functional coverage for disposable verify DB snapshot process access."""
 
+import contextlib
 import json
 import os
 import shutil
@@ -14,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from gza.providers import DockerConfig
-from gza.providers.base import build_docker_cmd
+from gza.providers.base import build_docker_cmd, is_docker_running
 from gza.runner import disposable_verify_db_snapshot_env
 from gza.runtime_context import RuntimeExecutionContext
 
@@ -40,6 +41,23 @@ def _items(db_path: Path) -> list[str]:
 
 def _metadata(paths: tuple[Path, ...]) -> dict[Path, tuple[int, int]]:
     return {path: (path.stat().st_gid, stat.S_IMODE(path.stat().st_mode)) for path in paths}
+
+
+def _require_python_docker_image(tmp_path: Path) -> str:
+    image_name = os.environ.get("GZA_FUNCTIONAL_DOCKER_IMAGE", "python:3.12-slim")
+    if shutil.which("docker") is None:
+        pytest.skip("requires Docker CLI")
+    if not is_docker_running(host_cwd=tmp_path):
+        pytest.skip("requires running Docker daemon")
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", image_name],
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    if inspect.returncode != 0:
+        pytest.skip(f"requires locally available Python Docker image: {image_name}")
+    return image_name
 
 
 def _ancestors_until_tmp_root(path: Path) -> tuple[Path, ...]:
@@ -114,9 +132,10 @@ def test_docker_verify_snapshot_is_writable_by_different_uid_process_and_cleaned
             snapshot_path = snapshot.host_path
             snapshot_dir = snapshot_path.parent
             supplemental_groups = snapshot.docker_group_ids
-            assert {cwd_gid, gza_gid, tmp_gid}.issubset(supplemental_groups)
+            assert supplemental_groups == (tmp_gid,)
             assert host_gid not in supplemental_groups
             assert snapshot.env["GZA_DOCKER_GROUP_ADD"] == ",".join(str(gid) for gid in supplemental_groups)
+            assert snapshot.docker_volumes == (snapshot.env["GZA_DOCKER_VERIFY_DB_VOLUME"],)
             assert snapshot_path.stat().st_gid == tmp_gid
             docker_config = DockerConfig(
                 image_name="test-image",
@@ -131,11 +150,23 @@ def test_docker_verify_snapshot_is_writable_by_different_uid_process_and_cleaned
                 timeout_minutes=10,
                 host_env=snapshot.env,
             )
+            docker_mounts = [
+                docker_cmd[index + 1]
+                for index, value in enumerate(docker_cmd)
+                if value == "-v"
+            ]
+            docker_env = [
+                docker_cmd[index + 1]
+                for index, value in enumerate(docker_cmd)
+                if value == "-e"
+            ]
             docker_groups = tuple(
                 int(docker_cmd[index + 1])
                 for index, value in enumerate(docker_cmd)
                 if value == "--group-add"
             )
+            assert snapshot.env["GZA_DOCKER_VERIFY_DB_VOLUME"] in docker_mounts
+            assert f"GZA_DB_PATH={snapshot.env['GZA_DOCKER_VERIFY_DB_PATH']}" in docker_env
             assert docker_groups == supplemental_groups
             for suffix in ("-wal", "-shm", "-journal"):
                 assert not Path(f"{snapshot_path}{suffix}").exists()
@@ -198,3 +229,122 @@ def test_docker_verify_snapshot_is_writable_by_different_uid_process_and_cleaned
         assert _metadata(untouched_ancestors) == ancestor_metadata
     finally:
         shutil.rmtree(dedicated_root, ignore_errors=True)
+
+
+@pytest.mark.functional
+def test_overlapping_docker_verify_snapshots_write_isolated_wal_data_and_cleanup(
+    tmp_path: Path,
+) -> None:
+    image_name = _require_python_docker_image(tmp_path)
+    db_path = tmp_path / "repo" / ".gza" / "gza.db"
+    _write_items_db(db_path)
+    verify_cwd = tmp_path / "worktree"
+    verify_tmp = verify_cwd / ".gza" / "tmp"
+    sync_dir = verify_cwd / "sync"
+    verify_tmp.mkdir(parents=True)
+    sync_dir.mkdir()
+    for path, mode in (
+        (verify_cwd, 0o700),
+        (verify_cwd / ".gza", 0o701),
+        (verify_tmp, 0o705),
+    ):
+        path.chmod(mode)
+    preexisting_paths = (verify_cwd, verify_cwd / ".gza", verify_tmp)
+    preexisting_metadata = _metadata(preexisting_paths)
+
+    runtime_context = RuntimeExecutionContext(
+        cwd=tmp_path / "repo",
+        env={"GZA_DB_PATH": str(db_path)},
+        project_id="project",
+        db_path=db_path,
+    )
+    config = SimpleNamespace(use_docker=True, docker_workdir="/workspace")
+    docker_config = DockerConfig(
+        image_name=image_name,
+        npm_package="@test/cli",
+        cli_command="testcli",
+        config_dir=None,
+        env_vars=[],
+    )
+    script = (
+        "import json, os, pathlib, sqlite3, time\n"
+        "db_path = os.environ['GZA_DB_PATH']\n"
+        "run_id = os.environ['RUN_ID']\n"
+        "sync_dir = pathlib.Path(os.environ['SYNC_DIR'])\n"
+        "conn = sqlite3.connect(db_path)\n"
+        "journal_mode = conn.execute('PRAGMA journal_mode=WAL').fetchone()[0]\n"
+        "assert journal_mode.lower() == 'wal'\n"
+        "conn.execute('INSERT INTO items (name) VALUES (?)', (run_id,))\n"
+        "conn.commit()\n"
+        "sidecars = {suffix: pathlib.Path(db_path + suffix).exists() for suffix in ('-wal', '-shm')}\n"
+        "(sync_dir / f'{run_id}.ready').write_text('ready')\n"
+        "deadline = time.monotonic() + 20\n"
+        "while not all((sync_dir / f'{name}.ready').exists() for name in ('first', 'second')):\n"
+        "    if time.monotonic() > deadline:\n"
+        "        raise TimeoutError('peer container did not overlap')\n"
+        "    time.sleep(0.05)\n"
+        "rows = [row[0] for row in conn.execute('SELECT name FROM items ORDER BY id')]\n"
+        "print(json.dumps({'run_id': run_id, 'journal_mode': journal_mode, 'sidecars': sidecars, 'rows': rows}))\n"
+        "conn.close()\n"
+    )
+
+    processes: list[subprocess.Popen[str]] = []
+    with contextlib.ExitStack() as stack:
+        first = stack.enter_context(disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config))
+        second = stack.enter_context(disposable_verify_db_snapshot_env(runtime_context, cwd=verify_cwd, config=config))
+        first_dir = first.host_path.parent
+        second_dir = second.host_path.parent
+        try:
+            assert first.host_path.parent != second.host_path.parent
+            assert first.docker_volumes != second.docker_volumes
+            assert first.env["GZA_DOCKER_VERIFY_DB_PATH"] != second.env["GZA_DOCKER_VERIFY_DB_PATH"]
+            assert _metadata(preexisting_paths) == preexisting_metadata
+
+            for run_id, snapshot in (("first", first), ("second", second)):
+                cmd = build_docker_cmd(
+                    docker_config,
+                    verify_cwd,
+                    timeout_minutes=1,
+                    docker_env=[f"RUN_ID={run_id}", "SYNC_DIR=/workspace/sync"],
+                    host_env=snapshot.env,
+                )
+                cmd.extend(["python", "-c", script])
+                processes.append(
+                    subprocess.Popen(
+                        cmd,
+                        cwd=verify_cwd,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        stdin=subprocess.DEVNULL,
+                    )
+                )
+
+            reports = []
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=30)
+                assert process.returncode == 0, stderr
+                reports.append(json.loads(stdout))
+
+            assert {report["run_id"] for report in reports} == {"first", "second"}
+            for report in reports:
+                assert report["journal_mode"].lower() == "wal"
+                assert report["sidecars"] == {"-wal": True, "-shm": True}
+                assert report["rows"] == ["live", report["run_id"]]
+
+            assert _items(first.host_path) == ["live", "first"]
+            assert _items(second.host_path) == ["live", "second"]
+            assert _items(db_path) == ["live"]
+            assert _metadata(preexisting_paths) == preexisting_metadata
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+    assert not first.host_path.exists()
+    assert not second.host_path.exists()
+    assert not first_dir.exists()
+    assert not second_dir.exists()
+    assert _items(db_path) == ["live"]
+    assert _metadata(preexisting_paths) == preexisting_metadata

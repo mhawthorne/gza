@@ -118,12 +118,15 @@ commands can run nested gza commands, but their writes MUST be discarded when th
 attempt ends. Each verify attempt MUST receive a fresh isolated copy so a rerun cannot
 inherit mutations from a prior failed attempt.
 
-For Docker verify snapshots, any temporary traversal permission added to pre-existing
-checkout path components MUST be coordinated across overlapping snapshot attempts,
-including attempts running in separate gza processes. A path's exact original mode MUST
-be restored only after the last active snapshot lease that depends on that path exits,
-including normal exit, verify-body exceptions, abrupt holder death, and partial setup
-failures. Ownership of pre-existing path components MUST NOT be changed.
+Docker verify snapshots MUST be exposed through a fresh dedicated bind mount for that
+snapshot attempt, not by widening traversal permissions on pre-existing checkout path
+components. The dedicated host directory and copied database file MAY be made writable
+for the container's supplemental group so SQLite can create WAL/SHM sidecars, but gza
+MUST NOT change permissions or ownership on pre-existing checkout ancestors such as the
+worktree, `.gza`, or `.gza/tmp`. Each Docker verify attempt MUST receive a unique,
+non-colliding mount target and container-visible `GZA_DB_PATH`, including when attempts
+overlap concurrently. Writes made through the snapshot mount MUST remain isolated to
+that snapshot and MUST be discarded, along with SQLite sidecars, when the attempt ends.
 
 ### SSI6 — Schema-runtime skew is unavailable, not code-red
 

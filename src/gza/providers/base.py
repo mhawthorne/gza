@@ -22,6 +22,9 @@ from ..config import DEFAULT_DOCKER_STARTUP_TIMEOUT
 from ..runtime_context import normalize_subprocess_env
 from ..usage import ProviderUsage, UsageUnsupported
 
+GZA_DOCKER_VERIFY_DB_PATH_ENV = "GZA_DOCKER_VERIFY_DB_PATH"
+GZA_DOCKER_VERIFY_DB_VOLUME_ENV = "GZA_DOCKER_VERIFY_DB_VOLUME"
+
 if TYPE_CHECKING:
     from ..config import Config
     from ..main_integration_verify import MainIntegrationVerifyEnvironmentIdentity
@@ -729,6 +732,20 @@ def build_docker_cmd(
     group_add_ids: set[str] = set()
     for group_add_id in _iter_docker_group_add_values(group_add_env, docker_env):
         group_add_ids.add(group_add_id)
+    effective_docker_volumes = list(docker_volumes or [])
+    verify_routing_env = {} if host_env is None else host_env
+    verify_db_volume = verify_routing_env.get(GZA_DOCKER_VERIFY_DB_VOLUME_ENV)
+    if verify_db_volume and verify_db_volume not in effective_docker_volumes:
+        effective_docker_volumes.append(verify_db_volume)
+    effective_docker_env = list(docker_env or [])
+    verify_db_path = verify_routing_env.get(GZA_DOCKER_VERIFY_DB_PATH_ENV)
+    if verify_db_path:
+        effective_docker_env = [
+            value
+            for value in effective_docker_env
+            if not value.startswith("GZA_DB_PATH=")
+        ]
+        effective_docker_env.append(f"GZA_DB_PATH={verify_db_path}")
     cmd = [
         "timeout", f"{timeout_minutes}m",
         "docker", "run", "--rm", stdio_flag,
@@ -747,9 +764,8 @@ def build_docker_cmd(
         cmd.insert(-2, arg)
 
     # Add custom volume mounts
-    if docker_volumes:
-        for volume in docker_volumes:
-            cmd.extend(["-v", volume])
+    for volume in effective_docker_volumes:
+        cmd.extend(["-v", volume])
 
     # Pass environment variables if set
     for env_var in docker_config.env_vars:
@@ -788,8 +804,8 @@ def build_docker_cmd(
     if docker_setup_command.strip():
         setup_commands.append(docker_setup_command.strip())
     combined_setup_command = "\n".join(setup_commands)
-    if docker_env:
-        for env_value in docker_env:
+    if effective_docker_env:
+        for env_value in effective_docker_env:
             cmd.extend(["-e", env_value])
     cmd.extend(["-e", "GZA_WORKTREE_ROOT=/workspace"])
     cmd.extend(["-e", f"GZA_DOCKER_SETUP_COMMAND={combined_setup_command}"])
