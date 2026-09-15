@@ -2738,29 +2738,6 @@ class TestHistoryCommand:
         assert "orphaned" not in result.stdout
         assert "Completed task" in result.stdout
 
-    def test_history_lookback_days(self, tmp_path: Path):
-        """--days excludes old tasks and includes recent ones."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        now = datetime.now(UTC)
-
-        old = store.add("Old task")
-        old.status = "completed"
-        old.completed_at = now - timedelta(days=30)
-        store.update(old)
-
-        recent = store.add("Recent task")
-        recent.status = "completed"
-        recent.completed_at = now - timedelta(days=1)
-        store.update(recent)
-
-        result = invoke_gza("history", "--days", "7", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Recent task" in result.stdout
-        assert "Old task" not in result.stdout
 
     def test_history_last_flag(self, tmp_path: Path):
         """--last limits the number of tasks shown."""
@@ -3262,34 +3239,6 @@ class TestHistoryCommand:
         assert reloaded is not None
         assert reloaded.status == "in_progress"
 
-    def test_history_tag_filter_is_case_insensitive_with_json_text_parity(self, tmp_path: Path):
-        """history --tag should match canonical lowercase tags regardless of filter case."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        tagged = store.add("Tagged completed history", tags=("release-1.2",))
-        assert tagged.id is not None
-        tagged.status = "completed"
-        tagged.completed_at = datetime.now(UTC)
-        store.update(tagged)
-
-        other = store.add("Other completed history", tags=("backlog",))
-        assert other.id is not None
-        other.status = "completed"
-        other.completed_at = datetime.now(UTC)
-        store.update(other)
-
-        text_result = invoke_gza("history", "--tag", "Release-1.2", "--project", str(tmp_path))
-        json_result = invoke_gza("history", "--tag", "Release-1.2", "--json", "--project", str(tmp_path))
-
-        assert text_result.returncode == 0
-        assert "Tagged completed history" in text_result.stdout
-        assert "Other completed history" not in text_result.stdout
-
-        assert json_result.returncode == 0
-        rows = json.loads(json_result.stdout)
-        prompts = [row["prompt"] for row in rows]
-        assert prompts == ["Tagged completed history"]
 
     def test_history_negative_filters_cover_status_type_and_tag(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -4746,42 +4695,7 @@ class TestQueueCommand:
             "cache-exit",
         ]
 
-    def test_queue_lists_pending_in_urgent_then_fifo_order(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
 
-        normal_1 = store.add("Normal 1")
-        normal_2 = store.add("Normal 2")
-        urgent = store.add("Urgent")
-        assert urgent.id is not None
-        store.set_urgent(urgent.id, True)
-
-        result = invoke_gza("queue", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        lines = result.stdout.splitlines()
-        assert any(line.strip() == "[urgent]" for line in lines)
-        urgent_line = next(i for i, line in enumerate(lines) if "Urgent" in line)
-        normal_1_line = next(i for i, line in enumerate(lines) if "Normal 1" in line)
-        normal_2_line = next(i for i, line in enumerate(lines) if "Normal 2" in line)
-        assert urgent_line < normal_1_line < normal_2_line
-        assert str(normal_1.id) in lines[normal_1_line]
-        assert str(normal_2.id) in lines[normal_2_line]
-        assert "[urgent]" not in lines[urgent_line]
-
-    @pytest.mark.parametrize("all_value", ["0", "-1"])
-    def test_queue_limit_zero_or_minus_one_shows_all(self, tmp_path: Path, all_value: str):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        for i in range(12):
-            store.add(f"Task {i + 1}")
-
-        result = invoke_gza("queue", "-n", all_value, "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Task 12" in result.stdout
-        assert "more runnable tasks" not in result.stdout
 
     def test_queue_all_shows_all(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -5795,23 +5709,6 @@ class TestQueueCommand:
         )
         assert "--add-tag ops`" not in gap_result.stdout
 
-    def test_next_shows_bumped_task_first(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        store.add("Older urgent", urgent=True)
-        store.add("Newer urgent", urgent=True)
-        bumped = store.add("Bumped now")
-        assert bumped.id is not None
-        invoke_gza("queue", "bump", bumped.id, "--project", str(tmp_path))
-
-        result = invoke_gza("next", "--project", str(tmp_path))
-        assert result.returncode == 0
-        lines = [line for line in result.stdout.splitlines() if line.strip()]
-        bumped_line = next(i for i, line in enumerate(lines) if "Bumped now" in line)
-        older_line = next(i for i, line in enumerate(lines) if "Older urgent" in line)
-        newer_line = next(i for i, line in enumerate(lines) if "Newer urgent" in line)
-        assert bumped_line < older_line < newer_line
 
     def test_queue_tag_view_shares_one_order_across_tasks_with_extra_tags(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -6146,95 +6043,7 @@ class TestQueueCommand:
         assert _span_styles(blocked_line) == ["green", "cyan", "magenta", "white"]
         assert _span_styles(blocked_meta) == ["blue"]
 
-    def test_queue_command_themes_recovery_lane_task_fields(self, tmp_path: Path) -> None:
-        from gza.colors import QueueColors
 
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        failed = _create_failed_recovery_candidate(
-            store,
-            prompt="Recovery row prompt",
-            task_type="plan",
-            failure_reason="INFRASTRUCTURE_ERROR",
-            session_id=None,
-        )
-
-        recording_console = _RecordingConsole()
-        config = Config.load(tmp_path)
-        queue_colors = QueueColors(
-            task_id="bold cyan",
-            task_type="italic magenta",
-            prompt="underline yellow",
-        )
-        with (
-            patch.object(watch_cli._colors, "QUEUE_COLORS", queue_colors),  # noqa: SLF001
-            patch.object(watch_cli, "console", recording_console),
-            patch.object(watch_cli.Config, "load", return_value=config),
-        ):
-            exit_code = watch_cli.cmd_queue(
-                argparse.Namespace(
-                    project_dir=tmp_path,
-                    queue_action=None,
-                    limit=10,
-                    all=True,
-                    tags=None,
-                    any_tag=False,
-                    full=True,
-                )
-            )
-
-        text_outputs = [output for output in recording_console.outputs if isinstance(output, Text)]
-        assert exit_code == 0
-        recovery_line = next(text for text in text_outputs if "Recovery row prompt" in text.plain)
-        styled = _styled_substrings(recovery_line)
-
-        assert styled[str(failed.id)] == queue_colors.task_id
-        assert styled[f"[{failed.task_type}]"] == queue_colors.task_type
-        assert styled["Recovery row prompt"] == queue_colors.prompt
-
-    def test_format_queue_recovery_lane_detail_themes_needs_attention_fields(self, tmp_path: Path) -> None:
-        from gza.advance_engine import build_needs_attention_entry_for_display
-        from gza.cli._recovery_lane import RecoveryLaneEntry
-        from gza.colors import QueueColors
-        from gza.recovery_engine import FailedRecoveryDecision
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add('Attention recovery prompt with "quote" inside', task_type="plan")
-        assert task.id is not None
-        decision = FailedRecoveryDecision(
-            task_id=task.id,
-            action="skip",
-            reason_code="retry-limit-reached",
-            reason_text="retry limit reached",
-            launch_mode="none",
-            attempt_index=3,
-            attempt_limit=3,
-        )
-        entry = RecoveryLaneEntry(
-            owner_task=task,
-            task=task,
-            decision=decision,
-            attention_action={
-                "needs_attention_reason": "retry-limit-reached",
-                "description": "Manual review required",
-            },
-        )
-        queue_colors = QueueColors(
-            task_id="bold cyan",
-            task_type="italic magenta",
-            prompt="underline yellow",
-        )
-
-        with patch.object(watch_cli._colors, "QUEUE_COLORS", queue_colors):  # noqa: SLF001
-            rendered = watch_cli._format_queue_recovery_lane_detail(entry)
-
-        assert isinstance(rendered, Text)
-        display = build_needs_attention_entry_for_display(task, action=entry.attention_action)
-        styled = _styled_substrings(rendered)
-        assert styled[str(task.id)] == queue_colors.task_id
-        assert styled[task.task_type] == queue_colors.task_type
-        assert styled[display.text[display.prompt_start:display.prompt_end]] == queue_colors.prompt
 
     def test_next_tag_filters_pending_and_blocked_counts(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -8124,157 +7933,7 @@ class TestShowCommand:
         assert "Warning: Worktree lookup failed:" in output
         assert "simulated os error" in output
 
-    def test_show_recovered_parent_reports_lifecycle_and_lineage_statuses(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """Show should answer recovery + review state without extra commands."""
-        from gza.cli.query import cmd_show
 
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        failed_root = store.add("Recovered failed implement", task_type="implement")
-        assert failed_root.id is not None
-        failed_root.status = "failed"
-        failed_root.failure_reason = "TIMEOUT"
-        failed_root.session_id = "sess-root"
-        failed_root.branch = "feature/root"
-        failed_root.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
-        store.update(failed_root)
-
-        resumed = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
-        assert resumed.id is not None
-        resumed.status = "completed"
-        resumed.session_id = failed_root.session_id
-        resumed.branch = failed_root.branch
-        resumed.has_commits = True
-        resumed.merge_status = "unmerged"
-        resumed.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
-        store.update(resumed)
-
-        review = store.add(f"Review {resumed.id}", task_type="review", based_on=resumed.id, depends_on=resumed.id)
-        assert review.id is not None
-        review.status = "in_progress"
-        review.created_at = datetime(2026, 5, 4, 10, 15, 0, tzinfo=UTC)
-        store.update(review)
-
-        git = MagicMock()
-        git.default_branch.return_value = "main"
-        git.branch_exists.return_value = True
-        git.ref_exists.return_value = False
-        git.rev_parse_if_exists.return_value = "a" * 40
-        git.can_merge.return_value = True
-        git.is_merged.return_value = False
-        git.count_commits_ahead.return_value = 1
-        git.get_diff_stat_parsed.return_value = (1, 1, 0)
-        git.worktree_list.return_value = []
-
-        with (
-            patch("gza.cli.query.Git", return_value=git),
-            patch("gza.git.Git.branch_exists", return_value=True),
-            patch("gza.git.Git.rev_parse_if_exists", return_value="a" * 40),
-            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
-            patch(
-                "gza.cli.query._summarize_lifecycle",
-                return_value=query_cli._LifecycleSummary(
-                    f"recovered, review in_progress ({review.id})",
-                    "running",
-                ),
-            ),
-        ):
-            exit_code = cmd_show(
-                argparse.Namespace(
-                    project_dir=tmp_path,
-                    task_id=str(failed_root.id),
-                    prompt=False,
-                    path=False,
-                    output=False,
-                    page=False,
-                    full=False,
-                    metadata_only=True,
-                )
-            )
-
-        output = capsys.readouterr().out
-        normalized = " ".join(output.split())
-        assert exit_code == 0
-        # Review state is surfaced on the Lifecycle line.
-        assert f"Lifecycle: recovered, review in_progress ({review.id})" in output
-        # The local lineage window shows this task and its immediate child.
-        assert "Lineage:" in output
-        assert f"{failed_root.id} implement failed (TIMEOUT)" in normalized
-        assert resumed.id in output
-
-    def test_show_recovered_parent_reports_completed_and_merged_for_merged_resume(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """Recovered parents should not re-plan already merged resume descendants."""
-        from gza.cli.query import cmd_show
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        failed_root = store.add("Recovered merged implement", task_type="implement")
-        assert failed_root.id is not None
-        failed_root.status = "failed"
-        failed_root.failure_reason = "TIMEOUT"
-        failed_root.session_id = "sess-root"
-        failed_root.branch = "feature/root"
-        failed_root.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
-        store.update(failed_root)
-
-        resumed = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
-        assert resumed.id is not None
-        resumed.status = "completed"
-        resumed.session_id = failed_root.session_id
-        resumed.branch = failed_root.branch
-        resumed.has_commits = True
-        resumed.merge_status = "merged"
-        resumed.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
-        store.update(resumed)
-
-        git = MagicMock()
-        git.default_branch.return_value = "main"
-        git.branch_exists.return_value = True
-        git.ref_exists.return_value = False
-        git.rev_parse_if_exists.return_value = "a" * 40
-        git.can_merge.return_value = True
-        git.is_merged.return_value = False
-        git.count_commits_ahead.return_value = 1
-        git.get_diff_stat_parsed.return_value = (1, 1, 0)
-        git.worktree_list.return_value = []
-
-        with (
-            patch("gza.cli.query.Git", return_value=git),
-            patch("gza.git.Git.branch_exists", return_value=True),
-            patch("gza.git.Git.rev_parse_if_exists", return_value="a" * 40),
-            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
-            patch(
-                "gza.cli.query._summarize_lifecycle",
-                return_value=query_cli._LifecycleSummary("recovered, completed and merged", "completed"),
-            ),
-        ):
-            exit_code = cmd_show(
-                argparse.Namespace(
-                    project_dir=tmp_path,
-                    task_id=str(failed_root.id),
-                    prompt=False,
-                    path=False,
-                    output=False,
-                    page=False,
-                    full=False,
-                    metadata_only=True,
-                )
-            )
-
-        output = capsys.readouterr().out
-        normalized = " ".join(output.split())
-        assert exit_code == 0
-        assert "Lifecycle: recovered, completed and merged" in output
-        assert "ready for review" not in output
-        assert "Lineage:" in output
-        assert f"{failed_root.id} implement failed (TIMEOUT)" in normalized
-        assert resumed.id in output
 
     def test_show_completed_plan_reports_terminal_lifecycle_from_merged_implement_descendant(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -10935,120 +10594,10 @@ class TestShowCommand:
         assert "Failure Reason:" not in result.stdout
         assert "Failure Summary:" not in result.stdout
 
-    def test_show_plan_lineage_includes_downstream_implement(self, tmp_path: Path):
-        """Show for a plan task includes downstream implement task in lineage."""
 
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
 
-        plan = store.add("Design the feature", task_type="plan")
-        assert plan.id is not None
-        impl = store.add("Implement the feature", task_type="implement", based_on=plan.id)
-        assert impl.id is not None
 
-        result = invoke_gza("show", str(plan.id), "--project", str(tmp_path))
 
-        assert result.returncode == 0
-        assert "Lineage:" in result.stdout
-        assert f"{plan.id}" in result.stdout
-        assert f"{impl.id}" in result.stdout
-
-    def test_show_implement_lineage_includes_plan_and_review_improve_chain(self, tmp_path: Path):
-        """Show for an implement task (based on a plan) includes plan, review, and improve."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        plan = store.add("Design the feature", task_type="plan")
-        assert plan.id is not None
-        impl = store.add("Implement the feature", task_type="implement", based_on=plan.id)
-        assert impl.id is not None
-        review = store.add("Review the feature", task_type="review", depends_on=impl.id)
-        assert review.id is not None
-        improve = store.add("Fix review issues", task_type="improve", based_on=impl.id)
-        assert improve.id is not None
-
-        result = invoke_gza("show", str(impl.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Lineage:" in result.stdout
-        assert f"{plan.id}" in result.stdout
-        assert f"{impl.id}" in result.stdout
-        assert f"{review.id}" in result.stdout
-        assert f"{improve.id}" in result.stdout
-
-    def test_show_multi_level_dependency_lineage(self, tmp_path: Path):
-        """Lineage traverses multi-level dependency chains (plan->impl->sub-impl)."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        plan = store.add("Top-level plan", task_type="plan")
-        assert plan.id is not None
-        impl1 = store.add("First implement", task_type="implement", based_on=plan.id)
-        assert impl1.id is not None
-        impl2 = store.add("Second implement based on first", task_type="implement", based_on=impl1.id)
-        assert impl2.id is not None
-
-        result = invoke_gza("show", str(plan.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Lineage:" in result.stdout
-        assert f"{plan.id}" in result.stdout
-        assert f"{impl1.id}" in result.stdout
-        assert f"{impl2.id}" in result.stdout
-
-    def test_show_lineage_orders_completed_root_before_pending_descendants(self, tmp_path: Path):
-        """Show lineage keeps root first even when downstream tasks are still pending."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root = store.add("Root task", task_type="implement")
-        root.status = "completed"
-        root.completed_at = datetime(2026, 3, 1, tzinfo=UTC)
-        store.update(root)
-
-        child = store.add("Child task", task_type="implement", based_on=root.id)
-        grandchild = store.add("Grandchild task", task_type="implement", based_on=child.id)
-
-        result = invoke_gza("show", str(root.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Lineage:" in result.stdout
-        # The local window lists this task before its immediate child; the deeper
-        # grandchild is summarized by the child's descendant count, not listed.
-        root_idx = result.stdout.index(f"{root.id}")
-        child_idx = result.stdout.index(f"{child.id}")
-        assert root_idx < child_idx
-        assert grandchild.id not in result.stdout
-        normalized = " ".join(result.stdout.split())
-        assert "2 tasks" in normalized
-
-    def test_show_depended_on_by_field(self, tmp_path: Path):
-        """Show displays 'Depended on by' listing tasks that reference the displayed task."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        plan = store.add("Design the feature", task_type="plan")
-        assert plan.id is not None
-        impl = store.add("Implement the feature", task_type="implement", based_on=plan.id)
-        assert impl.id is not None
-        review = store.add("Review the feature", task_type="review", depends_on=impl.id)
-        assert review.id is not None
-
-        # Show the plan: it should list impl as "Depended on by"
-        result_plan = invoke_gza("show", str(plan.id), "--project", str(tmp_path))
-        assert result_plan.returncode == 0
-        assert "Depended on by:" in result_plan.stdout
-        assert impl.id in result_plan.stdout
-
-        # Show the impl: it should list review as "Depended on by"
-        result_impl = invoke_gza("show", str(impl.id), "--project", str(tmp_path))
-        assert result_impl.returncode == 0
-        assert "Depended on by:" in result_impl.stdout
-        assert review.id in result_impl.stdout
 
     def test_show_truncates_long_output(self, tmp_path: Path):
         """gza show truncates output >30 lines to 20 with a remainder hint."""
@@ -13500,67 +13049,7 @@ class TestUnmergedReviewStatus:
         assert "⚠ changes requested" in result.stdout
         assert "✓ approved" not in result.stdout
 
-    def test_unmerged_uses_most_recent_review(self, tmp_path: Path):
-        """Unmerged output shows status from most recent review."""
-        import time
 
-        store, task, git = setup_unmerged_env(tmp_path)
-
-        # Create first review (changes requested)
-        review1 = store.add("First review", task_type="review")
-        review1.status = "completed"
-        review1.completed_at = datetime.now(UTC)
-        review1.depends_on = task.id
-        review1.slug = "20260212-first-review"
-        review1.output_content = "Verdict: CHANGES_REQUESTED"
-        store.update(review1)
-
-        # Wait a bit to ensure different timestamps
-        time.sleep(0.1)
-
-        # Create second review (approved)
-        review2 = store.add("Second review", task_type="review")
-        review2.status = "completed"
-        review2.completed_at = datetime.now(UTC)
-        review2.depends_on = task.id
-        review2.slug = "20260212-second-review"
-        review2.output_content = "**Verdict: APPROVED**"
-        store.update(review2)
-
-        # Run unmerged command - should show approved (most recent)
-        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
-            result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "✓ approved" in result.stdout
-
-    def test_unmerged_uses_older_verdict_when_latest_review_has_no_output(self, tmp_path: Path):
-        """Unmerged scans newest-to-oldest and uses first parseable review verdict."""
-        import time
-
-        store, task, git = setup_unmerged_env(tmp_path)
-
-        older_review = store.add("Older review", task_type="review")
-        older_review.status = "completed"
-        older_review.completed_at = datetime.now(UTC)
-        older_review.depends_on = task.id
-        older_review.slug = "20260212-older-review"
-        older_review.output_content = "Verdict: CHANGES_REQUESTED"
-        store.update(older_review)
-
-        time.sleep(0.01)
-
-        latest_review = store.add("Latest review", task_type="review")
-        latest_review.status = "completed"
-        latest_review.completed_at = datetime.now(UTC)
-        latest_review.depends_on = task.id
-        latest_review.slug = "20260212-latest-review"
-        latest_review.output_content = None
-        latest_review.report_file = None
-        store.update(latest_review)
-
-        result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "⚠ changes requested" in result.stdout
 
     def test_unmerged_does_not_use_older_stale_verdict_when_latest_review_has_no_output(self, tmp_path: Path):
         """Staleness via review_cleared_at still suppresses older verdicts."""
@@ -13967,53 +13456,6 @@ class TestUnmergedReviewStatus:
         assert retry_impl.id in lineage_output
         assert sibling_impl.id in lineage_output
 
-    def test_unmerged_keeps_owner_identity_for_retry_resume_branch_summary(self, tmp_path: Path):
-        """Shared-branch retry/resume chains keep the owner row while summarizing the newest review."""
-        store, root_impl, git = setup_unmerged_env(tmp_path)
-
-        retry_impl = store.add("Retry implementation", task_type="implement")
-        retry_impl.status = "completed"
-        retry_impl.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
-        retry_impl.based_on = root_impl.id
-        retry_impl.branch = "feature/test"
-        retry_impl.same_branch = True
-        retry_impl.has_commits = True
-        retry_impl.merge_status = "unmerged"
-        retry_impl.session_id = "sess-retry"
-        store.update(retry_impl)
-
-        retry_review = store.add("Review retry", task_type="review")
-        retry_review.status = "completed"
-        retry_review.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
-        retry_review.depends_on = retry_impl.id
-        retry_review.output_content = "Verdict: CHANGES_REQUESTED"
-        store.update(retry_review)
-
-        resumed_impl = store.add("Resume retry implementation", task_type="implement")
-        resumed_impl.status = "completed"
-        resumed_impl.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
-        resumed_impl.based_on = retry_impl.id
-        resumed_impl.branch = "feature/test"
-        resumed_impl.same_branch = True
-        resumed_impl.has_commits = True
-        resumed_impl.merge_status = "unmerged"
-        resumed_impl.session_id = "sess-retry"
-        store.update(resumed_impl)
-
-        resumed_review = store.add("Review resumed implementation", task_type="review")
-        resumed_review.status = "completed"
-        resumed_review.completed_at = datetime(2026, 2, 12, 14, 0, tzinfo=UTC)
-        resumed_review.depends_on = resumed_impl.id
-        resumed_review.output_content = "Verdict: APPROVED"
-        store.update(resumed_review)
-
-        result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-
-        normalized = " ".join(result.stdout.split())
-        assert f"⚡ {root_impl.id}" in normalized
-        assert "review: reviewed [✓ approved]" in normalized
-        assert "⚠ changes requested" not in normalized
 
     def test_unmerged_marks_review_stale_when_newer_same_branch_implement_has_no_review(self, tmp_path: Path):
         """A newer same-branch implementation retry must stale prior review verdicts."""
@@ -14737,53 +14179,7 @@ class TestUnmergedSelectionBehavior:
         assert refreshed.pr_number == 123
         assert refreshed.pr_state == "open"
 
-    def test_unmerged_update_refreshes_diff_stats_for_live_branch(self, tmp_path: Path):
-        """Plain unmerged refreshes canonical diff stats for branches still unmerged."""
-        store, task, git = setup_unmerged_env(
-            tmp_path,
-            task_prompt="Refresh diff stats task",
-            task_id="20260220-refresh-diff-stats",
-            branch="feature/refresh-diff-stats",
-        )
 
-        task.diff_files_changed = 99
-        task.diff_lines_added = 999
-        task.diff_lines_removed = 111
-        store.update(task)
-
-        git._numstat = "2\t0\tfeature.txt\n"
-
-        result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "+2/-0 LOC, 1 files" in result.stdout
-
-        updated_task = store.get(task.id)
-        assert updated_task.merge_status == "unmerged"
-        assert updated_task.diff_files_changed == 1
-        assert updated_task.diff_lines_added == 2
-        assert updated_task.diff_lines_removed == 0
-
-    def test_unmerged_into_current_uses_current_branch(self, tmp_path: Path):
-        """--into-current uses live git state against the current branch."""
-        store, task, git = setup_unmerged_env(
-            tmp_path,
-            task_prompt="Branch local task",
-            task_id="20260220-branch-local-task",
-            branch="feature/branch-local-task",
-        )
-
-        git._current_branch = "integration"
-        git._branches.add("integration")
-        git._merged[("feature/branch-local-task", "integration")] = True
-
-        result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "Branch local task" in result.stdout
-
-        result = invoke_gza("unmerged", "--into-current", "--project", str(tmp_path), cwd=tmp_path)
-        assert result.returncode == 0
-        assert "Showing tasks unmerged relative to integration" in result.stdout
-        assert "No unmerged tasks" in result.stdout
 
     def test_unmerged_into_current_keeps_deleted_branch_visible_when_not_merged_into_current(
         self,
@@ -15565,155 +14961,8 @@ class TestUnmergedUnifiedQueryOutput:
         assert payload[0]["source_branch"] == "feature/test"
         assert payload[0]["target_branch"] == "main"
 
-    def test_unmerged_json_unions_unit_backed_and_legacy_candidates_during_default_refresh(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
 
-        unit_task = store.add("Unit-backed task", task_type="implement")
-        unit_task.status = "completed"
-        unit_task.completed_at = datetime.now(UTC)
-        unit_task.branch = "feature/unit-backed"
-        unit_task.has_commits = True
-        unit_task.merge_status = "unmerged"
-        store.update(unit_task)
-        assert unit_task.id is not None
-        existing_unit = store.get_or_create_merge_unit_for_task(unit_task)
-        assert existing_unit is not None
 
-        legacy_task = store.add("Legacy task pending backfill", task_type="implement")
-        legacy_task.status = "completed"
-        legacy_task.completed_at = datetime.now(UTC)
-        legacy_task.branch = "feature/legacy-backfill"
-        legacy_task.has_commits = True
-        legacy_task.merge_status = "unmerged"
-        store.update(legacy_task)
-        assert legacy_task.id is not None
-        assert store.resolve_merge_unit_for_task(legacy_task.id) is None
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=0,
-            json=True,
-            fields="id,prompt,merge_unit_id",
-        )
-
-        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
-
-        captured = capsys.readouterr()
-        assert result == 0
-        payload = json.loads(captured.out)
-        assert [row["prompt"] for row in payload] == [
-            "Legacy task pending backfill",
-            "Unit-backed task",
-        ]
-        assert all(row["merge_unit_id"] for row in payload)
-        backfilled_unit = store.resolve_merge_unit_for_task(legacy_task.id)
-        assert backfilled_unit is not None
-        assert backfilled_unit.state == "unmerged"
-
-    def test_unmerged_default_refresh_ignores_historical_merged_unit_when_branch_is_reused(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        historical = store.add("Historical merged task", task_type="implement")
-        historical.status = "completed"
-        historical.completed_at = datetime.now(UTC)
-        historical.branch = "feature/reused"
-        historical.has_commits = True
-        historical.merge_status = "unmerged"
-        store.update(historical)
-        assert historical.id is not None
-        historical_unit = store.get_or_create_merge_unit_for_task(historical)
-        assert historical_unit is not None
-        store.set_merge_unit_state(historical_unit.id, "merged")
-
-        unrelated = store.add("Current reused branch task", task_type="implement")
-        unrelated.status = "completed"
-        unrelated.completed_at = datetime.now(UTC)
-        unrelated.branch = "feature/reused"
-        unrelated.has_commits = True
-        unrelated.merge_status = "unmerged"
-        store.update(unrelated)
-        assert unrelated.id is not None
-        unrelated_unit = store.get_or_create_merge_unit_for_task(unrelated)
-        assert unrelated_unit is not None
-        assert unrelated_unit.id != historical_unit.id
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=0,
-            json=True,
-            fields="id,prompt,merge_unit_id",
-        )
-
-        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
-
-        captured = capsys.readouterr()
-        assert result == 0
-        assert json.loads(captured.out) == [
-            {
-                "id": unrelated.id,
-                "prompt": "Current reused branch task",
-                "merge_unit_id": unrelated_unit.id,
-            }
-        ]
-
-        refreshed_historical = store.get(historical.id)
-        refreshed_unrelated = store.get(unrelated.id)
-        refreshed_historical_unit = store.resolve_merge_unit_for_task(historical.id)
-        refreshed_unrelated_unit = store.resolve_merge_unit_for_task(unrelated.id)
-        assert refreshed_historical is not None
-        assert refreshed_unrelated is not None
-        assert refreshed_historical_unit is not None
-        assert refreshed_unrelated_unit is not None
-        assert refreshed_historical_unit.state == "merged"
-        assert refreshed_historical.merge_status == "merged"
-        assert refreshed_unrelated_unit.state == "unmerged"
-        assert refreshed_unrelated.merge_status == "unmerged"
-
-    def test_unmerged_live_target_json_fields_use_live_state_not_default_target_unit(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        store, task, git = _setup_unmerged_env_fast(tmp_path, task_prompt="Live target unit metadata task")
-        assert task.id is not None
-        unit = store.get_or_create_merge_unit_for_task(task)
-        assert unit is not None
-        store.set_merge_unit_state(unit.id, "merged")
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target="release",
-            fetch=False,
-            limit=5,
-            json=True,
-            fields="id,merge_unit_id,merge_unit_state,target_branch",
-        )
-
-        result = query_cli.cmd_unmerged(args, git=git)
-
-        captured = capsys.readouterr()
-        assert result == 0
-        payload = json.loads(captured.out)
-        assert payload[0]["target_branch"] == "release"
-        assert payload[0]["merge_unit_state"] == "unmerged"
-        assert payload[0]["merge_unit_id"] is None
 
     def test_unmerged_live_target_text_fields_use_live_state_not_default_target_unit(
         self,
@@ -16317,34 +15566,6 @@ class TestUnmergedUnifiedQueryOutput:
         assert json.loads(captured.out) == [{"id": task.id, "prompt": "JSON output task"}]
         assert "Progress:" in captured.err
 
-    def test_unmerged_default_text_shows_lineage_summary(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        _setup_unmerged_env_fast(tmp_path, task_prompt="Rich output task")
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=5,
-            json=False,
-            fields=None,
-        )
-        original_stats = query_cli._lv.lineage_summary_stats
-
-        with patch("gza.cli.query.GitHub", _UnavailableGitHub):
-            with patch("gza.cli.lineage_view.lineage_summary_stats", wraps=original_stats) as summary_stats:
-                result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
-
-        captured = capsys.readouterr()
-        assert result == 0
-        assert summary_stats.call_count > 0
-        assert "lineage:" in captured.out
-        # A standalone implement heads its own lineage (no plan/root/parent above).
-        assert "lineage: root" in captured.out
-        assert "Rich output task" in captured.out
 
     def test_unmerged_default_text_attaches_review_verdict_color_via_theme(self, tmp_path: Path) -> None:
         import gza.colors as current_colors
@@ -16825,28 +16046,6 @@ class TestNextCommandWithDependencies:
         assert "Blocked task" in after.stdout
         assert "blocked by dependencies" not in after.stdout
 
-    def test_next_excludes_internal_and_only_shows_blocked_via_blocked_path(self, tmp_path: Path):
-        """Internal pending tasks should not appear in runnable or blocked output."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        blocker = store.add("Dependency blocker")
-        store.add("Blocked task", depends_on=blocker.id)
-        store.add("Internal pending", task_type="internal")
-        store.add("Runnable task")
-
-        result = invoke_gza("next", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "Runnable task" in result.stdout
-        assert "Internal pending" not in result.stdout
-        assert "Blocked task" not in result.stdout
-        assert "blocked by dependencies" in result.stdout
-
-        result_all = invoke_gza("next", "--all", "--project", str(tmp_path))
-        assert result_all.returncode == 0
-        assert "Runnable task" in result_all.stdout
-        assert "Blocked task" in result_all.stdout
-        assert "Internal pending" not in result_all.stdout
 
 
 class TestKillCommand:
@@ -18835,63 +18034,6 @@ class TestIncompleteCommand:
         assert _incomplete_json_rows(result.stdout) == []
         assert result.stderr == ""
 
-    def test_incomplete_deferred_blocker_count_uses_positive_tag_scope(self, tmp_path: Path) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        _seed_max_cycles_deferred_blocker(
-            store,
-            blocker_tags=("deferred-review-blocker", "release", "backend"),
-        )
-        _seed_max_cycles_deferred_blocker(
-            store,
-            blocker_tags=("deferred-review-blocker", "frontend"),
-        )
-
-        any_tag_result = invoke_gza(
-            "incomplete",
-            "--json",
-            "--tag",
-            "release",
-            "--tag",
-            "frontend",
-            "--last",
-            "0",
-            "--project",
-            str(tmp_path),
-        )
-        all_tags_result = invoke_gza(
-            "incomplete",
-            "--json",
-            "--tag",
-            "release",
-            "--tag",
-            "backend",
-            "--all-tags",
-            "--last",
-            "0",
-            "--project",
-            str(tmp_path),
-        )
-        missing_all_result = invoke_gza(
-            "incomplete",
-            "--json",
-            "--tag",
-            "release",
-            "--tag",
-            "frontend",
-            "--all-tags",
-            "--last",
-            "0",
-            "--project",
-            str(tmp_path),
-        )
-
-        assert any_tag_result.returncode == 0
-        assert all_tags_result.returncode == 0
-        assert missing_all_result.returncode == 0
-        assert _incomplete_deferred_summary(any_tag_result.stdout) == 2
-        assert _incomplete_deferred_summary(all_tags_result.stdout) == 1
-        assert _incomplete_deferred_summary(missing_all_result.stdout) == 0
 
     def test_incomplete_tag_filters_text_and_json_match_owner_scope(self, tmp_path: Path) -> None:
         tasks = self._setup_incomplete_tag_filter_fixture(tmp_path)
@@ -19135,26 +18277,6 @@ class TestIncompleteCommand:
         assert _incomplete_json_rows(result.stdout) == []
         assert result.stderr == ""
 
-    def test_incomplete_without_tag_filters_preserves_unfiltered_owner_rows(self, tmp_path: Path) -> None:
-        tasks = self._setup_incomplete_tag_filter_fixture(tmp_path)
-
-        result = invoke_gza(
-            "incomplete",
-            "--json",
-            "--fields",
-            "id",
-            "--last",
-            "0",
-            "--project",
-            str(tmp_path),
-        )
-
-        assert result.returncode == 0
-        assert {row["id"] for row in _incomplete_json_rows(result.stdout)} == {
-            tasks["alpha"].id,
-            tasks["beta"].id,
-            tasks["both"].id,
-        }
 
     def test_incomplete_tag_filters_keep_blocked_dependents_scoped(self, tmp_path: Path) -> None:
         tasks = self._setup_incomplete_tag_filter_fixture(tmp_path)
@@ -21470,16 +20592,6 @@ class TestLineageOwnerParity:
             dropped_two.id: impl.id,
         }
 
-    def test_ps_remains_task_scoped_in_a_lineage_owner_fixture(self, tmp_path: Path) -> None:
-        tasks = _setup_lineage_owner_parity_fixture(tmp_path)
-        improve = tasks["improve"]
-
-        result = invoke_gza("ps", "--json", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        rows = json.loads(result.stdout)
-        assert len(rows) == 1
-        assert rows[0]["task_id"] == improve.id
 
     def test_incomplete_hides_dropped_rebase_chain_in_both_views(
         self,

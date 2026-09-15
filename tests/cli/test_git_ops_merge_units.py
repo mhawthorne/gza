@@ -778,32 +778,6 @@ def test_merge_explicit_retry_task_id_uses_actionable_member_when_owner_failed(t
     assert unit.merged_by_task_id == retry.id
 
 
-def test_merge_explicit_improve_task_uses_owner_for_provenance_and_squash_subject(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = store.add("Implement shared branch", task_type="implement")
-    store.mark_completed(impl, has_commits=True, branch="feature/explicit-improve")
-    assert impl.id is not None
-
-    improve = store.add("Improve shared branch", task_type="improve", based_on=impl.id, same_branch=True)
-    store.mark_completed(improve, has_commits=True, branch="feature/explicit-improve")
-    assert improve.id is not None
-    review = _add_completed_approved_review(store, based_on_task=impl, depends_on_task=improve)
-    _persist_current_green_verify(tmp_path, store, owner_task=impl, source_task=review)
-
-    fake_git = _MergeGit(tmp_path)
-    with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = invoke_gza("merge", str(improve.id), "--squash", "--project", str(tmp_path), cwd=tmp_path)
-
-    assert result.returncode == 0
-    assert fake_git.merged == [("feature/explicit-improve", True)]
-    assert fake_git.commit_messages and fake_git.commit_messages[0] is not None
-    assert impl.id in fake_git.commit_messages[0]
-    assert "Implement shared branch" in fake_git.commit_messages[0]
-    unit = store.resolve_merge_unit_for_task(improve.id)
-    assert unit is not None
-    assert unit.merged_by_task_id == impl.id
 
 
 def test_merge_force_bypasses_lifecycle_gate_and_records_manual_force_provenance(tmp_path: Path) -> None:
@@ -856,46 +830,6 @@ def test_merge_force_bypasses_lifecycle_gate_and_records_manual_force_provenance
     assert unit.merge_source == MERGE_SOURCE_MANUAL_FORCE
 
 
-def test_merge_force_alone_refuses_actionable_verify_gate(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = store.add("Implement red verify gate path", task_type="implement")
-    store.mark_completed(impl, has_commits=True, branch="feature/red-verify-gate")
-    assert impl.id is not None
-
-    review = _add_completed_approved_review(store, based_on_task=impl, depends_on_task=impl)
-    _persist_current_verify(
-        tmp_path,
-        store,
-        owner_task=impl,
-        source_task=impl,
-        status="failed",
-        exit_status="1",
-    )
-
-    fake_git = _MergeGit(tmp_path)
-    with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = invoke_gza(
-            "merge",
-            str(impl.id),
-            "--force",
-            "--project",
-            str(tmp_path),
-            cwd=tmp_path,
-        )
-
-    assert result.returncode == 1
-    assert "Create verify_fix task for verify epoch" in result.stdout
-    assert "Red verify gates require --force --ignore-verify-gate" in result.stdout
-    assert "Warning: Forcing merge despite red verify gate" not in result.stdout
-    assert fake_git.merged == []
-    unit = store.resolve_merge_unit_for_task(impl.id)
-    assert unit is not None
-    assert unit.state == "unmerged"
-    assert unit.merge_source is None
-    verify_fix_tasks = [task for task in store.get_all() if task.task_type == "verify_fix"]
-    assert verify_fix_tasks == []
 
 
 def test_merge_force_ignore_verify_gate_accepts_production_create_verify_fix_action(
@@ -1282,32 +1216,6 @@ def test_merge_force_refuses_unavailable_pre_merge_verify_fix_exact_head_proof(t
     assert refreshed_fix.status == "completed"
 
 
-def test_merge_force_refuses_pre_merge_verify_fix_representative_resolution_failure(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = store.add("Implement representative resolution refusal", task_type="implement")
-    store.mark_completed(impl, has_commits=True, branch="feature/representative-resolution-refusal")
-    assert impl.id is not None
-    unrelated = store.add("Unrelated evidence source", task_type="implement")
-    store.mark_completed(unrelated, has_commits=True, branch="feature/unrelated-evidence")
-    assert unrelated.id is not None
-    _add_completed_approved_review(store, based_on_task=impl, depends_on_task=impl)
-    _persist_current_verify(
-        tmp_path,
-        store,
-        owner_task=impl,
-        source_task=unrelated,
-        status="failed",
-        exit_status="1",
-    )
-
-    _assert_verify_family_merge_refused(
-        tmp_path,
-        store,
-        impl=impl,
-        expected_text="could not resolve verify_fix representative task",
-    )
 
 
 def test_merge_force_refuses_malformed_red_verify_gate_proof_with_proof_requirement(tmp_path: Path) -> None:

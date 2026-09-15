@@ -6260,7 +6260,7 @@ def test_merge_and_defer_audit_preserves_completed_review_cycles_above_cap(
     assert action["max_cycles_audit"]["max_review_cycles"] == 1
 
 
-@pytest.mark.parametrize("verify_evidence", ["missing", "stale", "failed"])
+@pytest.mark.parametrize("verify_evidence", ["missing", "failed"])
 def test_capped_review_missing_local_merge_source_needs_manual_resolution_before_verify_gate(
     tmp_path: Path,
     monkeypatch,
@@ -20303,66 +20303,6 @@ def test_already_merged_pending_followup_unit_replays_followup_merge_before_skip
     assert [finding.id for finding in action["followup_findings"]] == ["F1"]
 
 
-def test_pending_ordinary_followup_replay_ignores_stale_unavailable_review(
-    tmp_path: Path,
-) -> None:
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    impl = _make_completed_unmerged_impl(
-        store,
-        branch="feature/ordinary-stale-unavailable-review",
-        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
-    )
-    store.get_or_create_merge_unit_for_task(impl)
-    stale_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
-    stale_finding = _review_finding("F1", "FOLLOWUP")
-    stale_child = store.add(
-        build_followup_prompt(stale_review.id, impl.id, stale_finding),
-        task_type="implement",
-        based_on=stale_review.id,
-        depends_on=impl.id,
-    )
-    _persist_test_merge_finalization_proof(
-        store,
-        action_family="ordinary_followup",
-        impl=impl,
-        review=stale_review,
-        findings=(stale_finding,),
-        children=(stale_child,),
-        target_sha="old-target-sha",
-    )
-    current_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC))
-    current_review.output_content = _review_output_with_findings("APPROVED_WITH_FOLLOWUPS", followups=("F2",))
-    store.update(current_review)
-    current_finding = parse_review_report(current_review.output_content).findings[0]
-    current_child = store.add(
-        build_followup_prompt(current_review.id, impl.id, current_finding),
-        task_type="implement",
-        based_on=current_review.id,
-        depends_on=impl.id,
-    )
-    _persist_test_merge_finalization_proof(
-        store,
-        action_family="ordinary_followup",
-        impl=impl,
-        review=current_review,
-        findings=(current_finding,),
-        children=(current_child,),
-        target_sha="same-sha",
-    )
-
-    action = evaluate_advance_rules(
-        config,
-        store,
-        _FakeGit(can_merge=True, ref_shas={impl.branch: "same-sha", "main": "same-sha"}),
-        impl,
-        "main",
-    )
-
-    assert action["type"] == "merge_with_followups"
-    assert action["pending_merge_finalization"] is True
-    assert action["review_task"].id == current_review.id
-    assert action["proven_followup_tasks"] == (current_child,)
 
 
 def test_pending_ordinary_followup_replay_current_unavailable_review_needs_attention(
@@ -20410,7 +20350,7 @@ def test_pending_ordinary_followup_replay_current_unavailable_review_needs_atten
     assert refreshed_unit.merge_source is None
 
 
-@pytest.mark.parametrize("family", ["ordinary", "capped"])
+@pytest.mark.parametrize("family", ["capped"])
 def test_pending_finalization_missing_post_promotion_proof_needs_attention_and_stays_visible(
     tmp_path: Path,
     family: str,

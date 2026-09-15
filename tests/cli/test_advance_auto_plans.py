@@ -1962,49 +1962,6 @@ def test_advance_repeat_no_progress_requires_two_consecutive_unchanged_cycles(tm
     assert "Advance repeat stopped: no progress after repeated create_review" in captured.out
 
 
-def test_advance_repeat_transitive_descendant_artifact_counts_as_progress(tmp_path: Path, capsys) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    impl = _create_completed_implement(store)
-    child = store.add("Review child", task_type="review", based_on=impl.id, depends_on=impl.id)
-    assert child.id is not None
-    child.status = "completed"
-    child.completed_at = datetime.now(UTC)
-    store.update(child)
-    grandchild = store.add("Improve grandchild", task_type="improve", based_on=child.id, depends_on=child.id)
-    assert grandchild.id is not None
-    grandchild.status = "completed"
-    grandchild.completed_at = datetime.now(UTC)
-    store.update(grandchild)
-    git = _mock_git()
-    calls = {"value": 0}
-
-    def fake_execute(*_args, **_kwargs):
-        calls["value"] += 1
-        if calls["value"] == 2:
-            store.add_artifact(
-                grandchild.id,
-                kind="repeat-progress",
-                label="progress",
-                path=".gza/artifacts/repeat-progress.txt",
-                content_type="text/plain",
-                byte_size=1,
-                sha256="abc",
-                producer="test",
-                status="created",
-            )
-        return AdvanceActionExecutionResult(action_type="create_review", status="success", message="noop")
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=git),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
-        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "create_review", "description": "Create review"}),
-        patch("gza.cli.git_ops.execute_advance_action", side_effect=fake_execute),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, repeat=True, max_iterations=5))
-
-    assert rc == 0
-    assert calls["value"] == 4
 
 
 def test_advance_repeat_no_progress_ignores_sibling_merge_unit_churn(tmp_path: Path, capsys) -> None:

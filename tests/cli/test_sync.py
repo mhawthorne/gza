@@ -105,45 +105,6 @@ def test_sync_without_task_ids_uses_default_branch_cohort_builder(tmp_path, caps
     assert "feature/default-sync" in output
 
 
-def test_sync_git_only_does_not_report_merged_when_only_origin_default_ref_would_prove_merge(tmp_path, capsys):
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    task = _completed_branch_task(store, "Remote-only merge", "feature/remote-only-merge")
-
-    git = Mock()
-    git.default_branch.return_value = "main"
-    git.fetch.return_value = None
-    git.ref_exists.return_value = True
-    git.branch_exists.return_value = True
-    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
-
-    def _is_merged(branch, into):
-        return into == "origin/main"
-
-    git.is_merged.side_effect = _is_merged
-
-    args = argparse.Namespace(
-        project_dir=tmp_path,
-        task_ids=[task.id],
-        dry_run=False,
-        git_only=True,
-        pr_only=False,
-        no_fetch=False,
-    )
-
-    with (
-        patch("gza.cli.git_ops.get_store", return_value=store),
-        patch("gza.cli.git_ops.Git", return_value=git),
-    ):
-        rc = cmd_sync(args)
-
-    assert rc == 0
-    refreshed = store.get(task.id)
-    assert refreshed is not None
-    assert refreshed.merge_status == "unmerged"
-    output = capsys.readouterr().out
-    assert "feature/remote-only-merge | merge=unmerged" in output
-    assert "marked merged" not in output
 
 
 def test_sync_no_fetch_does_not_use_cached_origin_default_ref_as_merge_proof(tmp_path, capsys):

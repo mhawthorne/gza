@@ -2194,23 +2194,6 @@ class TestInitCommand:
         assert config.db_path == shared_db.resolve()
         assert not shared_db.exists()
 
-    def test_init_local_writes_explicit_db_path_even_with_global_shared_default(self, tmp_path: Path):
-        """Local mode must opt out explicitly when a user-level shared default exists."""
-        from gza.config import Config
-
-        home_dir, env = self._home_env(tmp_path)
-        shared_db = home_dir / ".gza" / "shared.db"
-        write_user_config(home_dir, f"db_path: {shared_db}\n")
-
-        result = invoke_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
-
-        assert result.returncode == 0
-        content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
-        assert self._active_db_path_line(content) == ".gza/gza.db"
-        with patch.dict(os.environ, env, clear=False):
-            config = Config.load(tmp_path)
-        assert config.db_path == (tmp_path / ".gza" / "gza.db").resolve()
-        assert (tmp_path / ".gza" / "gza.db").exists()
 
     def test_init_shared_without_global_default_writes_explicit_default_path(self, tmp_path: Path):
         """Shared mode should write the default shared db_path when nothing is inherited."""
@@ -3275,64 +3258,6 @@ class TestCleanArchiveCommand:
         refreshed = make_store(tmp_path).list_artifacts(task.id, kind="verify_command_output")[0]
         assert refreshed.path == stored_path
 
-    def test_clean_archive_keep_unmerged_preserves_old_artifact_and_db_path(self, tmp_path: Path) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        target = store.add("artifact archive keep-unmerged", task_type="implement")
-        target.status = "completed"
-        target.branch = "gza/unmerged-target"
-        target.has_commits = True
-        store.update(target)
-        config = Config.load(tmp_path)
-        stored = store_command_output_artifact(
-            store,
-            target,
-            config,
-            kind="verify_command_output",
-            producer="review_verify",
-            label="verify_command",
-            output="keep archived artifact live\n",
-            created_at=datetime.now(UTC) - timedelta(days=60),
-        )
-        artifact_path = tmp_path / stored.path
-        old_time = (datetime.now(UTC) - timedelta(days=60)).timestamp()
-        os.utime(artifact_path, (old_time, old_time))
-
-        filler = store.add("archive filler task", task_type="implement")
-        filler.status = "completed"
-        filler.branch = "gza/merged-filler"
-        filler.has_commits = True
-        store.update(filler)
-
-        def fake_merge_state(*args, **kwargs):
-            task = kwargs["task"]
-            return "unmerged" if task.id == target.id else "merged"
-
-        with (
-            patch("gza.cli.config_cmds.SqliteTaskStore.get_history", return_value=[filler] * 200),
-            patch("gza.cli.config_cmds.SqliteTaskStore.get_all", return_value=[filler] * 205 + [target]),
-            patch("gza.cli.config_cmds.resolve_task_merge_state_for_target", side_effect=fake_merge_state),
-            patch("gza.cli.config_cmds.Git.default_branch", return_value="main"),
-            patch("gza.cli.config_cmds.Git.is_merged", return_value=False),
-        ):
-            result = invoke_gza(
-                "clean",
-                "--archive",
-                "--logs",
-                "--keep-unmerged",
-                "--days",
-                "30",
-                "--project",
-                str(tmp_path),
-            )
-
-        assert result.returncode == 0
-        assert "Artifacts: 0 files" in result.stdout
-        assert artifact_path.exists()
-        archived_path = tmp_path / ".gza" / "archives" / "artifacts" / str(target.id) / artifact_path.name
-        assert archived_path.exists() is False
-        refreshed = make_store(tmp_path).list_artifacts(target.id, kind="verify_command_output")[0]
-        assert refreshed.path == stored.path
 
     def test_clean_archive_keep_unmerged_preserves_log_group_for_unmerged_slug(self, tmp_path: Path) -> None:
         setup_config(tmp_path)

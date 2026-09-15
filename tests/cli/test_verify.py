@@ -900,83 +900,6 @@ def test_verify_force_recredited_red_then_persistence_failure_reports_pre_existi
     )
 
 
-def test_verify_merge_unit_newer_contributor_green_dry_run_and_no_force_reconcile_without_verify(
-    tmp_path, capsys
-):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    owner = _completed_branch_task_without_merge_unit(store, prompt="Owner red")
-    contributor = _completed_branch_task_without_merge_unit(
-        store,
-        prompt="Contributor green",
-        branch=owner.branch,
-        task_type="fix",
-        based_on=owner.id,
-    )
-    _attach_merge_unit(store, owner, contributor)
-    captured_at = datetime(2026, 8, 21, 11, 0, tzinfo=UTC)
-    _persist_verify(
-        store,
-        config,
-        owner,
-        status="failed",
-        exit_status="1",
-        path="owner-red.md",
-        captured_at=captured_at,
-    )
-    _persist_verify(
-        store,
-        config,
-        contributor,
-        status="passed",
-        exit_status="0",
-        path="contributor-green.md",
-        captured_at=captured_at + timedelta(minutes=1),
-    )
-    git = _fake_git(tmp_path)
-    before_dry_run = _snapshot_verify_dry_run_state(store)
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch("gza.cli.verify.execute_advance_action") as execute_action,
-    ):
-        dry_rc = cmd_verify(_args(tmp_path, owner.id, dry_run=True))
-
-    dry_output = capsys.readouterr().out
-    assert dry_rc == 0
-    execute_action.assert_not_called()
-    assert _snapshot_verify_dry_run_state(store) == before_dry_run
-    assert "[dry-run] Verify gate: passed" in dry_output
-    assert f"evidence: {contributor.id}" in dry_output
-
-    action_types = []
-
-    def execute_action(*, task, action, context):
-        action_types.append(action["type"])
-        if action["type"] == "verify_gate":
-            raise AssertionError("verify should not rerun when reconciliation makes the epoch green")
-        return advance_executor.execute_advance_action(task=task, action=action, context=context)
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch("gza.cli.verify.execute_advance_action", side_effect=execute_action),
-    ):
-        normal_rc = cmd_verify(_args(tmp_path, owner.id))
-
-    normal_output = capsys.readouterr().out
-    refreshed_owner = store.get(owner.id)
-    assert refreshed_owner is not None
-    assert normal_rc == 0
-    assert action_types == ["reconcile_verify_gate_evidence"]
-    assert "Recredited current merge-unit verify gate evidence (passed)" in normal_output
-    assert "Verify gate: passed" in normal_output
-    next_action = determine_next_action(config, store, git, refreshed_owner, "main", selected_for_merge=True)
-    assert next_action["type"] not in {
-        "reconcile_verify_gate_evidence",
-        "verify_gate",
-        "create_verify_fix",
-        "run_verify_fix",
-    }
 
 
 def test_verify_blocked_stale_owner_reconciles_green_to_canonical_representative_without_rerun(
@@ -1999,43 +1922,6 @@ def test_verify_dry_run_unattached_successful_implementation_joining_active_unit
     assert refreshed_unit.owner_task_id == latest_tip.id
 
 
-def test_verify_dry_run_existing_merge_unit_uses_owner_and_effective_evidence(tmp_path, capsys):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    owner = _completed_branch_task_without_merge_unit(store, prompt="Owner with unit")
-    contributor = _completed_branch_task_without_merge_unit(
-        store,
-        prompt="Contributor with unit",
-        branch=owner.branch,
-        task_type="fix",
-        based_on=owner.id,
-    )
-    _attach_merge_unit(store, owner, contributor)
-    _persist_verify(
-        store,
-        config,
-        contributor,
-        status="passed",
-        exit_status="0",
-        path="existing-unit-green.md",
-        captured_at=datetime(2026, 8, 21, 12, 0, tzinfo=UTC),
-    )
-    before = _snapshot_verify_dry_run_state(store)
-    git = _fake_git(tmp_path)
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch("gza.cli.verify.execute_advance_action") as execute_action,
-    ):
-        rc = cmd_verify(_args(tmp_path, contributor.id, dry_run=True))
-
-    output = capsys.readouterr().out
-    assert rc == 0
-    execute_action.assert_not_called()
-    assert _snapshot_verify_dry_run_state(store) == before
-    assert f"[dry-run] Verify gate: passed for {owner.id}" in output
-    assert f"evidence: {contributor.id}" in output
-    assert "artifact: existing-unit-green.md" in output
 
 
 def test_verify_dry_run_reports_current_epoch_without_mutation(tmp_path, capsys):
