@@ -1,4 +1,7 @@
 .coverage
+# Written by bin/test-cull-candidates; defaults to tmp/ now, but older branches
+# and explicit --timings still put it here, where it reads as uncommitted work.
+test-timings.json
 .DS_Store
 .env
 *.pyc
