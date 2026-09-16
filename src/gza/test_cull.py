@@ -45,6 +45,9 @@ import pytest
 
 DEFAULT_PACKAGE_MARKER = "/src/gza/"
 DEFAULT_SPEC_DIR = Path("specs/behavior")
+# Under tmp/, which is gitignored: regenerated scratch output, and a stray untracked
+# file at the repo root reads as uncommitted work to the bead runner.
+DEFAULT_TIMINGS = Path("tmp/test-timings.json")
 # A term must appear this often in the specs before its absence means anything;
 # below it, one-off prose words dominate and every list turns into noise.
 SPEC_TERM_MIN_USES = 5
@@ -97,7 +100,9 @@ def pytest_runtest_call(item):  # noqa: ANN001, ANN201 - pytest hook
 def pytest_sessionfinish(session, exitstatus):  # noqa: ANN001, ANN201 - pytest hook
     target = os.environ.get(TIMINGS_ENV)
     if target and _records:
-        Path(target).write_text(json.dumps(_records), encoding="utf-8")
+        path = Path(target)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_records), encoding="utf-8")
 
 
 def run_timing(pytest_args: list[str], output: Path) -> int:
@@ -241,7 +246,7 @@ def render(report: CullReport) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--coverage-file", type=Path, default=Path(".coverage"))
-    parser.add_argument("--timings", type=Path, default=Path("test-timings.json"))
+    parser.add_argument("--timings", type=Path, default=DEFAULT_TIMINGS)
     parser.add_argument("--spec-dir", type=Path, default=DEFAULT_SPEC_DIR)
     parser.add_argument("--package-marker", default=DEFAULT_PACKAGE_MARKER)
     parser.add_argument("--run", action="store_true", help="produce the timing file first")
