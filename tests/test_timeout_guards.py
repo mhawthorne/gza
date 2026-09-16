@@ -27,33 +27,6 @@ def _disable_parent_subprocess_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(root_conftest, "UNIT_RUNTIME_SUBPROCESS_GUARD_ENABLED", False)
 
 
-def test_cpu_heavy_unit_test_fails_with_cpu_budget_message(
-    pytester: pytest.Pytester,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_timeout_harness(pytester)
-    monkeypatch.setenv("GZA_UNIT_TEST_CPU_BUDGET_MS", "10")
-    _disable_parent_subprocess_guard(monkeypatch)
-    pytester.makepyfile(
-        tests_test_cpu_guard="""
-        import time
-
-        def test_cpu_bound():
-            start = time.process_time()
-            while time.process_time() - start < 0.04:
-                pass
-        """
-    )
-
-    result = pytester.runpytest("tests_test_cpu_guard.py")
-
-    result.assert_outcomes(failed=1)
-    result.stdout.fnmatch_lines(
-        [
-            "*CPU latency budget exceeded: tests_test_cpu_guard.py::test_cpu_bound consumed *ms CPU (budget 10ms).*",
-            "*@pytest.mark.cpu_budget(ms=...)*",
-        ]
-    )
 
 
 

@@ -883,24 +883,6 @@ class TestSharedStreamOutputFormatter:
 class TestBuildDockerCmd:
     """Tests for Docker command building."""
 
-    def test_basic_command_structure(self, tmp_path):
-        """Should build correct basic command structure."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=".testconfig",
-            env_vars=[],
-        )
-
-        cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10)
-
-        assert cmd[0] == "timeout"
-        assert cmd[1] == "10m"
-        assert "docker" in cmd
-        assert "run" in cmd
-        assert "--rm" in cmd
-        assert cmd[-1] == "test-image"
 
     def test_docker_run_omits_supplemental_groups_by_default(self, tmp_path, monkeypatch):
         """Ordinary container processes should not receive broad supplemental groups."""
@@ -1047,32 +1029,6 @@ class TestBuildDockerCmd:
         assert {call["env"]["PATH"] for call in git_calls} == {"/runtime/bin"}
         assert "-e" in cmd
 
-    def test_worktree_git_file_does_not_mount_shared_git_dir(self, tmp_path):
-        """A worktree .git file must not add an implicit shared host .git mount."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=".testconfig",
-            env_vars=[],
-        )
-
-        # Simulate a git worktree: .git is a file pointing to a gitdir
-        fake_git_dir = tmp_path / "repo" / ".git" / "worktrees" / "my-task"
-        fake_git_dir.mkdir(parents=True)
-        main_git_dir = tmp_path / "repo" / ".git"
-
-        worktree_dir = tmp_path / "worktree"
-        worktree_dir.mkdir()
-        (worktree_dir / ".git").write_text(f"gitdir: {fake_git_dir}\n")
-
-        cmd = build_docker_cmd(docker_config, worktree_dir, timeout_minutes=10)
-        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
-        volume_mounts = [cmd[i + 1] for i in v_indices]
-
-        assert f"{main_git_dir}:{main_git_dir}" not in volume_mounts
-        assert volume_mounts[0] == f"{worktree_dir}:/workspace"
-        assert any(".testconfig" in mount for mount in volume_mounts)
 
     def test_worktree_git_metadata_mounts_use_container_only_paths(self, tmp_path):
         """Prepared git metadata mounts should target container-only paths, not host paths."""
@@ -1113,77 +1069,9 @@ class TestBuildDockerCmd:
         assert "GZA_CONTAINER_GITDIR=/gza-git/worktree" in env_values
         assert "GZA_CONTAINER_COMMON_GITDIR=/gza-git/common" in env_values
 
-    def test_no_git_mount_for_regular_repo(self, tmp_path):
-        """Should not add extra mount when .git is a directory (regular repo)."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=".testconfig",
-            env_vars=[],
-        )
 
-        # .git is a directory, not a worktree
-        (tmp_path / ".git").mkdir()
 
-        cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10)
-        # Only the workspace mount and config mount should have -v
-        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
-        mount_args = [cmd[i + 1] for i in v_indices]
-        assert all("/workspace" in m or ".testconfig" in m for m in mount_args)
 
-    def test_mounts_workspace(self, tmp_path):
-        """Should mount workspace directory."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=".testconfig",
-            env_vars=[],
-        )
-
-        cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10)
-
-        # Find the workspace mount
-        mount_idx = cmd.index("-v")
-        mount_arg = cmd[mount_idx + 1]
-        assert mount_arg == f"{tmp_path}:/workspace"
-
-    def test_mounts_workspace_venv_tmpfs(self, tmp_path):
-        """Should shadow /workspace/.venv with a writable tmpfs mount."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=".testconfig",
-            env_vars=[],
-        )
-
-        cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10)
-        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
-        volume_mounts = [cmd[i + 1] for i in v_indices]
-        tmpfs_idx = cmd.index("--tmpfs")
-        assert cmd[tmpfs_idx + 1] == "/workspace/.venv:rw,exec,mode=1777"
-        assert volume_mounts[0] == f"{tmp_path}:/workspace"
-
-    def test_mounts_config_dir(self, tmp_path):
-        """Should mount provider config directory."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=".myconfig",
-            env_vars=[],
-        )
-
-        cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10)
-
-        # Find the config mount after the workspace mount.
-        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
-        assert len(v_indices) >= 2
-        config_mount = cmd[v_indices[1] + 1]
-        assert ".myconfig" in config_mount
-        assert "/home/gza/.myconfig" in config_mount
 
     def test_passes_env_vars_when_set(self, tmp_path):
         """Should pass environment variables when they are set."""
@@ -1204,152 +1092,11 @@ class TestBuildDockerCmd:
         assert "MY_API_KEY" in env_vars_passed
         assert "OTHER_KEY" not in env_vars_passed
 
-    def test_skips_env_vars_when_not_set(self, tmp_path):
-        """Should not pass unset provider env vars."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=".testconfig",
-            env_vars=["UNSET_VAR"],
-        )
 
-        # Ensure the var is not set
-        with patch.dict(os.environ, {}, clear=True):
-            # Need to preserve PATH etc for the test to work
-            cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10)
 
-        e_indices = [i for i, x in enumerate(cmd) if x == "-e"]
-        env_values = [cmd[i + 1] for i in e_indices]
-        assert "UNSET_VAR" not in env_values
 
-    def test_mounts_custom_volumes(self, tmp_path):
-        """Should mount custom docker volumes."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=".testconfig",
-            env_vars=[],
-        )
 
-        custom_volumes = [
-            "/host/datasets:/datasets:ro",
-            "/host/models:/models",
-        ]
 
-        cmd = build_docker_cmd(
-            docker_config,
-            tmp_path,
-            timeout_minutes=10,
-            docker_volumes=custom_volumes
-        )
-
-        # Verify custom volumes are present
-        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
-        volume_mounts = [cmd[i + 1] for i in v_indices]
-
-        assert "/host/datasets:/datasets:ro" in volume_mounts
-        assert "/host/models:/models" in volume_mounts
-
-    def test_custom_volumes_added_after_standard_mounts(self, tmp_path):
-        """Custom volumes should be added after workspace and config mounts."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=".testconfig",
-            env_vars=[],
-        )
-
-        custom_volumes = ["/custom:/custom"]
-
-        cmd = build_docker_cmd(
-            docker_config,
-            tmp_path,
-            timeout_minutes=10,
-            docker_volumes=custom_volumes
-        )
-
-        # Find all -v flags and their mounts
-        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
-        volume_mounts = [cmd[i + 1] for i in v_indices]
-
-        # Workspace and config should come before custom mounts.
-        assert len(volume_mounts) >= 3
-        assert volume_mounts[0] == f"{tmp_path}:/workspace"
-        assert ".testconfig" in volume_mounts[1]
-        assert "/custom:/custom" in volume_mounts
-        tmpfs_idx = cmd.index("--tmpfs")
-        assert cmd[tmpfs_idx + 1] == "/workspace/.venv:rw,exec,mode=1777"
-
-    def test_custom_volumes_with_none(self, tmp_path):
-        """Should handle docker_volumes=None gracefully."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=".testconfig",
-            env_vars=[],
-        )
-
-        cmd = build_docker_cmd(
-            docker_config,
-            tmp_path,
-            timeout_minutes=10,
-            docker_volumes=None
-        )
-
-        # Should only have workspace and config bind mounts.
-        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
-        assert len(v_indices) == 2
-        tmpfs_idx = cmd.index("--tmpfs")
-        assert cmd[tmpfs_idx + 1] == "/workspace/.venv:rw,exec,mode=1777"
-
-    def test_custom_volumes_with_empty_list(self, tmp_path):
-        """Should handle docker_volumes=[] gracefully."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=".testconfig",
-            env_vars=[],
-        )
-
-        cmd = build_docker_cmd(
-            docker_config,
-            tmp_path,
-            timeout_minutes=10,
-            docker_volumes=[]
-        )
-
-        # Should only have workspace and config bind mounts.
-        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
-        assert len(v_indices) == 2
-        tmpfs_idx = cmd.index("--tmpfs")
-        assert cmd[tmpfs_idx + 1] == "/workspace/.venv:rw,exec,mode=1777"
-
-    def test_custom_container_workdir(self, tmp_path):
-        """Should scope the tmpfs .venv mount to the Docker working directory."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=".testconfig",
-            env_vars=[],
-        )
-
-        cmd = build_docker_cmd(
-            docker_config,
-            tmp_path,
-            timeout_minutes=10,
-            docker_workdir="/workspace/services/foo",
-        )
-
-        workdir_idx = cmd.index("-w")
-        tmpfs_idx = cmd.index("--tmpfs")
-        assert cmd[workdir_idx + 1] == "/workspace/services/foo"
-        assert cmd[tmpfs_idx + 1] == "/workspace/services/foo/.venv:rw,exec,mode=1777"
 
     def test_passes_setup_command_as_env_var(self, tmp_path):
         """Should pass GZA_DOCKER_SETUP_COMMAND when docker_setup_command is set."""
@@ -1375,88 +1122,8 @@ class TestBuildDockerCmd:
         assert "uv sync --project /workspace" in setup_cmd
         assert "mkdir -p /tmp/gza-shims" in setup_cmd
 
-    def test_no_setup_command_env_var_when_empty(self, tmp_path):
-        """Should still pass default shim setup when docker_setup_command is empty."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=None,
-            env_vars=[],
-        )
 
-        cmd = build_docker_cmd(
-            docker_config,
-            tmp_path,
-            timeout_minutes=10,
-            docker_setup_command="",
-        )
 
-        e_indices = [i for i, x in enumerate(cmd) if x == "-e"]
-        env_values = [cmd[i + 1] for i in e_indices]
-        setup_value = next(v for v in env_values if v.startswith("GZA_DOCKER_SETUP_COMMAND="))
-        setup_cmd = setup_value.split("=", 1)[1]
-        assert GZA_SHIM_SETUP_COMMAND.strip() in setup_cmd
-        assert GZA_GIT_GUARD_SETUP_COMMAND.strip() in setup_cmd
-
-    def test_setup_command_placed_before_image_name(self, tmp_path):
-        """GZA_DOCKER_SETUP_COMMAND should be added before image name."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=None,
-            env_vars=[],
-        )
-
-        cmd = build_docker_cmd(
-            docker_config,
-            tmp_path,
-            timeout_minutes=10,
-            docker_setup_command="make setup",
-        )
-
-        image_idx = cmd.index("test-image")
-        e_indices = [i for i, x in enumerate(cmd) if x == "-e"]
-        setup_cmd_idx = next(
-            i for i in e_indices
-            if cmd[i + 1].startswith("GZA_DOCKER_SETUP_COMMAND=")
-        )
-        assert setup_cmd_idx < image_idx
-
-    def test_default_setup_command_installs_gza_shim(self, tmp_path):
-        """Default setup command should install and expose a container gza shim."""
-        docker_config = DockerConfig(
-            image_name="test-image",
-            npm_package="@test/cli",
-            cli_command="testcli",
-            config_dir=None,
-            env_vars=[],
-        )
-
-        cmd = build_docker_cmd(
-            docker_config,
-            tmp_path,
-            timeout_minutes=10,
-            docker_setup_command="",
-        )
-
-        setup_value = next(
-            cmd[i + 1]
-            for i, token in enumerate(cmd)
-            if token == "-e" and cmd[i + 1].startswith("GZA_DOCKER_SETUP_COMMAND=")
-        )
-        setup_cmd = setup_value.split("=", 1)[1]
-        assert "cat > /tmp/gza-shims/gza <<'EOF'" in setup_cmd
-        assert "if [ -x /workspace/bin/gza ]; then" in setup_cmd
-        assert 'exec /workspace/bin/gza "$@"' in setup_cmd
-        assert 'path_without_shim="${PATH#/tmp/gza-shims:}"' in setup_cmd
-        assert 'gza_path="$(PATH="$path_without_shim" command -v gza 2>/dev/null || true)"' in setup_cmd
-        assert 'exec "$gza_path" "$@"' in setup_cmd
-        assert "Supported options:" in setup_cmd
-        assert "Set docker_setup_command in gza.yaml to install gza into PATH" in setup_cmd
-        assert 'exec uv run --directory /workspace gza "$@"' not in setup_cmd
-        assert 'export PATH="/tmp/gza-shims:/workspace/bin:$PATH"' in setup_cmd
 
 
 

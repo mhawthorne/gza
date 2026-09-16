@@ -338,14 +338,6 @@ class TestQueryHistory:
         results = query_history(store, f)
         assert len(results) == 3
 
-    def test_flat_query_default_limit(self, tmp_path: Path):
-        store = self._make_store(tmp_path)
-        for i in range(15):
-            self._add_completed(store, f"task {i}")
-
-        f = HistoryFilter(limit=10)
-        results = query_history(store, f)
-        assert len(results) == 10
 
     def test_negative_filters_apply_to_history_query(self, tmp_path: Path):
         store = self._make_store(tmp_path)

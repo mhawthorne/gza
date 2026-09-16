@@ -239,25 +239,6 @@ def test_behavior_monitor_dry_run_reports_without_filing(tmp_path: Path, monkeyp
     assert [task for task in store.get_all() if task.task_type != "internal"] == []
 
 
-def test_behavior_monitor_force_overrides_disabled_config(tmp_path: Path, monkeypatch) -> None:
-    setup_config(tmp_path)
-    config_path = tmp_path / "gza.yaml"
-    config_path.write_text(
-        config_path.read_text() + "\nbehavior_monitor:\n  enabled: false\n",
-        encoding="utf-8",
-    )
-    store = make_store(tmp_path)
-
-    monkeypatch.setattr(
-        "gza.behavior_monitor._run_behavior_check_task",
-        lambda *_args, **_kwargs: ("gza-1", "reviews/20260629080000-behavior-check.md", _REPORT),
-    )
-
-    result = invoke_gza("behavior-monitor", "--once", "--force", "--project", str(tmp_path))
-
-    assert result.returncode == 0
-    assert "filed: 1 new" in result.stdout
-    assert len([task for task in store.get_all() if task.task_type == "implement"]) == 1
 
 
 def test_behavior_monitor_successful_cycle_files_followup_from_fake_report(

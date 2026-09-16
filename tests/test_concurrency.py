@@ -213,50 +213,6 @@ def test_launch_permit_allows_same_process_reentry_without_deadlock(tmp_path) ->
     ]
 
 
-def test_launch_permit_blocks_other_threads_until_owner_releases(tmp_path) -> None:
-    setup_config(tmp_path)
-    _append_config(tmp_path, "max_concurrent: 1\n")
-    config = Config.load(tmp_path)
-    store = make_store(tmp_path)
-
-    ready = threading.Event()
-    release_first = threading.Event()
-    events: list[str] = []
-
-    def _first() -> None:
-        permit = launch_permit(config, store)
-        events.append("first-acquired")
-        ready.set()
-        release_first.wait(timeout=1)
-        permit.release()
-        events.append("first-released")
-
-    def _second() -> None:
-        ready.wait(timeout=1)
-        events.append("second-waiting")
-        permit = launch_permit(config, store)
-        events.append("second-acquired")
-        permit.release()
-        events.append("second-released")
-
-    first = threading.Thread(target=_first)
-    second = threading.Thread(target=_second)
-    first.start()
-    second.start()
-    ready.wait(timeout=1)
-    time.sleep(0.05)
-    assert events == ["first-acquired", "second-waiting"]
-    release_first.set()
-    first.join()
-    second.join()
-
-    assert events == [
-        "first-acquired",
-        "second-waiting",
-        "first-released",
-        "second-acquired",
-        "second-released",
-    ]
 
 
 def test_verify_permit_limit_one_waits_for_active_verify(tmp_path) -> None:

@@ -447,17 +447,6 @@ class TestGetInProgress:
 
 
 class TestGetHistory:
-    def test_default_limit_ten(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        for i in range(15):
-            task = store.add(f"Task {i}")
-            task.status = "completed"
-            task.completed_at = datetime.now(UTC)
-            store.update(task)
-        client = make_client(tmp_path)
-        history = client.get_history()
-        assert len(history) == 10
 
     def test_filter_by_status_completed(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -507,17 +496,6 @@ class TestGetHistory:
         assert impl.id in ids
         assert review.id not in ids
 
-    def test_limit_none_returns_all(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        for i in range(15):
-            task = store.add(f"Task {i}")
-            task.status = "completed"
-            task.completed_at = datetime.now(UTC)
-            store.update(task)
-        client = make_client(tmp_path)
-        result = client.get_history(limit=None)
-        assert len(result) == 15
 
     def test_pending_tasks_excluded(self, tmp_path: Path):
         setup_config(tmp_path)

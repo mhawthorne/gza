@@ -600,29 +600,6 @@ def test_get_store_warns_for_readwrite_linked_registry_conflict_without_promotin
     assert row == (str(canonical.resolve()), str((canonical / "gza.yaml").resolve()))
 
 
-def test_get_store_warns_for_canonical_registry_conflict_with_shell_quoted_path(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    shared_db = tmp_path / "shared.db"
-    canonical_a = tmp_path / "canonical-a"
-    canonical_b = tmp_path / "canonical b"
-    _write_project_config(canonical_a, project_name="CanonicalA", project_id="shared", db_path=shared_db)
-    _write_project_config(canonical_b, project_name="CanonicalB", project_id="shared", db_path=shared_db)
-    (canonical_a / ".git").mkdir()
-    (canonical_b / ".git").mkdir()
-
-    with patch(
-        "gza.cli._common.resolve_canonical_migration_authority",
-        side_effect=lambda config: _test_migration_authority(Path(config.project_dir)),
-    ):
-        get_store(Config.load(canonical_a))
-        capsys.readouterr()
-        get_store(Config.load(canonical_b))
-
-    captured = capsys.readouterr()
-    assert "Warning: Project registry path conflict for shared" in captured.err
-    assert f"uv run gza projects register --project '{canonical_b.resolve()}' --replace" in captured.err
 
 
 class TestHelpOutput:

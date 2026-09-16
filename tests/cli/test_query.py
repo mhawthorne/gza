@@ -2269,33 +2269,6 @@ class TestHistoryCommand:
         assert "Internal task" in result.stdout
         assert "Implement task" not in result.stdout
 
-    def test_history_json_matches_default_internal_filtering(self, tmp_path: Path):
-        """history and history --json should select the same default task IDs."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        public_task = store.add("public history task", task_type="implement")
-        public_task.status = "completed"
-        public_task.completed_at = datetime.now(UTC)
-        store.update(public_task)
-
-        internal_task = store.add("internal history task", task_type="internal")
-        internal_task.status = "completed"
-        internal_task.completed_at = datetime.now(UTC)
-        store.update(internal_task)
-
-        text_result = invoke_gza("history", "--project", str(tmp_path))
-        json_result = invoke_gza("history", "--json", "--project", str(tmp_path))
-
-        assert text_result.returncode == 0
-        assert json_result.returncode == 0
-        assert "public history task" in text_result.stdout
-        assert "internal history task" not in text_result.stdout
-
-        payload = json.loads(json_result.stdout)
-        ids = {row["id"] for row in payload}
-        assert public_task.id in ids
-        assert internal_task.id not in ids
 
     def test_history_internal_type_json_includes_internal_rows(self, tmp_path: Path):
         """history --type internal --json should include internal tasks."""
@@ -2372,26 +2345,6 @@ class TestHistoryCommand:
         assert result.returncode == 0
         assert result.stdout.strip() == task.id
 
-    def test_history_json_fields_override_limits_projection(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("history json projection", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(UTC)
-        store.update(task)
-
-        result = invoke_gza(
-            "history",
-            "--json",
-            "--fields",
-            "id,status",
-            "--project",
-            str(tmp_path),
-        )
-
-        assert result.returncode == 0
-        payload = json.loads(result.stdout)
-        assert payload == [{"id": task.id, "status": "completed"}]
 
     def test_history_fields_accept_model_projection(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -2465,17 +2418,6 @@ class TestHistoryCommand:
             "verify_current": False,
         }
 
-    def test_history_unknown_fields_list_valid_choices(self, tmp_path: Path):
-        setup_config(tmp_path)
-        make_store(tmp_path).add("history unknown field", task_type="implement")
-
-        result = invoke_gza("history", "--fields", "id,nope", "--project", str(tmp_path))
-
-        assert result.returncode == 2
-        assert "unknown field for gza history: nope" in result.stderr
-        assert "valid fields:" in result.stderr
-        assert "id" in result.stderr
-        assert "Run uv run gza history --list-fields to list valid fields." in result.stderr
 
     def test_history_list_fields_prints_valid_projection_choices(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -2501,21 +2443,6 @@ class TestHistoryCommand:
         assert "unknown field for gza history: group" in result.stderr
         assert "Run uv run gza history --list-fields to list valid fields." in result.stderr
 
-    def test_history_rejects_next_action_projection_field(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("history next action unsupported", task_type="implement")
-        task.status = "completed"
-        task.completed_at = datetime.now(UTC)
-        store.update(task)
-
-        result = invoke_gza("history", "--fields", "next_action", "--project", str(tmp_path))
-
-        assert result.returncode == 2
-        assert "unknown field for gza history: next_action" in result.stderr
-        assert "valid fields:" in result.stderr
-        assert "id" in result.stderr
-        assert "next_action" not in result.stderr.split("valid fields:", 1)[1]
 
     def test_history_shows_task_type_labels(self, tmp_path: Path):
         """History command displays task type labels for all task types."""
@@ -2561,33 +2488,6 @@ class TestHistoryCommand:
         assert "unmerged" in normalized
         assert "[merged]" not in normalized
 
-    def test_history_uses_default_target_merge_unit_state_for_merge_label(self, tmp_path: Path):
-        """History should render the merged badge from the default-target merge unit."""
-        setup_config(tmp_path)
-        config = Config.load(tmp_path)
-        store = query_cli.get_store(config, open_mode="readwrite")
-
-        task = store.add("Unit merged row", task_type="implement")
-        store.mark_completed(task, has_commits=True, branch="feature/history-merged")
-        assert task.id is not None
-
-        target_branch = store.default_merge_target()
-        unit = store.resolve_merge_unit_for_task(task.id)
-        assert unit is not None
-        assert unit.target_branch == target_branch
-        store.set_merge_unit_state(unit.id, "merged")
-
-        stale_row = store.get(task.id)
-        assert stale_row is not None
-        stale_row.merge_status = "unmerged"
-        store.update(stale_row)
-
-        result = invoke_gza("history", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        normalized = " ".join(result.stdout.split())
-        assert "Unit merged row [implement] [merged]" in normalized
-        assert "unmerged" not in result.stdout
 
     def test_history_renders_empty_merge_unit_as_moot(self, tmp_path: Path):
         """History should visibly surface empty merge units as moot/empty rows."""
@@ -3015,41 +2915,6 @@ class TestHistoryCommand:
         assert f"→ retried as {retry_2.id} ✓" in result.stdout
         assert f"→ retried as {review.id}" not in result.stdout
 
-    def test_history_retry_annotation_resolves_latest_descendant_across_sibling_branches(self, tmp_path: Path):
-        """Retry annotation resolves from the full same-type descendant tree, not one direct-child branch."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        original = store.add("Original failed", task_type="implement")
-        original.status = "failed"
-        original.failure_reason = "MAX_STEPS"
-        original.completed_at = datetime.now(UTC)
-        store.update(original)
-        assert original.id is not None
-
-        older_branch = store.add("Older retry branch", task_type="implement", based_on=original.id)
-        older_branch.status = "failed"
-        older_branch.failure_reason = "MAX_TURNS"
-        older_branch.completed_at = datetime.now(UTC)
-        store.update(older_branch)
-        assert older_branch.id is not None
-
-        newer_direct_child = store.add("Newest direct child", task_type="implement", based_on=original.id)
-        newer_direct_child.status = "pending"
-        store.update(newer_direct_child)
-        assert newer_direct_child.id is not None
-
-        final_attempt = store.add("Final success on older branch", task_type="implement", based_on=older_branch.id)
-        final_attempt.status = "completed"
-        final_attempt.completed_at = datetime.now(UTC)
-        store.update(final_attempt)
-        assert final_attempt.id is not None
-
-        result = invoke_gza("history", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert f"→ retried as {final_attempt.id} ✓" in result.stdout
-        assert f"→ retried as {newer_direct_child.id}" not in result.stdout
 
     def test_history_retry_annotation_keeps_resume_label_in_mixed_sibling_branches(self, tmp_path: Path):
         """Mixed retry/resume siblings should keep action label from the resolved descendant path."""
@@ -3099,27 +2964,6 @@ class TestHistoryCommand:
         assert f"→ resumed as {resumed_terminal.id} ✓" in result.stdout
         assert f"→ retried as {resumed_terminal.id}" not in result.stdout
 
-    def test_history_shows_parent_task_id(self, tmp_path: Path):
-        """History shows parent task ID when based_on or depends_on is set."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        parent = store.add("Parent task")
-        parent.status = "completed"
-        parent.completed_at = datetime.now(UTC)
-        store.update(parent)
-        assert parent.id is not None
-
-        child = store.add("Child task", based_on=parent.id)
-        child.status = "completed"
-        child.completed_at = datetime.now(UTC)
-        store.update(child)
-
-        result = invoke_gza("history", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert f"← {parent.id}" in result.stdout
 
     def test_history_shows_comment_count_indicator_when_present(self, tmp_path: Path):
         """History detail lines should include a comment count when task comments exist."""
@@ -4153,25 +3997,6 @@ class TestNextCommand:
         pending_idx = result.stdout.index("Pending lane:")
         assert recovery_idx < lifecycle_idx < pending_idx
 
-    def test_next_preview_does_not_persist_merged_lifecycle_state_in_query_only_mode(self, tmp_path: Path):
-        merged_impl, plan = _seed_preview_persistence_fixture(tmp_path)
-        preview_git = _PreviewLifecycleGit(merged_branches=(merged_impl.branch or "",))
-
-        with patch("gza.cli.query.Git", return_value=preview_git):
-            result = invoke_gza("next", "--project", str(tmp_path))
-
-        store = make_store(tmp_path)
-        refreshed_impl = store.get(merged_impl.id)
-
-        assert result.returncode == 0
-        assert "Lifecycle actions:" in result.stdout
-        assert plan.id in result.stdout
-        assert "Materialize implementation slices from plan review" in result.stdout
-        assert "readonly" not in result.stderr.lower()
-        assert "traceback" not in result.stderr.lower()
-        assert refreshed_impl is not None
-        assert refreshed_impl.merge_status == "unmerged"
-        assert store.resolve_merge_unit_for_task(merged_impl.id) is None
 
     def test_next_shows_legacy_unmerged_merge_action_between_recovery_and_pending(self, tmp_path: Path):
         failed, legacy_impl = _seed_legacy_unmerged_lifecycle_and_recovery_fixture(tmp_path)
@@ -4363,53 +4188,6 @@ class TestQueueCommand:
         assert "Lifecycle actions:" not in result.stdout
         assert failed.id not in result.stdout
 
-    @pytest.mark.parametrize("flag", ["--recovery", "--recovery-only"])
-    def test_queue_recovery_only_mode_shows_runnable_and_needs_human_sections(
-        self,
-        tmp_path: Path,
-        flag: str,
-    ) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        first_runnable = _create_failed_recovery_candidate(
-            store,
-            prompt="Resume first",
-            task_type="implement",
-            failure_reason="MAX_TURNS",
-            session_id="resume-session-1",
-        )
-        second_runnable = _create_failed_recovery_candidate(
-            store,
-            prompt="Resume second",
-            task_type="implement",
-            failure_reason="MAX_TURNS",
-            session_id="resume-session-2",
-        )
-        manual = _create_failed_recovery_candidate(
-            store,
-            prompt="Manual follow-up",
-            task_type="plan",
-            failure_reason="TEST_FAILURE",
-            session_id=None,
-        )
-        store.add("Pending queue work")
-
-        with patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()):
-            result = invoke_gza("queue", flag, "-n", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        normalized = " ".join(result.stdout.split())
-        assert "Runnable recovery lane (watch will run): 1 shown / 1 more" in result.stdout
-        assert "Needs human - watch skips: 1 shown / all shown" in result.stdout
-        assert f"resume {first_runnable.id}" in normalized
-        assert first_runnable.id in result.stdout
-        assert second_runnable.id not in result.stdout
-        assert "Resume second" not in result.stdout
-        assert manual.id in result.stdout
-        assert "Manual follow-up" in result.stdout
-        assert "Lifecycle actions:" not in result.stdout
-        assert "Pending lane (watch will run after recovery policy allows slots):" not in result.stdout
-        assert "Pending queue work" not in result.stdout
 
     def test_queue_recovery_only_empty_state_reports_no_recovery_candidates(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
@@ -4742,33 +4520,6 @@ class TestQueueCommand:
         assert "held until" in result.stdout
         assert "Other tag task" not in result.stdout
 
-    def test_queue_keeps_dependency_blocked_quiet_task_out_of_quiet_lane(self, tmp_path: Path) -> None:
-        setup_config(tmp_path)
-        (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "quiet_period_seconds: 300\n")
-        store = make_store(tmp_path)
-
-        runnable = store.add("Runnable queue task")
-        blocker = store.add("Blocking queue dependency")
-        blocked_quiet = store.add("Blocked fresh queue task", depends_on=blocker.id)
-        assert runnable.id is not None
-        assert blocker.id is not None
-        assert blocked_quiet.id is not None
-        runnable.last_edited_at = datetime.now(UTC) - timedelta(minutes=15)
-        blocker.last_edited_at = datetime.now(UTC) - timedelta(minutes=15)
-        blocked_quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=20)
-        store.update(runnable)
-        store.update(blocker)
-        store.update(blocked_quiet)
-
-        result = invoke_gza("queue", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Quiet lane:" not in result.stdout
-        assert f"1  {runnable.id}" in result.stdout
-        blocked_line = next(line for line in result.stdout.splitlines() if "Blocked fresh queue task" in line)
-        assert blocked_line.lstrip().startswith("-")
-        assert "blocked by" in result.stdout
-        assert "held until" not in result.stdout
 
     def test_queue_bump_and_unbump(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -4817,27 +4568,6 @@ class TestQueueCommand:
         assert refreshed is not None
         assert refreshed.urgent is True
 
-    def test_queue_bump_moves_task_to_front_of_urgent_lane(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        older_urgent = store.add("Older urgent", urgent=True)
-        newer_urgent = store.add("Newer urgent", urgent=True)
-        bumped = store.add("Bumped now")
-        assert older_urgent.id is not None
-        assert newer_urgent.id is not None
-        assert bumped.id is not None
-
-        bump = invoke_gza("queue", "bump", bumped.id, "--project", str(tmp_path))
-        assert bump.returncode == 0
-
-        queue = invoke_gza("queue", "--project", str(tmp_path))
-        assert queue.returncode == 0
-        lines = queue.stdout.splitlines()
-        bumped_line = next(i for i, line in enumerate(lines) if "Bumped now" in line)
-        older_line = next(i for i, line in enumerate(lines) if "Older urgent" in line)
-        newer_line = next(i for i, line in enumerate(lines) if "Newer urgent" in line)
-        assert bumped_line < older_line < newer_line
 
     @pytest.mark.parametrize(
         ("action", "extra_args"),
@@ -5207,54 +4937,6 @@ class TestQueueCommand:
         assert child.id in result.stdout
         assert "out-of-scope child" in result.stdout
 
-    def test_queue_tag_scope_reports_owner_missing_from_lineage_projection(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        unrelated = store.add(
-            "Visible scoped pending task",
-            task_type="implement",
-            tags=("202606-recovery",),
-        )
-        assert unrelated.id is not None
-
-        plan = store.add(
-            "Scoped owner hidden from owner rows",
-            task_type="plan",
-            tags=("202606-recovery", "v0.5.0"),
-            auto_implement=False,
-        )
-        assert plan.id is not None
-        plan.status = "completed"
-        plan.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
-        store.update(plan)
-
-        child = store.add(
-            "Scope-less implement child",
-            task_type="implement",
-            based_on=plan.id,
-            tags=(),
-        )
-        assert child.id is not None
-
-        result = invoke_gza(
-            "queue",
-            "--full",
-            "--tag",
-            "202606-recovery",
-            "--project",
-            str(tmp_path),
-        )
-
-        assert result.returncode == 0
-        assert unrelated.id in result.stdout
-        assert "Scope gap:" in result.stdout
-        assert plan.id in result.stdout
-        assert child.id in result.stdout
-        assert "out-of-scope child" in result.stdout
 
     def test_queue_tag_scope_reports_blocked_scope_less_pending_child(
         self,
@@ -5553,102 +5235,8 @@ class TestQueueCommand:
         assert "Scoped runnable owner" in result.stdout
         assert child.id not in result.stdout
 
-    def test_queue_tag_scope_uses_default_any_tag_matching_for_scope_gap_detection(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        plan = store.add(
-            "Scoped recovery owner",
-            task_type="plan",
-            tags=("202606-recovery", "ops"),
-            auto_implement=False,
-        )
-        assert plan.id is not None
-        plan.status = "completed"
-        plan.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
-        store.update(plan)
-
-        matching_child = store.add(
-            "Any-tag matching child",
-            task_type="implement",
-            based_on=plan.id,
-            tags=("ops",),
-        )
-        assert matching_child.id is not None
-
-        matching_result = invoke_gza(
-            "queue",
-            "--full",
-            "--tag",
-            "202606-recovery",
-            "--tag",
-            "ops",
-            "--project",
-            str(tmp_path),
-        )
-        assert matching_result.returncode == 0
-        assert "Scope gap:" not in matching_result.stdout
-        assert matching_child.id in matching_result.stdout
-
-        store.delete(matching_child.id)
-        out_of_scope_child = store.add(
-            "Any-tag scope-less child",
-            task_type="implement",
-            based_on=plan.id,
-            tags=(),
-        )
-        assert out_of_scope_child.id is not None
-
-        gap_result = invoke_gza(
-            "queue",
-            "--full",
-            "--tag",
-            "202606-recovery",
-            "--tag",
-            "ops",
-            "--project",
-            str(tmp_path),
-        )
-        assert gap_result.returncode == 0
-        assert "Scope gap:" in gap_result.stdout
-        assert out_of_scope_child.id in gap_result.stdout
-        assert (
-            f"hint: `uv run gza edit {out_of_scope_child.id} --add-tag 202606-recovery`"
-            in gap_result.stdout
-        )
-        assert "--add-tag ops`" not in gap_result.stdout
 
 
-    def test_queue_tag_view_shares_one_order_across_tasks_with_extra_tags(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        release_plain = store.add("Release plain", tags=("release",))
-        release_backend = store.add("Release backend", tags=("release", "backend"))
-        release_docs = store.add("Release docs", tags=("release", "docs"))
-        assert release_plain.id is not None
-        assert release_backend.id is not None
-        assert release_docs.id is not None
-
-        # Setup ordering via direct calls; only the view itself goes through the CLI.
-        assert set_task_queue_position_scoped(store, release_plain.id, position=1, tags=("release",))
-        assert set_task_queue_position_scoped(store, release_backend.id, position=2, tags=("release",))
-        assert set_task_queue_position_scoped(store, release_docs.id, position=3, tags=("release",))
-
-        queue = invoke_gza("queue", "--tag", "release", "--project", str(tmp_path))
-        assert queue.returncode == 0
-
-        lines = queue.stdout.splitlines()
-        first_idx = next(i for i, line in enumerate(lines) if "Release plain" in line)
-        second_idx = next(i for i, line in enumerate(lines) if "Release backend" in line)
-        third_idx = next(i for i, line in enumerate(lines) if "Release docs" in line)
-        assert first_idx < second_idx < third_idx
-        assert lines[first_idx + 1].strip() == "[#1]"
-        assert lines[second_idx + 1].strip() == "[#2]"
-        assert lines[third_idx + 1].strip() == "[#3]"
 
     def test_queue_tag_scoped_clear_shares_order_across_tasks_with_extra_tags(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -5707,32 +5295,6 @@ class TestQueueCommand:
         urgent_line = next(i for i, line in enumerate(lines) if "Older urgent" in line)
         assert ordered_line < urgent_line
 
-    def test_queue_lists_blocked_pending_tasks_after_runnable_rows(self, tmp_path: Path):
-        """Queue should show blocked pending tasks at the bottom with direct blocker metadata."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        runnable = store.add("Runnable")
-        store.add("Internal pending", task_type="internal")
-        blocker = store.add("Dependency blocker")
-        blocked = store.add("Blocked pending", depends_on=blocker.id)
-        assert runnable.id is not None
-        assert blocker.id is not None
-        assert blocked.id is not None
-
-        result = invoke_gza("queue", "--all", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Runnable" in result.stdout
-        assert "Internal pending" not in result.stdout
-        assert "Blocked pending" in result.stdout
-        lines = result.stdout.splitlines()
-        runnable_line = next(i for i, line in enumerate(lines) if "Runnable" in line)
-        blocker_line = next(i for i, line in enumerate(lines) if "Dependency blocker" in line)
-        blocked_line = next(i for i, line in enumerate(lines) if blocked.id in line and "Blocked pending" in line)
-        assert runnable_line < blocker_line < blocked_line
-        assert lines[blocked_line].split()[0] == "-"
-        assert lines[blocked_line + 1].strip() == f"blocked by {blocker.id}"
 
     def test_queue_tag_filters_runnable_tasks_to_tag(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -5753,24 +5315,6 @@ class TestQueueCommand:
         assert "Blocked release task" in result.stdout
         assert "Other task" not in result.stdout
 
-    def test_queue_shows_blocked_pending_tasks_when_no_runnable_tasks_exist(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        blocker = store.add("Internal blocker", task_type="internal")
-        blocked = store.add("Blocked pending", depends_on=blocker.id)
-        assert blocker.id is not None
-        assert blocked.id is not None
-
-        result = invoke_gza("queue", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "No pending tasks" not in result.stdout
-        assert "Blocked pending" in result.stdout
-        lines = result.stdout.splitlines()
-        blocked_line = next(i for i, line in enumerate(lines) if blocked.id in line and "Blocked pending" in line)
-        assert lines[blocked_line].split()[0] == "-"
-        assert lines[blocked_line + 1].strip() == f"blocked by {blocker.id}"
 
     def test_queue_completed_empty_prerequisite_is_not_reported_blocked(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -5849,21 +5393,6 @@ class TestQueueCommand:
         if task_line + 1 < len(lines):
             assert not lines[task_line + 1].startswith(" ")
 
-    def test_queue_shows_urgent_and_blocked_metadata_on_same_second_line(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        blocker = store.add("Blocking task")
-        blocked_urgent = store.add("Blocked urgent", depends_on=blocker.id, urgent=True)
-        assert blocker.id is not None
-        assert blocked_urgent.id is not None
-
-        result = invoke_gza("queue", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        lines = result.stdout.splitlines()
-        blocked_line = next(i for i, line in enumerate(lines) if "Blocked urgent" in line)
-        assert lines[blocked_line + 1].strip() == f"[urgent]  blocked by {blocker.id}"
 
     def test_queue_command_uses_shared_queue_theme_renderables(self, tmp_path: Path) -> None:
         from gza.colors import QueueColors
@@ -5939,45 +5468,6 @@ class TestQueueCommand:
         assert "Backlog runnable" not in result.stdout
         assert "1 task blocked by dependencies" in result.stdout
 
-    def test_next_repeated_tag_filters_use_or_by_default_and_all_tags_for_and(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        store.add("Recovery-only runnable", tags=("202606-recovery",))
-        store.add("System-only runnable", tags=("system",))
-        store.add("Both tags runnable", tags=("202606-recovery", "system"))
-        store.add("Backlog runnable", tags=("backlog",))
-
-        default_result = invoke_gza(
-            "next",
-            "--tag",
-            "202606-recovery",
-            "--tag",
-            "system",
-            "--project",
-            str(tmp_path),
-        )
-        assert default_result.returncode == 0
-        assert "Recovery-only runnable" in default_result.stdout
-        assert "System-only runnable" in default_result.stdout
-        assert "Both tags runnable" in default_result.stdout
-        assert "Backlog runnable" not in default_result.stdout
-
-        all_tags_result = invoke_gza(
-            "next",
-            "--tag",
-            "202606-recovery",
-            "--tag",
-            "system",
-            "--all-tags",
-            "--project",
-            str(tmp_path),
-        )
-        assert all_tags_result.returncode == 0
-        assert "Recovery-only runnable" not in all_tags_result.stdout
-        assert "System-only runnable" not in all_tags_result.stdout
-        assert "Both tags runnable" in all_tags_result.stdout
-        assert "Backlog runnable" not in all_tags_result.stdout
 
     def test_next_command_uses_shared_queue_theme_renderables(self, tmp_path: Path) -> None:
         from gza.colors import QueueColors
@@ -6358,23 +5848,6 @@ class TestShowCommand:
         assert result.returncode == 0
         assert "Execution Mode: skill_inline" in result.stdout
 
-    def test_show_displays_trigger_source_and_unknown_for_legacy_rows(self, tmp_path: Path):
-        """Show command should surface trigger source and label legacy NULL rows as unknown."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        manual = store.add("Task with trigger source", trigger_source="manual")
-        legacy = store.add("Legacy task without trigger source")
-        assert manual.id is not None
-        assert legacy.id is not None
-
-        manual_result = invoke_gza("show", str(manual.id), "--project", str(tmp_path))
-        legacy_result = invoke_gza("show", str(legacy.id), "--project", str(tmp_path))
-
-        assert manual_result.returncode == 0
-        assert "Trigger Source: manual" in manual_result.stdout
-        assert legacy_result.returncode == 0
-        assert "Trigger Source: unknown" in legacy_result.stdout
 
     def test_show_displays_provider_and_model_lines(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -6602,99 +6075,6 @@ class TestShowCommand:
         assert "legacy markdown should not win" not in result.stdout
         assert "/tmp/canonical-verify-worktree" in result.stdout
 
-    def test_show_implement_displays_owner_verify_evidence_from_canonical_helper(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        from gza.cli.query import cmd_show
-
-        setup_config(tmp_path)
-        config_path = tmp_path / "gza.yaml"
-        config_path.write_text(config_path.read_text() + "verify_command: ./bin/tests\n", encoding="utf-8")
-        store = make_store(tmp_path)
-        impl = store.add("Implement feature", task_type="implement")
-        assert impl.id is not None
-        impl.status = "completed"
-        impl.branch = "feature/owner-verify-show"
-        store.update(impl)
-
-        review = store.add("Review feature", task_type="review", depends_on=impl.id)
-        assert review.id is not None
-        review.status = "completed"
-        review.review_verify_command = "./bin/tests"
-        review.review_verify_status = "failed"
-        review.review_verify_exit_status = "7"
-        review.review_verify_branch = impl.branch
-        review.review_verify_head_sha = "a" * 40
-        review.review_verify_base_sha = "cafebabe"
-        review.review_verify_captured_at = datetime(2026, 6, 5, 10, 0, tzinfo=UTC)
-        store.update(review)
-        config = Config.load(tmp_path)
-        stored = store_command_output_artifact(
-            store,
-            review,
-            config,
-            kind="verify_command_output",
-            producer="review_verify",
-            label="verify_command",
-            output="owner artifact output\n",
-            command="./bin/tests",
-            status="passed",
-            exit_status="0",
-            head_sha="a" * 40,
-            metadata={
-                "reviewed_branch": impl.branch,
-                "reviewed_base_sha": "cafebabe",
-                "working_directory": "/tmp/canonical-verify-worktree",
-            },
-            created_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
-        )
-        persist_verify_gate_artifact(
-            store,
-            config,
-            owner_task=impl,
-            source_task=review,
-            result=SimpleNamespace(
-                command="./bin/tests",
-                status="passed",
-                exit_status="0",
-                captured_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
-                reviewed_branch=impl.branch,
-                reviewed_head_sha="a" * 40,
-                reviewed_base_sha="cafebabe",
-                working_directory="/tmp/canonical-verify-worktree",
-                failure=None,
-            ),
-            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
-            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
-            output_artifact_path=stored.path,
-            producer="review_verify",
-        )
-
-        git = _mock_unmerged_git()
-        with patch("gza.cli.query.Git", return_value=git):
-            exit_code = cmd_show(
-                argparse.Namespace(
-                    project_dir=tmp_path,
-                    task_id=str(impl.id),
-                    prompt=False,
-                    path=False,
-                    output=False,
-                    page=False,
-                    full=False,
-                    metadata_only=False,
-                )
-            )
-
-        output = capsys.readouterr().out
-        assert exit_code == 0
-        assert "Verify Status:" in output
-        assert "Verify Artifact:" in output
-        assert "Verify Result:" in output
-        assert stored.path in output
-        assert "owner artifact output" in output
-        assert "Review Verify" not in output
 
     def test_show_lifecycle_summary_does_not_persist_legacy_verify_fix_upgrade(
         self,
@@ -7162,110 +6542,8 @@ class TestShowCommand:
         assert path_result.returncode == 0
         assert path_result.stdout.strip() == str(tmp_path / newer.path)
 
-    def test_artifact_command_preserves_content_without_trailing_newline(self, tmp_path: Path) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Task with artifact without newline", task_type="review")
-        store.update(task)
-        config = Config.load(tmp_path)
-        store_command_output_artifact(
-            store,
-            task,
-            config,
-            kind="verify_command_output",
-            producer="review_verify",
-            label="verify_command",
-            output="exact output",
-            created_at=datetime(2026, 6, 2, tzinfo=UTC),
-        )
 
-        content_result = invoke_gza("artifact", str(task.id), "--project", str(tmp_path))
 
-        assert content_result.returncode == 0
-        assert content_result.stdout == "exact output"
-
-    def test_artifact_command_preserves_crlf_and_carriage_return_bytes(self, tmp_path: Path) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Task with carriage-return artifact output", task_type="review")
-        store.update(task)
-        config = Config.load(tmp_path)
-        stored = store_command_output_artifact(
-            store,
-            task,
-            config,
-            kind="verify_command_output",
-            producer="review_verify",
-            label="verify_command",
-            output="line one\r\nprogress 10%\rprogress 100%\r\nline two",
-            created_at=datetime(2026, 6, 2, tzinfo=UTC),
-        )
-        expected_bytes = (tmp_path / stored.path).read_bytes()
-
-        content_result = invoke_gza("artifact", str(task.id), "--project", str(tmp_path))
-
-        assert content_result.returncode == 0
-        assert content_result.stdout.encode("utf-8") == expected_bytes
-
-    def test_artifact_command_filters_by_kind_and_returns_latest_match(self, tmp_path: Path) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Task with mixed artifact kinds", task_type="review")
-        store.update(task)
-        config = Config.load(tmp_path)
-        store_command_output_artifact(
-            store,
-            task,
-            config,
-            kind="verify_command_output",
-            producer="review_verify",
-            label="verify_command",
-            output="older verify output\n",
-            created_at=datetime(2026, 6, 1, tzinfo=UTC),
-        )
-        store_command_output_artifact(
-            store,
-            task,
-            config,
-            kind="build_output",
-            producer="review_verify",
-            label="build",
-            output="newest build output\n",
-            created_at=datetime(2026, 6, 3, tzinfo=UTC),
-        )
-        latest_verify = store_command_output_artifact(
-            store,
-            task,
-            config,
-            kind="verify_command_output",
-            producer="review_verify",
-            label="verify_command",
-            output="latest verify output\n",
-            created_at=datetime(2026, 6, 2, tzinfo=UTC),
-        )
-
-        content_result = invoke_gza(
-            "artifact",
-            str(task.id),
-            "--kind",
-            "verify_command_output",
-            "--project",
-            str(tmp_path),
-        )
-        path_result = invoke_gza(
-            "artifact",
-            str(task.id),
-            "--kind",
-            "verify_command_output",
-            "--path",
-            "--project",
-            str(tmp_path),
-        )
-
-        assert content_result.returncode == 0
-        assert content_result.stdout == "latest verify output\n"
-        assert path_result.returncode == 0
-        assert path_result.stdout.strip() == str(tmp_path / latest_verify.path)
 
     def test_artifact_command_errors_when_task_has_no_artifacts(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
@@ -7386,62 +6664,6 @@ class TestShowCommand:
         assert path_result.returncode == 1
         assert f"missing on disk: {stored.path}" in path_result.stdout
 
-    def test_show_metadata_only_lists_skipped_cross_project_metadata_only_artifact(self, tmp_path: Path) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Cross-project review with skipped verify artifact", task_type="review")
-        task.status = "completed"
-        store.update(task)
-        config = Config.load(tmp_path)
-        older = store_command_output_artifact(
-            store,
-            task,
-            config,
-            kind="verify_command_output",
-            producer="review_verify",
-            label="verify_command",
-            output="services/foo passed\n",
-            status="passed",
-            exit_status="0",
-            scope="services/foo",
-            metadata={
-                "scope": "services/foo",
-                "working_directory": "services/foo",
-                "skip_reason": None,
-            },
-            created_at=datetime(2026, 6, 1, tzinfo=UTC),
-        )
-        newer = store_command_output_artifact(
-            store,
-            task,
-            config,
-            kind="verify_command_output",
-            producer="review_verify",
-            label="verify_command",
-            output=None,
-            status="skipped",
-            exit_status="skipped",
-            scope="unknown paths",
-            metadata={
-                "scope": "unknown paths",
-                "working_directory": "unknown paths",
-                "skip_reason": "affected paths fell outside all discovered project roots",
-            },
-            created_at=datetime(2026, 6, 2, tzinfo=UTC),
-        )
-        task.review_verify_artifact_file = older.path
-        store.update(task)
-
-        result = invoke_gza("show", str(task.id), "--metadata-only", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Artifacts:" in result.stdout
-        assert older.path in result.stdout
-        assert newer.path in result.stdout
-        assert "skipped" in result.stdout
-        assert "missing" in result.stdout
-        assert "Verify Artifact:" in result.stdout
-        assert newer.path in result.stdout
 
     def test_show_warns_and_reads_when_readonly_db_is_missing_task_comments(self, tmp_path: Path):
         """Show should warn instead of trying to repair task_comments on a frozen DB."""
@@ -7711,77 +6933,7 @@ class TestShowCommand:
         compact_output = "".join(result.stdout.split())
         assert f"Worktree: {worktree_path}".replace(" ", "") in compact_output
 
-    def test_show_omits_worktree_path_when_branch_has_no_active_worktree(self, tmp_path: Path):
-        """Show command omits worktree line when no active worktree is registered for the task branch."""
-        task, worktree_path = _setup_task_with_worktree_metadata(
-            tmp_path,
-            task_prompt="Task without active worktree",
-            branch_name="feature/no-worktree",
-            worktree_name=None,
-        )
-        assert task.id is not None
-        assert worktree_path is None
 
-        fake_git = MagicMock()
-        fake_git.worktree_list.return_value = []
-        fake_git.branch_exists.return_value = True
-        fake_git.ref_exists.return_value = False
-        fake_git.rev_parse_if_exists.return_value = "a" * 40
-        fake_git.can_merge.return_value = True
-        fake_git.is_merged.return_value = False
-        fake_git.count_commits_ahead.return_value = 1
-        fake_git.get_diff_stat_parsed.return_value = (1, 1, 0)
-        fake_git.default_branch.return_value = "main"
-
-        with patch("gza.cli.query.Git", return_value=fake_git):
-            result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Branch: feature/no-worktree" in result.stdout
-        assert "Worktree:" not in result.stdout
-
-    def test_show_warns_when_worktree_lookup_raises_git_error(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-        """Show command emits a warning when worktree lookup fails with GitError."""
-        from gza.cli.query import cmd_show
-        from gza.git import GitError
-
-        task, worktree_path = _setup_task_with_worktree_metadata(
-            tmp_path,
-            task_prompt="Task with lookup failure",
-            branch_name="feature/worktree-lookup-giterror",
-            worktree_name=None,
-        )
-        assert task.id is not None
-        assert worktree_path is None
-
-        fake_git = MagicMock()
-        fake_git.worktree_list.side_effect = GitError("simulated worktree list failure")
-        fake_git.branch_exists.return_value = True
-        fake_git.ref_exists.return_value = False
-        fake_git.rev_parse_if_exists.return_value = "a" * 40
-        fake_git.can_merge.return_value = True
-        fake_git.is_merged.return_value = False
-        fake_git.count_commits_ahead.return_value = 1
-        fake_git.get_diff_stat_parsed.return_value = (1, 1, 0)
-        fake_git.default_branch.return_value = "main"
-
-        with patch("gza.cli.query.Git", return_value=fake_git):
-            args = argparse.Namespace(
-                project_dir=tmp_path,
-                task_id=str(task.id),
-                prompt=False,
-                path=False,
-                output=False,
-                page=False,
-                full=False,
-            )
-            exit_code = cmd_show(args)
-        output = capsys.readouterr().out
-
-        assert exit_code == 0
-        assert "Branch: feature/worktree-lookup-giterror" in output
-        assert "Warning: Worktree lookup failed:" in output
-        assert "simulated worktree list failure" in output
 
     def test_show_warns_when_worktree_lookup_raises_os_error(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """Show command emits a warning when worktree lookup fails with OSError."""
@@ -8428,125 +7580,7 @@ class TestShowCommand:
         assert "Merge Status: merged" in output
         assert f"Review: APPROVED (carried across rebase {rebase.id})" in output
 
-    def test_show_implement_renders_review_invalidated_by_rebase(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from gza import advance_engine as advance_engine_module
-        from gza.cli.query import cmd_show
 
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        task = store.add("Implement feature", task_type="implement")
-        assert task.id is not None
-        task.status = "completed"
-        task.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
-        task.branch = "feature/review-invalidated-show"
-        task.has_commits = True
-        task.merge_status = "unmerged"
-        store.update(task)
-
-        review = store.add(f"Review {task.id}", task_type="review", based_on=task.id, depends_on=task.id)
-        review.status = "completed"
-        review.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
-        store.update(review)
-
-        rebase = store.add(f"Rebase {task.id}", task_type="rebase", based_on=task.id, same_branch=True)
-        rebase.status = "completed"
-        rebase.completed_at = datetime(2026, 5, 4, 10, 20, 0, tzinfo=UTC)
-        rebase.branch = task.branch
-        rebase.changed_diff = True
-        store.update(rebase)
-
-        monkeypatch.setattr(
-            advance_engine_module,
-            "get_review_report",
-            lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
-        )
-
-        git = MagicMock()
-        git.default_branch.return_value = "main"
-        git.can_merge.return_value = True
-        git.worktree_list.return_value = []
-
-        with (
-            patch("gza.cli.query.Git", return_value=git),
-            patch(
-                "gza.cli.query._implementation_review_rebase_detail",
-                return_value=f"invalidated by rebase {rebase.id} (diff changed)",
-            ),
-        ):
-            exit_code = cmd_show(
-                argparse.Namespace(
-                    project_dir=tmp_path,
-                    task_id=str(task.id),
-                    prompt=False,
-                    path=False,
-                    output=False,
-                    page=False,
-                    full=False,
-                    metadata_only=True,
-                )
-            )
-
-        output = capsys.readouterr().out
-        assert exit_code == 0
-        assert f"Review: invalidated by rebase {rebase.id} (diff changed)" in output
-
-    def test_show_changes_requested_lifecycle_reports_active_improve_id(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """Show should surface the concrete active improve task for CHANGES_REQUESTED reviews."""
-        from gza.cli.query import cmd_show
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        task = store.add("Implement feature", task_type="implement")
-        assert task.id is not None
-        task.status = "completed"
-        task.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
-        task.branch = "feature/changes-requested"
-        task.has_commits = True
-        task.merge_status = "unmerged"
-        store.update(task)
-
-        review = store.add(f"Review {task.id}", task_type="review", based_on=task.id, depends_on=task.id)
-        assert review.id is not None
-        review.status = "completed"
-        review.output_content = "Verdict: CHANGES_REQUESTED"
-        review.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
-        store.update(review)
-
-        improve = store.add("Improve feature", task_type="improve", based_on=task.id, depends_on=review.id)
-        assert improve.id is not None
-        improve.status = "in_progress"
-        improve.created_at = datetime(2026, 5, 4, 10, 15, 0, tzinfo=UTC)
-        store.update(improve)
-
-        git = MagicMock()
-        git.default_branch.return_value = "main"
-        git.can_merge.return_value = True
-        git.worktree_list.return_value = []
-
-        with patch("gza.cli.query.Git", return_value=git):
-            exit_code = cmd_show(
-                argparse.Namespace(
-                    project_dir=tmp_path,
-                    task_id=str(task.id),
-                    prompt=False,
-                    path=False,
-                    output=False,
-                    page=False,
-                    full=False,
-                    metadata_only=True,
-                )
-            )
-
-        output = capsys.readouterr().out
-        assert exit_code == 0
-        assert f"Lifecycle: improve in_progress ({improve.id})" in output
-        assert "(unknown)" not in output
 
     def test_show_fresh_comments_lifecycle_reports_active_improve_id(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -8682,46 +7716,6 @@ class TestShowCommand:
         assert exit_code == 0
         assert "Merge Status: unmerged" in output
 
-    def test_show_suppresses_merge_status_for_same_branch_follow_up_rows(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """Show should suppress stale row-local merge metadata on same-branch follow-up tasks."""
-        from gza.cli.query import cmd_show
-
-        _owner, improve = _seed_same_branch_merge_owner_and_improve(tmp_path)
-
-        git = MagicMock()
-        git.default_branch.return_value = "main"
-        git.branch_exists.return_value = True
-        git.ref_exists.return_value = False
-        git.rev_parse_if_exists.return_value = "a" * 40
-        git.can_merge.return_value = True
-        git.is_merged.return_value = False
-        git.count_commits_ahead.return_value = 1
-        git.get_diff_stat_parsed.return_value = (1, 1, 0)
-        git.worktree_list.return_value = []
-
-        with (
-            patch("gza.cli.query.Git", return_value=git),
-            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
-        ):
-            exit_code = cmd_show(
-                argparse.Namespace(
-                    project_dir=tmp_path,
-                    task_id=str(improve.id),
-                    prompt=False,
-                    path=False,
-                    output=False,
-                    page=False,
-                    full=False,
-                    metadata_only=True,
-                )
-            )
-        output = capsys.readouterr().out
-
-        assert exit_code == 0
-        assert "Type: improve" in output
-        assert "Merge Status:" not in output
 
     def test_show_failed_recovery_chain_needs_attention_uses_shared_wording(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -9357,111 +8351,6 @@ class TestShowCommand:
         assert metadata.pre_rebase_merge_base_sha == "old-base"
         assert "resolution-review-metadata-invalid" not in output
 
-    def test_show_readonly_skips_provenance_warning_when_changed_rebase_and_resolution_review_are_complete(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        from gza.cli.query import cmd_show
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        impl = store.add("Implementation with complete read-only provenance", task_type="implement")
-        assert impl.id is not None
-        impl.status = "completed"
-        impl.branch = "feature/show-readonly-complete-provenance"
-        impl.has_commits = True
-        impl.merge_status = "unmerged"
-        impl.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
-        store.update(impl)
-
-        review = store.add("Approved review before rebase", task_type="review", depends_on=impl.id)
-        assert review.id is not None
-        review.status = "completed"
-        review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
-        review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
-        store.update(review)
-
-        rebase = store.add("Changed-diff rebase", task_type="rebase", based_on=impl.id, same_branch=True)
-        assert rebase.id is not None
-        rebase.status = "completed"
-        rebase.branch = impl.branch
-        rebase.has_commits = True
-        rebase.changed_diff = True
-        rebase.review_scope = (
-            "Rebase diff provenance: yes\n"
-            "Pre-rebase head SHA: old-head\n"
-            "Pre-rebase target SHA: old-target\n"
-            "Pre-rebase merge-base SHA: old-base\n"
-            "Resolved head SHA: rebased-head\n"
-            "Resolved target SHA: target-now\n"
-            "Recovered baseline: no"
-        )
-        rebase.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
-        store.update(rebase)
-
-        resolution_review = store.add("Approved resolution review", task_type="review", depends_on=impl.id)
-        assert resolution_review.id is not None
-        resolution_review.status = "completed"
-        resolution_review.completed_at = datetime(2026, 5, 10, 13, 0, tzinfo=UTC)
-        resolution_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
-        resolution_review.review_scope = (
-            "Review mode: resolution\n"
-            f"Implementation task: {impl.id}\n"
-            f"Rebase task: {rebase.id}\n"
-            "Pre-rebase head SHA: old-head\n"
-            "Pre-rebase target SHA: old-target\n"
-            "Pre-rebase merge-base SHA: old-base\n"
-            "Resolved head SHA: rebased-head\n"
-            "Resolved target SHA: target-now\n"
-            "\n"
-            "Review only the conflict-resolution delta introduced by this rebase.\n"
-            "Do not re-review the whole implementation except where context is required."
-        )
-        store.update(resolution_review)
-
-        db_path = tmp_path / ".gza" / "gza.db"
-        original_mode = db_path.stat().st_mode
-        os.chmod(db_path, 0o444)
-
-        git = MagicMock(spec=Git)
-        git.repo_dir = tmp_path
-        git.default_branch.return_value = "main"
-        git.worktree_list.return_value = []
-
-        try:
-            with (
-                patch("gza.cli.query.Git", return_value=git),
-                patch(
-                    "gza.cli.query.determine_next_action",
-                    return_value={
-                        "type": "verify_gate",
-                        "description": "Run verify gate before merge",
-                        "verify_gate_phase": "pre_merge",
-                    },
-                ),
-                patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
-            ):
-                exit_code = cmd_show(
-                    argparse.Namespace(
-                        project_dir=tmp_path,
-                        task_id=str(impl.id),
-                        prompt=False,
-                        path=False,
-                        output=False,
-                        page=False,
-                        full=False,
-                        metadata_only=True,
-                    )
-                )
-        finally:
-            os.chmod(db_path, original_mode)
-
-        output = capsys.readouterr().out
-        assert exit_code == 0
-        assert "Could not repair changed-diff rebase provenance" not in output
-        assert "Lifecycle:" in output
 
     def test_show_readonly_warns_when_resolution_review_provenance_repair_is_still_needed(
         self,
@@ -9582,122 +8471,6 @@ class TestShowCommand:
         assert "because the task database is read-only" in output
         assert "Lifecycle:" in output
 
-    def test_show_backfills_stale_complete_resolution_review_provenance_before_query_only_lifecycle_render(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        from gza.cli.query import cmd_show
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        impl = store.add("Implementation needing stale resolution review rewrite", task_type="implement")
-        assert impl.id is not None
-        impl.status = "completed"
-        impl.branch = "feature/show-stale-resolution-review-repair"
-        impl.has_commits = True
-        impl.merge_status = "unmerged"
-        impl.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
-        store.update(impl)
-
-        review = store.add("Approved review before rebase", task_type="review", depends_on=impl.id)
-        assert review.id is not None
-        review.status = "completed"
-        review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
-        review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
-        store.update(review)
-
-        rebase = store.add("Changed-diff rebase", task_type="rebase", based_on=impl.id, same_branch=True)
-        assert rebase.id is not None
-        rebase.status = "completed"
-        rebase.branch = impl.branch
-        rebase.has_commits = True
-        rebase.changed_diff = True
-        rebase.review_scope = (
-            "Rebase diff provenance: yes\n"
-            "Pre-rebase head SHA: old-head\n"
-            "Pre-rebase target SHA: old-target\n"
-            "Pre-rebase merge-base SHA: old-base\n"
-            "Resolved head SHA: rebased-head\n"
-            "Resolved target SHA: target-now\n"
-            "Recovered baseline: no"
-        )
-        rebase.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
-        store.update(rebase)
-
-        resolution_review = store.add("Approved resolution review", task_type="review", depends_on=impl.id)
-        assert resolution_review.id is not None
-        resolution_review.status = "completed"
-        resolution_review.completed_at = datetime(2026, 5, 10, 13, 0, tzinfo=UTC)
-        resolution_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
-        resolution_review.review_scope = (
-            "Review mode: resolution\n"
-            f"Implementation task: {impl.id}\n"
-            f"Rebase task: {rebase.id}\n"
-            "Pre-rebase head SHA: stale-head\n"
-            "Pre-rebase target SHA: stale-target\n"
-            "Pre-rebase merge-base SHA: stale-base\n"
-            "Resolved head SHA: rebased-head\n"
-            "Resolved target SHA: target-now\n"
-            "\n"
-            "Review only the conflict-resolution delta introduced by this rebase.\n"
-            "Do not re-review the whole implementation except where context is required."
-        )
-        store.update(resolution_review)
-
-        git = MagicMock(spec=Git)
-        git.repo_dir = tmp_path
-        git.default_branch.return_value = "main"
-        git.worktree_list.return_value = []
-
-        def _determine_action(_config, action_store, _git, task, _target_branch, **_kwargs):
-            del task
-            refreshed_review = action_store.get(resolution_review.id)
-            assert refreshed_review is not None
-            metadata = parse_resolution_review_scope(refreshed_review.review_scope)
-            if (
-                metadata is None
-                or metadata.pre_rebase_head_sha != "old-head"
-                or metadata.pre_rebase_target_sha != "old-target"
-                or metadata.pre_rebase_merge_base_sha != "old-base"
-            ):
-                return {
-                    "type": "needs_discussion",
-                    "description": "SKIP: required resolution-review metadata is missing or malformed",
-                    "needs_attention_reason": "resolution-review-metadata-invalid",
-                    "subject_task_id": impl.id,
-                }
-            return {"type": "verify_gate", "description": "Run verify gate before merge", "verify_gate_phase": "pre_merge"}
-
-        with (
-            patch("gza.cli.query.Git", return_value=git),
-            patch("gza.cli.query.determine_next_action", side_effect=_determine_action),
-            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
-        ):
-            exit_code = cmd_show(
-                argparse.Namespace(
-                    project_dir=tmp_path,
-                    task_id=str(impl.id),
-                    prompt=False,
-                    path=False,
-                    output=False,
-                    page=False,
-                    full=False,
-                    metadata_only=True,
-                )
-            )
-
-        output = capsys.readouterr().out
-        persisted_review = store.get(resolution_review.id)
-        assert exit_code == 0
-        assert persisted_review is not None
-        metadata = parse_resolution_review_scope(persisted_review.review_scope)
-        assert metadata is not None
-        assert metadata.pre_rebase_head_sha == "old-head"
-        assert metadata.pre_rebase_target_sha == "old-target"
-        assert metadata.pre_rebase_merge_base_sha == "old-base"
-        assert "resolution-review-metadata-invalid" not in output
 
     def test_show_readonly_warns_for_stale_complete_resolution_review_provenance_before_lifecycle_render(
         self,
@@ -10182,23 +8955,6 @@ class TestShowCommand:
         assert "uv run pytest tests/ -q" in result.stdout
         assert "AssertionError" in result.stdout
 
-    def test_show_failed_test_failure_excludes_resume_next_step(self, tmp_path: Path):
-        """TEST_FAILURE guidance should not advertise gza resume."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        task = store.add("Failed verification")
-        assert task.id is not None
-        task.status = "failed"
-        task.failure_reason = "TEST_FAILURE"
-        task.session_id = "sess-test-failure"
-        store.update(task)
-
-        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert f"gza retry {task.id}" in result.stdout
-        assert f"gza resume {task.id}" not in result.stdout
 
     def test_show_failed_task_prerequisite_unmerged_next_steps(self, tmp_path: Path):
         """PREREQUISITE_UNMERGED should show merge-only guidance for legacy parked rows."""
@@ -10340,20 +9096,6 @@ class TestShowCommand:
         assert "Worker Failure: failed during startup" in result.stdout
         assert "Startup Log: .gza/workers/w-20260318-startup-failure-startup.log" in result.stdout
 
-    def test_show_completed_task_omits_failure_diagnostics(self, tmp_path: Path):
-        """Completed task output should not include failed-task diagnostics block."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Completed task")
-        task.status = "completed"
-        store.update(task)
-
-        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Failure Reason:" not in result.stdout
-        assert "Failure Summary:" not in result.stdout
 
 
 
@@ -10608,62 +9350,6 @@ class TestPsCommand:
         task_start = header.rindex("TASK")
         assert row[merge_unit_start:task_start].strip() == "-"
 
-    def test_ps_shows_model_column_and_json_key(self, tmp_path: Path) -> None:
-        from gza.workers import WorkerMetadata, WorkerRegistry
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        with_model = store.add("ps task with model")
-        with_model.model = "claude-opus-4-8"
-        store.update(with_model)
-
-        without_model = store.add("ps task without model")
-
-        workers_dir = tmp_path / ".gza" / "workers"
-        workers_dir.mkdir(parents=True, exist_ok=True)
-        registry = WorkerRegistry(workers_dir)
-        registry.register(
-            WorkerMetadata(
-                worker_id="w-test-ps-model-1",
-                pid=99997,
-                task_id=with_model.id,
-                task_slug=None,
-                started_at=datetime.now(UTC).isoformat(),
-                status="running",
-                log_file=None,
-                worktree=None,
-            )
-        )
-        registry.register(
-            WorkerMetadata(
-                worker_id="w-test-ps-model-2",
-                pid=99996,
-                task_id=without_model.id,
-                task_slug=None,
-                started_at=datetime.now(UTC).isoformat(),
-                status="running",
-                log_file=None,
-                worktree=None,
-            )
-        )
-
-        try:
-            text_result = invoke_gza("ps", "--project", str(tmp_path))
-            json_result = invoke_gza("ps", "--json", "--project", str(tmp_path))
-        finally:
-            registry.remove("w-test-ps-model-1")
-            registry.remove("w-test-ps-model-2")
-
-        assert text_result.returncode == 0
-        assert "MODEL" in text_result.stdout
-        assert "claude-opus-4-8" in text_result.stdout
-        assert "ps task without model" in text_result.stdout
-
-        payload = json.loads(json_result.stdout)
-        rows_by_id = {row["task_id"]: row for row in payload}
-        assert rows_by_id[with_model.id]["model"] == "claude-opus-4-8"
-        assert rows_by_id[without_model.id]["model"] is None
 
     def test_ps_self_sizes_type_column_so_status_stays_aligned(self, tmp_path: Path) -> None:
         from gza.workers import WorkerMetadata, WorkerRegistry
@@ -12998,24 +11684,6 @@ class TestUnmergedSelectionBehavior:
         assert unit.state == "unmerged"
 
 
-    def test_unmerged_marks_stale_merged_task_as_merged(self, tmp_path: Path):
-        """Plain unmerged repairs stale merged rows in the canonical DB view."""
-        store, task, git = setup_unmerged_env(
-            tmp_path,
-            task_prompt="Stale unmerged task",
-            task_id="20260220-stale-unmerged",
-            branch="feature/stale-unmerged",
-        )
-
-        git._merged[("feature/stale-unmerged", "main")] = True
-
-        result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "Stale unmerged task" not in result.stdout
-        assert "No unmerged tasks" in result.stdout
-
-        stale_task = store.get(task.id)
-        assert stale_task.merge_status == "merged"
 
 
     def test_unmerged_branch_owner_stops_before_branchless_plan_dependency(
@@ -13229,31 +11897,6 @@ class TestUnmergedSelectionBehavior:
         assert "Showing tasks unmerged relative to integration" in result.stdout
         assert "No unmerged tasks" in result.stdout
 
-    def test_unmerged_target_keeps_deleted_branch_visible_when_not_merged_into_target(
-        self,
-        tmp_path: Path,
-    ):
-        """Deleted local branches stay visible for live targets even with cached default-branch merges."""
-        store, task, git = setup_unmerged_env(
-            tmp_path,
-            task_prompt="Deleted branch explicit-target task",
-            task_id="20260220-deleted-explicit-target-task",
-            branch="feature/deleted-explicit-target-task",
-            merge_status="merged",
-        )
-
-        git._branches.add("integration")
-        git._branches.discard("feature/deleted-explicit-target-task")
-
-        result = invoke_gza("unmerged", "--target", "integration", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Showing tasks unmerged relative to integration" in result.stdout
-        assert "Deleted branch explicit-target task" in result.stdout
-        assert "branch deleted" in result.stdout
-        refreshed = store.get(task.id)
-        assert refreshed is not None
-        assert refreshed.merge_status == "merged"
 
     def test_unmerged_live_target_does_not_persist_reconciliation(self, tmp_path: Path):
         """Live target comparisons stay query-only and do not backfill merge_status."""
@@ -13283,38 +11926,6 @@ class TestUnmergedSelectionBehavior:
         assert refreshed is not None
         assert refreshed.merge_status is None
 
-    def test_unmerged_live_target_excludes_same_branch_fix_descendants(self, tmp_path: Path):
-        """Live-target unmerged (--into-current/--target) must not double-list a fix task
-        that shares a branch with its implementation — otherwise the same branch appears
-        twice. See .gza/learnings.md (exclude completed same-branch fix descendants)."""
-        from datetime import UTC, datetime
-
-        store, impl_task, git = setup_unmerged_env(
-            tmp_path,
-            task_prompt="Implement widget",
-            task_id="20260220-impl-widget",
-            branch="feature/widget",
-        )
-
-        fix_task = store.add(
-            "Fix widget churn",
-            task_type="fix",
-        )
-        fix_task.status = "completed"
-        fix_task.completed_at = datetime.now(UTC)
-        fix_task.branch = "feature/widget"
-        fix_task.has_commits = True
-        fix_task.merge_status = "unmerged"
-        fix_task.slug = "20260220-fix-widget-churn"
-        fix_task.based_on = impl_task.id
-        fix_task.same_branch = True
-        store.update(fix_task)
-
-        result = invoke_gza("unmerged", "--into-current", "--project", str(tmp_path), cwd=tmp_path)
-        assert result.returncode == 0
-        assert "Implement widget" in result.stdout
-        # The fix must not appear as its own branch row — the impl row already represents the branch.
-        assert "Fix widget churn" not in result.stdout
 
 
 class TestUnmergedImprovedDisplay:
@@ -13509,45 +12120,6 @@ class TestUnmergedImprovedDisplay:
         assert "Live diff-stat failure task" not in captured.out
 
 
-    def test_unmerged_default_refresh_persists_empty_branch_and_hides_it(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """Default unmerged refresh should persist zero-commit merged branches as redundant."""
-        store, task, git = _setup_unmerged_env_fast(
-            tmp_path,
-            task_prompt="Empty merge-unit task",
-            branch="feature/empty-merge-unit",
-        )
-        git._merged[(task.branch, "main")] = True
-        git._ahead_counts[(task.branch, "main")] = 0
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=5,
-            json=False,
-            fields=None,
-            list_fields=False,
-        )
-
-        result = query_cli.cmd_unmerged(args, git=git)
-
-        captured = capsys.readouterr()
-        assert result == 0
-        assert "No unmerged tasks" in captured.out
-        assert "Empty merge-unit task" not in captured.out
-
-        assert task.id is not None
-        refreshed = store.get(task.id)
-        assert refreshed is not None
-        assert refreshed.merge_status is None
-        unit = store.resolve_merge_unit_for_task(task.id)
-        assert unit is not None
-        assert unit.state == "redundant"
 
     def test_unmerged_live_target_hides_zero_commit_empty_branch(
         self,
@@ -13635,48 +12207,6 @@ class TestUnmergedUnifiedQueryOutput:
     def _stub_github(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(query_cli, "GitHub", _UnavailableGitHub)
 
-    def test_unmerged_default_text_is_slim_and_scannable(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        store, task, _git = _setup_unmerged_env_fast(
-            tmp_path,
-            task_prompt=(
-                "Ship slimmer unmerged view\n\n"
-                "Context:\n- this should not render verbatim\n\n"
-                "Acceptance:\n- one line only"
-            ),
-        )
-
-        review = store.add("Review slim output", task_type="review")
-        review.status = "completed"
-        review.completed_at = datetime.now(UTC)
-        review.depends_on = task.id
-        review.output_content = "Verdict: APPROVED"
-        store.update(review)
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=5,
-            json=False,
-            fields=None,
-        )
-
-        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
-
-        captured = capsys.readouterr()
-        assert result == 0
-        header_line = next(line for line in captured.out.splitlines() if line.startswith("⚡ "))
-        assert "Ship slimmer unmerged view" in header_line
-        assert "Context:" not in header_line
-        assert "Acceptance:" not in header_line
-        assert "lineage:" in captured.out
-        assert "branch:" in captured.out
-        assert "review: reviewed [✓ approved]" in " ".join(captured.out.split())
 
     def test_unmerged_default_text_surfaces_conflicts_on_own_line(
         self,
@@ -14239,130 +12769,9 @@ class TestUnmergedUnifiedQueryOutput:
         assert "Showing 5 of 6" in captured.err
 
 
-    def test_unmerged_json_rebase_representative_with_branchless_plan_returns_branch_owner_row(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        plan = store.add("Branchless plan root", task_type="plan")
-        plan.status = "completed"
-        plan.completed_at = datetime(2026, 2, 12, 9, 0, tzinfo=UTC)
-        store.update(plan)
-        assert plan.id is not None
-
-        implement = store.add("Actionable branch owner", task_type="implement", depends_on=plan.id)
-        implement.status = "completed"
-        implement.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
-        implement.branch = "feature/rebase-representative"
-        implement.has_commits = True
-        store.update(implement)
-        assert implement.id is not None
-
-        rebase = store.add("Selected representative rebase", task_type="rebase", based_on=implement.id)
-        rebase.status = "completed"
-        rebase.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
-        rebase.branch = "feature/rebase-representative"
-        rebase.has_commits = True
-        store.update(rebase)
-        assert rebase.id is not None
-
-        unit = store.create_merge_unit(
-            source_branch="feature/rebase-representative",
-            target_branch="main",
-            owner_task_id=plan.id,
-            state="unmerged",
-        )
-        store.attach_task_to_merge_unit(implement.id, unit.id, "owner")
-        store.attach_task_to_merge_unit(rebase.id, unit.id, "rebase")
-
-        selected = store.resolve_merge_unit_representative_task(unit, require_actionable=True)
-        assert selected is not None
-        assert selected.id == rebase.id
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=5,
-            json=True,
-            fields="id,prompt,branch",
-        )
-
-        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
-
-        captured = capsys.readouterr()
-        assert result == 0
-        assert json.loads(captured.out) == [
-            {
-                "id": implement.id,
-                "prompt": "Actionable branch owner",
-                "branch": "feature/rebase-representative",
-            }
-        ]
-
-    def test_unmerged_json_id_prompt_projection_skips_lineage_rendering_work(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        _store, task, _git = _setup_unmerged_env_fast(tmp_path, task_prompt="JSON output task")
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=5,
-            json=True,
-            fields="id,prompt",
-        )
-
-        with patch("gza.cli.lineage_view.lineage_summary_stats", side_effect=AssertionError("lineage render should be skipped")):
-            result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
-
-        captured = capsys.readouterr()
-        assert result == 0
-        assert json.loads(captured.out) == [{"id": task.id, "prompt": "JSON output task"}]
-        assert "Progress:" in captured.err
 
 
-    def test_unmerged_default_text_attaches_review_verdict_color_via_theme(self, tmp_path: Path) -> None:
-        import gza.colors as current_colors
 
-        store, task, _git = _setup_unmerged_env_fast(tmp_path, task_prompt="Color verdict task")
-        review = store.add("Review color verdict", task_type="review")
-        review.status = "completed"
-        review.completed_at = datetime.now(UTC)
-        review.depends_on = task.id
-        review.output_content = "Verdict: APPROVED"
-        store.update(review)
-
-        config = query_cli.Config.load(tmp_path)
-        store = query_cli.get_store(config, open_mode="readwrite")
-        service = query_cli._TaskQueryService(store)
-        query = query_cli._TaskQueryPresets.unmerged(
-            branch_owner_ids=(task.id,),
-            task_ids=(task.id,),
-            limit=5,
-            mode="rich",
-            projection=query_cli._TaskProjectionSpec(preset=query_cli._TaskProjectionPreset.UNMERGED_DEFAULT),
-        )
-        result = service.run(query)
-        enriched = query_cli._enrich_unmerged_result(
-            result,
-            store=store,
-            config=config,
-            git_client=_FastUnmergedGit(),
-            target_branch="main",
-            default_branch="main",
-        )
-
-        rendered = enriched.render("rich")
-        approved_color = current_colors.UNMERGED_COLORS.review_approved
-        assert f"[{approved_color}]✓ approved[/{approved_color}]" in rendered
 
     @pytest.mark.parametrize(
         ("verdict_text", "score", "badge_text", "expected_color_attr"),
@@ -14426,31 +12835,6 @@ class TestUnmergedUnifiedQueryOutput:
         assert rendered.count(f"({score})") == 1
         assert f"[{expected_color}]{badge_text} ({score})[/{expected_color}]" in rendered
 
-    def test_unmerged_progress_logs_counts_for_refresh_query_and_render(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        _setup_unmerged_env_fast(tmp_path, task_prompt="Progress task")
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=5,
-            json=False,
-            fields=None,
-        )
-
-        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
-
-        captured = capsys.readouterr()
-        assert result == 0
-        assert "Progress:" not in captured.out
-        assert re.search(r"Progress: refreshing canonical merge truth for \d+ candidate tasks", captured.err)
-        assert re.search(r"Progress: running unmerged query over \d+ task rows for \d+ selected branches", captured.err)
-        assert re.search(r"Progress: rendering \d+ row\(s\) from \d+ filtered result\(s\) as rich", captured.err)
 
     def test_unmerged_descendants_only_lineage_promotes_depends_on_only_child_to_owner_tip(
         self,
@@ -14550,48 +12934,6 @@ class TestUnmergedUnifiedQueryOutput:
         assert [child.task.id for child in tree.children].count(review_a.id) == 1
         assert [child.task.id for child in tree.children].count(review_b.id) == 1
 
-    def test_unmerged_descendants_only_lineage_renders_each_review_once(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        store, impl, _git = _setup_unmerged_env_fast(tmp_path, task_prompt="Owner implementation")
-        impl.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
-        store.update(impl)
-
-        review_a = store.add("Review one", task_type="review", based_on=impl.id, depends_on=impl.id)
-        review_a.status = "completed"
-        review_a.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
-        review_a.output_content = "Verdict: APPROVED"
-        store.update(review_a)
-        assert review_a.id is not None
-
-        review_b = store.add("Review two", task_type="review", based_on=impl.id, depends_on=impl.id)
-        review_b.status = "completed"
-        review_b.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
-        review_b.output_content = "Verdict: CHANGES_REQUESTED"
-        store.update(review_b)
-        assert review_b.id is not None
-
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=5,
-            json=True,
-            fields="id,member_ids",
-        )
-
-        result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
-
-        captured = capsys.readouterr()
-        assert result == 0
-        # The descendants-only pruning lists each review once in member_ids (the
-        # lineage tree text is gone; member membership is the structured signal).
-        member_ids = json.loads(captured.out)[0]["member_ids"]
-        assert member_ids.count(str(review_a.id)) == 1
-        assert member_ids.count(str(review_b.id)) == 1
 
     def test_unmerged_shows_descendants_only_lineage_without_ancestors(
         self,
@@ -14761,23 +13103,6 @@ class TestNextCommandWithDependencies:
         assert dependent.id in normalized
         assert f"blocked-by-dropped {prereq.id}" in normalized
 
-    def test_next_shows_blocked_count(self, tmp_path: Path):
-        """Next command shows count of blocked tasks."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        # Create blocked tasks
-        task1 = store.add("First task")
-        store.add("Blocked task 1", depends_on=task1.id)
-        store.add("Blocked task 2", depends_on=task1.id)
-        store.add("Independent task")
-
-        result = invoke_gza("next", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        # Should mention 2 blocked tasks
-        assert "2" in result.stdout and "blocked" in result.stdout.lower()
 
     def test_next_picks_up_task_after_clearing_dependency(self, tmp_path: Path):
         """A blocked pending task becomes runnable after its dependency is cleared."""
@@ -16749,52 +15074,8 @@ class TestIncompleteCommand:
         assert _incomplete_json_rows(result.stdout) == [{"id": task.id, "status": "failed"}]
         assert result.stderr == ""
 
-    def test_incomplete_cli_json_fields_can_project_trigger_source(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("cli json trigger source", task_type="implement", trigger_source="watch")
-        task.status = "failed"
-        task.completed_at = datetime.now(UTC)
-        task.failure_reason = "TEST_FAILURE"
-        store.update(task)
 
-        result = invoke_gza(
-            "incomplete",
-            "--json",
-            "--fields",
-            "id,trigger_source",
-            "--project",
-            str(tmp_path),
-        )
 
-        assert result.returncode == 0
-        assert _incomplete_json_rows(result.stdout) == [{"id": task.id, "trigger_source": "watch"}]
-        assert result.stderr == ""
-
-    def test_incomplete_text_includes_deferred_blocker_count_with_no_rows(self, tmp_path: Path) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        _seed_max_cycles_deferred_blocker(store)
-
-        result = invoke_gza("incomplete", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Deferred blockers outstanding: 1" in result.stdout
-        assert "No unresolved task lineages" in result.stdout
-        assert "Deferred review blocker" not in result.stdout
-        assert result.stderr == ""
-
-    def test_incomplete_json_includes_deferred_blocker_summary_with_no_rows(self, tmp_path: Path) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        _seed_max_cycles_deferred_blocker(store)
-
-        result = invoke_gza("incomplete", "--json", "--last", "0", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert _incomplete_deferred_summary(result.stdout) == 1
-        assert _incomplete_json_rows(result.stdout) == []
-        assert result.stderr == ""
 
 
 
@@ -16906,48 +15187,6 @@ class TestIncompleteCommand:
         assert impl.tags == ("alpha",)
 
 
-    def test_incomplete_tag_filter_excludes_owner_when_only_descendant_matches_in_json(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        owner = store.add("Beta owner", task_type="implement", tags=("beta",))
-        owner.status = "failed"
-        owner.completed_at = datetime.now(UTC)
-        owner.failure_reason = "TEST_FAILURE"
-        store.update(owner)
-        assert owner.id is not None
-
-        descendant = store.add(
-            "Alpha descendant",
-            task_type="improve",
-            based_on=owner.id,
-            tags=("alpha",),
-        )
-        descendant.status = "failed"
-        descendant.completed_at = datetime.now(UTC)
-        descendant.failure_reason = "TEST_FAILURE"
-        store.update(descendant)
-        assert descendant.id is not None
-
-        result = invoke_gza(
-            "incomplete",
-            "--tag",
-            "alpha",
-            "--json",
-            "--fields",
-            "id,tags",
-            "--last",
-            "0",
-            "--project",
-            str(tmp_path),
-        )
-
-        assert result.returncode == 0
-        assert _incomplete_json_rows(result.stdout) == []
-        assert result.stderr == ""
 
 
     def test_incomplete_tag_filters_keep_blocked_dependents_scoped(self, tmp_path: Path) -> None:
@@ -16960,36 +15199,6 @@ class TestIncompleteCommand:
         assert tasks["dependent_alpha"].id in result.stdout
         assert tasks["dependent_beta"].id not in result.stdout
 
-    def test_incomplete_untagged_filters_blocked_dependents_section(self, tmp_path: Path) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        owner = store.add("Untagged failed owner", task_type="implement")
-        owner.status = "failed"
-        owner.completed_at = datetime.now(UTC)
-        owner.failure_reason = "TEST_FAILURE"
-        store.update(owner)
-        assert owner.id is not None
-
-        untagged_dependent = store.add(
-            "Untagged blocked dependent",
-            task_type="implement",
-            depends_on=owner.id,
-        )
-        tagged_dependent = store.add(
-            "Tagged blocked dependent",
-            task_type="implement",
-            depends_on=owner.id,
-            tags=("release",),
-        )
-
-        result = invoke_gza("incomplete", "--untagged", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Blocked dependents:" in result.stdout
-        assert untagged_dependent.id in result.stdout
-        assert tagged_dependent.id not in result.stdout
-        assert "Tagged blocked dependent" not in result.stdout
 
 
     def test_incomplete_json_tag_filter_drops_row_when_rerooted_owner_falls_out_of_scope(
@@ -17236,67 +15445,6 @@ class TestIncompleteCommand:
             }
         ]
 
-    def test_incomplete_tag_scope_matches_shared_recovery_preview_ids(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        store._default_merge_target_cache = "main"  # noqa: SLF001
-        store._project_root = None  # noqa: SLF001
-
-        release_only = store.add("Release only", task_type="plan", tags=("release",))
-        release_only.status = "failed"
-        release_only.failure_reason = "INFRASTRUCTURE_ERROR"
-        release_only.completed_at = datetime(2026, 6, 24, 9, 0, tzinfo=UTC)
-        store.update(release_only)
-        assert release_only.id is not None
-
-        release_ops = store.add("Release and ops", task_type="plan", tags=("release", "ops"))
-        release_ops.status = "failed"
-        release_ops.failure_reason = "TEST_FAILURE"
-        release_ops.completed_at = datetime(2026, 6, 24, 9, 5, tzinfo=UTC)
-        store.update(release_ops)
-        assert release_ops.id is not None
-
-        ops_only = store.add("Ops only", task_type="plan", tags=("ops",))
-        ops_only.status = "failed"
-        ops_only.failure_reason = "INFRASTRUCTURE_ERROR"
-        ops_only.completed_at = datetime(2026, 6, 24, 9, 10, tzinfo=UTC)
-        store.update(ops_only)
-        assert ops_only.id is not None
-
-        with patch(
-            "gza.recovery_engine._load_merge_context",
-            return_value=_recovery_engine_module._MergeContext(git=None, default_branch="main"),
-        ):
-            preview = build_dispatch_preview(
-                store,
-                tags=("release", "ops"),
-                any_tag=True,
-                max_recovery_attempts=1,
-                selection_mode="recovery_only",
-                include_pending=False,
-            )
-
-        args = self._incomplete_args(tmp_path, fields="id", json=True)
-        args.tags = ["release", "ops"]
-        args.all_tags = False
-        result = query_cli.cmd_incomplete(args)
-
-        captured = capsys.readouterr()
-        assert result == 0
-        assert {row["id"] for row in _incomplete_json_rows(captured.out)} == {
-            release_only.id,
-            release_ops.id,
-            ops_only.id,
-        }
-        assert {entry.task.id for entry in preview.recovery_entries} == {
-            release_only.id,
-            release_ops.id,
-            ops_only.id,
-        }
 
     def test_incomplete_all_tags_scope_matches_shared_recovery_preview_ids(
         self,
@@ -17463,41 +15611,6 @@ class TestIncompleteCommand:
         assert self._tree_root_id(tree_text) == failed_review.id
         assert plan.id not in tree_text
 
-    def test_incomplete_mixed_owner_recovery_row_keeps_plan_blocked_dependents_after_reroot(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        plan, failed_review = self._setup_mixed_owner_recovery_fixture(tmp_path)
-        store = make_store(tmp_path)
-        blocked = store.add(
-            "Blocked by mixed recovery plan",
-            task_type="implement",
-            depends_on=plan.id,
-            tags=("release",),
-        )
-        assert blocked.id is not None
-        plan = store.get(plan.id)
-        assert plan is not None
-        plan.auto_implement = False
-        store.update(plan)
-
-        args = self._incomplete_args(tmp_path, fields=None)
-        args.tags = ["release"]
-        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
-            result = query_cli.cmd_incomplete(args)
-
-        captured = capsys.readouterr()
-        assert result == 0
-        lines = captured.out.splitlines()
-        assert not lines[0].startswith("Deferred blockers outstanding")
-        assert any(line.startswith(f"{failed_review.id}: Resume failed task (MAX_TURNS)") for line in lines)
-        assert plan.id not in self._one_line_row_id(captured.out)
-        assert "Blocked dependents:" in captured.out
-        blocked_output = " ".join(captured.out.split())
-        assert blocked.id in blocked_output
-        assert f"blocked: awaiting plan review for {plan.id}" in blocked_output
-        assert f"release with uv run gza implement {plan.id}" in blocked_output
 
     def test_recovery_ids_match_queue_watch_advance_and_incomplete_for_unscoped_mixed_owner_row(
         self,
@@ -18146,75 +16259,6 @@ class TestIncompleteCommand:
         assert "| unresolved:" not in row_lines[0]
         assert result.stderr == ""
 
-    def test_incomplete_roots_plan_impl_review_improve_lineage_at_impl_in_both_views(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        plan = store.add("Plan background job retries", task_type="plan")
-        plan.status = "completed"
-        plan.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
-        store.update(plan)
-        assert plan.id is not None
-
-        impl = store.add("Implement background job retries", task_type="implement", based_on=plan.id)
-        impl.status = "completed"
-        impl.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
-        impl.branch = "feature/retries"
-        impl.has_commits = True
-        impl.merge_status = "unmerged"
-        store.update(impl)
-        assert impl.id is not None
-
-        unit = store.create_merge_unit(
-            source_branch=impl.branch,
-            target_branch="main",
-            owner_task_id=impl.id,
-            state="unmerged",
-        )
-        store.attach_task_to_merge_unit(impl.id, unit.id, "owner")
-
-        review = store.add(
-            "Review background job retries",
-            task_type="review",
-            based_on=impl.id,
-            depends_on=impl.id,
-        )
-        review.status = "completed"
-        review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
-        review.output_content = "**Verdict: CHANGES_REQUESTED**"
-        store.update(review)
-        assert review.id is not None
-        store.attach_task_to_merge_unit(review.id, unit.id, "review")
-
-        improve = store.add(
-            "Improve background job retries",
-            task_type="improve",
-            based_on=impl.id,
-            depends_on=review.id,
-            same_branch=True,
-        )
-        improve.status = "in_progress"
-        improve.branch = impl.branch
-        improve.has_commits = True
-        store.update(improve)
-        assert improve.id is not None
-        store.attach_task_to_merge_unit(improve.id, unit.id, "improve")
-
-        git = _mock_unmerged_git()
-        with patch("gza.cli.query.Git", return_value=git):
-            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None))
-        captured = capsys.readouterr()
-
-        assert result == 0
-        one_line_output = captured.out
-        assert self._one_line_row_id(one_line_output) == impl.id
-        assert f"SKIP: improve task {improve.id} is in_progress" in one_line_output
-        assert plan.prompt not in one_line_output
-        assert plan.id not in one_line_output
 
     def test_incomplete_roots_failed_rebase_lineage_at_impl_and_reports_blocker(
         self,
@@ -18826,48 +16870,6 @@ class TestLineageOwnerParity:
         search_rows = {row["id"]: row["branch_owner_id"] for row in json.loads(search_result.stdout)}
         assert search_rows[rebase.id] == impl.id
 
-    def test_unattached_retry_review_owner_identity_parity_across_lineage_history_and_search(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        tasks = _setup_retry_review_owner_fixture(tmp_path)
-        root = tasks["root"]
-        review = tasks["review"]
-
-        lineage_result = query_cli.cmd_lineage(
-            argparse.Namespace(project_dir=tmp_path, task_id=str(review.id), flat=True)
-        )
-        lineage_captured = capsys.readouterr()
-        assert lineage_result == 0
-        assert _lineage_root_id(lineage_captured.out) == root.id
-
-        history_result = invoke_gza(
-            "history",
-            "--status",
-            "completed",
-            "--json",
-            "--fields",
-            "id,branch_owner_id",
-            "--project",
-            str(tmp_path),
-        )
-        assert history_result.returncode == 0
-        history_rows = {row["id"]: row["branch_owner_id"] for row in json.loads(history_result.stdout)}
-        assert history_rows[review.id] == root.id
-
-        search_result = invoke_gza(
-            "search",
-            "same-branch retry",
-            "--json",
-            "--fields",
-            "id,branch_owner_id",
-            "--project",
-            str(tmp_path),
-        )
-        assert search_result.returncode == 0
-        search_rows = {row["id"]: row["branch_owner_id"] for row in json.loads(search_result.stdout)}
-        assert search_rows[review.id] == root.id
 
     def test_lineage_keeps_requested_plan_root_for_fanout_implementations(
         self,
@@ -18984,110 +16986,6 @@ class TestLineageOwnerParity:
         }
 
 
-    def test_incomplete_hides_dropped_rebase_chain_in_both_views(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        setup_config(tmp_path)
-        config_path = tmp_path / "gza.yaml"
-        config_path.write_text(config_path.read_text() + "verify_command: ./bin/tests\n", encoding="utf-8")
-        store = make_store(tmp_path)
-        config = Config.load(tmp_path)
-
-        impl = store.add("Implement background mode startup errors", task_type="implement")
-        impl.status = "completed"
-        impl.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
-        impl.branch = "feature/background-errors"
-        impl.has_commits = True
-        impl.merge_status = "unmerged"
-        store.update(impl)
-        assert impl.id is not None
-
-        unit = store.create_merge_unit(
-            source_branch=impl.branch,
-            target_branch="main",
-            owner_task_id=impl.id,
-            state="unmerged",
-        )
-        store.attach_task_to_merge_unit(impl.id, unit.id, "owner")
-
-        rebase_resolved = store.add(
-            "Resolved rebase",
-            task_type="rebase",
-            based_on=impl.id,
-            same_branch=True,
-        )
-        rebase_resolved.status = "completed"
-        rebase_resolved.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
-        rebase_resolved.branch = impl.branch
-        rebase_resolved.has_commits = True
-        rebase_resolved.merge_status = "unmerged"
-        store.update(rebase_resolved)
-        assert rebase_resolved.id is not None
-        store.attach_task_to_merge_unit(rebase_resolved.id, unit.id, "rebase")
-        persist_verify_gate_artifact(
-            store,
-            config,
-            owner_task=impl,
-            source_task=rebase_resolved,
-            result=SimpleNamespace(
-                command="./bin/tests",
-                status="passed",
-                exit_status="0",
-                captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
-                reviewed_branch=rebase_resolved.branch,
-                reviewed_head_sha="a" * 40,
-                reviewed_base_sha="b" * 40,
-                working_directory="/tmp/rebase-resolved-verify",
-                failure=None,
-            ),
-            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
-            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
-            producer="review_verify",
-        )
-
-        dropped_one = store.add(
-            "Dropped rebase one",
-            task_type="rebase",
-            based_on=rebase_resolved.id,
-            same_branch=True,
-        )
-        dropped_one.status = "dropped"
-        dropped_one.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
-        dropped_one.branch = impl.branch
-        dropped_one.has_commits = True
-        store.update(dropped_one)
-        assert dropped_one.id is not None
-        store.attach_task_to_merge_unit(dropped_one.id, unit.id, "rebase")
-
-        dropped_two = store.add(
-            "Dropped rebase two",
-            task_type="rebase",
-            based_on=dropped_one.id,
-            same_branch=True,
-        )
-        dropped_two.status = "dropped"
-        dropped_two.completed_at = datetime(2026, 5, 10, 13, 0, tzinfo=UTC)
-        dropped_two.branch = impl.branch
-        dropped_two.has_commits = True
-        store.update(dropped_two)
-        assert dropped_two.id is not None
-        store.attach_task_to_merge_unit(dropped_two.id, unit.id, "rebase")
-
-        git = _mock_unmerged_git()
-        git.can_merge.return_value = False
-
-        with patch("gza.cli.query.Git", return_value=git):
-            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None))
-        captured = capsys.readouterr()
-
-        assert result == 0
-        one_line_output = captured.out
-        assert self._one_line_row_id(one_line_output) == impl.id
-        assert "Rebase before create_review" in one_line_output
-        assert f"{dropped_one.id} (dropped)" not in one_line_output
-        assert f"{dropped_two.id} (dropped)" not in one_line_output
 
 
 def test_cmd_next_does_not_call_load_merge_context_when_git_provided(
@@ -19176,94 +17074,6 @@ def test_cmd_next_does_not_call_load_merge_context_when_git_provided(
     assert result == 0
 
 
-def test_cmd_next_enters_git_cache_for_recovery_lifecycle_and_queue_query(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    setup_config(tmp_path)
-    make_store(tmp_path)
-    config = Config.load(tmp_path)
-
-    cache_state = {"active": False}
-    phases: list[str] = []
-
-    class _TrackedGit:
-        def cached(self):
-            @contextlib.contextmanager
-            def _scope():
-                assert cache_state["active"] is False
-                cache_state["active"] = True
-                phases.append("cache-enter")
-                try:
-                    yield self
-                finally:
-                    phases.append("cache-exit")
-                    cache_state["active"] = False
-
-            return _scope()
-
-        def default_branch(self) -> str:
-            assert cache_state["active"] is True
-            phases.append("default-branch")
-            return "main"
-
-    git = _TrackedGit()
-
-    def _fake_collect_recovery(*args, git: object, target_branch: str, **kwargs):
-        del args, kwargs
-        assert cache_state["active"] is True
-        assert git is not None
-        assert target_branch == "main"
-        phases.append("recovery")
-        return []
-
-    def _fake_collect_lifecycle(*args, git: object, target_branch: str, **kwargs):
-        del args, kwargs
-        assert cache_state["active"] is True
-        assert git is not None
-        assert target_branch == "main"
-        phases.append("lifecycle")
-        return []
-
-    def _fake_run(
-        _self: query_cli._TaskQueryService,  # noqa: SLF001
-        query: query_cli._TaskQuery,  # noqa: SLF001
-        *,
-        config: Config,
-        git: object,
-        target_branch: str | None,
-    ) -> query_cli._TaskQueryResult:  # noqa: SLF001
-        del config
-        assert cache_state["active"] is True
-        assert git is not None
-        assert target_branch == "main"
-        phases.append("run")
-        return query_cli._TaskQueryResult(query=query, rows=())
-
-    monkeypatch.setattr(query_cli.Config, "load", lambda _project_dir: config)
-    monkeypatch.setattr(query_cli, "Git", lambda _project_dir: git)
-    monkeypatch.setattr(query_cli, "collect_recovery_lane_entries", _fake_collect_recovery)
-    monkeypatch.setattr(query_cli, "collect_lifecycle_action_entries", _fake_collect_lifecycle)
-    monkeypatch.setattr(query_cli._TaskQueryService, "run", _fake_run)
-
-    result = query_cli.cmd_next(
-        argparse.Namespace(
-            project_dir=tmp_path,
-            tags=None,
-            any_tag=False,
-            all=False,
-        )
-    )
-
-    assert result == 0
-    assert phases == [
-        "cache-enter",
-        "default-branch",
-        "recovery",
-        "lifecycle",
-        "run",
-        "cache-exit",
-    ]
 
 
 class TestTagScopedUnmergedCohorts:

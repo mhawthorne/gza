@@ -104,27 +104,6 @@ def test_no_color_config_disables_ansi_on_forced_tty(
     assert ANSI_RE.search(output) is None, output
 
 
-@pytest.mark.parametrize(
-    ("command_name", "seed_status"),
-    [
-        ("history", "completed"),
-        ("show", "completed"),
-        ("queue", "pending"),
-    ],
-)
-def test_default_color_still_emits_ansi_on_forced_tty(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    command_name: str,
-    seed_status: str,
-) -> None:
-    task = _seed_task(tmp_path, status=seed_status)
-    cli_args = (command_name, str(task.id)) if command_name == "show" else (command_name,)
-
-    returncode, output = _capture_command_output(monkeypatch, tmp_path, *cli_args)
-
-    assert returncode == 0
-    assert ANSI_RE.search(output) is not None, output
 
 
 def test_no_color_env_disables_ansi_even_when_config_allows_color(

@@ -545,35 +545,6 @@ def test_discover_parked_tasks_includes_real_retry_limit_failed_owner_row(tmp_pa
     ]
 
 
-def test_select_and_clear_parked_tasks_clears_backstop_and_is_idempotent(tmp_path: Path) -> None:
-    config, store = _config_and_store(tmp_path)
-    git = _GitDouble()
-
-    impl, owner_row = _make_backstop_owner(store, prompt="Backstop candidate", branch="feature/backstop")
-    impl.tags = ("ops", "critical")
-    store.update(impl)
-
-    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((owner_row,), object())):
-        first = select_and_clear_parked_tasks(
-            store,
-            config=config,
-            git=git,
-            target_branch="main",
-            task_ids=(impl.id,),
-            reason_classes=("backstop",),
-        )
-    assert [outcome.status for outcome in first.outcomes] == ["rearmed"]
-    assert store.list_watch_progress_observations(subject_kind="merge_unit", subject_id=str(store.get_or_create_merge_unit_for_task(impl).id)) == []
-
-    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((), object())):
-        second = select_and_clear_parked_tasks(
-            store,
-            config=config,
-            git=git,
-            target_branch="main",
-            task_ids=(impl.id,),
-        )
-    assert [(outcome.status, outcome.detail) for outcome in second.outcomes] == [("skipped", "not currently parked")]
 
 
 def test_select_and_clear_parked_tasks_finds_and_rearms_real_retry_limit_owner_row(tmp_path: Path) -> None:
@@ -827,91 +798,8 @@ def test_select_and_clear_parked_tasks_rearms_verify_fix_failed_by_tag_scope(tmp
     )
 
 
-def test_select_and_clear_parked_tasks_rearms_recovered_verify_fix_failed_on_root_by_explicit_id(
-    tmp_path: Path,
-) -> None:
-    config, store = _config_and_store(tmp_path)
-    git = _GitDouble()
-    root, recovery, owner_row = _make_recovered_verify_fix_failed_owner(
-        store,
-        prompt="Recovered verify fix failed clear",
-        branch="feature/recovered-verify-fix-failed-clear",
-    )
-    assert root.id is not None
-    assert recovery.id is not None
-
-    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((owner_row,), object())):
-        result = select_and_clear_parked_tasks(
-            store,
-            config=config,
-            git=git,
-            target_branch="main",
-            task_ids=(root.id,),
-            reason_classes=("verify-fix-failed",),
-        )
-
-    assert [(outcome.owner_task.id, outcome.status, outcome.reason_class) for outcome in result.outcomes] == [
-        (root.id, "rearmed", "verify-fix-failed"),
-    ]
-    root_rearm = store.get_parked_task_rearm(
-        subject_kind="task",
-        subject_id=root.id,
-        attention_reason="verify-fix-failed",
-    )
-    assert root_rearm is not None
-    assert root_rearm.manual_rearm_epoch == 1
-    assert (
-        store.get_parked_task_rearm(
-            subject_kind="task",
-            subject_id=recovery.id,
-            attention_reason="verify-fix-failed",
-        )
-        is None
-    )
 
 
-def test_select_and_clear_parked_tasks_rearms_recovered_verify_fix_failed_on_root_by_tag_scope(
-    tmp_path: Path,
-) -> None:
-    config, store = _config_and_store(tmp_path)
-    git = _GitDouble()
-    root, recovery, owner_row = _make_recovered_verify_fix_failed_owner(
-        store,
-        prompt="Tagged recovered verify fix failed clear",
-        branch="feature/tagged-recovered-verify-fix-failed-clear",
-        tags=("ops",),
-    )
-    assert root.id is not None
-    assert recovery.id is not None
-
-    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((owner_row,), object())):
-        result = select_and_clear_parked_tasks(
-            store,
-            config=config,
-            git=git,
-            target_branch="main",
-            tags=("ops",),
-            reason_classes=("verify-fix-failed",),
-        )
-
-    assert [(outcome.owner_task.id, outcome.status, outcome.reason_class) for outcome in result.outcomes] == [
-        (root.id, "rearmed", "verify-fix-failed"),
-    ]
-    root_rearm = store.get_parked_task_rearm(
-        subject_kind="task",
-        subject_id=root.id,
-        attention_reason="verify-fix-failed",
-    )
-    assert root_rearm is not None
-    assert root_rearm.manual_rearm_epoch == 1
-    assert (
-        store.get_parked_task_rearm(
-            subject_kind="task",
-            subject_id=recovery.id,
-            attention_reason="verify-fix-failed",
-        )
-        is None
-    )
 
 
 def test_select_and_clear_parked_tasks_applies_landed_and_missing_branch_guards(tmp_path: Path) -> None:

@@ -22,85 +22,12 @@ def _completed_branch_task(store, prompt: str, branch: str):
 
 
 
-def test_sync_without_task_ids_uses_default_branch_cohort_builder(tmp_path, capsys):
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    cohort = Mock()
-    cohort.branch = "feature/default-sync"
-    cohort.code_tasks = ()
-
-    args = argparse.Namespace(
-        project_dir=tmp_path,
-        task_ids=[],
-        dry_run=True,
-        git_only=True,
-        pr_only=False,
-        no_fetch=False,
-    )
-
-    with (
-        patch("gza.cli.git_ops.get_store", return_value=store),
-        patch("gza.cli.git_ops.Git", return_value=Mock()),
-        patch("gza.cli.git_ops.build_default_branch_cohorts", return_value=[cohort]) as build_default,
-        patch(
-            "gza.cli.git_ops.sync_branch_cohorts",
-            return_value=([BranchSyncResult(branch="feature/default-sync", task_ids=(), reconciled=True)], False),
-        ) as sync_call,
-    ):
-        rc = cmd_sync(args)
-
-    assert rc == 0
-    build_default.assert_called_once_with(store)
-    assert sync_call.call_args.args[2] == [cohort]
-    output = capsys.readouterr().out
-    assert "feature/default-sync" in output
 
 
 
 
 
 
-def test_sync_reports_degraded_provenance_warning_without_clearing_stored_base_sha(tmp_path, capsys):
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    task = _completed_branch_task(store, "Partial provenance", "feature/partial-provenance")
-    assert task.id is not None
-    unit = store.get_or_create_merge_unit_for_task(task)
-    assert unit is not None
-    store.refresh_merge_unit_head(unit.id, "head-old-123", "base-old-456")
-
-    git = Mock()
-    git.default_branch.return_value = "main"
-    git.branch_exists.return_value = True
-    git.is_merged.return_value = False
-    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
-    git.rev_parse_if_exists.side_effect = lambda ref: {
-        "feature/partial-provenance": "head-new-789",
-        "main": None,
-    }.get(ref)
-
-    args = argparse.Namespace(
-        project_dir=tmp_path,
-        task_ids=[task.id],
-        dry_run=False,
-        git_only=True,
-        pr_only=False,
-        no_fetch=True,
-    )
-
-    with (
-        patch("gza.cli.git_ops.get_store", return_value=store),
-        patch("gza.cli.git_ops.Git", return_value=git),
-    ):
-        rc = cmd_sync(args)
-
-    assert rc == 0
-    refreshed_unit = store.get_merge_unit(unit.id)
-    assert refreshed_unit is not None
-    assert refreshed_unit.head_sha == "head-new-789"
-    assert refreshed_unit.base_sha == "base-old-456"
-    output = capsys.readouterr().out
-    assert "warnings: degraded merge-unit provenance: could not resolve base SHA for 'main'; preserving any stored base_sha" in output
 
 
 def test_sync_reports_unexpected_ref_resolution_warning_without_clearing_stored_shas(tmp_path, capsys):

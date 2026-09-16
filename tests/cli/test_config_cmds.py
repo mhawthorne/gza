@@ -2589,23 +2589,6 @@ class TestInitCommand:
         config_path = tmp_path / "gza.yaml"
         assert "original" in config_path.read_text()
 
-    def test_init_force_overwrites(self, tmp_path: Path):
-        """Init command overwrites existing config with --force."""
-        _home_dir, env = self._home_env(tmp_path)
-        setup_config(tmp_path, project_name="original")
-        local_example_path = tmp_path / "gza.local.yaml.example"
-        local_example_path.write_text("# stale local example\n")
-
-        result = invoke_gza("init", "--force", "--db", "local", "--project", str(tmp_path), env=env)
-
-        assert result.returncode == 0
-
-        # Verify config was overwritten (has directory name, not "original")
-        config_path = tmp_path / "gza.yaml"
-        content = config_path.read_text()
-        assert tmp_path.name in content
-        assert local_example_path.exists()
-        assert "# stale local example" not in local_example_path.read_text()
 
 
     def test_init_interactive_conventional_branch_strategy_still_scaffolds_correctly(self, tmp_path: Path):

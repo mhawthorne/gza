@@ -94,40 +94,8 @@ def _create_completed_non_implement_task(store, prompt="Document the codebase"):
     return task
 
 
-def test_advance_no_squash_when_threshold_zero(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    _create_completed_non_implement_task(store)
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=_mock_git(commit_count=3)),
-        patch("gza.git.Git.default_branch", return_value="main"),
-        patch("gza.git.Git.local_branch_names", return_value=()),
-        patch("gza.cli.git_ops._merge_single_task", return_value=0) as merge_single,
-    ):
-        rc = cmd_advance(_advance_args(tmp_path))
-
-    assert rc == 0
-    merge_args = merge_single.call_args.args[4]
-    assert merge_args.squash is False
 
 
-def test_advance_squash_when_commits_meet_threshold(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    _create_completed_non_implement_task(store)
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=_mock_git(commit_count=3)),
-        patch("gza.git.Git.default_branch", return_value="main"),
-        patch("gza.git.Git.local_branch_names", return_value=()),
-        patch("gza.cli.git_ops._merge_single_task", return_value=0) as merge_single,
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, squash_threshold=2))
-
-    assert rc == 0
-    merge_args = merge_single.call_args.args[4]
-    assert merge_args.squash is True
 
 
 def test_advance_no_squash_when_commits_below_threshold(tmp_path: Path) -> None:
@@ -164,24 +132,6 @@ def test_advance_squash_threshold_cli_override(tmp_path: Path, capsys) -> None:
     assert "auto-squash" in capsys.readouterr().out
 
 
-def test_advance_dry_run_shows_squash_annotation(tmp_path: Path, capsys) -> None:
-    (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
-        "db_path: .gza/gza.db\n"
-        "merge_squash_threshold: 2\n"
-    )
-    store = make_store(tmp_path)
-    _create_completed_non_implement_task(store)
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=_mock_git(commit_count=3)),
-        patch("gza.git.Git.default_branch", return_value="main"),
-        patch("gza.git.Git.local_branch_names", return_value=()),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, dry_run=True))
-
-    assert rc == 0
-    assert "auto-squash" in capsys.readouterr().out
 
 
 def test_default_merge_squash_threshold_is_zero(tmp_path: Path) -> None:

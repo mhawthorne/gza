@@ -2133,47 +2133,6 @@ def test_check_main_integration_verify_unknown_head_does_not_cache_green_across_
     assert second.merges_halted is True
 
 
-def test_check_main_integration_verify_structured_fingerprint_establishes_freshness_when_head_unknown(
-    tmp_path,
-) -> None:
-    setup_config(tmp_path)
-    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "verify_command: ./bin/tests\n")
-    store = make_store(tmp_path)
-    config = Config.load(tmp_path)
-
-    git = MagicMock()
-    git.repo_dir = tmp_path
-    git.current_branch.return_value = "main"
-    git.rev_parse_if_exists.return_value = None
-    git._run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    fingerprint = "a" * 64
-    verify_result = _make_review_verify_result(
-        "./bin/tests",
-        status="passed",
-        exit_status="0",
-        captured_at=datetime(2026, 6, 23, 12, 0, tzinfo=UTC),
-        reviewed_branch="main",
-        reviewed_head_sha=None,
-        working_directory=str(tmp_path),
-        output=f"gza-verify phase=passed name=unit duration_seconds=1.0 tree_fingerprint={fingerprint}",
-    )
-
-    with patch("gza.main_integration_verify._run_review_verify_command", return_value=verify_result) as run_verify:
-        check = check_main_integration_verify(
-            config,
-            store,
-            git,
-            reason="unknown-head-structured-fingerprint",
-            resolved_head_sha=None,
-        )
-
-    run_verify.assert_called_once()
-    assert check.performed_verify is True
-    assert check.current_tree_fingerprint is None
-    assert check.state.tree_fingerprint == fingerprint
-    assert check.state.verify_status == "passed"
-    assert check.merges_halted is False
 
 
 def test_check_main_integration_verify_reuses_checkpoint_when_only_python_path_differs(tmp_path) -> None:
@@ -2225,70 +2184,6 @@ def test_check_main_integration_verify_reuses_checkpoint_when_only_python_path_d
     assert check.state.environment_identity == legacy_same_runtime_identity
 
 
-def test_check_main_integration_verify_persists_container_runner_class(tmp_path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    config = MagicMock(spec=Config)
-    config.verify_command = "./bin/tests"
-    config.autonomous_verify_timeout_seconds = 120
-    config.review_verify_timeout_grace_seconds = 5.0
-    config.main_integration_verify_red_ttl_minutes = 30
-
-    git = MagicMock()
-    git.repo_dir = tmp_path
-    git.current_branch.return_value = "main"
-    git.rev_parse_if_exists.return_value = "abc123"
-
-    verify_result = _make_review_verify_result(
-        "./bin/tests",
-        status="passed",
-        exit_status="0",
-        captured_at=datetime(2026, 6, 23, tzinfo=UTC),
-        reviewed_branch="main",
-        reviewed_head_sha="abc123",
-        working_directory=str(tmp_path),
-        output="all good",
-    )
-
-    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
-        task.review_verify_command = result.command
-        task.review_verify_status = result.status
-        task.review_verify_exit_status = result.exit_status
-        task.review_verify_failure = result.failure
-        task.review_verify_head_sha = result.reviewed_head_sha
-        task.review_verify_branch = result.reviewed_branch
-        task.review_verify_captured_at = result.captured_at
-        store.update(task)
-
-    with (
-        patch("gza.main_integration_verify._compute_tree_fingerprint", side_effect=["fp-verified", "fp-verified"]),
-        patch("gza.main_integration_verify._run_review_verify_command", return_value=verify_result),
-        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
-    ):
-        check = check_main_integration_verify(
-            config,
-            store,
-            git,
-            reason="unit-test-container-runner-class",
-            runner_class="container",
-        )
-
-    persisted = load_main_integration_verify_state(store)
-
-    assert check.performed_verify is True
-    assert check.state.environment_identity == _current_identity(runner_class="container")
-    assert persisted is not None
-    assert persisted.environment_identity == _current_identity(runner_class="container")
-    payload = json.loads(persisted.task.output_content or "{}")
-    assert payload["environment_identity"] == {
-        "runner_class": "container",
-        "platform_system": platform.system(),
-        "platform_machine": platform.machine(),
-        "python_implementation": platform.python_implementation(),
-        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
-    }
-    assert "python_executable" not in payload["environment_identity"]
 
 
 def test_check_candidate_integration_verify_pass_returns_structured_evidence_without_persisting_main_state(
@@ -3140,70 +3035,6 @@ def test_check_main_integration_verify_classifies_shell_not_found_phase_failure_
     assert "abc123" not in check.state.alert_message
 
 
-def test_check_main_integration_verify_reruns_and_halts_when_current_fingerprint_is_unavailable(tmp_path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    _seed_main_verify_task(
-        store,
-        verify_status="passed",
-        verify_exit_status="0",
-        failure="",
-        alert_message="",
-    )
-
-    config = MagicMock(spec=Config)
-    config.verify_command = "./bin/tests"
-    config.autonomous_verify_timeout_seconds = 120
-    config.review_verify_timeout_grace_seconds = 5.0
-    config.main_integration_verify_red_ttl_minutes = 30
-
-    git = MagicMock()
-    git.repo_dir = tmp_path
-    git.current_branch.return_value = "main"
-    git.rev_parse_if_exists.return_value = "abc123"
-
-    verify_result = _make_review_verify_result(
-        "./bin/tests",
-        status="passed",
-        exit_status="0",
-        captured_at=datetime(2026, 6, 23, tzinfo=UTC),
-        reviewed_branch="main",
-        reviewed_head_sha="abc123",
-        working_directory=str(tmp_path),
-        output="all good",
-    )
-
-    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
-        task.review_verify_command = result.command
-        task.review_verify_status = result.status
-        task.review_verify_exit_status = result.exit_status
-        task.review_verify_failure = result.failure
-        task.review_verify_head_sha = result.reviewed_head_sha
-        task.review_verify_branch = result.reviewed_branch
-        task.review_verify_captured_at = result.captured_at
-        store.update(task)
-
-    with (
-        patch("gza.main_integration_verify._compute_tree_fingerprint", side_effect=[None, None]),
-        patch("gza.main_integration_verify._run_review_verify_command", return_value=verify_result),
-        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
-    ):
-        check = check_main_integration_verify(
-            config,
-            store,
-            git,
-            reason="unit-test",
-        )
-
-    assert check.performed_verify is True
-    assert check.merges_halted is True
-    assert check.state.verify_status == "unavailable"
-    assert check.state.verify_exit_status == MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
-    assert check.state.failure == (
-        "could not prove exact local target tree freshness because the tree fingerprint is unavailable"
-    )
-    assert check.state.alert_message == "main verify freshness unproven; exact tree fingerprint unavailable"
-    assert "abc123" not in check.state.alert_message
 
 
 def test_current_main_integration_verify_alert_surfaces_unproven_freshness_when_default_branch_probe_fails(

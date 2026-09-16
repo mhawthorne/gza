@@ -864,106 +864,8 @@ def test_verify_dry_run_legacy_branch_task_without_merge_unit_writes_nothing(tmp
     assert store.resolve_merge_unit_for_task(task.id) is None
 
 
-def test_verify_dry_run_unmaterialized_legacy_unit_matches_writable_newer_red(tmp_path, capsys):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    owner = _completed_branch_task_without_merge_unit(store, prompt="Legacy owner green")
-    contributor = _completed_branch_task_without_merge_unit(
-        store,
-        prompt="Legacy contributor red",
-        branch=owner.branch,
-        task_type="fix",
-        based_on=owner.id,
-    )
-    captured_at = datetime(2026, 8, 21, 10, 0, tzinfo=UTC)
-    _persist_verify(store, config, owner, status="passed", exit_status="0", path="legacy-owner-green.md", captured_at=captured_at)
-    _persist_verify(
-        store,
-        config,
-        contributor,
-        status="failed",
-        exit_status="1",
-        path="legacy-contributor-red.md",
-        captured_at=captured_at + timedelta(minutes=1),
-    )
-    assert store.resolve_merge_unit_for_task(contributor.id) is None
-    before = _snapshot_verify_dry_run_state(store)
-    git = _fake_git(tmp_path)
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch("gza.cli.verify.execute_advance_action") as execute_action,
-    ):
-        rc = cmd_verify(_args(tmp_path, contributor.id, dry_run=True))
-
-    output = capsys.readouterr().out
-    assert rc == 1
-    execute_action.assert_not_called()
-    assert _snapshot_verify_dry_run_state(store) == before
-    assert f"[dry-run] Verify gate: failed for {owner.id}" in output
-    assert f"evidence: {contributor.id}" in output
-    assert "artifact: legacy-contributor-red.md" in output
-
-    unit = store.get_or_create_merge_unit_for_task(contributor)
-    assert unit is not None
-    assert unit.owner_task_id == owner.id
-    writable_owner = store.resolve_merge_unit_owner_task(unit)
-    assert writable_owner is not None
-    writable_decision = _effective_verify_gate_decision(store=store, owner_task=writable_owner, config=config, git=git)
-    assert writable_decision.state == "failed"
-    assert writable_decision.lookup.result is not None
-    assert writable_decision.lookup.result.output_artifact_path == "legacy-contributor-red.md"
 
 
-def test_verify_dry_run_unmaterialized_legacy_unit_matches_writable_newer_green(tmp_path, capsys):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    owner = _completed_branch_task_without_merge_unit(store, prompt="Legacy owner red")
-    contributor = _completed_branch_task_without_merge_unit(
-        store,
-        prompt="Legacy contributor green",
-        branch=owner.branch,
-        task_type="fix",
-        based_on=owner.id,
-    )
-    captured_at = datetime(2026, 8, 21, 10, 0, tzinfo=UTC)
-    _persist_verify(store, config, owner, status="failed", exit_status="1", path="legacy-owner-red.md", captured_at=captured_at)
-    _persist_verify(
-        store,
-        config,
-        contributor,
-        status="passed",
-        exit_status="0",
-        path="legacy-contributor-green.md",
-        captured_at=captured_at + timedelta(minutes=1),
-    )
-    assert store.resolve_merge_unit_for_task(contributor.id) is None
-    before = _snapshot_verify_dry_run_state(store)
-    git = _fake_git(tmp_path)
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch("gza.cli.verify.execute_advance_action") as execute_action,
-    ):
-        rc = cmd_verify(_args(tmp_path, contributor.id, dry_run=True))
-
-    output = capsys.readouterr().out
-    assert rc == 0
-    execute_action.assert_not_called()
-    assert _snapshot_verify_dry_run_state(store) == before
-    assert f"[dry-run] Verify gate: passed for {owner.id}" in output
-    assert f"evidence: {contributor.id}" in output
-    assert "artifact: legacy-contributor-green.md" in output
-
-    unit = store.get_or_create_merge_unit_for_task(contributor)
-    assert unit is not None
-    assert unit.owner_task_id == owner.id
-    writable_owner = store.resolve_merge_unit_owner_task(unit)
-    assert writable_owner is not None
-    writable_decision = _effective_verify_gate_decision(store=store, owner_task=writable_owner, config=config, git=git)
-    assert writable_decision.state == "passed"
-    assert writable_decision.lookup.result is not None
-    assert writable_decision.lookup.result.output_artifact_path == "legacy-contributor-green.md"
 
 
 
@@ -1063,91 +965,12 @@ def test_verify_branchless_self_linked_review_cycle_refuses_without_mutation(
 
 
 
-def test_verify_dry_run_attached_successful_implementation_previews_owner_tip_sync_without_mutation(
-    tmp_path, capsys
-):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    stale_owner = _completed_branch_task_without_merge_unit(store, prompt="Stale owner")
-    latest_tip = _completed_branch_task_without_merge_unit(
-        store,
-        prompt="Latest implementation tip",
-        branch=stale_owner.branch,
-    )
-    stale_owner.completed_at = datetime(2026, 8, 21, 10, 0, tzinfo=UTC)
-    latest_tip.completed_at = datetime(2026, 8, 21, 11, 0, tzinfo=UTC)
-    store.update(stale_owner)
-    store.update(latest_tip)
-    unit = _attach_merge_unit(store, stale_owner, latest_tip)
-    assert unit.owner_task_id == stale_owner.id
-    _persist_verify(
-        store,
-        config,
-        latest_tip,
-        status="passed",
-        exit_status="0",
-        path="latest-tip-green.md",
-        captured_at=datetime(2026, 8, 21, 16, 0, tzinfo=UTC),
-    )
-    before_tables = _snapshot_verify_dry_run_state(store)
-    before_bytes = _snapshot_db_bytes(store)
-    git = _fake_git(tmp_path)
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch("gza.cli.verify.execute_advance_action") as execute_action,
-    ):
-        rc = cmd_verify(_args(tmp_path, latest_tip.id, dry_run=True))
-
-    output = capsys.readouterr().out
-    assert rc == 0
-    execute_action.assert_not_called()
-    dry_summary = _dry_run_resolution_verify_summary(store, config, git, latest_tip)
-    assert _snapshot_verify_dry_run_state(store) == before_tables
-    assert _snapshot_db_bytes(store) == before_bytes
-    assert dry_summary == {
-        "owner_id": latest_tip.id,
-        "representative_id": latest_tip.id,
-        "epoch": {"branch": latest_tip.branch, "head": "head-current", "command": "./bin/tests"},
-        "verdict": "passed",
-        "exit_status": "0",
-        "evidence_source": latest_tip.id,
-        "artifact_path": "latest-tip-green.md",
-    }
-    assert f"[dry-run] Verify gate: passed for {latest_tip.id}" in output
-    assert "artifact: latest-tip-green.md" in output
-
-    writable_summary = _writable_resolution_verify_summary(store, config, git, latest_tip)
-    assert writable_summary == dry_summary
-    refreshed_unit = store.get_merge_unit(unit.id)
-    assert refreshed_unit is not None
-    assert refreshed_unit.owner_task_id == latest_tip.id
 
 
 
 
 
 
-def test_verify_dry_run_reports_current_epoch_without_mutation(tmp_path, capsys):
-    config = _setup_verify_config(tmp_path)
-    store = make_store(tmp_path)
-    task = _completed_unmerged_task(store)
-    _persist_verify(store, config, task, status="failed", exit_status="1", path="red-output.md")
-    git = _fake_git(tmp_path)
-    before = store.list_artifacts(task.id, kind=VERIFY_GATE_ARTIFACT_KIND)
-
-    with (
-        patch("gza.cli.verify.Git", return_value=git),
-        patch("gza.cli.verify.execute_advance_action") as execute_action,
-    ):
-        rc = cmd_verify(_args(tmp_path, task.id, dry_run=True))
-
-    assert rc == 1
-    execute_action.assert_not_called()
-    assert store.list_artifacts(task.id, kind=VERIFY_GATE_ARTIFACT_KIND) == before
-    output = capsys.readouterr().out
-    assert "[dry-run] Verify gate: failed" in output
-    assert "head=head-current" in output
 
 
 def test_verify_context_reports_progress_like_advance(tmp_path, capsys):

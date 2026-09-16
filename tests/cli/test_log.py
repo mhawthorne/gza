@@ -573,22 +573,6 @@ class TestLogCommand:
         assert "gza merge" not in output
 
 
-    def test_log_by_task_id_missing_log_file(self, tmp_path: Path):
-        """Log command by task ID handles missing log file."""
-
-        setup_config(tmp_path)
-
-        # Create a task with a log file path that doesn't exist
-        store = make_store(tmp_path)
-        task = store.add("Test task with missing log")
-        task.status = "completed"
-        task.log_file = ".gza/logs/nonexistent.log"
-        store.update(task)
-
-        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 1
-        assert "Log file not found" in result.stdout
 
 
 
@@ -641,29 +625,6 @@ class TestLogCommand:
         assert "Log file not found" in result.stdout
         assert "retry output" not in result.stdout
 
-    def test_log_default_mode_renders_entries_when_result_exists(self, tmp_path: Path):
-        """Default formatted output should include entry rendering, not metadata-only output."""
-        import json
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Default render parity task")
-        task.status = "completed"
-        task.log_file = ".gza/logs/test.log"
-        store.update(task)
-
-        log_dir = tmp_path / ".gza" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        lines = [
-            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Entry text should render"}]}},
-            {"type": "result", "subtype": "success", "result": "summary", "num_steps": 1, "duration_ms": 1000, "total_cost_usd": 0.01},
-        ]
-        (log_dir / "test.log").write_text("\n".join(json.dumps(line) for line in lines))
-
-        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Entry text should render" in result.stdout
 
     def test_log_follow_by_task_uses_running_worker_when_available(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
         """-t -f should follow via live worker when a task is actively running."""

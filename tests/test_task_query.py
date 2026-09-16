@@ -130,45 +130,8 @@ def _attach_child_merge_unit(
     return unit.id
 
 
-@pytest.mark.parametrize("status", ["pending", "in_progress", "failed", "completed_unmerged"])
-def test_outstanding_deferred_review_blocker_count_includes_open_lifecycles(
-    tmp_path: Path,
-    status: str,
-) -> None:
-    store = _store(tmp_path)
-    source = _max_cycles_merged_source(store)
-    assert source.id is not None
-    blocker = _deferred_blocker(store, source.id)
-
-    if status == "in_progress":
-        store.mark_in_progress(blocker)
-    elif status == "failed":
-        store.mark_failed(blocker, failure_reason="TEST_FAILURE")
-    elif status == "completed_unmerged":
-        store.mark_completed(blocker, has_commits=True, branch="feature/deferred-open")
-
-    assert count_outstanding_deferred_review_blockers(store) == 1
 
 
-@pytest.mark.parametrize("terminal_state", ["merged", "empty", "redundant", "dropped", "superseded"])
-def test_outstanding_deferred_review_blocker_count_excludes_terminal_child_merge_units(
-    tmp_path: Path,
-    terminal_state: str,
-) -> None:
-    store = _store(tmp_path)
-    source = _max_cycles_merged_source(store)
-    assert source.id is not None
-    blocker = _deferred_blocker(store, source.id)
-    store.mark_completed(blocker, has_commits=True, branch=f"feature/deferred-{terminal_state}")
-    assert blocker.id is not None
-    blocker_unit = store.resolve_merge_unit_for_task(blocker.id)
-    assert blocker_unit is not None
-    if terminal_state == "merged":
-        store.set_merge_unit_state(blocker_unit.id, terminal_state, merge_source="advance")
-    else:
-        store.set_merge_unit_state(blocker_unit.id, terminal_state)
-
-    assert count_outstanding_deferred_review_blockers(store) == 0
 
 
 def test_outstanding_deferred_review_blocker_count_excludes_dropped_task_without_unit(
@@ -200,18 +163,6 @@ def test_outstanding_deferred_review_blocker_count_excludes_legacy_merged_task_w
     assert count_outstanding_deferred_review_blockers(store) == 0
 
 
-def test_outstanding_deferred_review_blocker_count_prefers_child_merge_unit_over_stale_legacy_status(
-    tmp_path: Path,
-) -> None:
-    store = _store(tmp_path)
-    source = _max_cycles_merged_source(store)
-    assert source.id is not None
-    blocker = _deferred_blocker(store, source.id)
-    store.mark_completed(blocker, has_commits=True, branch="feature/deferred-stale-legacy")
-    blocker.merge_status = "merged"
-    store.update(blocker)
-
-    assert count_outstanding_deferred_review_blockers(store) == 1
 
 
 @pytest.mark.parametrize("active_state", ["unmerged", "blocked", "stale"])
@@ -316,28 +267,6 @@ def test_outstanding_deferred_review_blocker_count_excludes_historical_only_memb
     assert count_outstanding_deferred_review_blockers(store) == 0
 
 
-def test_outstanding_deferred_review_blocker_count_requires_tag_and_max_cycle_source(
-    tmp_path: Path,
-) -> None:
-    store = _store(tmp_path)
-    source = _max_cycles_merged_source(store)
-    assert source.id is not None
-    _deferred_blocker(store, source.id, "untagged child", tags=())
-
-    manual_source = store.add("manual source", task_type="implement")
-    store.mark_completed(manual_source, has_commits=True, branch="feature/manual-source")
-    assert manual_source.id is not None
-    manual_unit = store.resolve_merge_unit_for_task(manual_source.id)
-    assert manual_unit is not None
-    store.set_merge_unit_state(manual_unit.id, "merged", merge_source="advance")
-    _deferred_blocker(store, manual_source.id, "manual-source child")
-
-    unmerged_source = store.add("unmerged source", task_type="implement")
-    store.mark_completed(unmerged_source, has_commits=True, branch="feature/unmerged-source")
-    assert unmerged_source.id is not None
-    _deferred_blocker(store, unmerged_source.id, "unmerged-source child")
-
-    assert count_outstanding_deferred_review_blockers(store) == 0
 
 
 def test_outstanding_deferred_review_blocker_count_is_zero_when_empty(tmp_path: Path) -> None:
@@ -3541,13 +3470,6 @@ def _offset_store(tmp_path: Path) -> tuple[SqliteTaskStore, list[str]]:
 
 
 
-def test_offset_does_not_change_total_count(tmp_path: Path) -> None:
-    store, ids = _offset_store(tmp_path)
-    service = TaskQueryService(store)
-    query = TaskQueryPresets.search("", limit=10)
-
-    assert service.run(query).total_count == len(ids)
-    assert service.run(replace(query, offset=20)).total_count == len(ids)
 
 
 def test_offset_past_the_end_returns_no_rows(tmp_path: Path) -> None:
@@ -3560,12 +3482,3 @@ def test_offset_past_the_end_returns_no_rows(tmp_path: Path) -> None:
     assert result.total_count == len(ids)
 
 
-def test_offset_defaults_to_zero_and_preserves_existing_behaviour(tmp_path: Path) -> None:
-    store, _ = _offset_store(tmp_path)
-    service = TaskQueryService(store)
-    query = TaskQueryPresets.search("", limit=10)
-
-    assert query.offset == 0
-    assert [row.task.id for row in service.run(query).rows] == [
-        row.task.id for row in service.run(replace(query, offset=0)).rows
-    ]

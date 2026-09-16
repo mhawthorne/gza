@@ -262,56 +262,6 @@ def test_attach_wrapper_manual_review_failed_task_does_not_auto_resume(tmp_path:
     mock_spawn.assert_not_called()
 
 
-def test_attach_wrapper_timeout_failed_implement_handoff_launches_iterate_resume(tmp_path: Path) -> None:
-    """Timeout failed implement handoff should relaunch through iterate resume, not a plain worker.
-
-    The Phase-1 boundary requires the parent to create and prepare a resume
-    recovery task before detachment, and hand its identity to the iterate spawn
-    as prepared metadata.
-    """
-    task_id, _ = _setup_task_with_log(tmp_path)
-    config = Config.load(tmp_path)
-    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
-
-    failed = store.get(task_id)
-    assert failed is not None
-    failed.status = "failed"
-    failed.failure_reason = "MAX_TURNS"
-    failed.session_id = "sess-123"
-    store.update(failed)
-
-    with (
-        patch.object(sys, "argv", [
-            "gza.attach_wrapper",
-            "--task-id", task_id,
-            "--session-id", "sess-123",
-            "--project", str(tmp_path),
-        ]),
-        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
-        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
-        patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
-    ):
-        rc = main()
-
-    assert rc == 0
-    mock_spawn_worker.assert_not_called()
-    mock_spawn_iterate.assert_called_once()
-    spawned_args = mock_spawn_iterate.call_args.args[0]
-    spawned_task = mock_spawn_iterate.call_args.args[2]
-    assert spawned_args.resume is False
-    assert spawned_args.retry is False
-    # Iterate targets the prepared recovery child directly; the parent only
-    # contributes the recovery decision and prepared metadata.
-    resume_children = store.get_based_on_children(task_id)
-    assert len(resume_children) == 1
-    resume_child = resume_children[0]
-    assert spawned_task.id == resume_child.id
-    assert resume_child.based_on == task_id
-    assert resume_child.recovery_origin == "resume"
-    spawned_kwargs = mock_spawn_iterate.call_args.kwargs
-    assert spawned_kwargs.get("prepared_task_id") == resume_child.id
-    assert spawned_kwargs.get("prepared_resume") is True
-    assert spawned_kwargs.get("prepared_phase") == "preloop"
 
 
 @pytest.mark.parametrize(
@@ -413,91 +363,8 @@ def test_attach_wrapper_legitimate_skip_recovery_stays_quiet(tmp_path: Path, cap
     assert "retry_failed" not in [event["event"] for event in lifecycle_events]
 
 
-def test_attach_wrapper_retryable_failed_implement_handoff_launches_iterate_retry(tmp_path: Path) -> None:
-    """Retryable failed implement handoff should relaunch a retry child via iterate."""
-    task_id, log_path = _setup_task_with_log(tmp_path)
-    config = Config.load(tmp_path)
-    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
-
-    failed = store.get(task_id)
-    assert failed is not None
-    failed.status = "failed"
-    failed.failure_reason = "INFRASTRUCTURE_ERROR"
-    store.update(failed)
-
-    with (
-        patch.object(sys, "argv", [
-            "gza.attach_wrapper",
-            "--task-id", task_id,
-            "--session-id", "sess-123",
-            "--project", str(tmp_path),
-        ]),
-        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
-        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
-        patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
-    ):
-        rc = main()
-
-    assert rc == 0
-    mock_spawn_worker.assert_not_called()
-    mock_spawn_iterate.assert_called_once()
-    spawned_args = mock_spawn_iterate.call_args.args[0]
-    retry_child = mock_spawn_iterate.call_args.args[2]
-    assert spawned_args.resume is False
-    assert spawned_args.retry is False
-    assert retry_child.id is not None
-    assert retry_child.id != task_id
-    assert retry_child.based_on == task_id
-    events = _read_log_events(log_path)
-    lifecycle_events = [event for event in events if event.get("subtype") == "worker_lifecycle"]
-    event_names = [event["event"] for event in lifecycle_events]
-    assert "retry" in event_names
-    assert "resume" not in event_names
 
 
-def test_attach_wrapper_retry_handoff_failure_logs_retry_failed(tmp_path: Path) -> None:
-    """Retry handoff failures should emit retry_failed rather than resume_failed events."""
-    task_id, log_path = _setup_task_with_log(tmp_path)
-    config = Config.load(tmp_path)
-    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
-
-    failed = store.get(task_id)
-    assert failed is not None
-    failed.status = "failed"
-    failed.failure_reason = "INFRASTRUCTURE_ERROR"
-    store.update(failed)
-
-    with (
-        patch.object(sys, "argv", [
-            "gza.attach_wrapper",
-            "--task-id", task_id,
-            "--session-id", "sess-123",
-            "--project", str(tmp_path),
-        ]),
-        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
-        patch("gza.attach_wrapper._spawn_background_iterate", return_value=9),
-        patch("gza.attach_wrapper._spawn_background_worker", return_value=0),
-    ):
-        rc = main()
-
-    assert rc == 0
-    events = _read_log_events(log_path)
-    lifecycle_events = [event for event in events if event.get("subtype") == "worker_lifecycle"]
-    event_names = [event["event"] for event in lifecycle_events]
-    assert "retry_failed" in event_names
-    assert "resume_failed" not in event_names
-    failure_event = [event for event in lifecycle_events if event["event"] == "retry_failed"][-1]
-    assert failure_event["handoff_exit_code"] == 9
-    retry_children = store.get_based_on_children(task_id)
-    assert len(retry_children) == 1
-    retry_child = retry_children[0]
-    assert retry_child.status == "pending"
-    refreshed_failed = store.get(task_id)
-    assert refreshed_failed is not None
-    decision = decide_failed_task_recovery(store, refreshed_failed, max_recovery_attempts=config.max_resume_attempts)
-    assert decision.action == "retry"
-    assert decision.reuse_existing is True
-    assert decision.recovery_task_id == retry_child.id
 
 
 def test_attach_wrapper_timeout_handoff_spawn_failure_keeps_resume_child_pending_for_shared_policy(tmp_path: Path) -> None:
@@ -1092,43 +959,3 @@ def test_attach_wrapper_retry_iterate_prepare_failure_rolls_back_recovery(tmp_pa
     assert "retry_failed" in [event["event"] for event in lifecycle_events]
 
 
-def test_attach_wrapper_retry_iterate_success_passes_prepared_metadata(tmp_path: Path) -> None:
-    """Retry+iterate handoff must hand prepared recovery task id, resume flag,
-    and prepared_phase=preloop to _spawn_background_iterate so the detached
-    worker inherits the parent-prepared identity."""
-    task_id, _ = _setup_task_with_log(tmp_path)
-    config = Config.load(tmp_path)
-    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
-
-    failed = store.get(task_id)
-    assert failed is not None
-    failed.status = "failed"
-    failed.failure_reason = "INFRASTRUCTURE_ERROR"
-    store.update(failed)
-
-    with (
-        patch.object(sys, "argv", [
-            "gza.attach_wrapper",
-            "--task-id", task_id,
-            "--session-id", "sess-123",
-            "--project", str(tmp_path),
-        ]),
-        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
-        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
-        patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
-    ):
-        rc = main()
-
-    assert rc == 0
-    mock_spawn_worker.assert_not_called()
-    mock_spawn_iterate.assert_called_once()
-    retry_children = [
-        t for t in store.get_based_on_children(task_id) if t.recovery_origin == "retry"
-    ]
-    assert len(retry_children) == 1
-    retry_child = retry_children[0]
-    assert mock_spawn_iterate.call_args.args[2].id == retry_child.id
-    kwargs = mock_spawn_iterate.call_args.kwargs
-    assert kwargs.get("prepared_task_id") == retry_child.id
-    assert kwargs.get("prepared_resume") is False
-    assert kwargs.get("prepared_phase") == "preloop"

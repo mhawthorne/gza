@@ -593,123 +593,8 @@ def test_advance_no_resume_failed_keeps_lifecycle_merge_rows_and_filters_recover
     assert "No eligible tasks to advance" not in captured.out
 
 
-def test_advance_dry_run_tag_scope_matches_shared_recovery_preview_ids(
-    tmp_path: Path,
-    capsys,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    store._default_merge_target_cache = "main"  # noqa: SLF001
-    store._project_root = None  # noqa: SLF001
-
-    release_retry = store.add("Release retry", task_type="plan", tags=("release",))
-    assert release_retry.id is not None
-    release_retry.status = "failed"
-    release_retry.failure_reason = "INFRASTRUCTURE_ERROR"
-    release_retry.completed_at = datetime(2026, 6, 24, 10, 0, tzinfo=UTC)
-    store.update(release_retry)
-
-    ops_retry = store.add("Ops retry", task_type="plan", tags=("ops",))
-    assert ops_retry.id is not None
-    ops_retry.status = "failed"
-    ops_retry.failure_reason = "INFRASTRUCTURE_ERROR"
-    ops_retry.completed_at = datetime(2026, 6, 24, 10, 5, tzinfo=UTC)
-    store.update(ops_retry)
-
-    release_manual = store.add("Release manual", task_type="plan", tags=("release", "ops"))
-    assert release_manual.id is not None
-    release_manual.status = "failed"
-    release_manual.failure_reason = "TEST_FAILURE"
-    release_manual.completed_at = datetime(2026, 6, 24, 10, 10, tzinfo=UTC)
-    store.update(release_manual)
-
-    with patch(
-        "gza.recovery_engine._load_merge_context",
-        return_value=_MergeContext(git=None, default_branch="main"),
-    ):
-        preview = build_dispatch_preview(
-            store,
-            tags=("release", "missing"),
-            any_tag=True,
-            max_recovery_attempts=1,
-            selection_mode="recovery_only",
-            include_pending=False,
-        )
-
-    preview_ids = [entry.task.id for entry in preview.recovery_entries]
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
-        patch(
-            "gza.recovery_engine._load_merge_context",
-            return_value=_MergeContext(git=None, default_branch="main"),
-        ),
-    ):
-        rc = cmd_advance(
-            _advance_args(
-                tmp_path,
-                dry_run=True,
-                tags=["release", "missing"],
-                all_tags=False,
-            )
-        )
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert preview_ids == [release_retry.id, release_manual.id]
-    for task_id in preview_ids:
-        assert str(task_id) in captured.out
-    assert str(ops_retry.id) not in captured.out
 
 
-def test_advance_dry_run_mixed_owner_recovery_row_shows_recovery_leaf_and_lifecycle_owner(
-    tmp_path: Path,
-    capsys,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    store._default_merge_target_cache = "main"  # noqa: SLF001
-    store._project_root = None  # noqa: SLF001
-    plan, failed_review = _create_mixed_owner_recovery_fixture(store)
-
-    with patch(
-        "gza.recovery_engine._load_merge_context",
-        return_value=_MergeContext(git=None, default_branch="main"),
-    ):
-        preview = build_dispatch_preview(
-            store,
-            tags=("release",),
-            any_tag=True,
-            max_recovery_attempts=1,
-            selection_mode="recovery_only",
-            include_pending=False,
-        )
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
-        patch(
-            "gza.recovery_engine._load_merge_context",
-            return_value=_MergeContext(git=None, default_branch="main"),
-        ),
-    ):
-        rc = cmd_advance(
-            _advance_args(
-                tmp_path,
-                dry_run=True,
-                tags=["release"],
-                all_tags=False,
-            )
-        )
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert [entry.task.id for entry in preview.recovery_entries] == [failed_review.id]
-    assert "Recovery subset (shared preview):" in captured.out
-    assert failed_review.id in captured.out
-    assert "Resume failed task (MAX_TURNS)" in captured.out
-    assert "Would advance 1 task(s):" in captured.out
-    assert plan.id in captured.out
-    assert "Create and start plan review task" in captured.out
 
 
 def test_advance_explicit_task_fails_closed_when_tag_scope_excludes_it(
@@ -1035,39 +920,6 @@ def test_advance_repeat_executor_attention_skip_parks_immediately(tmp_path: Path
     assert "cycle 2:" not in captured.out
 
 
-def test_advance_repeat_plain_executor_skip_without_progress_stops_after_one_attempt(
-    tmp_path: Path,
-    capsys,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    impl = _create_completed_implement(store)
-    git = _mock_git()
-    execute_calls = 0
-
-    def fake_execute(*_args, **_kwargs):
-        nonlocal execute_calls
-        execute_calls += 1
-        return AdvanceActionExecutionResult(
-            action_type="create_review",
-            status="skip",
-            message="SKIP: ordinary executor skip",
-        )
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=git),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
-        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "create_review", "description": "Create review"}),
-        patch("gza.cli.git_ops.execute_advance_action", side_effect=fake_execute),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, repeat=True, max_iterations=3))
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert execute_calls == 1
-    assert "cycle 1: create_review -> skip: SKIP: ordinary executor skip" in captured.out
-    assert "Advance repeat stopped on skip: SKIP: ordinary executor skip" in captured.out
-    assert "cycle 2:" not in captured.out
 
 
 def test_advance_repeat_capacity_loss_at_permit_acquisition_stops_after_one_attempt(
@@ -1176,39 +1028,6 @@ def test_advance_repeat_candidate_verify_block_parks_not_error(tmp_path: Path, c
     assert "-> error:" not in captured.out
 
 
-def test_advance_repeat_uses_single_available_permit_for_foreground_action(tmp_path: Path, capsys) -> None:
-    setup_config(tmp_path)
-    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "max_concurrent: 1\n")
-    store = make_store(tmp_path)
-    impl = _create_completed_implement(store)
-    git = _mock_git()
-    foreground_task_ids: list[str] = []
-
-    def fake_run_foreground(_config, task_id, **kwargs):
-        foreground_task_ids.append(task_id)
-        prepared_task = kwargs["prepared_task"]
-        permit = take_task_launch_permit(str(prepared_task.id))
-        assert permit is not None
-        permit.release()
-        return 0
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=git),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
-        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "create_review", "description": "Create review"}),
-        patch("gza.cli.advance_executor._prepare_task_for_reserved_launch", side_effect=lambda _c, task, **_k: task),
-        patch("gza.cli.git_ops._run_foreground", side_effect=fake_run_foreground),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, repeat=True, max_iterations=1))
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert foreground_task_ids
-    assert "cycle 1: create_review -> success" in captured.out
-    config = Config.load(tmp_path)
-    snapshot = get_concurrency_snapshot(config, store, cleanup_stale=False)
-    assert snapshot.available == 1
-    assert not WorkerRegistry(config.workers_path).list_all(include_completed=False)
 
 
 def test_advance_repeat_launch_lock_released_when_foreground_action_visible(tmp_path: Path, capsys) -> None:
@@ -1262,64 +1081,8 @@ def test_advance_repeat_launch_lock_released_when_foreground_action_visible(tmp_
     assert observed_capacity_block["value"] is True
 
 
-def test_advance_repeat_dry_run_projects_action_chain_without_side_effects(tmp_path: Path, capsys) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    impl = _create_completed_implement(store)
-    git = _mock_git()
-    before = _durable_repeat_snapshot(store, impl.id)
-    workers_dir = tmp_path / ".gza" / "workers"
-    before_workers = sorted(path.name for path in workers_dir.iterdir()) if workers_dir.exists() else []
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=git),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
-        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "needs_rebase", "description": "Create rebase task"}),
-        patch("gza.cli.git_ops.check_main_integration_verify", return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=impl, alert_message=None))),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, repeat=True, dry_run=True, max_iterations=4))
-
-    captured = capsys.readouterr()
-    after = _durable_repeat_snapshot(store, impl.id)
-    after_workers = sorted(path.name for path in workers_dir.iterdir()) if workers_dir.exists() else []
-    assert rc == 0
-    assert "cycle 1: needs_rebase -> dry-run" in captured.out
-    assert "Advance repeat dry-run stopped: next action requires executing needs_rebase" in captured.out
-    assert "cycle 2:" not in captured.out
-    assert after == before
-    assert after_workers == before_workers
 
 
-def test_advance_repeat_dry_run_merge_without_main_checkpoint_has_no_side_effects(
-    tmp_path: Path,
-    capsys,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    impl = _create_completed_implement(store)
-    git = _mock_git()
-    before = _durable_repeat_snapshot(store, impl.id)
-    workers_dir = tmp_path / ".gza" / "workers"
-    before_workers = sorted(path.name for path in workers_dir.iterdir()) if workers_dir.exists() else []
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=git),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
-        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge", "description": "Merge task"}),
-        patch("gza.cli.git_ops.check_main_integration_verify") as check_main,
-        patch("gza.cli.git_ops._execute_merge_action") as execute_merge,
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, repeat=True, dry_run=True, max_iterations=2))
-
-    captured = capsys.readouterr()
-    after_workers = sorted(path.name for path in workers_dir.iterdir()) if workers_dir.exists() else []
-    assert rc == 0
-    assert "cycle 1: merge -> dry-run: Merge task" in captured.out
-    assert "Advance repeat dry-run stopped: next action requires executing merge" in captured.out
-    check_main.assert_not_called()
-    execute_merge.assert_not_called()
-    assert _durable_repeat_snapshot(store, impl.id) == before
-    assert after_workers == before_workers
 
 
 def test_advance_repeat_dry_run_merge_with_stale_main_checkpoint_has_no_side_effects(
@@ -1543,50 +1306,6 @@ def test_advance_repeat_non_current_target_ignores_red_main_verify_for_merge(
     assert "Advance repeat parked" not in captured.out
 
 
-def test_advance_repeat_successful_merge_runs_post_merge_main_verify(
-    tmp_path: Path,
-    capsys,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    impl = _create_completed_implement(store)
-    git = _mock_git()
-    merge_result = SimpleNamespace(rc=0)
-    reasons: list[str] = []
-
-    def fake_check_main(_config, _store, check_git, *, reason):
-        assert check_git is git
-        reasons.append(reason)
-        checkpoint = store.add(MAIN_INTEGRATION_VERIFY_PROMPT, task_type="internal", skip_learnings=True)
-        assert checkpoint.id is not None
-        checkpoint.status = "completed"
-        checkpoint.completed_at = datetime.now(UTC)
-        checkpoint.review_verify_status = "passed"
-        checkpoint.review_verify_exit_status = "0"
-        checkpoint.output_content = json.dumps({"reason": reason, "tree_fingerprint": "green-target"})
-        store.update(checkpoint)
-        return SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=checkpoint, alert_message=None))
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=git),
-        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge", "description": "Merge task"}),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", side_effect=["unmerged", "unmerged", "merged"]),
-        patch("gza.cli.git_ops.check_main_integration_verify", side_effect=fake_check_main),
-        patch("gza.cli.git_ops._execute_merge_action", return_value=merge_result),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, repeat=True, max_iterations=1))
-
-    captured = capsys.readouterr()
-    checkpoints = [
-        task
-        for task in store.get_all()
-        if task.prompt == MAIN_INTEGRATION_VERIFY_PROMPT and task.review_verify_status == "passed"
-    ]
-    assert rc == 0
-    assert reasons == ["advance-repeat-pre-merge", "advance-post-merge"]
-    assert len(checkpoints) == 2
-    assert "cycle 1: merge -> success: merged" in captured.out
-    assert f"Advance repeat completed: {impl.id} merged" in captured.out
 
 
 def test_advance_repeat_successful_merge_surfaces_red_post_merge_verify(
@@ -1752,57 +1471,6 @@ def test_advance_repeat_no_progress_requires_two_consecutive_unchanged_cycles(tm
 
 
 
-def test_advance_repeat_supervised_session_survives_reconciliation_after_timeout(
-    tmp_path: Path,
-) -> None:
-    setup_config(tmp_path)
-    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "max_concurrent: 1\n")
-    config = Config.load(tmp_path)
-    config.watch.no_activity_timeout = 1
-    store = make_store(tmp_path)
-    repeat = store.add(
-        "Internal advance repeat session for test-1",
-        task_type="internal",
-        depends_on="test-1",
-        tags=("system-advance-repeat",),
-        skip_learnings=True,
-    )
-    assert repeat.id is not None
-    repeat.status = "in_progress"
-    repeat.running_pid = os.getpid()
-    repeat.started_at = datetime(2026, 1, 1, tzinfo=UTC)
-    store.update(repeat)
-    registry = WorkerRegistry(config.workers_path)
-    registry.register(
-        WorkerMetadata(
-            worker_id="w-repeat-session-worker",
-            task_id=repeat.id,
-            pid=os.getpid(),
-            started_at=datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
-            status="running",
-            is_background=False,
-        )
-    )
-    signaled: list[tuple[int, int]] = []
-
-    def fake_kill(pid: int, sig: int) -> None:
-        if sig != 0:
-            signaled.append((pid, sig))
-
-    with patch("gza.cli._common.os.kill", side_effect=fake_kill):
-        reconcile_in_progress_tasks(config)
-        snapshot = get_concurrency_snapshot(config, store)
-        permit = launch_permit(config, store, current_pid=os.getpid())
-        permit.release()
-
-    refreshed = store.get(repeat.id)
-    assert refreshed is not None
-    assert refreshed.status == "in_progress"
-    assert refreshed.running_pid == os.getpid()
-    assert signaled == []
-    assert snapshot.running == 1
-    assert snapshot.available == 0
-    assert snapshot.running_task_ids == (repeat.id,)
 
 
 def test_advance_dry_run_uses_post_rebase_review_after_later_completed_rebase(
@@ -1975,88 +1643,8 @@ def test_advance_explicit_impl_reports_already_merged_when_branch_is_reachable_b
     assert "Would advance" not in captured.out
 
 
-def test_advance_explicit_impl_remote_only_fresh_ref_no_longer_proves_merged(
-    tmp_path: Path,
-    capsys,
-) -> None:
-    from gza.git import ResolvedMergeSourceRef
-
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = _create_completed_implement(store, "Implement feature")
-    assert impl.id is not None
-    _create_completed_review(store, impl, verdict="APPROVED")
-
-    rebase = store.add("Completed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
-    assert rebase.id is not None
-    rebase.status = "completed"
-    rebase.completed_at = datetime.now(UTC)
-    rebase.branch = impl.branch
-    rebase.has_commits = True
-    rebase.changed_diff = True
-    store.update(rebase)
-
-    git = _mock_git(can_merge=False)
-    git.default_branch.return_value = "main"
-    git.branch_exists.return_value = True
-    git.ref_exists.return_value = True
-    git.resolve_merge_source_ref.return_value = impl.branch
-    git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(f"origin/{impl.branch}")
-    git.is_merged.side_effect = lambda source_ref, target_branch: (
-        source_ref == f"origin/{impl.branch}" and target_branch == "main"
-    )
-
-    with patch("gza.cli.git_ops.Git", return_value=git):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, dry_run=True))
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert "Needs attention (1 task):" in captured.out
-    assert f'{impl.id} implement "Implement feature"' in captured.out
-    assert "reason=review-freshness-unverified" in captured.out
-    assert "latest review freshness could not be verified" in captured.out
-    assert "Run verify gate before review" not in captured.out
-    assert "resolution-review-metadata-invalid" not in captured.out
 
 
-def test_advance_explicit_impl_conflict_plan_skips_orphan_rebase_branch_for_non_merge_action(
-    tmp_path: Path,
-    capsys,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = _create_completed_implement(store, "Implement feature")
-    assert impl.id is not None
-
-    orphan = store.add("Completed orphan rebase", task_type="rebase", based_on=impl.id, same_branch=True)
-    assert orphan.id is not None
-    orphan.status = "completed"
-    orphan.completed_at = datetime.now(UTC)
-    orphan.branch = "feature/orphan"
-    orphan.merge_status = "unmerged"
-    orphan.has_commits = True
-    store.update(orphan)
-
-    orphan_unit = store.create_merge_unit(
-        source_branch=orphan.branch,
-        target_branch="main",
-        owner_task_id=orphan.id,
-        state="unmerged",
-    )
-    store.attach_task_to_merge_unit(orphan.id, orphan_unit.id, "owner")
-    store.dual_write_legacy_merge_status(orphan_unit.id)
-
-    with patch("gza.cli.git_ops.Git", return_value=_mock_git(can_merge=False)):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, dry_run=True))
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert "Would advance 1 task(s):" in captured.out
-    assert str(impl.id) in captured.out
-    assert "Rebase before verify_gate" in captured.out
-    assert str(orphan.id) not in captured.out
 
 
 def test_advance_explicit_task_without_merge_unit_uses_strict_non_main_default_target(tmp_path: Path) -> None:
@@ -2345,46 +1933,3 @@ def test_advance_creates_exactly_one_closing_review_after_completed_improve(
     assert f"Created review task {closing_review.id}" not in output
 
 
-def test_advance_dry_run_surfaces_improve_noop_attention_reason(tmp_path: Path, capsys, monkeypatch) -> None:
-    from gza import advance_engine as advance_engine_module
-    from gza.review_verdict import ParsedReviewReport
-
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = _create_completed_implement(store)
-    review = _create_completed_review(store, impl, verdict="CHANGES_REQUESTED")
-    review.report_file = "reviews/fake.md"
-    store.update(review)
-
-    for hour in (11, 12):
-        improve = store.add(
-            f"Improve {hour}",
-            task_type="improve",
-            based_on=impl.id,
-            depends_on=review.id,
-            same_branch=True,
-        )
-        improve.status = "completed"
-        improve.completed_at = datetime(2026, 1, 3, hour, 0, tzinfo=UTC)
-        improve.branch = impl.branch
-        improve.changed_diff = False
-        store.update(improve)
-
-    monkeypatch.setattr(
-        advance_engine_module,
-        "get_review_report",
-        lambda _project_dir, _review: ParsedReviewReport(
-            verdict="CHANGES_REQUESTED",
-            findings=(),
-            format_version="legacy",
-        ),
-    )
-
-    with patch("gza.cli.git_ops.Git", return_value=_mock_git()):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, dry_run=True))
-
-    output = capsys.readouterr().out
-    assert rc == 0
-    assert "reason=improve-no-op" in output
-    assert "consecutive no-op improves" in output

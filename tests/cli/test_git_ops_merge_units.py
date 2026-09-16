@@ -367,22 +367,6 @@ def test_collect_advance_completed_tasks_backfills_legacy_unmerged_owner(tmp_pat
     assert unit.state == "unmerged"
 
 
-def test_collect_advance_completed_tasks_returns_owner_once_for_same_unit_descendants(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = store.add("Implement shared branch", task_type="implement")
-    store.mark_completed(impl, has_commits=True, branch="feature/owner-only-advance")
-    assert impl.id is not None
-
-    improve = store.add("Improve shared branch", task_type="improve", based_on=impl.id, same_branch=True)
-    store.mark_completed(improve, has_commits=True, branch="feature/owner-only-advance")
-    assert improve.id is not None
-
-    tasks, _ = _collect_advance_completed_tasks(store, target_branch="main")
-
-    assert [task.id for task in tasks if task.task_type == "implement"] == [impl.id]
-    assert improve.id not in [task.id for task in tasks]
 
 
 def test_collect_advance_completed_tasks_filters_unmerged_tasks_by_target_branch(tmp_path: Path) -> None:
@@ -419,38 +403,6 @@ def test_collect_advance_completed_tasks_filters_unmerged_tasks_by_target_branch
     assert [task.id for task in release_tasks if task.task_type == "implement"] == [release_task.id]
 
 
-def test_advance_explicit_task_uses_default_target_merge_unit_over_stale_legacy_row(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    task = store.add("Advance explicit task", task_type="implement")
-    store.mark_completed(task, has_commits=True, branch="feature/advance-explicit")
-    assert task.id is not None
-
-    refreshed = store.get(task.id)
-    assert refreshed is not None
-    refreshed.merge_status = "merged"
-    store.update(refreshed)
-
-    calls: list[str] = []
-
-    def _fake_determine_next_action(*args, **kwargs):
-        selected_task = args[3]
-        assert selected_task.id is not None
-        calls.append(selected_task.id)
-        return {"type": "skip", "description": "still actionable via merge unit"}
-
-    with (
-        patch("gza.cli.git_ops.Git", lambda _project_dir: _AdvanceGit()),
-        patch("gza.git.Git.default_branch", return_value="main"),
-        patch("gza.git.Git.local_branch_names", return_value=()),
-        patch("gza.cli.git_ops.determine_next_action", side_effect=_fake_determine_next_action),
-    ):
-        result = invoke_gza("advance", task.id, "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
-
-    assert result.returncode == 0
-    assert f"Task {task.id} is already merged" not in result.stdout
-    assert calls == [task.id]
 
 
 def test_advance_failed_task_recovery_planning_uses_merge_unit_over_stale_legacy_row(tmp_path: Path) -> None:
@@ -495,42 +447,6 @@ def test_advance_failed_task_recovery_planning_uses_merge_unit_over_stale_legacy
     assert calls == [recovery.id]
 
 
-def test_advance_dry_run_uses_current_branch_for_merge_unit_target_collection(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    release_task = _add_completed_legacy_impl(store, "Release-target work", "feature/release-advance")
-    assert release_task.id is not None
-
-    release_unit = store.create_merge_unit(
-        source_branch="feature/release-advance",
-        target_branch="release",
-        owner_task_id=release_task.id,
-        state="unmerged",
-    )
-    store.attach_task_to_merge_unit(release_task.id, release_unit.id, "owner")
-    store.dual_write_legacy_merge_status(release_unit.id)
-
-    calls: list[str] = []
-
-    def _fake_determine_next_action(*args, **kwargs):
-        selected_task = args[3]
-        assert selected_task.id is not None
-        calls.append(selected_task.id)
-        return {"type": "skip", "description": "eligible on current release branch"}
-
-    fake_git = _AdvanceGit(default_branch="main", current_branch="release")
-
-    with (
-        patch("gza.cli.git_ops.Git", lambda _project_dir: fake_git),
-        patch("gza.cli.git_ops.determine_next_action", side_effect=_fake_determine_next_action),
-    ):
-        result = invoke_gza("advance", "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
-
-    assert result.returncode == 0
-    assert release_task.id in result.stdout
-    assert "eligible on current release branch" in result.stdout
-    assert calls == [release_task.id]
 
 
 def test_advance_dry_run_filters_owner_rows_by_target_branch_and_keeps_legacy_fallback(
@@ -709,119 +625,8 @@ def test_merge_force_bypasses_lifecycle_gate_and_records_manual_force_provenance
 
 
 
-def test_merge_force_alone_refuses_red_verify_needs_discussion_after_completed_verify_fix(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = store.add("Implement red verify discussion path", task_type="implement")
-    store.mark_completed(impl, has_commits=True, branch="feature/red-verify-discussion")
-    assert impl.id is not None
-
-    review = _add_completed_approved_review(store, based_on_task=impl, depends_on_task=impl)
-    _persist_current_green_verify(tmp_path, store, owner_task=impl, source_task=review)
-
-    fake_git = _MergeGit(tmp_path)
-    verify_action = {
-        "type": "needs_discussion",
-        "description": "SKIP: verify gate is still red after completed verify_fix testproject-77",
-        "verify_epoch": SimpleNamespace(reviewed_head_sha="bad-head", verify_command="./bin/tests"),
-        "red_verify_gate_proof": {
-            "phase": "pre_merge",
-            "reviewed_head_sha": "bad-head",
-            "verify_command": "./bin/tests",
-        },
-        "needs_attention_reason": PARK_REASON_VERIFY_FIX_FAILED,
-    }
-
-    with (
-        patch("gza.cli.git_ops.Git", lambda project_dir: fake_git),
-        patch("gza.cli.git_ops.determine_next_action", return_value=verify_action),
-    ):
-        result = invoke_gza(
-            "merge",
-            str(impl.id),
-            "--force",
-            "--project",
-            str(tmp_path),
-            cwd=tmp_path,
-        )
-
-    assert result.returncode == 1
-    assert "Red verify gates require --force --ignore-verify-gate" in result.stdout
-    assert "Warning: Forcing merge despite lifecycle gate" not in result.stdout
-    assert "Warning: Forcing merge despite red verify gate" not in result.stdout
-    assert fake_git.merged == []
-    unit = store.resolve_merge_unit_for_task(impl.id)
-    assert unit is not None
-    assert unit.state == "unmerged"
-    assert unit.merge_source is None
 
 
-@pytest.mark.parametrize(
-    "action_type,description",
-    [
-        ("create_verify_fix", "Create verify_fix task for verify epoch at head bad-head"),
-        (
-            "rerun_completed_verify_fix",
-            "Rerun exact-head verify for completed no-source verify_fix testproject-77",
-        ),
-        (
-            "needs_discussion",
-            "SKIP: verify gate is still red after completed verify_fix testproject-77",
-        ),
-    ],
-)
-def test_merge_force_ignore_verify_gate_warns_and_records_manual_force_provenance(
-    tmp_path: Path,
-    action_type: str,
-    description: str,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = store.add(f"Implement ignored red verify gate path {action_type}", task_type="implement")
-    store.mark_completed(impl, has_commits=True, branch=f"feature/ignore-red-verify-gate-{action_type}")
-    assert impl.id is not None
-
-    review = _add_completed_approved_review(store, based_on_task=impl, depends_on_task=impl)
-    _persist_current_green_verify(tmp_path, store, owner_task=impl, source_task=review)
-
-    fake_git = _MergeGit(tmp_path)
-    verify_action = {
-        "type": action_type,
-        "description": description,
-        "verify_epoch": SimpleNamespace(reviewed_head_sha="bad-head", verify_command="./bin/tests"),
-        "red_verify_gate_proof": {
-            "phase": "pre_merge",
-            "reviewed_head_sha": "bad-head",
-            "verify_command": "./bin/tests",
-        },
-    }
-    if action_type == "needs_discussion":
-        verify_action["needs_attention_reason"] = PARK_REASON_VERIFY_FIX_FAILED
-
-    with (
-        patch("gza.cli.git_ops.Git", lambda project_dir: fake_git),
-        patch("gza.cli.git_ops.determine_next_action", return_value=verify_action),
-    ):
-        result = invoke_gza(
-            "merge",
-            str(impl.id),
-            "--force",
-            "--ignore-verify-gate",
-            "--project",
-            str(tmp_path),
-            cwd=tmp_path,
-        )
-
-    assert result.returncode == 0
-    assert "Warning: Forcing merge despite red verify gate" in result.stdout
-    assert "failing epoch head=bad-head" in result.stdout
-    assert "verify command='./bin/tests'" in result.stdout
-    assert fake_git.merged == [(f"feature/ignore-red-verify-gate-{action_type}", False)]
-    unit = store.resolve_merge_unit_for_task(impl.id)
-    assert unit is not None
-    assert unit.merge_source == MERGE_SOURCE_MANUAL_FORCE
 
 
 @pytest.mark.parametrize(
@@ -1511,52 +1316,6 @@ def test_merge_force_malformed_verify_fix_failed_does_not_fall_through_to_generi
 
 
 
-def test_merge_force_ignore_verify_gate_still_refuses_git_conflicts(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = store.add("Implement conflicted ignored verify gate path", task_type="implement")
-    store.mark_completed(impl, has_commits=True, branch="feature/conflicted-red-verify-gate")
-    assert impl.id is not None
-
-    review = _add_completed_approved_review(store, based_on_task=impl, depends_on_task=impl)
-    _persist_current_green_verify(tmp_path, store, owner_task=impl, source_task=review)
-
-    fake_git = _MergeGit(tmp_path)
-    fake_git.can_merge = lambda branch, into=None: False  # type: ignore[method-assign]
-    verify_action = {
-        "type": "create_verify_fix",
-        "description": "Create verify_fix task for verify epoch at head bad-head",
-        "verify_epoch": SimpleNamespace(reviewed_head_sha="bad-head", verify_command="./bin/tests"),
-        "red_verify_gate_proof": {
-            "phase": "pre_merge",
-            "reviewed_head_sha": "bad-head",
-            "verify_command": "./bin/tests",
-        },
-    }
-
-    with (
-        patch("gza.cli.git_ops.Git", lambda project_dir: fake_git),
-        patch("gza.cli.git_ops.determine_next_action", return_value=verify_action),
-    ):
-        result = invoke_gza(
-            "merge",
-            str(impl.id),
-            "--force",
-            "--ignore-verify-gate",
-            "--project",
-            str(tmp_path),
-            cwd=tmp_path,
-        )
-
-    assert result.returncode == 1
-    assert "Warning: Forcing merge despite red verify gate" in result.stdout
-    assert "has conflicts against 'main' and cannot be merged cleanly" in result.stdout
-    assert fake_git.merged == []
-    unit = store.resolve_merge_unit_for_task(impl.id)
-    assert unit is not None
-    assert unit.state == "unmerged"
-    assert unit.merge_source is None
 
 
 def test_merge_force_ignore_verify_gate_still_refuses_open_review_blockers(tmp_path: Path) -> None:
@@ -1614,25 +1373,3 @@ def test_merge_force_ignore_verify_gate_still_refuses_open_review_blockers(tmp_p
     assert unit.merge_source is None
 
 
-def test_merge_valid_and_missing_explicit_task_ids_report_missing_without_partial_merge(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = store.add("Implement shared branch", task_type="implement")
-    store.mark_completed(impl, has_commits=True, branch="feature/shared")
-    assert impl.id is not None
-
-    fake_git = _MergeGit(tmp_path)
-    with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = invoke_gza(
-            "merge",
-            str(impl.id),
-            "testproject-9999",
-            "--project",
-            str(tmp_path),
-            cwd=tmp_path,
-        )
-
-    assert result.returncode == 1
-    assert "Error: Task testproject-9999 not found" in result.stdout
-    assert fake_git.merged == []

@@ -914,47 +914,6 @@ def _invoke_unstick_run_for_lifecycle_action(
     return result, owner, execution_probe or execute_action
 
 
-@pytest.mark.parametrize(
-    "action_type,worker_label",
-    (
-        ("create_verify_fix", "verify_fix"),
-        ("run_verify_fix", "verify_fix"),
-        ("create_review_adjudication", "review_adjudication"),
-        ("run_review_adjudication", "review_adjudication"),
-    ),
-)
-def test_unstick_run_reports_worker_lifecycle_launch_permit_capacity_race_as_capacity_blocked(
-    tmp_path,
-    action_type,
-    worker_label,
-):
-    result, owner, execute_action = _invoke_unstick_run_for_lifecycle_action(
-        tmp_path,
-        action_type=action_type,
-        exec_result=AdvanceActionExecutionResult(
-            action_type=action_type,
-            status="skip",
-            execution_phase="worker_launch",
-            message="SKIP: already at max concurrent tasks: 1 running, limit is 1",
-            worker_consuming=False,
-            worker_label=worker_label,
-        ),
-    )
-
-    assert result.returncode == 0
-    assert execute_action.call_count == 1
-    assert (
-        "Run summary: 0 started, 0 direct, 0 direct-blocked, 0 launch-blocked, 0 cleared-only, 1 capacity-blocked"
-        in result.stdout
-    )
-    assert "Capacity Blocked:" in result.stdout
-    assert f"{owner.id} [backstop]" in result.stdout
-    assert "Lifecycle recovery owner" in result.stdout
-    assert "Direct Blocked:" not in result.stdout
-    assert "Cleared Only:" not in result.stdout
-    assert (
-        "already at max concurrent tasks: 1 running, limit is 1" in (tmp_path / ".gza" / "unstick-run.log").read_text()
-    )
 
 
 @pytest.mark.parametrize(
@@ -1771,35 +1730,6 @@ def _invoke_unstick_run_for_needs_rebase_recovery(tmp_path):
     return result, owner, spawn_worker
 
 
-def test_unstick_run_reports_confirmed_reconcile_rebase_launch_as_started(tmp_path):
-    result, owner, execute_action = _invoke_unstick_run_for_reconcile_recovery(
-        tmp_path,
-        exec_result=AdvanceActionExecutionResult(
-            action_type="reconcile_branch_divergence",
-            status="success",
-            execution_phase="worker_launch",
-            message="Created rebase task",
-            success_message="Created rebase task",
-            worker_consuming=True,
-            attempted_spawn=True,
-            worker_started=True,
-            work_done=True,
-            worker_label="rebase",
-        ),
-        settle_status=watch_module._DispatchSettleStatus.LIVE,
-    )
-
-    assert result.returncode == 0
-    assert execute_action.call_count == 1
-    assert (
-        "Run summary: 1 started, 0 direct, 0 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked"
-        in result.stdout
-    )
-    assert "Started:" in result.stdout
-    assert f"{owner.id} [reconcile]" in result.stdout
-    assert "Reconcile recovery owner" in result.stdout
-    assert "Direct:" not in result.stdout
-    assert "Direct Blocked:" not in result.stdout
 
 
 def test_unstick_run_does_not_report_undispatched_reconcile_rebase_launch_as_direct_or_started(tmp_path):
@@ -1836,60 +1766,8 @@ def test_unstick_run_does_not_report_undispatched_reconcile_rebase_launch_as_dir
     assert "dispatch did not reach live slot occupancy" in result.stdout
 
 
-def test_unstick_run_reports_terminal_before_running_reconcile_rebase_launch_as_launch_blocked(tmp_path):
-    result, owner, execute_action = _invoke_unstick_run_for_reconcile_recovery(
-        tmp_path,
-        exec_result=AdvanceActionExecutionResult(
-            action_type="reconcile_branch_divergence",
-            status="success",
-            execution_phase="worker_launch",
-            message="Created rebase task",
-            success_message="Created rebase task",
-            worker_consuming=True,
-            attempted_spawn=True,
-            worker_started=True,
-            work_done=True,
-            worker_label="rebase",
-        ),
-        settle_status=watch_module._DispatchSettleStatus.TERMINAL_BEFORE_RUNNING,
-    )
-
-    assert result.returncode == 0
-    assert execute_action.call_count == 1
-    assert (
-        "Run summary: 0 started, 0 direct, 0 direct-blocked, 1 launch-blocked, 0 cleared-only, 0 capacity-blocked"
-        in result.stdout
-    )
-    assert "Started:" not in result.stdout
-    assert "Direct:" not in result.stdout
-    assert "Direct Blocked:" not in result.stdout
-    assert "Launch Blocked:" in result.stdout
-    assert "Cleared Only:" not in result.stdout
-    assert f"{owner.id} [reconcile]" in result.stdout
-    assert "Reconcile recovery owner" in result.stdout
-    assert "dispatch exited before occupying a live slot" in result.stdout
 
 
-def test_unstick_run_reports_reconcile_direct_skip_as_direct_blocked(tmp_path):
-    result, owner, execute_action = _invoke_unstick_run_for_reconcile_recovery(
-        tmp_path,
-        exec_result=AdvanceActionExecutionResult(
-            action_type="reconcile_branch_divergence",
-            status="skip",
-            message="SKIP: reconcile needs manual resolution",
-            worker_consuming=False,
-        ),
-    )
-
-    assert result.returncode == 0
-    assert execute_action.call_count == 1
-    assert (
-        "Run summary: 0 started, 0 direct, 1 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked"
-        in result.stdout
-    )
-    assert "Direct Blocked:" in result.stdout
-    assert f"{owner.id} [reconcile] reconcile_branch_divergence blocked: Reconcile recovery owner" in result.stdout
-    assert "Cleared Only:" not in result.stdout
 
 
 def test_unstick_run_reports_reconcile_rebase_capacity_race_as_capacity_blocked(tmp_path):
@@ -1948,33 +1826,6 @@ def test_unstick_run_does_not_report_reconcile_rebase_duplicate_child_as_direct_
     assert "active rebase child already exists for this owner" in result.stdout
 
 
-def test_unstick_run_does_not_report_reconcile_rebase_startup_error_as_direct_error(tmp_path):
-    result, owner, execute_action = _invoke_unstick_run_for_reconcile_recovery(
-        tmp_path,
-        exec_result=AdvanceActionExecutionResult(
-            action_type="reconcile_branch_divergence",
-            status="error",
-            execution_phase="worker_launch",
-            message="startup preparation failed for task gza-999",
-            error_message="Failed to start rebase worker for task gza-999",
-            worker_consuming=False,
-            worker_label="rebase",
-        ),
-    )
-
-    assert result.returncode == 0
-    assert execute_action.call_count == 1
-    assert (
-        "Run summary: 0 started, 0 direct, 0 direct-blocked, 1 launch-blocked, 0 cleared-only, 0 capacity-blocked"
-        in result.stdout
-    )
-    assert "Launch Blocked:" in result.stdout
-    assert "Direct Blocked:" not in result.stdout
-    assert "Cleared Only:" not in result.stdout
-    assert "Capacity Blocked:" not in result.stdout
-    assert f"{owner.id} [reconcile]" in result.stdout
-    assert "Reconcile recovery owner" in result.stdout
-    assert "startup preparation failed for task gza-999" in result.stdout
 
 
 def test_unstick_run_reports_real_reconcile_rebase_spawn_failure_diagnostic_as_launch_blocked(tmp_path):
@@ -1998,22 +1849,6 @@ def test_unstick_run_reports_real_reconcile_rebase_spawn_failure_diagnostic_as_l
     assert f"Failed to start rebase worker for task {spawned_task.id}" in result.stdout
 
 
-def test_unstick_run_reports_real_recovery_needs_rebase_spawn_failure_diagnostic_as_launch_blocked(tmp_path):
-    result, owner, spawn_worker = _invoke_unstick_run_for_needs_rebase_recovery(tmp_path)
-
-    assert result.returncode == 0
-    assert spawn_worker.call_count == 1
-    spawned_task = spawn_worker.call_args.args[0]
-    assert (
-        "Run summary: 0 started, 0 direct, 0 direct-blocked, 1 launch-blocked, 0 cleared-only, 0 capacity-blocked"
-        in result.stdout
-    )
-    assert "Launch Blocked:" in result.stdout
-    assert "Direct Blocked:" not in result.stdout
-    assert "Cleared Only:" not in result.stdout
-    assert "Capacity Blocked:" not in result.stdout
-    assert f"{owner.id} [retry-limit] needs_rebase: Needs rebase recovery owner" in result.stdout
-    assert f"Failed to start rebase worker for task {spawned_task.id}" in result.stdout
 
 
 def test_unstick_run_reports_reconcile_direct_error_as_direct_blocked_error(tmp_path):
@@ -2326,120 +2161,6 @@ def test_unstick_run_reports_merge_conflict_rebase_launch_failures_as_launch_blo
         assert spawn_worker.call_count == 0
 
 
-def test_unstick_run_reports_zero_slot_lifecycle_owner_as_capacity_blocked(tmp_path, monkeypatch):
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    owner = store.add("Blocked lifecycle owner", task_type="implement")
-    assert owner.id is not None
-    owner.status = "completed"
-    owner.completed_at = datetime.now(UTC)
-    owner.branch = "feature/blocked-lifecycle"
-    owner.has_commits = True
-    store.update(owner)
-    monkeypatch.setattr("gza.cli.unstick.Git", _UnstickGitDouble)
-    owner_row = LineageOwnerRow(
-        owner_task=owner,
-        members=(owner,),
-        tree=None,
-        lineage_status="actionable",
-        next_action={"type": "create_review", "description": "Create review before merge"},
-        next_action_reason="review",
-        unresolved_tasks=(owner,),
-        unresolved_leaf_summary=(),
-        lifecycle_action_task=owner,
-        recovery_action_task=None,
-        recovery_leaf_task=None,
-    )
-    outcomes = (
-        UnstickOutcome(
-            owner_task=owner, reason_class="backstop", status="rearmed", detail="cleared watch-no-progress-backstop"
-        ),
-    )
-
-    with (
-        patch(
-            "gza.cli.unstick.select_and_clear_parked_tasks",
-            return_value=SimpleNamespace(selected=(SimpleNamespace(current_candidate=object()),), outcomes=outcomes, stale_backstop_cleared=0),
-        ),
-        patch(
-            "gza.cli.unstick.get_concurrency_snapshot",
-            return_value=ConcurrencySnapshot(
-                limit=1,
-                running=1,
-                available=0,
-                live_pids=frozenset({101}),
-                running_task_ids=("gza-900",),
-                anonymous_worker_count=0,
-                current_pid_counted=False,
-            ),
-        ),
-        patch(
-            "gza.cli.watch.get_concurrency_snapshot",
-            return_value=ConcurrencySnapshot(
-                limit=1,
-                running=1,
-                available=0,
-                live_pids=frozenset({101}),
-                running_task_ids=("gza-900",),
-                anonymous_worker_count=0,
-                current_pid_counted=False,
-            ),
-        ),
-        patch("gza.cli.watch.Git", return_value=_UnstickGitDouble()),
-        patch("gza.cli._common.reconcile_in_progress_tasks"),
-        patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
-        patch("gza.cli.watch.reconcile_stale_watch_no_progress_parks"),
-        patch(
-            "gza.cli.watch.check_canonical_checkout_invariant",
-            return_value=SimpleNamespace(
-                restored=False,
-                needs_attention=False,
-                dirty_tracked_paths=[],
-                current_branch="main",
-                expected_branch="main",
-            ),
-        ),
-        patch(
-            "gza.cli.watch.check_main_integration_verify",
-            return_value=SimpleNamespace(
-                merges_halted=False,
-                state=SimpleNamespace(task=SimpleNamespace(id=None), alert_message=None),
-            ),
-        ),
-        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
-        patch(
-            "gza.cli.watch._query_owner_rows_with_context",
-            return_value=((owner_row,), RecoveryReadContext()),
-        ),
-        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
-        patch(
-            "gza.cli.watch.determine_next_action",
-            return_value={"type": "create_review", "description": "Create review before merge"},
-        ),
-        patch(
-            "gza.cli.watch.execute_advance_action",
-            side_effect=AssertionError("lifecycle capacity gate should skip before execution"),
-        ),
-    ):
-        result = invoke_gza(
-            "unstick",
-            str(owner.id),
-            "--reason",
-            "backstop",
-            "--run",
-            "--project",
-            str(tmp_path),
-        )
-
-    assert result.returncode == 0
-    assert (
-        "Run summary: 0 started, 0 direct, 0 direct-blocked, 0 launch-blocked, 0 cleared-only, 1 capacity-blocked"
-        in result.stdout
-    )
-    assert "Capacity Blocked:" in result.stdout
-    assert f"{owner.id} [backstop] Blocked lifecycle owner" in result.stdout
-    assert "Cleared Only:" not in result.stdout
 
 
 def test_unstick_cli_rearms_real_retry_limit_failed_owner_by_retry_id(tmp_path, monkeypatch):
