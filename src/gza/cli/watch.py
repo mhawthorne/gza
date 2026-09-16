@@ -7094,8 +7094,13 @@ class _CycleUnitAccounting:
     exactly one bucket, driven by its single current "live" task:
 
     - running: the live task is in_progress.
-    - pending: the live task is pending and not blocked.
+    - pending: the live task has not started (status pending) and is not
+      blocked.
     - blocked: the live task is pending and blocked on a dependency.
+    - advancing: the live task completed and the unit isn't merged yet, but
+      nothing is wrong - the unit is between lifecycle steps (e.g. an
+      implement finished and its review hasn't been created yet). Not
+      "pending": work already happened, it just isn't the live task's turn.
     - recovery: the live task failed and the recovery engine will retry it
       automatically (resume/retry/reconcile).
     - parked: the live task failed and the recovery engine will not touch it
@@ -7111,13 +7116,22 @@ class _CycleUnitAccounting:
     running: int
     pending: int
     blocked: int
+    advancing: int
     parked: int
     recovery: int
     other: int
 
     @property
     def total(self) -> int:
-        return self.running + self.pending + self.blocked + self.parked + self.recovery + self.other
+        return (
+            self.running
+            + self.pending
+            + self.blocked
+            + self.advancing
+            + self.parked
+            + self.recovery
+            + self.other
+        )
 
 
 def _bucket_unit_live_task(
@@ -7157,7 +7171,7 @@ def _bucket_unit_live_task(
         if owner_row is not None and owner_row.next_action is not None:
             if classify_advance_action(owner_row.next_action) == "needs_attention":
                 return "parked"
-        return "blocked" if unit is not None and unit.state == "blocked" else "pending"
+        return "blocked" if unit is not None and unit.state == "blocked" else "advancing"
     if task.status == "dropped":
         # A dropped task means its unit's state should already be tombstoned
         # (see drop_active_merge_units_owned_by), which removes it from the
@@ -7176,7 +7190,15 @@ def _compute_cycle_unit_accounting(
     any_tag: bool,
     max_recovery_attempts: int,
 ) -> _CycleUnitAccounting:
-    counts = {"running": 0, "pending": 0, "blocked": 0, "parked": 0, "recovery": 0, "other": 0}
+    counts = {
+        "running": 0,
+        "pending": 0,
+        "blocked": 0,
+        "advancing": 0,
+        "parked": 0,
+        "recovery": 0,
+        "other": 0,
+    }
     owner_row_by_id = {
         row.owner_task.id: row for row in analysis.owner_rows if row.owner_task.id is not None
     }
@@ -7224,7 +7246,7 @@ def _compute_cycle_unit_accounting(
 def _format_cycle_unit_accounting_message(accounting: _CycleUnitAccounting) -> str:
     return (
         f"unit accounting: running={accounting.running} pending={accounting.pending} "
-        f"blocked={accounting.blocked} parked={accounting.parked} "
+        f"blocked={accounting.blocked} advancing={accounting.advancing} parked={accounting.parked} "
         f"recovery={accounting.recovery} other={accounting.other}"
     )
 

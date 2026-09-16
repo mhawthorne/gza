@@ -151,7 +151,7 @@ def test_parse_log_attaches_unit_accounting_to_its_cycle(tmp_path: Path) -> None
             [
                 "10:00:00 WAKE      checking... (1 running, pending=2 runnable, blocked=3, 4 slots)",
                 "10:00:05 INFO      cycle accounting: running=1 pending=2 blocked=3 parked=4 recovery=5 other=6",
-                "10:00:06 INFO      unit accounting: running=1 pending=1 blocked=1 parked=2 recovery=1 other=0",
+                "10:00:06 INFO      unit accounting: running=1 pending=1 blocked=1 advancing=3 parked=2 recovery=1 other=0",
                 # No unit accounting line on this cycle - predates the feature.
                 "10:01:00 WAKE      checking... (0 running, pending=0 runnable, blocked=0, 4 slots)",
                 "10:01:05 INFO      cycle accounting: running=0 pending=0 blocked=0 parked=0 recovery=0 other=0",
@@ -166,6 +166,7 @@ def test_parse_log_attaches_unit_accounting_to_its_cycle(tmp_path: Path) -> None
     with_unit, without_unit = points
     assert with_unit.unit is not None
     assert (with_unit.unit.running, with_unit.unit.pending, with_unit.unit.blocked) == (1, 1, 1)
+    assert with_unit.unit.advancing == 3
     assert (with_unit.unit.parked, with_unit.unit.recovery, with_unit.unit.other) == (2, 1, 0)
     assert without_unit.unit is None
 
@@ -178,7 +179,7 @@ def test_select_view_defaults_to_units_when_available(tmp_path: Path) -> None:
             [
                 "10:00:00 WAKE      checking... (1 running, pending=2 runnable, blocked=3, 4 slots)",
                 "10:00:05 INFO      cycle accounting: running=1 pending=2 blocked=3 parked=4 recovery=5 other=6",
-                "10:00:06 INFO      unit accounting: running=9 pending=8 blocked=7 parked=6 recovery=5 other=0",
+                "10:00:06 INFO      unit accounting: running=9 pending=8 blocked=7 advancing=4 parked=6 recovery=5 other=0",
                 "",
             ]
         ),
@@ -200,7 +201,7 @@ def test_select_view_task_level_flag_shows_task_counts(tmp_path: Path) -> None:
             [
                 "10:00:00 WAKE      checking... (1 running, pending=2 runnable, blocked=3, 4 slots)",
                 "10:00:05 INFO      cycle accounting: running=1 pending=2 blocked=3 parked=4 recovery=5 other=6",
-                "10:00:06 INFO      unit accounting: running=9 pending=8 blocked=7 parked=6 recovery=5 other=0",
+                "10:00:06 INFO      unit accounting: running=9 pending=8 blocked=7 advancing=4 parked=6 recovery=5 other=0",
                 "",
             ]
         ),

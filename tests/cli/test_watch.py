@@ -22132,7 +22132,7 @@ def test_watch_cycle_logs_cycle_accounting_line(tmp_path: Path) -> None:
         )
 
     assert (
-        "INFO      unit accounting: running=0 pending=2 blocked=1 parked=0 recovery=0 other=0"
+        "INFO      unit accounting: running=0 pending=2 blocked=1 advancing=0 parked=0 recovery=0 other=0"
         in log_path.read_text()
     )
 
@@ -22228,12 +22228,12 @@ def test_bucket_unit_live_task_completed_but_stuck_owner_is_parked_not_pending()
             unit=unit,
             owner_row=ready_row,
         )
-        == "pending"
+        == "advancing"
     )
 
 
 def test_compute_cycle_unit_accounting_counts_units_not_tasks(tmp_path: Path) -> None:
-    """A completed owner awaiting its next step is pending/blocked, never other.
+    """A completed owner awaiting its next step is advancing/blocked, never other.
 
     Regression: the live task of a not-yet-merged unit is very commonly
     ``completed`` (the implement finished; watch hasn't created the review or
@@ -22297,7 +22297,7 @@ def test_compute_cycle_unit_accounting_counts_units_not_tasks(tmp_path: Path) ->
         max_recovery_attempts=3,
     )
 
-    assert accounting.pending == 1
+    assert accounting.advancing == 1
     assert accounting.blocked == 1
     assert accounting.running == 1
     assert accounting.other == 0
