@@ -1,0 +1,42 @@
+# Sandbox image for dirty bead sessions in this repo.
+#
+# One image, not one per harness: dirty picks the harness at run time, so the
+# image carries all of them (Claude, Codex, OpenCode) plus bd. That is the
+# difference from etc/Dockerfile.claude and etc/Dockerfile.codex, which gza
+# builds per harness.
+#
+# It also carries what gza's own verify needs -- python3 and uv -- because the
+# session runs ./bin/tests inside this container. An image without them makes
+# every verify-bearing bead unrunnable.
+
+FROM node:20-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    git \
+    ripgrep \
+    python3 \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+RUN cp /root/.local/bin/uv /usr/local/bin/uv
+
+RUN npm install -g \
+    @anthropic-ai/claude-code \
+    @openai/codex \
+    opencode-ai
+
+RUN curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
+
+# Runtime contract below must match dirty's own Dockerfile: dirty invokes the
+# image as `bash -c "<command>"`, so the entrypoint, user and PATH are part of
+# the interface, not local preference.
+RUN useradd -m -s /bin/bash dirty
+USER dirty
+ENV PATH="/usr/local/bin:/usr/bin:/bin:/home/dirty/.local/bin"
+WORKDIR /home/dirty
+
+ENTRYPOINT ["/bin/bash", "-c"]
