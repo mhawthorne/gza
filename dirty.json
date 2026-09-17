@@ -1,0 +1,6 @@
+{
+  "sandbox": "docker",
+  "dockerfile": "etc/Dockerfile.dirty",
+  "verify": "./bin/tests",
+  "timeoutMinutes": 90
+}
