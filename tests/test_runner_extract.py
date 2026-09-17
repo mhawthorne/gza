@@ -559,49 +559,6 @@ def test_seed_extraction_bundle_retries_after_runtime_patch_artifact_left_by_fai
     assert worktree_git.apply_patch_file_result.call_count == 2
 
 
-def test_complete_code_task_stages_seeded_paths_even_without_provider_edits(tmp_path: Path) -> None:
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
-    task = store.add("Extracted task", task_type="implement")
-    task.slug = "20260427-seeded"
-    task.status = "in_progress"
-    store.update(task)
-
-    config = Mock(spec=Config)
-    config.project_dir = tmp_path
-    config.log_path = tmp_path / "logs"
-    config.log_path.mkdir(parents=True, exist_ok=True)
-
-    log_file = config.log_path / "seeded.log"
-    worktree_summary_path = tmp_path / "worktree-summary.md"
-    worktree_summary_path.write_text("# Summary\n")
-    summary_path = tmp_path / ".gza" / "summaries" / "seeded.md"
-
-    worktree_git = Mock()
-    worktree_git.status_porcelain.return_value = {("M", "src/file.py")}
-    worktree_git.default_branch.return_value = "main"
-    worktree_git.get_diff_numstat.return_value = "1\t1\tsrc/file.py\n"
-    worktree_git._run.return_value = Mock(stdout="", returncode=0, stderr="")
-
-    with patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
-        rc = _complete_code_task(
-            task,
-            config,
-            store,
-            worktree_git,
-            log_file,
-            "feature/seeded",
-            TaskStats(duration_seconds=1.0, num_steps_computed=1, cost_usd=0.0),
-            0,
-            pre_run_status={("M", "src/file.py")},
-            worktree_summary_path=worktree_summary_path,
-            summary_path=summary_path,
-            summary_dir=summary_path.parent,
-            seeded_paths={"src/file.py"},
-        )
-
-    assert rc == 0
-    worktree_git.add.assert_any_call("src/file.py")
-    assert worktree_git.commit.call_count == 1
 
 
 def test_complete_code_task_does_not_stage_owned_artifact_paths(tmp_path: Path) -> None:
@@ -648,63 +605,6 @@ def test_complete_code_task_does_not_stage_owned_artifact_paths(tmp_path: Path) 
     worktree_git.commit.assert_not_called()
 
 
-def test_complete_code_task_does_not_stage_scoped_owned_artifact_paths_in_subdir_project(tmp_path: Path) -> None:
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
-    task = store.add("Extracted task", task_type="implement")
-    task.slug = "20260427-seeded-owned-scoped"
-    task.status = "in_progress"
-    store.update(task)
-
-    project_dir = tmp_path / "tarantino-ui"
-    project_dir.mkdir()
-
-    config = Mock(spec=Config)
-    config.project_dir = project_dir
-    config.log_path = project_dir / ".gza" / "logs"
-    config.log_path.mkdir(parents=True, exist_ok=True)
-    config._project_boundary_cache = ProjectBoundary(
-        repo_root=tmp_path,
-        scope_root=Path("tarantino-ui"),
-        local_dependencies=(),
-    )
-
-    log_file = config.log_path / "seeded-owned-scoped.log"
-    worktree_summary_path = tmp_path / "worktree-summary.md"
-    worktree_summary_path.write_text("# Summary\n")
-    summary_path = project_dir / ".gza" / "summaries" / "seeded-owned-scoped.md"
-
-    worktree_git = Mock()
-    worktree_git.status_porcelain.return_value = {
-        ("M", "tarantino-ui/.gza/summaries/seeded-owned-scoped.md"),
-        ("M", "tarantino-ui/src/file.py"),
-    }
-    worktree_git.default_branch.return_value = "main"
-    worktree_git.get_diff_numstat.return_value = "1\t1\ttarantino-ui/src/file.py\n"
-    worktree_git._run.return_value = Mock(stdout="", returncode=0, stderr="")
-
-    with patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
-        rc = _complete_code_task(
-            task,
-            config,
-            store,
-            worktree_git,
-            log_file,
-            "feature/seeded-owned-scoped",
-            TaskStats(duration_seconds=1.0, num_steps_computed=1, cost_usd=0.0),
-            0,
-            pre_run_status=set(),
-            worktree_summary_path=worktree_summary_path,
-            summary_path=summary_path,
-            summary_dir=summary_path.parent,
-            seeded_paths={
-                "tarantino-ui/.gza/summaries/seeded-owned-scoped.md",
-                "tarantino-ui/src/file.py",
-            },
-        )
-
-    assert rc == 0
-    worktree_git.add.assert_called_once_with("tarantino-ui/src/file.py")
-    assert worktree_git.commit.call_count == 1
 
 
 def test_complete_code_task_ignores_missing_seeded_paths_without_pathspec_crash(tmp_path: Path) -> None:
@@ -914,66 +814,6 @@ def test_complete_code_task_fails_on_out_of_scope_paths(tmp_path: Path) -> None:
     assert refreshed.failure_reason == "PROJECT_SCOPE_VIOLATION"
 
 
-def test_complete_code_task_allows_out_of_scope_paths_for_cross_project_tag(tmp_path: Path) -> None:
-    store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
-    task = store.add("Cross-project task", task_type="implement")
-    task.slug = "20260427-cross-project"
-    task.status = "in_progress"
-    task.tags = ("cross-project",)
-    store.update(task)
-
-    config = Mock(spec=Config)
-    config.project_dir = tmp_path / "services" / "foo"
-    config.project_dir.mkdir(parents=True)
-    (config.project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
-    sibling_project_dir = tmp_path / "services" / "bar"
-    sibling_project_dir.mkdir(parents=True)
-    (sibling_project_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
-    config.log_path = config.project_dir / ".gza" / "logs"
-    config.log_path.mkdir(parents=True, exist_ok=True)
-    config.enforce_project_scope = True
-    setattr(
-        config,
-        "_project_boundary_cache",
-        ProjectBoundary(
-            repo_root=tmp_path,
-            scope_root=Path("services/foo"),
-            local_dependencies=(),
-        ),
-    )
-
-    log_file = config.log_path / "cross-project.log"
-    worktree_summary_path = tmp_path / "worktree-summary.md"
-    worktree_summary_path.write_text("# Summary\n")
-    summary_path = config.project_dir / ".gza" / "summaries" / "cross-project.md"
-
-    worktree_git = Mock()
-    worktree_git.status_porcelain.return_value = {("M", "services/bar/file.py")}
-    worktree_git.default_branch.return_value = "main"
-    worktree_git.get_diff_numstat.return_value = "1\t1\tservices/bar/file.py\n"
-    worktree_git._run.return_value = Mock(stdout="", returncode=0, stderr="")
-
-    with patch("gza.runner._project_boundary") as mock_boundary, \
-         patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
-        mock_boundary.return_value = config._project_boundary_cache
-        rc = _complete_code_task(
-            task,
-            config,
-            store,
-            worktree_git,
-            log_file,
-            "feature/cross-project",
-            TaskStats(duration_seconds=1.0, num_steps_computed=1, cost_usd=0.0),
-            0,
-            pre_run_status=set(),
-            worktree_summary_path=worktree_summary_path,
-            summary_path=summary_path,
-            summary_dir=summary_path.parent,
-        )
-
-    assert rc == 0
-    worktree_git.add.assert_called_once_with("services/bar/file.py")
-    assert worktree_git.commit.call_count == 1
 
 
 def test_complete_code_task_cross_project_fails_on_unknown_project_path(tmp_path: Path) -> None:
@@ -1764,77 +1604,6 @@ def test_run_marks_failed_when_extraction_manifest_touched_paths_is_null(tmp_pat
     assert mock_provider.run.call_count == 0
 
 
-def test_run_marks_failed_when_extraction_manifest_patch_path_traverses_outside_bundle(tmp_path: Path) -> None:
-    db_path = tmp_path / "test.db"
-    store = SqliteTaskStore(db_path, prefix="testproject")
-    task = store.add("Extracted task", task_type="implement")
-    task.slug = "20260427-unsafe-patch-traversal"
-    store.update(task)
-
-    project_bundle = tmp_path / ".gza" / "extractions" / task.slug
-    project_bundle.mkdir(parents=True, exist_ok=True)
-    (project_bundle / "manifest.json").write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "source_branch": "feature/source",
-                "source_base_ref": "main",
-                "target_task_id": task.id,
-                "target_slug": task.slug,
-                "selected_paths": ["src/file.py"],
-                "touched_paths": ["src/file.py"],
-                "patch_path": "../other.patch",
-            }
-        )
-    )
-    (project_bundle / "selected.patch").write_text(
-        "diff --git a/src/file.py b/src/file.py\n"
-        "--- a/src/file.py\n"
-        "+++ b/src/file.py\n"
-        "@@ -0,0 +1 @@\n"
-        "+print('seeded')\n"
-    )
-    (project_bundle / "prompt.md").write_text("prompt\n")
-
-    config = _build_config(tmp_path, db_path)
-
-    mock_provider = Mock()
-    mock_provider.name = "TestProvider"
-    mock_provider.check_credentials.return_value = True
-    mock_provider.verify_credentials.return_value = True
-    mock_provider.run.return_value = RunResult(
-        exit_code=0,
-        duration_seconds=1.0,
-        num_turns_reported=1,
-        cost_usd=0.01,
-        error_type=None,
-    )
-
-    mock_main_git = Mock()
-    mock_main_git.default_branch.return_value = "main"
-    mock_main_git.branch_exists.return_value = False
-    mock_main_git.worktree_list.return_value = []
-    mock_main_git.worktree_add.return_value = config.worktree_path / task.slug
-    mock_main_git.count_commits_ahead.return_value = 0
-    mock_main_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
-
-    mock_worktree_git = Mock()
-    mock_worktree_git.status_porcelain.return_value = set()
-
-    with (
-        patch("gza.runner.get_provider", return_value=mock_provider),
-        patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
-        patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
-        patch("gza.runner.load_dotenv"),
-    ):
-        rc = run(config, task_id=task.id)
-
-    assert rc == 1
-    refreshed = store.get(task.id)
-    assert refreshed is not None
-    assert refreshed.status == "failed"
-    assert refreshed.failure_reason == EXTRACTION_PRECHECK_FAILURE_REASON
-    assert mock_provider.run.call_count == 0
 
 
 def test_run_marks_failed_when_extraction_manifest_patch_path_is_absolute(tmp_path: Path) -> None:

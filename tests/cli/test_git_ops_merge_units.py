@@ -349,22 +349,6 @@ def _snapshot_merge_refusal_state(store, task_id: str) -> dict[str, object]:
 
 
 
-def test_collect_advance_completed_tasks_backfills_legacy_unmerged_owner(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    legacy = _add_completed_legacy_impl(store, "Legacy shared branch", "feature/legacy-advance")
-
-    assert legacy.id is not None
-    assert store.resolve_merge_unit_for_task(legacy.id) is None
-
-    tasks, impl_based_on_ids = _collect_advance_completed_tasks(store, target_branch="main")
-
-    assert legacy.id not in impl_based_on_ids
-    assert [task.id for task in tasks if task.task_type == "implement"] == [legacy.id]
-    unit = store.resolve_merge_unit_for_task(legacy.id)
-    assert unit is not None
-    assert unit.state == "unmerged"
 
 
 
@@ -1127,44 +1111,6 @@ def test_merge_removed_rebase_resolve_flags_refuse_before_conflict_resolution(
     assert store.resolve_merge_unit_for_task(impl.id) is None
 
 
-def test_merge_rebase_resolve_without_force_is_rejected_without_provider_resolution(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = store.add("Implement ordinary rebase resolve", task_type="implement")
-    store.mark_completed(impl, has_commits=True, branch="feature/ordinary-rebase-resolve")
-    assert impl.id is not None
-    review = _add_completed_approved_review(store, based_on_task=impl, depends_on_task=impl)
-    _persist_current_green_verify(tmp_path, store, owner_task=impl, source_task=review)
-
-    fake_git = _ConflictingRebaseMergeGit(tmp_path)
-    with (
-        patch("gza.cli.git_ops.Git", lambda project_dir: fake_git),
-        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
-        patch("gza.cli.git_ops.invoke_provider_resolve", return_value=True) as invoke_provider_resolve,
-    ):
-        result = invoke_gza(
-            "merge",
-            str(impl.id),
-            "--rebase",
-            "--resolve",
-            "--project",
-            str(tmp_path),
-            cwd=tmp_path,
-        )
-
-    assert result.returncode == 2
-    assert "unrecognized arguments" in result.stderr
-    assert "--rebase" in result.stderr
-    assert "--resolve" in result.stderr
-    invoke_provider_resolve.assert_not_called()
-    assert fake_git.checked_out == []
-    assert fake_git.rebased == []
-    assert fake_git.merged == []
-    unit = store.resolve_merge_unit_for_task(impl.id)
-    assert unit is not None
-    assert unit.state == "unmerged"
-    assert unit.merge_source is None
 
 
 

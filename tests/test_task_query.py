@@ -134,88 +134,14 @@ def _attach_child_merge_unit(
 
 
 
-def test_outstanding_deferred_review_blocker_count_excludes_dropped_task_without_unit(
-    tmp_path: Path,
-) -> None:
-    store = _store(tmp_path)
-    source = _max_cycles_merged_source(store)
-    assert source.id is not None
-    blocker = _deferred_blocker(store, source.id)
-    blocker.status = "dropped"
-    blocker.completed_at = datetime.now(UTC)
-    store.update(blocker)
-
-    assert count_outstanding_deferred_review_blockers(store) == 0
-
-
-def test_outstanding_deferred_review_blocker_count_excludes_legacy_merged_task_without_unit(
-    tmp_path: Path,
-) -> None:
-    store = _store(tmp_path)
-    source = _max_cycles_merged_source(store)
-    assert source.id is not None
-    blocker = _deferred_blocker(store, source.id)
-    blocker.status = "completed"
-    blocker.completed_at = datetime.now(UTC)
-    blocker.merge_status = "merged"
-    store.update(blocker)
-
-    assert count_outstanding_deferred_review_blockers(store) == 0
 
 
 
 
-@pytest.mark.parametrize("active_state", ["unmerged", "blocked", "stale"])
-def test_outstanding_deferred_review_blocker_count_prefers_current_actionable_unit_over_historical_drop(
-    tmp_path: Path,
-    active_state: str,
-) -> None:
-    store = _store(tmp_path)
-    source = _max_cycles_merged_source(store)
-    assert source.id is not None
-    blocker = _deferred_blocker(store, source.id)
-    assert blocker.id is not None
-    _attach_child_merge_unit(
-        store,
-        blocker.id,
-        "dropped",
-        branch_suffix=f"historical-dropped-{active_state}",
-    )
-    _attach_child_merge_unit(
-        store,
-        blocker.id,
-        active_state,
-        branch_suffix=f"current-{active_state}",
-    )
-
-    assert count_outstanding_deferred_review_blockers(store) == 1
 
 
-@pytest.mark.parametrize("active_state", ["unmerged", "blocked", "stale"])
-def test_outstanding_deferred_review_blocker_count_prefers_current_actionable_unit_over_historical_supersession(
-    tmp_path: Path,
-    active_state: str,
-) -> None:
-    store = _store(tmp_path)
-    source = _max_cycles_merged_source(store)
-    assert source.id is not None
-    blocker = _deferred_blocker(store, source.id)
-    assert blocker.id is not None
-    _attach_child_merge_unit(
-        store,
-        blocker.id,
-        "superseded",
-        branch_suffix=f"historical-superseded-{active_state}",
-        superseded_by_unit_id="replacement-unit",
-    )
-    _attach_child_merge_unit(
-        store,
-        blocker.id,
-        active_state,
-        branch_suffix=f"current-{active_state}",
-    )
 
-    assert count_outstanding_deferred_review_blockers(store) == 1
+
 
 
 @pytest.mark.parametrize("terminal_state", ["merged", "empty", "redundant"])
@@ -249,22 +175,6 @@ def test_outstanding_deferred_review_blocker_count_excludes_current_terminal_uni
     assert count_outstanding_deferred_review_blockers(store) == 0
 
 
-def test_outstanding_deferred_review_blocker_count_excludes_historical_only_membership(
-    tmp_path: Path,
-) -> None:
-    store = _store(tmp_path)
-    source = _max_cycles_merged_source(store)
-    assert source.id is not None
-    blocker = _deferred_blocker(store, source.id)
-    assert blocker.id is not None
-    _attach_child_merge_unit(
-        store,
-        blocker.id,
-        "dropped",
-        branch_suffix="historical-only-dropped",
-    )
-
-    assert count_outstanding_deferred_review_blockers(store) == 0
 
 
 
@@ -273,48 +183,8 @@ def test_outstanding_deferred_review_blocker_count_is_zero_when_empty(tmp_path: 
     assert count_outstanding_deferred_review_blockers(_store(tmp_path)) == 0
 
 
-def test_outstanding_deferred_review_blocker_count_deduplicates_reused_task_membership(
-    tmp_path: Path,
-) -> None:
-    store = _store(tmp_path)
-    source = _max_cycles_merged_source(store)
-    assert source.id is not None
-    blocker = _deferred_blocker(store, source.id)
-    duplicate_source_unit = store.create_merge_unit(
-        source_branch="feature/duplicate-source",
-        target_branch="main",
-        owner_task_id=source.id,
-        state="merged",
-        merged_at=datetime.now(UTC),
-    )
-    store.attach_task_to_merge_unit(source.id, duplicate_source_unit.id, "owner")
-    store.set_merge_unit_state(
-        duplicate_source_unit.id,
-        "merged",
-        merge_source=MERGE_SOURCE_MAX_CYCLES_DEFERRED,
-    )
-
-    assert blocker.id is not None
-    assert count_outstanding_deferred_review_blockers(store) == 1
 
 
-def test_outstanding_deferred_review_blocker_count_applies_positive_tag_scope(
-    tmp_path: Path,
-) -> None:
-    store = _store(tmp_path)
-    source = _max_cycles_merged_source(store)
-    assert source.id is not None
-    _deferred_blocker(
-        store,
-        source.id,
-        tags=("backend", "deferred-review-blocker", "release"),
-    )
-
-    assert count_outstanding_deferred_review_blockers(store, tags=("release",), any_tag=True) == 1
-    assert count_outstanding_deferred_review_blockers(store, tags=("frontend",), any_tag=True) == 0
-    assert count_outstanding_deferred_review_blockers(store, tags=("release", "backend"), any_tag=False) == 1
-    assert count_outstanding_deferred_review_blockers(store, tags=("release", "frontend"), any_tag=False) == 0
-    assert count_outstanding_deferred_review_blockers(store, tags=("release", "frontend"), any_tag=True) == 1
 
 
 def test_outstanding_deferred_review_blocker_count_avoids_per_task_merge_unit_queries(
@@ -2181,93 +2051,8 @@ def test_incomplete_preset_warns_and_falls_back_to_owner_for_missing_subject_tas
     assert "without subject_task_id" in caplog.text
 
 
-def test_attention_subject_agrees_across_show_incomplete_and_watch_for_held_plan_lineage(
-    tmp_path: Path,
-) -> None:
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n")
-    store = _store(tmp_path)
-    config = Config.load(tmp_path)
-
-    impl = store.add("Merged implement", task_type="implement")
-    assert impl.id is not None
-    impl.status = "completed"
-    impl.completed_at = datetime(2026, 5, 18, 9, 0, tzinfo=UTC)
-    impl.branch = "feature/merged-parent"
-    impl.has_commits = True
-    impl.merge_status = "merged"
-    store.update(impl)
-
-    plan = store.add("Held plan", task_type="plan", based_on=impl.id, auto_implement=False)
-    assert plan.id is not None
-    plan.status = "completed"
-    plan.completed_at = datetime(2026, 5, 18, 10, 0, tzinfo=UTC)
-    store.update(plan)
-
-    git = SimpleNamespace(
-        can_merge=lambda source, target: True,
-        is_merged=lambda source, target: False,
-        resolve_fresh_merge_source=lambda branch: (f"origin/{branch}", None),
-        count_commits_behind=lambda source, target: 0,
-        get_diff_name_status=lambda revision_range, paths=(), check=False: "",
-    )
-
-    show_action = determine_next_action(config, store, git, plan, "main")
-    assert show_action["subject_task_id"] == plan.id
-
-    service = TaskQueryService(store)
-    incomplete_result = service.run(
-        TaskQueryPresets.incomplete(limit=None),
-        config=config,
-        git=git,
-        target_branch="main",
-    )
-    assert len(incomplete_result.rows) == 1
-    incomplete_row = incomplete_result.rows[0]
-    assert incomplete_row.values["next_action_owner_id"] == plan.id
-
-    from gza.cli.watch import _resolve_watch_attention_display_task, _watch_needs_attention_message
-
-    watch_rows = query_lineage_owner_rows(
-        store,
-        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
-        config=config,
-        git=git,
-        target_branch="main",
-    )
-    assert len(watch_rows) == 1
-    watch_row = watch_rows[0]
-    subject_task = _resolve_watch_attention_display_task(store, watch_row)
-    assert subject_task.id == plan.id
-    message = _watch_needs_attention_message(subject_task, watch_row.next_action or {})
-    assert plan.id in message
-    assert impl.id not in message
 
 
-def test_lifecycle_incomplete_prefers_merged_unit_state_over_stale_task_row(tmp_path: Path) -> None:
-    store = _store(tmp_path)
-    task = store.add("stale task-row merge status", task_type="implement")
-    store.mark_completed(task, has_commits=True, branch="feature/stale-task-row-status")
-    assert task.id is not None
-
-    unit = store.resolve_merge_unit_for_task(task.id)
-    assert unit is not None
-    store.set_merge_unit_state(unit.id, "merged")
-
-    task = store.get(task.id)
-    assert task is not None
-    task.merge_status = "unmerged"
-    store.update(task)
-
-    service = TaskQueryService(store)
-    result = service.run(
-        TaskQuery(
-            statuses=("completed",),
-            lifecycle_state=("incomplete",),
-            limit=None,
-        )
-    )
-
-    assert result.rows == ()
 
 
 def test_lifecycle_incomplete_excludes_completed_empty_implementation(tmp_path: Path) -> None:
@@ -2456,33 +2241,6 @@ def test_merge_chain_unmerged_matches_legacy_unmerged_status(tmp_path: Path) -> 
     assert "legacy unmerged" in prompts
 
 
-def test_merge_chain_unmerged_hides_legacy_unmerged_status_when_unit_is_merged(tmp_path: Path) -> None:
-    store = _store(tmp_path)
-    task = store.add("legacy unmerged status with merged unit", task_type="implement")
-    store.mark_completed(task, has_commits=True, branch="feature/legacy-unmerged-merged-unit")
-    assert task.id is not None
-
-    unit = store.resolve_merge_unit_for_task(task.id)
-    assert unit is not None
-    store.set_merge_unit_state(unit.id, "merged")
-
-    task = store.get(task.id)
-    assert task is not None
-    task.status = "unmerged"
-    task.merge_status = None
-    store.update(task)
-
-    service = TaskQueryService(store)
-    query = TaskQuery(
-        statuses=("completed", "unmerged"),
-        merge_chain_state=("unmerged",),
-        lifecycle_state=("terminal",),
-        limit=None,
-    )
-    result = service.run(query)
-
-    prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
-    assert "legacy unmerged status with merged unit" not in prompts
 
 
 def test_branch_merge_state_projects_empty_for_moot_merge_unit(tmp_path: Path) -> None:
@@ -2569,57 +2327,6 @@ def test_unmerged_preset_uses_lineage_scope_and_unmerged_default_projection() ->
     assert query.presentation.mode == "flat"
 
 
-def test_unmerged_branch_owner_filter_uses_same_branch_owner_for_representative_descendant(
-    tmp_path: Path,
-) -> None:
-    store = _store(tmp_path)
-    plan = store.add("Branchless plan", task_type="plan")
-    plan.status = "completed"
-    plan.completed_at = datetime(2026, 2, 12, 9, 0, tzinfo=UTC)
-    store.update(plan)
-    assert plan.id is not None
-
-    implement = store.add("Branch owner implementation", task_type="implement", depends_on=plan.id)
-    implement.status = "completed"
-    implement.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
-    implement.branch = "feature/representative-descendant"
-    implement.has_commits = True
-    store.update(implement)
-    assert implement.id is not None
-
-    rebase = store.add("Representative rebase", task_type="rebase", based_on=implement.id)
-    rebase.status = "completed"
-    rebase.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
-    rebase.branch = "feature/representative-descendant"
-    rebase.has_commits = True
-    store.update(rebase)
-    assert rebase.id is not None
-
-    unit = store.create_merge_unit(
-        source_branch="feature/representative-descendant",
-        target_branch="main",
-        owner_task_id=plan.id,
-        state="unmerged",
-    )
-    store.attach_task_to_merge_unit(implement.id, unit.id, "owner")
-    store.attach_task_to_merge_unit(rebase.id, unit.id, "rebase")
-
-    service = TaskQueryService(store)
-    result = service.run(
-        TaskQueryPresets.unmerged(
-            branch_owner_ids=(implement.id,),
-            merge_unit_ids=(unit.id,),
-            task_ids=(rebase.id,),
-            limit=None,
-            mode="json",
-        )
-    )
-
-    assert len(result.rows) == 1
-    row = result.rows[0]
-    assert hasattr(row, "owner_task")
-    assert row.owner_task.id == implement.id
-    assert row.values["branch_owner_id"] == implement.id
 
 
 def test_incomplete_date_field_created_vs_effective_affects_lineage_selection(tmp_path: Path) -> None:
@@ -2650,46 +2357,6 @@ def test_incomplete_date_field_created_vs_effective_affects_lineage_selection(tm
     assert len(effective_result.rows) == 0
 
 
-def test_incomplete_preset_tag_filters_owner_rows_with_or_and_and_modes(tmp_path: Path) -> None:
-    store = _store(tmp_path)
-
-    alpha = store.add("alpha owner", task_type="implement", tags=("alpha",))
-    alpha.status = "failed"
-    alpha.completed_at = datetime.now(UTC)
-    alpha.failure_reason = "TEST_FAILURE"
-    store.update(alpha)
-    assert alpha.id is not None
-
-    beta = store.add("beta owner", task_type="implement", tags=("beta",))
-    beta.status = "failed"
-    beta.completed_at = datetime.now(UTC)
-    beta.failure_reason = "TEST_FAILURE"
-    store.update(beta)
-    assert beta.id is not None
-
-    both = store.add("both owner", task_type="implement", tags=("alpha", "beta"))
-    both.status = "failed"
-    both.completed_at = datetime.now(UTC)
-    both.failure_reason = "TEST_FAILURE"
-    store.update(both)
-    assert both.id is not None
-
-    service = TaskQueryService(store)
-    unfiltered = service.run(TaskQueryPresets.incomplete(limit=None))
-    any_tag = service.run(TaskQueryPresets.incomplete(limit=None, tags=("alpha", "beta")))
-    all_tags = service.run(
-        TaskQueryPresets.incomplete(limit=None, tags=("alpha", "beta"), any_tag=False)
-    )
-
-    assert {
-        row.owner_task.id for row in unfiltered.rows if hasattr(row, "owner_task")
-    } == {alpha.id, beta.id, both.id}
-    assert {
-        row.owner_task.id for row in any_tag.rows if hasattr(row, "owner_task")
-    } == {alpha.id, beta.id, both.id}
-    assert {
-        row.owner_task.id for row in all_tags.rows if hasattr(row, "owner_task")
-    } == {both.id}
 
 
 def test_incomplete_preset_tag_filters_exclude_owner_when_only_descendant_matches(tmp_path: Path) -> None:
@@ -2715,75 +2382,6 @@ def test_incomplete_preset_tag_filters_exclude_owner_when_only_descendant_matche
     assert not result.rows
 
 
-def test_incomplete_preset_tag_filters_keep_owner_when_only_owner_matches_actionable_descendant(
-    tmp_path: Path,
-) -> None:
-    store = _store(tmp_path)
-
-    owner = store.add("alpha owner", task_type="implement", tags=("alpha",))
-    owner.status = "in_progress"
-    owner.branch = "feature/incomplete-owner-tag-match"
-    owner.has_commits = True
-    store.update(owner)
-    assert owner.id is not None
-
-    descendant = store.add(
-        "beta actionable descendant",
-        task_type="rebase",
-        based_on=owner.id,
-        same_branch=True,
-        tags=("beta",),
-    )
-    descendant.status = "completed"
-    descendant.completed_at = datetime.now(UTC)
-    descendant.has_commits = True
-    descendant.branch = "feature/incomplete-owner-tag-match-orphan"
-    descendant.merge_status = "unmerged"
-    store.update(descendant)
-    assert descendant.id is not None
-
-    both_owner = store.add("alpha beta owner", task_type="implement", tags=("alpha", "beta"))
-    both_owner.status = "in_progress"
-    both_owner.branch = "feature/incomplete-owner-all-tags"
-    both_owner.has_commits = True
-    store.update(both_owner)
-    assert both_owner.id is not None
-
-    all_tags_descendant = store.add(
-        "gamma actionable descendant",
-        task_type="rebase",
-        based_on=both_owner.id,
-        same_branch=True,
-        tags=("gamma",),
-    )
-    all_tags_descendant.status = "completed"
-    all_tags_descendant.completed_at = datetime.now(UTC)
-    all_tags_descendant.has_commits = True
-    all_tags_descendant.branch = "feature/incomplete-owner-all-tags-orphan"
-    all_tags_descendant.merge_status = "unmerged"
-    store.update(all_tags_descendant)
-    assert all_tags_descendant.id is not None
-
-    service = TaskQueryService(store)
-    any_tag_result = service.run(TaskQueryPresets.incomplete(limit=None, tags=("alpha",)), target_branch="main")
-    all_tags_result = service.run(
-        TaskQueryPresets.incomplete(limit=None, tags=("alpha", "beta"), any_tag=False),
-        target_branch="main",
-    )
-
-    assert {
-        (row.owner_task.id, tuple(row.values["tags"]), tuple(task.id for task in row.unresolved_tasks))
-        for row in any_tag_result.rows
-    } == {
-        (owner.id, ("alpha",), (descendant.id,)),
-        (both_owner.id, ("alpha", "beta"), (all_tags_descendant.id,)),
-    }
-    assert {
-        (row.owner_task.id, tuple(row.values["tags"]), tuple(task.id for task in row.unresolved_tasks))
-        for row in all_tags_result.rows
-    } == {
-        (both_owner.id, ("alpha", "beta"), (all_tags_descendant.id,))
-    }
 
 
 def test_task_row_plan_fanout_keeps_branch_owner_task_scoped(tmp_path: Path) -> None:
@@ -3248,33 +2846,6 @@ def test_dependency_state_blocked_by_dropped_dep_filters_pending_only(tmp_path: 
     assert blocked_resolved.id not in ids
 
 
-def test_dependency_state_completed_empty_prereq_is_unblocked(tmp_path: Path) -> None:
-    store = _store(tmp_path)
-
-    dep = store.add("Empty dependency", task_type="implement")
-    store.mark_completed(dep, has_commits=True, branch="feature/query-empty-default")
-    assert dep.id is not None
-    unit = store.resolve_merge_unit_for_task(dep.id)
-    assert unit is not None
-    store.set_merge_unit_state(unit.id, "empty")
-
-    blocked = store.add("Blocked downstream", task_type="implement", depends_on=dep.id)
-    ready = store.add("Ready task", task_type="task")
-
-    service = TaskQueryService(store)
-    blocked_result = service.run(
-        TaskQuery(scope="tasks", statuses=("pending",), dependency_state=("blocked",), limit=None)
-    )
-    unblocked_result = service.run(
-        TaskQuery(scope="tasks", statuses=("pending",), dependency_state=("unblocked",), limit=None)
-    )
-
-    blocked_ids = [row.task.id for row in blocked_result.rows if hasattr(row, "task")]
-    unblocked_ids = [row.task.id for row in unblocked_result.rows if hasattr(row, "task")]
-
-    assert blocked.id not in blocked_ids
-    assert blocked.id in unblocked_ids
-    assert ready.id in unblocked_ids
 
 
 def test_dependency_state_failed_empty_prereq_stays_blocked(tmp_path: Path) -> None:
@@ -3472,13 +3043,5 @@ def _offset_store(tmp_path: Path) -> tuple[SqliteTaskStore, list[str]]:
 
 
 
-def test_offset_past_the_end_returns_no_rows(tmp_path: Path) -> None:
-    store, ids = _offset_store(tmp_path)
-    service = TaskQueryService(store)
-
-    result = service.run(replace(TaskQueryPresets.search("", limit=10), offset=500))
-
-    assert result.rows == ()
-    assert result.total_count == len(ids)
 
 

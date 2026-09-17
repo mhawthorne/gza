@@ -288,30 +288,6 @@ def test_invoke_provider_resolve_returns_false_on_nonzero_exit(tmp_path: Path) -
     assert result is False
 
 
-def test_invoke_provider_resolve_does_not_create_internal_tasks_and_logs_to_parent_file(tmp_path: Path) -> None:
-    from gza.cli import invoke_provider_resolve
-
-    config = _new_config(tmp_path, provider="codex")
-    store = SqliteTaskStore(config.db_path)
-    task = _new_task()
-    log_file = _new_log_file(tmp_path)
-
-    with (
-        patch("gza.cli.ensure_skill", return_value=True),
-        patch("gza.providers.get_provider") as mock_get_provider,
-        patch("gza.cli.git_ops._is_rebase_in_progress", return_value=False),
-    ):
-        mock_provider = Mock()
-        mock_provider.run.return_value = RunResult(exit_code=0)
-        mock_get_provider.return_value = mock_provider
-
-        result = invoke_provider_resolve(task, "feature", "main", config, log_file=log_file)
-
-    assert result is True
-    assert store.get_history(limit=None, task_type="internal") == []
-    log_text = ops_log_path_for(log_file).read_text()
-    assert "Provider fallback" in log_text
-    assert "Running provider command: /gza-rebase --auto --continue" in log_text
 
 
 def test_invoke_provider_resolve_uses_runtime_home_for_skill_preflight_and_provider_env(

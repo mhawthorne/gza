@@ -333,27 +333,6 @@ def test_projects_register_refuses_relocation_without_replace(tmp_path: Path) ->
     )
 
 
-def test_projects_register_replaces_relocated_project_with_explicit_flag(tmp_path: Path) -> None:
-    db_path = tmp_path / "shared.db"
-    old_dir = tmp_path / "old"
-    new_dir = tmp_path / "new"
-    _write_project_config(old_dir, project_name="Moved", project_id="moved", db_path=db_path)
-    _write_project_config(new_dir, project_name="Moved", project_id="moved", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(old_dir), migration_policy="auto_private")
-
-    before = _db_snapshot(db_path)
-    assert before is not None
-
-    result = invoke_gza("projects", "register", "--project", str(new_dir), "--replace")
-
-    assert result.returncode == 0
-    after = _db_snapshot(db_path)
-    assert after is not None
-    assert _changed_tables(before, after) == {"projects"}
-    assert _registry_row(db_path, "moved") == (
-        str(new_dir.resolve()),
-        str((new_dir / "gza.yaml").resolve()),
-    )
 
 
 def test_projects_diagnose_reports_invalid_and_duplicate_rows(tmp_path: Path) -> None:
@@ -709,39 +688,6 @@ def test_projects_register_first_activation_deleted_before_registration_refuses_
     _assert_db_and_sidecars_absent(db_path)
 
 
-def test_projects_register_first_activation_replaced_before_registration_refuses_without_mutating_either_db(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "shared.db"
-    original_db = tmp_path / "original.db"
-    replacement_db = tmp_path / "replacement.db"
-    project_dir = tmp_path / "project"
-    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    _write_current_registry_db(replacement_db, project_id="replacement")
-    _prepare_replacement_db_for_pragma_guard(replacement_db)
-    replacement_before = _db_file_state_snapshot(replacement_db)
-    assert replacement_before is not None
-    original = SqliteTaskStore.register_project_paths_for_identity
-    original_before: dict[str, Any] | None = None
-
-    def replace_before_registration(self: SqliteTaskStore, *args: Any, **kwargs: Any) -> Any:
-        nonlocal original_before
-        assert self._open_mode == "registry_mutation"
-        original_before = _db_file_state_snapshot(db_path)
-        assert original_before is not None
-        _install_replacement_db(db_path, original_db=original_db, replacement_db=replacement_db)
-        return original(self, *args, **kwargs)
-
-    with patch.object(SqliteTaskStore, "register_project_paths_for_identity", replace_before_registration):
-        result = invoke_gza("projects", "register", "--project", str(project_dir))
-
-    assert result.returncode == 1
-    assert "changed after validation" in result.stdout
-    _assert_no_traceback(result)
-    assert original_before is not None
-    _assert_db_file_state_unchanged(original_db, original_before)
-    _assert_db_file_state_unchanged(db_path, replacement_before)
-    assert _registry_row(db_path, "project") is None
 
 
 def test_projects_deactivate_refuses_current_project_id_drift_before_activation(tmp_path: Path) -> None:
@@ -839,234 +785,18 @@ def test_projects_deactivate_existing_db_deleted_after_activation_refuses_withou
     assert not db_path.exists()
 
 
-def test_projects_deactivate_refuses_future_db_replacement_after_activation_without_mutating_either_db(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "shared.db"
-    original_db = tmp_path / "original.db"
-    project_dir = tmp_path / "project"
-    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
-    _insert_registry_row(
-        db_path,
-        project_id="alias",
-        root_path=str(project_dir.resolve()),
-        config_path=str((project_dir / "gza.yaml").resolve()),
-    )
-    before_original = _db_snapshot(db_path)
-    original = SqliteTaskStore.deactivate_project_registry_row
-
-    def replace_before_mutation(self: SqliteTaskStore, project_id: str) -> Any:
-        assert self._open_mode == "registry_mutation_existing"
-        db_path.rename(original_db)
-        _write_future_db(db_path)
-        return original(self, project_id)
-
-    with patch.object(SqliteTaskStore, "deactivate_project_registry_row", replace_before_mutation):
-        result = invoke_gza("projects", "deactivate", "alias", "--project", str(project_dir))
-
-    assert result.returncode == 1
-    assert "changed after validation" in result.stdout
-    assert _db_snapshot(original_db) == before_original
-    with sqlite3.connect(db_path) as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone() == (SCHEMA_VERSION + 1,)
 
 
 
 
-def test_projects_deactivate_refuses_current_db_replacement_before_writable_connection_without_pragmas(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "shared.db"
-    original_db = tmp_path / "original.db"
-    replacement_db = tmp_path / "replacement.db"
-    project_dir = tmp_path / "project"
-    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
-    _insert_registry_row(db_path, project_id="alias", root_path="", config_path="")
-    _write_current_registry_db(replacement_db, project_id="replacement")
-    _insert_registry_row(
-        replacement_db,
-        project_id="alias",
-        root_path=str(project_dir.resolve()),
-        config_path=str((project_dir / "gza.yaml").resolve()),
-    )
-    _prepare_replacement_db_for_pragma_guard(replacement_db)
-    replacement_before = _db_snapshot(replacement_db)
-    replacement_journal_before = _journal_mode(replacement_db)
-    replacement_sidecars_before = _sidecar_snapshot(replacement_db)
-    before_original = _db_snapshot(db_path)
-    original = SqliteTaskStore.deactivate_project_registry_row
-
-    def replace_before_writable_connection(self: SqliteTaskStore, project_id: str) -> Any:
-        assert self._open_mode == "registry_mutation_existing"
-        _install_replacement_db(db_path, original_db=original_db, replacement_db=replacement_db)
-        return original(self, project_id)
-
-    with patch.object(SqliteTaskStore, "deactivate_project_registry_row", replace_before_writable_connection):
-        result = invoke_gza("projects", "deactivate", "alias", "--project", str(project_dir))
-
-    assert result.returncode == 1
-    assert "changed after validation" in result.stdout
-    assert "Project registry row deactivated" not in result.stdout
-    assert _db_snapshot(original_db) == before_original
-    assert _db_snapshot(db_path) == replacement_before
-    assert _journal_mode(db_path) == replacement_journal_before
-    assert _sidecar_snapshot(db_path) == replacement_sidecars_before
-    assert _registry_row(db_path, "alias") == (
-        str(project_dir.resolve()),
-        str((project_dir / "gza.yaml").resolve()),
-    )
 
 
-def test_projects_deactivate_refuses_current_db_replacement_after_transaction_check_without_success(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "shared.db"
-    original_db = tmp_path / "original.db"
-    replacement_db = tmp_path / "replacement.db"
-    project_dir = tmp_path / "project"
-    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
-    _insert_registry_row(
-        db_path,
-        project_id="alias",
-        root_path=str(project_dir.resolve()),
-        config_path=str((project_dir / "gza.yaml").resolve()),
-    )
-    _write_current_registry_db(replacement_db, project_id="replacement")
-    _insert_registry_row(
-        replacement_db,
-        project_id="alias",
-        root_path=str(project_dir.resolve()),
-        config_path=str((project_dir / "gza.yaml").resolve()),
-    )
-    replacement_before = _db_snapshot(replacement_db)
-    before_original = _db_snapshot(db_path)
-    original_validate = SqliteTaskStore._validate_registry_mutation_transaction
-    calls = 0
-
-    def replace_after_transaction_check(self: SqliteTaskStore, conn: sqlite3.Connection) -> None:
-        nonlocal calls
-        original_validate(self, conn)
-        if self._open_mode == "registry_mutation_existing":
-            calls += 1
-            if calls == 1:
-                _install_replacement_db(db_path, original_db=original_db, replacement_db=replacement_db)
-
-    with patch.object(
-        SqliteTaskStore,
-        "_validate_registry_mutation_transaction",
-        replace_after_transaction_check,
-    ):
-        result = invoke_gza("projects", "deactivate", "alias", "--project", str(project_dir))
-
-    assert result.returncode == 1
-    assert "changed after validation" in result.stdout
-    assert "Project registry row deactivated" not in result.stdout
-    assert _db_snapshot(original_db) == before_original
-    assert _db_snapshot(db_path) == replacement_before
-    assert _registry_row(original_db, "alias") == (
-        str(project_dir.resolve()),
-        str((project_dir / "gza.yaml").resolve()),
-    )
-    assert _registry_row(db_path, "alias") == (
-        str(project_dir.resolve()),
-        str((project_dir / "gza.yaml").resolve()),
-    )
 
 
-def test_projects_register_refuses_future_db_replacement_after_activation_without_mutating_either_db(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "shared.db"
-    original_db = tmp_path / "original.db"
-    project_dir = tmp_path / "project"
-    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
-    before_original = _db_snapshot(db_path)
-    original = SqliteTaskStore.register_project_paths_for_identity
-
-    def replace_before_mutation(self: SqliteTaskStore, *args: Any, **kwargs: Any) -> Any:
-        assert self._open_mode == "registry_mutation_existing"
-        db_path.rename(original_db)
-        _write_future_db(db_path)
-        return original(self, *args, **kwargs)
-
-    with patch.object(SqliteTaskStore, "register_project_paths_for_identity", replace_before_mutation):
-        result = invoke_gza("projects", "register", "--project", str(project_dir))
-
-    assert result.returncode == 1
-    assert "changed after validation" in result.stdout
-    assert _db_snapshot(original_db) == before_original
-    with sqlite3.connect(db_path) as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone() == (SCHEMA_VERSION + 1,)
 
 
-def test_projects_register_refuses_current_db_replacement_after_activation_without_mutating_either_db(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "shared.db"
-    original_db = tmp_path / "original.db"
-    replacement_db = tmp_path / "replacement.db"
-    project_dir = tmp_path / "project"
-    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
-    _write_current_registry_db(replacement_db, project_id="replacement")
-    _prepare_replacement_db_for_pragma_guard(replacement_db)
-    replacement_before = _db_snapshot(replacement_db)
-    before_original = _db_snapshot(db_path)
-    original = SqliteTaskStore.register_project_paths_for_identity
-
-    def replace_before_mutation(self: SqliteTaskStore, *args: Any, **kwargs: Any) -> Any:
-        assert self._open_mode == "registry_mutation_existing"
-        db_path.rename(original_db)
-        shutil.copy2(replacement_db, db_path)
-        return original(self, *args, **kwargs)
-
-    with patch.object(SqliteTaskStore, "register_project_paths_for_identity", replace_before_mutation):
-        result = invoke_gza("projects", "register", "--project", str(project_dir))
-
-    assert result.returncode == 1
-    assert "changed after validation" in result.stdout
-    assert _db_snapshot(original_db) == before_original
-    assert _db_snapshot(db_path) == replacement_before
-    assert _registry_row(db_path, "project") is None
 
 
-def test_projects_register_refuses_current_db_replacement_before_writable_connection_without_pragmas(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "shared.db"
-    original_db = tmp_path / "original.db"
-    replacement_db = tmp_path / "replacement.db"
-    project_dir = tmp_path / "project"
-    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    SqliteTaskStore.from_config(Config.load(project_dir), migration_policy="auto_private")
-    _write_current_registry_db(replacement_db, project_id="replacement")
-    _prepare_replacement_db_for_pragma_guard(replacement_db)
-    replacement_before = _db_snapshot(replacement_db)
-    replacement_journal_before = _journal_mode(replacement_db)
-    replacement_sidecars_before = _sidecar_snapshot(replacement_db)
-    before_original = _db_snapshot(db_path)
-    original = SqliteTaskStore.register_project_paths_for_identity
-
-    def replace_before_writable_connection(self: SqliteTaskStore, *args: Any, **kwargs: Any) -> Any:
-        assert self._open_mode == "registry_mutation_existing"
-        _install_replacement_db(db_path, original_db=original_db, replacement_db=replacement_db)
-        return original(self, *args, **kwargs)
-
-    with patch.object(SqliteTaskStore, "register_project_paths_for_identity", replace_before_writable_connection):
-        result = invoke_gza("projects", "register", "--project", str(project_dir))
-
-    assert result.returncode == 1
-    assert "changed after validation" in result.stdout
-    assert "Project project" not in result.stdout
-    assert _db_snapshot(original_db) == before_original
-    assert _db_snapshot(db_path) == replacement_before
-    assert _journal_mode(db_path) == replacement_journal_before
-    assert _sidecar_snapshot(db_path) == replacement_sidecars_before
-    assert _registry_row(db_path, "project") is None
 
 
 def test_projects_register_refuses_current_db_replacement_after_transaction_check_without_success(
@@ -1266,33 +996,6 @@ def test_projects_deactivate_current_refusal_quotes_register_repair_command(
     )
 
 
-def test_projects_deactivate_current_refusal_scopes_all_repair_commands_to_explicit_project(
-    tmp_path: Path,
-) -> None:
-    cwd_project = tmp_path / "project-a"
-    target_project = tmp_path / "project b with 'quote' and $semi;"
-    cwd_db = tmp_path / "a.db"
-    target_db = tmp_path / "target.db"
-    _write_project_config(cwd_project, project_name="A", project_id="a", db_path=cwd_db)
-    _write_project_config(target_project, project_name="B", project_id="b", db_path=target_db)
-    SqliteTaskStore.from_config(Config.load(cwd_project), migration_policy="auto_private")
-    SqliteTaskStore.from_config(Config.load(target_project), migration_policy="auto_private")
-    before_cwd = _db_snapshot(cwd_db)
-    before_target = _db_snapshot(target_db)
-    expected_project = shlex.quote(str(target_project.resolve()))
-    expected_diagnose = f"uv run gza projects diagnose --project {expected_project}"
-    expected_register = f"uv run gza projects register --project {expected_project} --replace"
-    wrong_project = shlex.quote(str(cwd_project.resolve()))
-
-    result = invoke_gza("projects", "deactivate", "b", "--project", str(target_project), cwd=cwd_project)
-
-    assert result.returncode == 1
-    assert expected_diagnose in result.stdout
-    assert expected_register in result.stdout
-    assert f"uv run gza projects diagnose --project {wrong_project}" not in result.stdout
-    assert "uv run gza projects diagnose' first" not in result.stdout
-    assert _db_snapshot(cwd_db) == before_cwd
-    assert _db_snapshot(target_db) == before_target
 
 
 def test_projects_register_anchor_path_writes_target_to_anchor_registry(tmp_path: Path) -> None:
@@ -1708,60 +1411,8 @@ def test_projects_register_failed_bootstrap_preserves_preexisting_public_sidecar
         assert Path(f"{db_path}{suffix}").read_bytes() == content
 
 
-def test_projects_register_publish_race_preserves_replacement_db_after_private_validation(tmp_path: Path) -> None:
-    db_path = tmp_path / "shared.db"
-    project_dir = tmp_path / "project"
-    replacement_db = tmp_path / "replacement.db"
-    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    _write_current_registry_db(replacement_db, project_id="replacement")
-    replacement_snapshot = _db_snapshot(replacement_db)
-
-    def publish_replacement_then_refuse(src: str | Path, dst: str | Path) -> None:
-        assert Path(dst) == db_path
-        shutil.copy2(replacement_db, db_path)
-        raise FileExistsError
-
-    with patch("gza.db.os.link", side_effect=publish_replacement_then_refuse):
-        result = invoke_gza("projects", "register", "--project", str(project_dir))
-
-    assert result.returncode == 1
-    assert "Registry DB appeared before mutation" in result.stdout
-    assert _db_snapshot(db_path) == replacement_snapshot
 
 
-def test_projects_register_publish_failure_cleanup_preserves_replacement_sidecars(tmp_path: Path) -> None:
-    db_path = tmp_path / "shared.db"
-    project_dir = tmp_path / "project"
-    replacement_db = tmp_path / "replacement.db"
-    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
-    _write_current_registry_db(replacement_db, project_id="replacement")
-    replacement_sidecars = {
-        "-wal": b"replacement wal",
-        "-shm": b"replacement shm",
-        "-journal": b"replacement journal",
-    }
-    original_cleanup = SqliteTaskStore._cleanup_private_registry_bootstrap
-
-    def fail_publish(src: str | Path, dst: str | Path) -> None:
-        assert Path(dst) == db_path
-        shutil.copy2(replacement_db, db_path)
-        raise FileExistsError
-
-    def install_sidecars_during_private_cleanup(self: SqliteTaskStore, temp_path: Path) -> None:
-        for suffix, content in replacement_sidecars.items():
-            Path(f"{db_path}{suffix}").write_bytes(content)
-        original_cleanup(self, temp_path)
-
-    with (
-        patch("gza.db.os.link", side_effect=fail_publish),
-        patch.object(SqliteTaskStore, "_cleanup_private_registry_bootstrap", install_sidecars_during_private_cleanup),
-    ):
-        result = invoke_gza("projects", "register", "--project", str(project_dir))
-
-    assert result.returncode == 1
-    assert "Registry DB appeared before mutation" in result.stdout
-    for suffix, content in replacement_sidecars.items():
-        assert Path(f"{db_path}{suffix}").read_bytes() == content
 
 
 def test_projects_register_rejects_broken_db_ancestor_before_registry_mutation(tmp_path: Path) -> None:
@@ -1967,74 +1618,8 @@ def test_global_migration_refusals_scope_migrate_command_to_explicit_project_wit
     assert _db_snapshot(target_db) == before_target
 
 
-def test_global_schema_integrity_handler_suppresses_embedded_bare_migrate_guidance(
-    tmp_path: Path,
-) -> None:
-    cwd_project = tmp_path / "project-a"
-    target_project = tmp_path / "project b with 'quote' and $semi;"
-    cwd_db = tmp_path / "a.db"
-    target_db = tmp_path / "target.db"
-    _write_project_config(cwd_project, project_name="A", project_id="a", db_path=cwd_db)
-    _write_project_config(target_project, project_name="B", project_id="b", db_path=target_db)
-    SqliteTaskStore.from_config(Config.load(cwd_project), migration_policy="auto_private")
-    SqliteTaskStore.from_config(Config.load(target_project), migration_policy="auto_private")
-    before_cwd = _db_snapshot(cwd_db)
-    before_target = _db_snapshot(target_db)
-    expected = f"uv run gza migrate --project {shlex.quote(str(target_project.resolve()))}"
-
-    with patch(
-        "gza.cli.main.cmd_next",
-        side_effect=SchemaIntegrityError(
-            "Registry mutation requires current projects schema; missing column projects.root_path. "
-            "Run 'uv run gza migrate' from the project root, then retry."
-        ),
-    ):
-        result = invoke_gza("next", "--project", str(target_project), cwd=cwd_project)
-    output = result.stdout + result.stderr
-
-    assert result.returncode == 1
-    assert "missing column projects.root_path" in output
-    assert output.count("uv run gza migrate") == 1
-    assert expected in output
-    assert "uv run gza migrate' from the project root" not in output
-    assert _db_snapshot(cwd_db) == before_cwd
-    assert _db_snapshot(target_db) == before_target
 
 
-def test_global_schema_integrity_handler_neutralizes_generic_only_migrate_guidance(
-    tmp_path: Path,
-) -> None:
-    cwd_project = tmp_path / "project-a"
-    target_project = tmp_path / "project b with 'quote' and $semi;"
-    cwd_db = tmp_path / "a.db"
-    target_db = tmp_path / "target.db"
-    _write_project_config(cwd_project, project_name="A", project_id="a", db_path=cwd_db)
-    _write_project_config(target_project, project_name="B", project_id="b", db_path=target_db)
-    SqliteTaskStore.from_config(Config.load(cwd_project), migration_policy="auto_private")
-    SqliteTaskStore.from_config(Config.load(target_project), migration_policy="auto_private")
-    before_cwd = _db_snapshot(cwd_db)
-    before_target = _db_snapshot(target_db)
-    expected = f"uv run gza migrate --project {shlex.quote(str(target_project.resolve()))}"
-    wrong_anchor = f"uv run gza migrate --project {shlex.quote(str(cwd_project.resolve()))}"
-
-    with patch(
-        "gza.cli.main.cmd_next",
-        side_effect=SchemaIntegrityError(
-            "Run 'uv run gza migrate' from the project root, then retry."
-        ),
-    ):
-        result = invoke_gza("next", "--project", str(target_project), cwd=cwd_project)
-    output = result.stdout + result.stderr
-
-    assert result.returncode == 1
-    assert "Database schema integrity check failed." in output
-    assert output.count("uv run gza migrate") == 1
-    assert expected in output
-    assert wrong_anchor not in output
-    assert "Run 'uv run gza migrate' from the project root" not in output
-    assert "uv run gza migrate' with a writable database" not in output
-    assert _db_snapshot(cwd_db) == before_cwd
-    assert _db_snapshot(target_db) == before_target
 
 
 def test_projects_register_rejects_incompatible_db_before_registry_mutation(tmp_path: Path) -> None:

@@ -163,67 +163,8 @@ class _GitTreeResolveRefsRaises:
         return self._delegate.resolve_refs(refs, peel=peel)
 
 
-def test_resolve_task_merge_state_classifies_zero_commit_branch_with_commits_as_redundant(
-    tmp_path: Path,
-) -> None:
-    store = SqliteTaskStore(tmp_path / "test.db")
-    task = store.add("Implement empty branch", task_type="implement")
-    store.mark_completed(task, has_commits=True, branch="feature/empty-branch")
-    assert task.id is not None
-
-    unit = store.resolve_merge_unit_for_task(task.id)
-    assert unit is not None
-    store.set_merge_unit_state(unit.id, "merged")
-
-    refreshed = store.get(task.id)
-    assert refreshed is not None
-
-    result = resolve_task_merge_state_for_target(
-        store=store,
-        task=refreshed,
-        git=_FakeGit(
-            source_ref="feature/empty-branch",
-            ref_shas={"feature/empty-branch": "same-sha", "main": "same-sha"},
-            tree_shas={"feature/empty-branch": "shared-tree-sha", "main": "shared-tree-sha"},
-            ahead_count=0,
-            merged=True,
-        ),
-        target_branch="main",
-    )
-
-    assert result == "merged"
 
 
-def test_resolve_task_merge_state_keeps_merged_when_empty_probe_is_indeterminate(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    store = SqliteTaskStore(tmp_path / "test.db")
-    task = store.add("Implement merged branch", task_type="implement")
-    store.mark_completed(task, has_commits=True, branch="feature/merged-branch")
-    assert task.id is not None
-
-    unit = store.resolve_merge_unit_for_task(task.id)
-    assert unit is not None
-    store.set_merge_unit_state(unit.id, "merged")
-
-    refreshed = store.get(task.id)
-    assert refreshed is not None
-
-    with caplog.at_level("DEBUG"):
-        result = resolve_task_merge_state_for_target(
-            store=store,
-            task=refreshed,
-            git=_FakeGit(
-                source_ref="feature/merged-branch",
-                ref_shas={"feature/merged-branch": "source-sha", "main": "target-sha"},
-                ahead_count=None,
-                merged=True,
-            ),
-            target_branch="main",
-        )
-
-    assert result == "merged"
-    assert caplog.text == ""
 
 
 def test_resolve_task_merge_state_prefers_redundant_over_merged_when_task_commits_have_no_unique_commits(

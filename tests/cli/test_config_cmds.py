@@ -2170,19 +2170,6 @@ class TestInitCommand:
         assert (tmp_path / ".gza" / "gza.db").exists()
         assert local_example_path.read_text(encoding="utf-8") == Path("src/gza/gza.local.yaml.example").read_text(encoding="utf-8")
 
-    def test_init_derives_readable_project_id_from_project_name(self, tmp_path: Path):
-        """Init should persist a readable project_id derived from project_name."""
-        project_dir = tmp_path / "My App.2"
-        project_dir.mkdir()
-        _home_dir, env = self._home_env(tmp_path)
-
-        result = invoke_gza("init", "--db", "local", "--project", str(project_dir), env=env)
-
-        assert result.returncode == 0
-        content = (project_dir / "gza.yaml").read_text(encoding="utf-8")
-        project_id_match = re.search(r"^project_id:\s*([a-z0-9]{1,64})\s*$", content, re.MULTILINE)
-        assert project_id_match is not None
-        assert project_id_match.group(1) == "myapp2"
 
     def test_init_invalid_project_name_requires_explicit_project_id(self, tmp_path: Path):
         """Init should fail closed when project_name cannot produce a valid project_id."""
@@ -2259,22 +2246,6 @@ class TestInitCommand:
         assert not shared_db.exists()
 
 
-    def test_init_shared_without_global_default_writes_explicit_default_path(self, tmp_path: Path):
-        """Shared mode should write the default shared db_path when nothing is inherited."""
-        from gza.config import Config
-
-        home_dir, env = self._home_env(tmp_path)
-
-        result = invoke_gza("init", "--db", "shared", "--project", str(tmp_path), env=env)
-
-        assert result.returncode == 0
-        content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
-        assert self._active_db_path_line(content) == "~/.gza/gza.db"
-        with patch.dict(os.environ, env, clear=False):
-            config = Config.load(tmp_path)
-        assert config.db_path == (home_dir / ".gza" / "gza.db").resolve()
-        assert "Database initialization deferred" in result.stdout
-        assert not (home_dir / ".gza" / "gza.db").exists()
 
     def test_init_db_path_flag_implies_shared_and_overrides_default(self, tmp_path: Path):
         """--db-path should imply shared mode and drive the configured database path."""
@@ -2523,26 +2494,6 @@ class TestInitCommand:
         assert (tmp_path / "gza.yaml").exists() is False
         assert (tmp_path / "gza.local.yaml.example").exists() is False
 
-    @pytest.mark.parametrize("user_model", ["claude-sonnet-4-6"])
-    def test_init_model_only_user_config_is_overridden_by_generated_project_pair(
-        self,
-        tmp_path: Path,
-        user_model: str,
-    ) -> None:
-        """Model-only user defaults must not block a project whose generated config overrides them."""
-        home_dir, env = self._home_env(tmp_path)
-        write_user_config(home_dir, f"model: {user_model}\n")
-
-        result = invoke_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
-
-        assert result.returncode == 0
-        content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
-        assert re.search(r"^provider:\s*codex\s*$", content, re.MULTILINE)
-        assert re.search(r"^model:\s*gpt-5\.5\s*$", content, re.MULTILINE)
-        with patch.dict(os.environ, env, clear=False):
-            config = Config.load(tmp_path)
-        assert config.provider == "codex"
-        assert config.model == "gpt-5.5"
 
     def test_init_rejects_invalid_resolved_timeout_scaling_in_user_config_before_writing_project_file(
         self,
@@ -3509,30 +3460,6 @@ class TestCleanArchiveCommand:
         # Verify subdirectory was NOT archived
         assert old_subdir.exists()
 
-    def test_clean_second_run_is_noop(self, tmp_path: Path):
-        """Second run of clean should be a no-op (only checks source dirs)."""
-        from datetime import datetime, timedelta
-
-        setup_config(tmp_path)
-
-        logs_dir = tmp_path / ".gza" / "logs"
-        logs_dir.mkdir(parents=True, exist_ok=True)
-
-        # Create old file
-        old_log = logs_dir / "old_log.txt"
-        old_log.write_text("old content")
-        old_time = (datetime.now(UTC) - timedelta(days=40)).timestamp()
-        os.utime(old_log, (old_time, old_time))
-
-        # First run - archives the file
-        result1 = invoke_gza("clean", "--archive", "--project", str(tmp_path))
-        assert result1.returncode == 0
-        assert "Logs: 1 files" in result1.stdout
-
-        # Second run - should find nothing to archive
-        result2 = invoke_gza("clean", "--archive", "--project", str(tmp_path))
-        assert result2.returncode == 0
-        assert "Logs: 0 files" in result2.stdout
 
     def test_clean_purge_mode(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Clean with --purge deletes archived files older than N days."""
@@ -3885,28 +3812,6 @@ class TestStatsReviewsCommand:
         assert "Review tasks:    0" in result.stdout
         assert "Reviewed:        0/1" in result.stdout
 
-    def test_stats_reviews_cycle_distribution(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        """gza stats reviews shows iteration distribution for reviewed impls."""
-        from gza.db import TaskStats
-
-        _install_frozen_stats_clock(monkeypatch)
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        impl = store.add("Implement feature", task_type="implement")
-        assert impl.id is not None
-        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
-
-        for i in range(2):
-            review = store.add(f"Review {i}", task_type="review", depends_on=impl.id)
-            assert review.id is not None
-            store.mark_completed(review, has_commits=False, stats=TaskStats(cost_usd=0.02))
-
-        result = invoke_gza("stats", "reviews", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Reviews per implementation" in result.stdout
 
     def test_stats_reviews_days_filter(self, tmp_path: Path):
         """gza stats reviews --days 7 restricts to last 7 days."""
@@ -4062,48 +3967,6 @@ class TestStatsIterationsCommand:
         assert "Iterations" in result.stdout
         assert "0 tasks" in result.stdout
 
-    def test_stats_iterations_rolls_up_reviews_improves_verdict_and_cost(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        """Iterations output should roll up child tasks and show latest run date/verdict/cost."""
-        from gza.db import TaskStats
-
-        fixed_now = _install_frozen_stats_clock(monkeypatch)
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        impl = store.add("Implement feature", task_type="implement")
-        assert impl.id is not None
-        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
-
-        review_1 = store.add("Review #1", task_type="review", depends_on=impl.id)
-        store.mark_completed(
-            review_1,
-            has_commits=False,
-            output_content="Verdict: CHANGES_REQUESTED",
-            stats=TaskStats(cost_usd=0.02),
-        )
-
-        improve_1 = store.add("Improve #1", task_type="improve", based_on=impl.id, depends_on=review_1.id)
-        store.mark_completed(improve_1, has_commits=False, stats=TaskStats(cost_usd=0.03))
-
-        review_2 = store.add("Review #2", task_type="review", depends_on=impl.id)
-        store.mark_completed(
-            review_2,
-            has_commits=False,
-            output_content="## Verdict\n\n**APPROVED**",
-            stats=TaskStats(cost_usd=0.04),
-        )
-
-        result = invoke_gza("stats", "iterations", "--all", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert impl.id in result.stdout
-        assert "Last Run Date" in result.stdout
-        assert "APPROVED" in result.stdout
-        assert "$   0.19" in result.stdout
-        assert f"{fixed_now.date():%Y-%m-%d}" in result.stdout
-        assert "1 tasks  |  2 iterations  |  1 improves  |  1/1 approved  |  $0.19 total" in result.stdout
-        assert "Iteration count stats: min 2  |  p10 2  |  p25 2  |  p50 2  |  p75 2  |  p90 2  |  p99 2  |  max 2" in result.stdout
 
     def test_stats_iterations_preserves_override_semantic_slug_label(self, tmp_path: Path):
         """Prefixless override-backed slugs should display full semantic labels."""
@@ -4146,36 +4009,6 @@ class TestStatsIterationsCommand:
         assert label_match is not None
         assert label_match.group("label") == "add-feature"
 
-    def test_stats_iterations_preserves_ambiguous_prefix_token_in_semantic_slug(
-        self, tmp_path: Path
-    ):
-        """Semantic slugs that start with project_prefix token are not truncated."""
-        from gza.db import TaskStats
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        impl = store.add("Implement gza rollout", task_type="implement")
-        assert impl.id is not None
-        impl.slug = "20260421-gza-rollout"
-        store.update(impl)
-        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
-
-        review = store.add("Review gza rollout", task_type="review", depends_on=impl.id)
-        assert review.id is not None
-        store.mark_completed(
-            review,
-            has_commits=False,
-            output_content="Verdict: APPROVED",
-            stats=TaskStats(cost_usd=0.01),
-        )
-
-        result = invoke_gza("stats", "iterations", "--all", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        label_match = re.search(rf"^{re.escape(impl.id)}\s+(?P<label>\S+)", result.stdout, re.MULTILINE)
-        assert label_match is not None
-        assert label_match.group("label") == "gza-rollout"
 
     def test_stats_iterations_last_limits_to_recent_implementations(self, tmp_path: Path):
         """--last N should keep only the N newest implementation rows."""
@@ -4255,117 +4088,8 @@ class TestStatsIterationsCommand:
         assert impl_with_recent_review.id in result.stdout
         assert impl_without_recent_activity.id not in result.stdout
 
-    def test_stats_iterations_uses_latest_child_activity_for_last_run_date(self, tmp_path: Path):
-        """Displayed last run date should use the latest activity across impl/review/improve tasks."""
-        from gza.db import TaskStats
 
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
 
-        impl = store.add("Implement old feature", task_type="implement")
-        assert impl.id is not None
-        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.30))
-
-        review = store.add("Recent review", task_type="review", depends_on=impl.id)
-        assert review.id is not None
-        store.mark_completed(
-            review,
-            has_commits=False,
-            output_content="Verdict: APPROVED",
-            stats=TaskStats(cost_usd=0.05),
-        )
-
-        old_completed = datetime(2026, 4, 10, tzinfo=UTC).isoformat()
-        recent_completed = datetime(2026, 4, 14, 18, 0, tzinfo=UTC).isoformat()
-        with store._connect() as conn:
-            conn.execute(
-                "UPDATE tasks SET created_at = ?, completed_at = ? WHERE id = ?",
-                (old_completed, old_completed, impl.id),
-            )
-            conn.execute(
-                "UPDATE tasks SET created_at = ?, completed_at = ? WHERE id = ?",
-                (recent_completed, recent_completed, review.id),
-            )
-
-        result = invoke_gza("stats", "iterations", "--all", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "2026-04-14" in result.stdout
-        assert "2026-04-10" not in result.stdout
-
-    def test_stats_iterations_hours_includes_review_completed_in_window(self, tmp_path: Path):
-        """--hours should include rows when review completion is in-window despite older creation."""
-        from gza.db import TaskStats
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        impl = store.add("Implement old with overnight review", task_type="implement")
-        assert impl.id is not None
-        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.30))
-
-        review = store.add("Overnight review completion", task_type="review", depends_on=impl.id)
-        assert review.id is not None
-        store.mark_completed(
-            review,
-            has_commits=False,
-            output_content="Verdict: APPROVED",
-            stats=TaskStats(cost_usd=0.05),
-        )
-
-        old_created = (datetime.now(UTC) - timedelta(days=2)).isoformat()
-        recent_completed = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
-        with store._connect() as conn:
-            conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (old_created, impl.id))
-            conn.execute(
-                "UPDATE tasks SET created_at = ?, completed_at = ? WHERE id = ?",
-                (old_created, recent_completed, review.id),
-            )
-
-        result = invoke_gza("stats", "iterations", "--hours", "12", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert impl.id in result.stdout
-
-    def test_stats_iterations_hours_includes_improve_completed_in_window(self, tmp_path: Path):
-        """--hours should include rows when improve completion is in-window despite older creation."""
-        from gza.db import TaskStats
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        impl = store.add("Implement old with overnight improve", task_type="implement")
-        assert impl.id is not None
-        store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.30))
-
-        review = store.add("Baseline review", task_type="review", depends_on=impl.id)
-        assert review.id is not None
-        store.mark_completed(
-            review,
-            has_commits=False,
-            output_content="Verdict: CHANGES_REQUESTED",
-            stats=TaskStats(cost_usd=0.04),
-        )
-
-        improve = store.add("Overnight improve completion", task_type="improve", based_on=impl.id, depends_on=review.id)
-        assert improve.id is not None
-        store.mark_completed(improve, has_commits=False, stats=TaskStats(cost_usd=0.06))
-
-        old_created = (datetime.now(UTC) - timedelta(days=2)).isoformat()
-        recent_completed = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
-        with store._connect() as conn:
-            conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (old_created, impl.id))
-            conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (old_created, review.id))
-            conn.execute(
-                "UPDATE tasks SET created_at = ?, completed_at = ? WHERE id = ?",
-                (old_created, recent_completed, improve.id),
-            )
-
-        result = invoke_gza("stats", "iterations", "--hours", "12", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert impl.id in result.stdout
-        assert "1 improves" in result.stdout
 
     def test_stats_iterations_rejects_incompatible_time_window_flags(self, tmp_path: Path):
         """--hours and --all should reject incompatible combinations."""

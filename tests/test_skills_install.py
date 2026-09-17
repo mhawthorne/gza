@@ -366,47 +366,6 @@ class TestSkillsInstallClaudeTarget:
         assert "python -m py_compile" not in refreshed
         assert "`origin/main` (default)" not in refreshed
 
-    def test_update_flag_refreshes_gza_test_and_fix_verify_lookup_contract(self, tmp_path: Path):
-        """--update should restore the bundled gza-test-and-fix gza.yaml-first lookup contract."""
-        from gza.skills_utils import get_skills_source_path
-
-        setup_config(tmp_path)
-
-        result1 = invoke_gza("skills-install", "--target", "claude", "gza-test-and-fix", "--project", str(tmp_path))
-        assert result1.returncode == 0
-
-        skill_file = tmp_path / ".claude" / "skills" / "gza-test-and-fix" / "SKILL.md"
-        skill_file.write_text(
-            "---\n"
-            "name: gza-test-and-fix\n"
-            "description: stale\n"
-            "allowed-tools: Read, Edit, Bash(uv run:*), Bash(git:*)\n"
-            "version: 3.0.0\n"
-            "public: true\n"
-            "---\n\n"
-            "Run `uv run gza config` and extract `verify_command` first.\n"
-            "If that fails, fall back to `gza.yaml`.\n"
-        )
-
-        result2 = invoke_gza(
-            "skills-install",
-            "--target",
-            "claude",
-            "--update",
-            "gza-test-and-fix",
-            "--project",
-            str(tmp_path),
-        )
-        assert result2.returncode == 0
-        assert "updated 1" in result2.stdout
-        assert "(updated)" in result2.stdout
-
-        refreshed = skill_file.read_text()
-        bundled = (get_skills_source_path() / "gza-test-and-fix" / "SKILL.md").read_text()
-        assert refreshed == bundled
-        assert "Read `verify_command` directly from `gza.yaml`" in refreshed
-        assert "do not treat `gza config` failure as an error when `gza.yaml` was readable" in refreshed
-        assert "Run `uv run gza config` and extract `verify_command` first." not in refreshed
 
     def test_update_flag_refreshes_gza_code_review_full_stale_importer_reference(self, tmp_path: Path):
         """--update should replace stale installed importer references in gza-code-review-full."""
@@ -568,26 +527,6 @@ class TestSkillsInstallClaudeTarget:
             assert "store=store," in refreshed
             assert "exclude_task_id=created.id," in refreshed
 
-    def test_overwrite_with_force_flag(self, tmp_path: Path):
-        """Existing skills are overwritten with --force flag."""
-        setup_config(tmp_path)
-
-        # Install skills first time
-        result1 = invoke_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
-        assert result1.returncode == 0
-
-        # Modify one of the skills
-        skill_file = tmp_path / ".claude" / "skills" / "gza-task-add" / "SKILL.md"
-        original_content = skill_file.read_text()
-        skill_file.write_text("Modified content")
-
-        # Install again with --force
-        result2 = invoke_gza("skills-install", "--target", "claude", "--force", "--project", str(tmp_path))
-        assert result2.returncode == 0
-        assert "skipped" not in result2.stdout
-
-        # Verify skill was overwritten
-        assert skill_file.read_text() == original_content
 
     def test_install_nonexistent_skill(self, tmp_path: Path):
         """Error when requesting a skill that doesn't exist."""

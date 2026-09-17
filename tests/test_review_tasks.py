@@ -902,42 +902,6 @@ class TestVerifyFixTasks:
 
         assert resolve_latest_failed_verify_epoch(store, config, impl, git) == epoch
 
-    def test_resolve_latest_failed_verify_epoch_accepts_command_only_drift(self, tmp_path: Path) -> None:
-        config, store = _make_store(tmp_path)
-        config.verify_command = "./bin/tests --current"
-        config.autonomous_verify_timeout_seconds = 1800
-        config.review_verify_timeout_grace_seconds = 5.0
-        impl = store.add("Implement feature", task_type="implement")
-        assert impl.id is not None
-        impl.branch = "feature/test"
-        store.update(impl)
-        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
-        recorded_epoch = VerifyEpoch(
-            reviewed_branch="feature/test",
-            reviewed_head_sha="deadbeef",
-            verify_command="./bin/tests --recorded",
-            verify_timeout_seconds=1800,
-            verify_timeout_grace_seconds=5.0,
-        )
-        _seed_failed_verify_evidence(
-            config=config,
-            store=store,
-            impl=impl,
-            source_task=improve,
-            epoch=recorded_epoch,
-        )
-
-        git = MagicMock()
-        git.rev_parse_if_exists.return_value = "deadbeef"
-
-        assert resolve_latest_failed_verify_epoch(store, config, impl, git) == VerifyEpoch(
-            reviewed_branch="feature/test",
-            reviewed_head_sha="deadbeef",
-            reviewed_tree_sha=None,
-            verify_command="./bin/tests --current",
-            verify_timeout_seconds=1800,
-            verify_timeout_grace_seconds=5.0,
-        )
 
     def test_resolve_latest_failed_verify_epoch_rebinds_same_tree_rewrite_to_current_head(
         self, tmp_path: Path

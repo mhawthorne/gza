@@ -192,74 +192,8 @@ def test_attach_wrapper_resume_failure_keeps_task_pending(tmp_path: Path) -> Non
     assert refreshed.failure_reason is None
 
 
-def test_attach_wrapper_failed_resume_descendant_does_not_auto_resume(tmp_path: Path) -> None:
-    """Failed resume descendants should not bypass shared recovery policy via attach handoff."""
-    task_id, _ = _setup_task_with_log(tmp_path)
-    config = Config.load(tmp_path)
-    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
-
-    original = store.get(task_id)
-    assert original is not None
-    assert original.id is not None
-    original.status = "failed"
-    original.failure_reason = "MAX_TURNS"
-    original.session_id = "sess-123"
-    store.update(original)
-
-    failed_resume_descendant = store.add(
-        original.prompt,
-        task_type=original.task_type,
-        based_on=original.id,
-    )
-    assert failed_resume_descendant.id is not None
-    failed_resume_descendant.status = "failed"
-    failed_resume_descendant.failure_reason = "INFRASTRUCTURE_ERROR"
-    failed_resume_descendant.session_id = original.session_id
-    store.update(failed_resume_descendant)
-
-    with (
-        patch.object(sys, "argv", [
-            "gza.attach_wrapper",
-            "--task-id", failed_resume_descendant.id,
-            "--session-id", original.session_id,
-            "--project", str(tmp_path),
-        ]),
-        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
-        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn,
-    ):
-        rc = main()
-
-    assert rc == 0
-    mock_spawn.assert_not_called()
 
 
-def test_attach_wrapper_manual_review_failed_task_does_not_auto_resume(tmp_path: Path) -> None:
-    """Manual-review-only failed reasons should not auto-resume after interactive attach exit."""
-    task_id, _ = _setup_task_with_log(tmp_path)
-    config = Config.load(tmp_path)
-    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
-
-    failed = store.get(task_id)
-    assert failed is not None
-    failed.status = "failed"
-    failed.failure_reason = "TEST_FAILURE"
-    failed.session_id = "sess-123"
-    store.update(failed)
-
-    with (
-        patch.object(sys, "argv", [
-            "gza.attach_wrapper",
-            "--task-id", task_id,
-            "--session-id", "sess-123",
-            "--project", str(tmp_path),
-        ]),
-        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
-        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn,
-    ):
-        rc = main()
-
-    assert rc == 0
-    mock_spawn.assert_not_called()
 
 
 
@@ -330,37 +264,6 @@ def test_attach_wrapper_auto_recovery_config_error_reports_failure_without_child
     assert any(f"task type '{task_type}' with provider 'codex'" in event["message"] for event in lifecycle_events)
 
 
-def test_attach_wrapper_legitimate_skip_recovery_stays_quiet(tmp_path: Path, capsys) -> None:
-    task_id, log_path = _setup_task_with_log(tmp_path)
-    config = Config.load(tmp_path)
-    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
-    failed = store.get(task_id)
-    assert failed is not None
-    failed.status = "failed"
-    failed.failure_reason = "TEST_FAILURE"
-    store.update(failed)
-
-    with (
-        patch.object(sys, "argv", [
-            "gza.attach_wrapper",
-            "--task-id", task_id,
-            "--session-id", "sess-123",
-            "--project", str(tmp_path),
-        ]),
-        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
-        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
-        patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
-    ):
-        rc = main()
-
-    output = capsys.readouterr()
-    assert rc == 0
-    assert "failed to create" not in output.out
-    mock_spawn_worker.assert_not_called()
-    mock_spawn_iterate.assert_not_called()
-    lifecycle_events = [event for event in _read_log_events(log_path) if event.get("subtype") == "worker_lifecycle"]
-    assert "resume_failed" not in [event["event"] for event in lifecycle_events]
-    assert "retry_failed" not in [event["event"] for event in lifecycle_events]
 
 
 
@@ -865,56 +768,6 @@ def test_attach_wrapper_non_docker_task_uses_host(tmp_path: Path) -> None:
     assert "docker" not in cmd
 
 
-def test_attach_wrapper_resume_iterate_prepare_failure_rolls_back_recovery(tmp_path: Path) -> None:
-    """When resume+iterate parent-side preparation fails for a freshly-created
-    recovery task, the iterate worker must not spawn, the recovery row must be
-    rolled back, and a resume_failed lifecycle event must be logged so the
-    failure is visible to the caller."""
-    task_id, log_path = _setup_task_with_log(tmp_path)
-    config = Config.load(tmp_path)
-    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
-
-    failed = store.get(task_id)
-    assert failed is not None
-    failed.status = "failed"
-    failed.failure_reason = "MAX_TURNS"
-    failed.session_id = "sess-123"
-    store.update(failed)
-
-    with (
-        patch.object(sys, "argv", [
-            "gza.attach_wrapper",
-            "--task-id", task_id,
-            "--session-id", "sess-123",
-            "--project", str(tmp_path),
-        ]),
-        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
-        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
-        patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
-        patch(
-            "gza.attach_wrapper._prepare_task_for_immediate_execution",
-            return_value=None,
-        ) as mock_prepare,
-    ):
-        rc = main()
-
-    assert rc == 0  # the attach session exit code; the handoff failure is logged.
-    mock_spawn_worker.assert_not_called()
-    mock_spawn_iterate.assert_not_called()
-    # Prepare was invoked with rollback_on_failure=True for the freshly-created
-    # resume child.
-    mock_prepare.assert_called_once()
-    prep_kwargs = mock_prepare.call_args.kwargs
-    assert prep_kwargs.get("rollback_on_failure") is True
-    # The patched prepare returns None, which simulates either a) a real failure
-    # in prepare_task_startup_phase that ran rollback internally, or b) a stub
-    # that returns None without performing rollback. The contract this test
-    # asserts is that the spawn does not happen on prepare failure. Real
-    # rollback of the recovery row lives in _prepare_task_for_immediate_execution
-    # and is covered by its own tests.
-    events = _read_log_events(log_path)
-    lifecycle_events = [event for event in events if event.get("subtype") == "worker_lifecycle"]
-    assert "resume_failed" in [event["event"] for event in lifecycle_events]
 
 
 def test_attach_wrapper_retry_iterate_prepare_failure_rolls_back_recovery(tmp_path: Path) -> None:

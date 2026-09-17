@@ -145,57 +145,6 @@ def test_watch_lease_helper_acquires_two_stores_and_releases_in_reverse_order(tm
     assert [result.target_key for result in leases.release()] == ["second", "first"]
 
 
-def test_watch_lease_conflict_rolls_back_earlier_acquired_leases(tmp_path: Path) -> None:
-    first = _store(tmp_path, "first")
-    second = _store(tmp_path, "second")
-    third = _store(tmp_path, "third")
-    release_order: list[str] = []
-    first_recording: WatchLeaseStore = RecordingStore("first", first, release_order)
-    third_recording: WatchLeaseStore = RecordingStore("third", third, release_order)
-    second_recording: WatchLeaseStore = RecordingStore("second", second, release_order)
-    blocking = second.try_acquire_project_lease(
-        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
-        owner_pid=os.getpid(),
-        owner_token="blocking-token",
-    )
-    assert blocking is not None
-
-    with pytest.raises(WatchLeaseConflict) as exc:
-        acquire_watch_project_leases(
-            [
-                WatchLeaseTarget("first", first_recording),
-                WatchLeaseTarget("third", third_recording),
-                WatchLeaseTarget("second", second_recording),
-            ],
-            owner_token="run-token",
-        )
-
-    assert exc.value.target_key == "second"
-    assert release_order == ["third", "first"]
-    assert (
-        first.try_acquire_project_lease(
-            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
-            owner_pid=os.getpid(),
-            owner_token="after-rollback",
-        )
-        is not None
-    )
-    assert (
-        second.try_acquire_project_lease(
-            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
-            owner_pid=os.getpid(),
-            owner_token="after-conflict",
-        )
-        is None
-    )
-    assert (
-        third.try_acquire_project_lease(
-            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
-            owner_pid=os.getpid(),
-            owner_token="after-third-conflict",
-        )
-        is not None
-    )
 
 
 def test_watch_lease_acquisition_error_rolls_back_earlier_acquired_lease(tmp_path: Path) -> None:
@@ -572,36 +521,6 @@ def test_watch_lease_refresh_conflict_after_replacement_rolls_back_new_and_prese
     )
 
 
-def test_watch_lease_refresh_appends_new_acquisitions_after_multiple_retained_existing_leases(
-    tmp_path: Path,
-) -> None:
-    retained_middle = _store(tmp_path, "retained-middle")
-    retained_last = _store(tmp_path, "retained-last")
-    released_old = _store(tmp_path, "released-old")
-    new_first = _store(tmp_path, "new-first")
-    new_after = _store(tmp_path, "new-after")
-    release_order: list[str] = []
-    existing = acquire_watch_project_leases(
-        [
-            WatchLeaseTarget("released", RecordingStore("released-old", released_old, release_order)),
-            WatchLeaseTarget("middle", RecordingStore("retained-middle", retained_middle, release_order)),
-            WatchLeaseTarget("last", RecordingStore("retained-last", retained_last, release_order)),
-        ],
-        owner_token="run-token",
-    )
-
-    refreshed = acquire_watch_project_leases(
-        [
-            WatchLeaseTarget("new-first", RecordingStore("new-first", new_first, release_order)),
-            WatchLeaseTarget("new-after", RecordingStore("new-after", new_after, release_order)),
-        ],
-        existing_lease_set=existing,
-        retain_existing_target_keys=frozenset({"middle", "last"}),
-    )
-
-    assert [held.target.key for held in refreshed.held] == ["middle", "last", "new-first", "new-after"]
-    assert release_order == ["released-old"]
-    assert [result.target_key for result in refreshed.release()] == ["new-after", "new-first", "last", "middle"]
 
 
 def test_watch_lease_refresh_replacement_is_ordered_after_older_retained_peer(

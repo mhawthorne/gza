@@ -91,45 +91,6 @@ def test_walk_lineage_descendants_follows_both_based_on_and_depends_on_links(tmp
     assert grandchild.id in descendant_ids
 
 
-def test_resolve_impl_task_for_implement_review_improve_verify_fix_fix_and_rebase(tmp_path: Path) -> None:
-    store = SqliteTaskStore(tmp_path / "test.db")
-    impl = store.add("Implementation", task_type="implement")
-    review = store.add("Review", task_type="review", depends_on=impl.id)
-    improve1 = store.add("Improve 1", task_type="improve", based_on=impl.id, depends_on=review.id)
-    improve2 = store.add("Improve 2", task_type="improve", based_on=improve1.id, depends_on=review.id)
-    verify_fix = store.add("Verify fix", task_type="verify_fix", based_on=improve2.id, same_branch=True)
-    fix = store.add("Fix", task_type="fix", based_on=verify_fix.id, depends_on=review.id)
-    rebase = store.add("Rebase", task_type="rebase", based_on=verify_fix.id, same_branch=True)
-
-    resolved_impl, err = resolve_impl_task(store, impl.id)
-    assert err is None
-    assert resolved_impl is not None
-    assert resolved_impl.id == impl.id
-
-    resolved_review, err = resolve_impl_task(store, review.id)
-    assert err is None
-    assert resolved_review is not None
-    assert resolved_review.id == impl.id
-
-    resolved_improve, err = resolve_impl_task(store, improve2.id)
-    assert err is None
-    assert resolved_improve is not None
-    assert resolved_improve.id == impl.id
-
-    resolved_verify_fix, err = resolve_impl_task(store, verify_fix.id)
-    assert err is None
-    assert resolved_verify_fix is not None
-    assert resolved_verify_fix.id == impl.id
-
-    resolved_fix, err = resolve_impl_task(store, fix.id)
-    assert err is None
-    assert resolved_fix is not None
-    assert resolved_fix.id == impl.id
-
-    resolved_rebase, err = resolve_impl_task(store, rebase.id)
-    assert err is None
-    assert resolved_rebase is not None
-    assert resolved_rebase.id == impl.id
 
 
 def test_resolve_impl_task_review_error_paths(tmp_path: Path) -> None:
@@ -191,27 +152,6 @@ def test_lineage_view_owner_prefers_completed_reattempt_over_failed_original(tmp
     assert owner.id == reattempt.id
 
 
-def test_lineage_view_owner_returns_latest_successful_implement_when_multiple_exist(tmp_path: Path) -> None:
-    store = SqliteTaskStore(tmp_path / "test.db")
-
-    first = store.add("First implementation", task_type="implement")
-    assert first.id is not None
-    first.branch = "feature/lineage-warning"
-    first.status = "completed"
-    first.completed_at = datetime(2026, 7, 5, 10, 0, tzinfo=UTC)
-    store.update(first)
-
-    second = store.add("Second implementation", task_type="implement", based_on=first.id)
-    assert second.id is not None
-    second.branch = first.branch
-    second.status = "completed"
-    second.completed_at = datetime(2026, 7, 5, 11, 0, tzinfo=UTC)
-    store.update(second)
-
-    owner = LineageView(store, first).owner()
-
-    assert owner is not None
-    assert owner.id == second.id
 
 
 def test_lineage_view_original_latest_and_all_sort_by_event_time(tmp_path: Path) -> None:

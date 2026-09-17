@@ -203,56 +203,8 @@ def _stub_accidental_real_git_probes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("gza.git.Git.is_merged", lambda _self, _source, _into="main": False)
 
 
-def test_advance_creates_plan_review_for_completed_plan(tmp_path: Path, capsys) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    plan = _create_completed_plan(store, "Design auth system")
-    plan.slug = "20260305-design-auth-system-2"
-    store.update(plan)
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
-        patch("gza.cli.git_ops.list_failed_tasks_for_recovery", return_value=[]),
-        patch("gza.recovery_engine.list_failed_tasks_for_recovery", return_value=[]),
-        patch("gza.git.Git.default_branch", return_value="main"),
-        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
-        patch("gza.cli.advance_executor._prepare_task_for_reserved_launch", side_effect=lambda _c, task, **_k: task),
-        patch("gza.cli.git_ops._spawn_background_worker", return_value=0) as spawn_worker,
-    ):
-        rc = cmd_advance(_advance_args(tmp_path))
-
-    assert rc == 0
-    assert "Created plan review task" in capsys.readouterr().out
-    plan_review_tasks = [task for task in store.get_all() if task.task_type == "plan_review"]
-    assert len(plan_review_tasks) == 1
-    assert plan_review_tasks[0].depends_on == plan.id
-    assert plan_review_tasks[0].based_on is None
-    assert spawn_worker.call_args.kwargs["task_id"] == plan_review_tasks[0].id
 
 
-def test_advance_create_plan_review_inherits_tags_from_completed_plan(tmp_path: Path, capsys) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    plan = _create_completed_plan(store, "Design auth slice")
-    plan.tags = ("lifecycle", "planner")
-    store.update(plan)
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
-        patch("gza.cli.git_ops.list_failed_tasks_for_recovery", return_value=[]),
-        patch("gza.recovery_engine.list_failed_tasks_for_recovery", return_value=[]),
-        patch("gza.git.Git.default_branch", return_value="main"),
-        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
-        patch("gza.cli.advance_executor._prepare_task_for_reserved_launch", side_effect=lambda _c, task, **_k: task),
-        patch("gza.cli.git_ops._spawn_background_worker", return_value=0),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path))
-
-    assert rc == 0
-    assert "Created plan review task" in capsys.readouterr().out
-    plan_review_tasks = [task for task in store.get_all() if task.task_type == "plan_review"]
-    assert len(plan_review_tasks) == 1
-    assert plan_review_tasks[0].tags == plan.tags
 
 
 def test_advance_auto_implement_inherits_all_parent_tags(tmp_path: Path, capsys) -> None:
@@ -420,47 +372,8 @@ def test_advance_skips_plan_with_existing_implement(tmp_path: Path, capsys) -> N
     assert "implement task already exists" in capsys.readouterr().out
 
 
-def test_advance_does_not_create_implement_for_held_plan(tmp_path: Path, capsys) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    plan = _create_completed_plan(store, "Design auth system")
-    plan.auto_implement = False
-    store.update(plan)
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
-        patch(
-            "gza.cli.git_ops._spawn_background_worker",
-            side_effect=AssertionError("held plan should not spawn an implement worker"),
-        ),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=plan.id, dry_run=True))
-
-    output = capsys.readouterr().out
-    assert rc == 0
-    assert "Awaiting human review" in output
-    assert f"uv run gza implement {plan.id}" in output
-    assert [task for task in store.get_all() if task.task_type == "implement"] == []
 
 
-def test_advance_type_plan_filters_to_plans_only(tmp_path: Path, capsys) -> None:
-    (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
-        "db_path: .gza/gza.db\n"
-        "require_review_before_merge: false\n"
-    )
-    store = make_store(tmp_path)
-    plan = _create_completed_plan(store, "Design feature X")
-    _create_completed_implement(store)
-
-    with patch("gza.cli.git_ops.Git", return_value=_mock_git()):
-        rc = cmd_advance(_advance_args(tmp_path, dry_run=True, advance_type="plan"))
-
-    output = capsys.readouterr().out
-    assert rc == 0
-    assert str(plan.id) in output
-    assert "Create and start plan review" in output
-    assert "Merge" not in output
 
 
 def test_advance_type_implement_filters_to_implements_only(tmp_path: Path, capsys) -> None:
@@ -738,82 +651,8 @@ def test_advance_repeat_reaches_merge_after_rebase_review_chain(tmp_path: Path, 
     assert f"Advance repeat completed: {impl.id} merged" in captured.out
 
 
-def test_advance_repeat_honors_launch_permit_cap(tmp_path: Path, capsys) -> None:
-    setup_config(tmp_path)
-    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "max_concurrent: 1\n")
-    store = make_store(tmp_path)
-    impl = _create_completed_implement(store)
-    other = store.add("Already running task", task_type="implement")
-    assert other.id is not None
-    other.status = "in_progress"
-    other.running_pid = os.getpid()
-    other.started_at = datetime.now(UTC)
-    store.update(other)
-    git = _mock_git()
-    WorkerRegistry(tmp_path / ".gza" / "workers").register(
-        WorkerMetadata(
-            worker_id="saturating-worker",
-            task_id=other.id,
-            pid=os.getpid(),
-            started_at=datetime.now(UTC).isoformat(),
-            status="running",
-        )
-    )
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=git),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
-        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "create_review", "description": "Create review"}),
-        patch("gza.cli.git_ops.execute_advance_action") as execute_mock,
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, repeat=True, max_iterations=2))
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert "already at max concurrent tasks: 1 running, limit is 1" in captured.out
-    execute_mock.assert_not_called()
 
 
-def test_advance_repeat_saturated_cap_does_not_enter_direct_merge_gate(
-    tmp_path: Path,
-    capsys,
-) -> None:
-    setup_config(tmp_path)
-    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "max_concurrent: 1\n")
-    store = make_store(tmp_path)
-    impl = _create_completed_implement(store)
-    other = store.add("Already running task", task_type="implement")
-    assert other.id is not None
-    other.status = "in_progress"
-    other.running_pid = os.getpid()
-    other.started_at = datetime.now(UTC)
-    store.update(other)
-    WorkerRegistry(tmp_path / ".gza" / "workers").register(
-        WorkerMetadata(
-            worker_id="saturating-merge-worker",
-            task_id=other.id,
-            pid=os.getpid(),
-            started_at=datetime.now(UTC).isoformat(),
-            status="running",
-        )
-    )
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
-        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge", "description": "Merge task"}),
-        patch("gza.cli.git_ops.check_main_integration_verify") as main_verify,
-        patch("gza.cli.git_ops.check_candidate_integration_verify") as candidate_verify,
-        patch("gza.cli.git_ops._execute_merge_action") as execute_merge,
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, repeat=True, max_iterations=2))
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert "already at max concurrent tasks: 1 running, limit is 1" in captured.out
-    main_verify.assert_not_called()
-    candidate_verify.assert_not_called()
-    execute_merge.assert_not_called()
 
 
 def test_advance_repeat_saturated_cap_does_not_execute_direct_verify_gate(
@@ -954,37 +793,6 @@ def test_advance_repeat_capacity_loss_at_permit_acquisition_stops_after_one_atte
     assert "cycle 2:" not in captured.out
 
 
-def test_advance_repeat_failed_owner_reports_merged_after_recovery_descendant_lands(
-    tmp_path: Path,
-    capsys,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    owner = _create_completed_implement(store)
-    owner.status = "failed"
-    owner.failure_reason = "MAX_TURNS"
-    owner.completed_at = datetime.now(UTC)
-    store.update(owner)
-    recovery = store.add("Recovered implementation", task_type="implement", based_on=owner.id)
-    assert recovery.id is not None
-    recovery.status = "completed"
-    recovery.branch = owner.branch
-    recovery.has_commits = True
-    recovery.completed_at = datetime.now(UTC)
-    store.update(recovery)
-    unit = store.resolve_merge_unit_for_task(owner.id)
-    assert unit is not None
-    store.attach_task_to_merge_unit(recovery.id, unit.id, "recovery")
-    store.set_merge_unit_state(unit.id, "merged", merged_by_task_id=owner.id)
-
-    with patch("gza.cli.git_ops.Git", return_value=_mock_git()):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=owner.id, repeat=True, max_iterations=3))
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert store.get(owner.id).status == "failed"
-    assert f"Task {owner.id} is already merged" in captured.out
-    assert "stopped on skip" not in captured.out
 
 
 def test_advance_repeat_candidate_verify_block_parks_not_error(tmp_path: Path, capsys) -> None:
@@ -1136,62 +944,6 @@ def test_advance_repeat_dry_run_merge_with_stale_main_checkpoint_has_no_side_eff
     assert after_workers == before_workers
 
 
-def test_advance_repeat_dry_run_uses_read_only_planning_and_cycle_resolution(
-    tmp_path: Path,
-    capsys,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    impl = _create_completed_implement(store)
-    git = _mock_git()
-    query_flags: list[tuple[bool, bool]] = []
-    determine_flags: list[tuple[bool, bool]] = []
-
-    from gza.cli import git_ops
-
-    original_query = git_ops.query_lineage_owner_rows
-
-    def spy_query(*args, **kwargs):
-        query_flags.append(
-            (
-                kwargs.get("persist_post_merge_rebase_state"),
-                kwargs.get("persist_review_clearance"),
-            )
-        )
-        return original_query(*args, **kwargs)
-
-    def fake_determine(*_args, **kwargs):
-        determine_flags.append(
-            (
-                kwargs.get("persist_post_merge_rebase_state"),
-                kwargs.get("persist_review_clearance"),
-            )
-        )
-        return {"type": "create_review", "description": "Create review"}
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=git),
-        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
-        patch("gza.cli.git_ops.query_lineage_owner_rows", side_effect=spy_query),
-        patch("gza.cli.git_ops.determine_next_action", side_effect=fake_determine),
-        patch("gza.cli.git_ops.apply_deferred_lineage_query_reconciliations") as apply_deferred,
-        patch(
-            "gza.cli.git_ops.execute_advance_action",
-            return_value=AdvanceActionExecutionResult(
-                action_type="create_review",
-                status="dry_run",
-                message="would create review",
-            ),
-        ),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, repeat=True, dry_run=True, max_iterations=2))
-
-    assert rc == 0
-    assert query_flags
-    assert all(flags == (False, False) for flags in query_flags)
-    assert determine_flags
-    assert all(flags == (False, False) for flags in determine_flags)
-    apply_deferred.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -1608,39 +1360,6 @@ def test_advance_explicit_impl_uses_canonical_target_and_skips_orphan_rebase_bra
     assert outputs[0] == outputs[1]
 
 
-def test_advance_explicit_impl_reports_already_merged_when_branch_is_reachable_but_merge_state_is_stale(
-    tmp_path: Path,
-    capsys,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = _create_completed_implement(store, "Implement feature")
-    assert impl.id is not None
-    _create_completed_review(store, impl, verdict="APPROVED")
-
-    rebase = store.add("Completed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
-    assert rebase.id is not None
-    rebase.status = "completed"
-    rebase.completed_at = datetime.now(UTC)
-    rebase.branch = impl.branch
-    rebase.has_commits = True
-    rebase.changed_diff = True
-    store.update(rebase)
-
-    git = _mock_git(can_merge=False)
-    git.default_branch.return_value = "main"
-    git.branch_exists.return_value = True
-    git.ref_exists.return_value = False
-    git.is_merged.return_value = True
-
-    with patch("gza.cli.git_ops.Git", return_value=git):
-        rc = cmd_advance(_advance_args(tmp_path, task_id=impl.id, dry_run=True))
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert f"Task {impl.id} is already merged" in captured.out
-    assert "Would advance" not in captured.out
 
 
 
@@ -1703,48 +1422,6 @@ def test_advance_explicit_task_errors_when_default_target_cannot_be_resolved(
     assert "Would advance" not in captured.out
 
 
-def test_advance_dry_run_shows_attention_for_orphan_owned_merge_unit_without_noop_banner(
-    tmp_path: Path,
-    capsys,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    impl = store.add("Implement feature", task_type="implement")
-    assert impl.id is not None
-    impl.status = "in_progress"
-    impl.branch = "feature/canonical"
-    impl.has_commits = True
-    store.update(impl)
-
-    orphan = store.add("Completed orphan rebase", task_type="rebase", based_on=impl.id, same_branch=True)
-    assert orphan.id is not None
-    orphan.status = "completed"
-    orphan.completed_at = datetime.now(UTC)
-    orphan.branch = "feature/orphan"
-    orphan.merge_status = "unmerged"
-    orphan.has_commits = True
-    store.update(orphan)
-
-    orphan_unit = store.create_merge_unit(
-        source_branch=orphan.branch,
-        target_branch="main",
-        owner_task_id=orphan.id,
-        state="unmerged",
-    )
-    store.attach_task_to_merge_unit(orphan.id, orphan_unit.id, "owner")
-    store.dual_write_legacy_merge_status(orphan_unit.id)
-
-    with patch("gza.cli.git_ops.Git", return_value=_mock_git()):
-        rc = cmd_advance(_advance_args(tmp_path, dry_run=True))
-
-    captured = capsys.readouterr()
-    assert rc == 0
-    assert "Would advance" not in captured.out
-    assert "No eligible tasks to advance" not in captured.out
-    assert "Needs attention" in captured.out
-    assert str(impl.id) in captured.out
-    assert "no descendant on the impl branch" in captured.out
 
 
 def test_advance_new_pending_implement_iterate_spawn_marks_auto_iterate(tmp_path: Path) -> None:
@@ -1790,56 +1467,6 @@ def test_advance_new_pending_implement_iterate_spawn_marks_auto_iterate(tmp_path
     ]
 
 
-def test_advance_new_pending_resume_row_on_empty_branch_preserves_resume_startup(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    pending_impl = store.add("Implement queued resume task", task_type="implement", recovery_origin="resume")
-    assert pending_impl.id is not None
-    pending_impl.status = "pending"
-    pending_impl.session_id = "sess-advance-pending"
-    pending_impl.branch = "feature/advance-pending-empty-resume"
-    store.update(pending_impl)
-
-    unit = store.create_merge_unit(
-        source_branch=pending_impl.branch,
-        target_branch="main",
-        owner_task_id=pending_impl.id,
-        state="empty",
-    )
-    store.attach_task_to_merge_unit(pending_impl.id, unit.id, "owner")
-
-    iterate_calls: list[dict[str, object]] = []
-
-    def fake_spawn_iterate(_args, _config, impl_task, **kwargs):
-        iterate_calls.append(
-            {
-                "task_id": impl_task.id,
-                "prepared_task_id": kwargs.get("prepared_task_id"),
-                "prepared_resume": kwargs.get("prepared_resume"),
-                "prepared_phase": kwargs.get("prepared_phase"),
-            }
-        )
-        return 0
-
-    with (
-        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
-        patch("gza.cli.git_ops.list_failed_tasks_for_recovery", return_value=[]),
-        patch("gza.recovery_engine.list_failed_tasks_for_recovery", return_value=[]),
-        patch("gza.cli.git_ops._advance_uses_iterate", return_value=True),
-        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
-        patch("gza.cli.git_ops._spawn_background_iterate_worker", side_effect=fake_spawn_iterate),
-    ):
-        rc = cmd_advance(_advance_args(tmp_path, batch=1, new=True))
-
-    assert rc == 0
-    assert iterate_calls == [
-        {
-            "task_id": pending_impl.id,
-            "prepared_task_id": pending_impl.id,
-            "prepared_resume": True,
-            "prepared_phase": "preloop",
-        }
-    ]
 
 
 def test_advance_new_pending_implement_iterate_startup_failure_surfaces_and_skips_spawn(

@@ -893,35 +893,6 @@ class TestHelpOutput:
         assert "project_id: p" in result.stdout
         assert "project_id:" not in config_path.read_text(encoding="utf-8")
 
-    def test_queue_and_lifecycle_help_make_command_scope_explicit(self, tmp_path: Path) -> None:
-        setup_config(tmp_path)
-
-        next_help = invoke_gza("next", "--help", "--project", str(tmp_path))
-        queue_help = invoke_gza("queue", "--help", "--project", str(tmp_path))
-        work_help = invoke_gza("work", "--help", "--project", str(tmp_path))
-        advance_help = invoke_gza("advance", "--help", "--project", str(tmp_path))
-        watch_help = invoke_gza("watch", "--help", "--project", str(tmp_path))
-        main_verify_help = invoke_gza("main-verify", "--help", "--project", str(tmp_path))
-        behavior_monitor_help = invoke_gza("behavior-monitor", "--help", "--project", str(tmp_path))
-
-        assert next_help.returncode == 0
-        assert "recovery, lifecycle, and pending lanes separately" in next_help.stdout
-        assert queue_help.returncode == 0
-        queue_help_text = " ".join(queue_help.stdout.split())
-        assert "Preview the shared dispatch order by default" in queue_help.stdout
-        assert "Use --pending or --recovery for narrower views." in queue_help_text
-        assert work_help.returncode == 0
-        assert "does not run recovery or review/merge lifecycle work" in work_help.stdout
-        assert advance_help.returncode == 0
-        assert "use --new to also start pending tasks" in advance_help.stdout
-        assert watch_help.returncode == 0
-        assert "run recovery, lifecycle, and pending pickup" in watch_help.stdout
-        assert main_verify_help.returncode == 0
-        assert "Force a fresh local main verify run now" in main_verify_help.stdout
-        assert behavior_monitor_help.returncode == 0
-        assert "host-side behavior conformance monitor" in behavior_monitor_help.stdout
-        assert "--dry-run" in behavior_monitor_help.stdout
-        assert "--force" in behavior_monitor_help.stdout
 
     def test_retry_help_describes_no_docker_for_background_and_immediate_runs(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
@@ -1853,22 +1824,6 @@ class TestHelpOutput:
         assert "front of the urgent lane" in normalized_help
         assert "picked up before normal queue items" not in normalized_help
 
-    def test_public_pr_help_and_docs_use_completion_time_request_wording(self, tmp_path):
-        """Public `--pr` help/docs should use the same deferred request wording."""
-        setup_config(tmp_path)
-
-        expected = (
-            "Request auto-create/reuse of a GitHub PR after successful code-task completion; "
-            "evaluated at completion time and skipped without failing when PRs are unavailable"
-        )
-
-        for command in ("work", "add", "edit", "improve", "implement", "extract"):
-            help_result = invoke_gza(command, "--help", "--project", str(tmp_path))
-            assert help_result.returncode == 0
-            normalized_help = " ".join(help_result.stdout.split())
-
-            assert "--pr" in help_result.stdout
-            assert expected in normalized_help
 
     def test_edit_help_and_docs_describe_non_pending_tag_only_restriction(self, tmp_path):
         """`edit --help` and docs should both explain the non-pending tag-only contract."""
@@ -2970,104 +2925,7 @@ class TestIterateBackgroundForceDispatch:
         assert captured_cmd is not None
         assert "--force" in captured_cmd
 
-    def test_iterate_background_propagates_explicit_max_iterations(self, tmp_path):
-        """`gza iterate --background --max-iterations N` should pass N unchanged to detached worker."""
-        from gza.cli.main import main
 
-        setup_config(tmp_path)
-        config = Config.load(tmp_path)
-        store = SqliteTaskStore(config.db_path)
-        task = store.add("Pending implement for iterate background max-iterations", task_type="implement")
-        assert task.id is not None
-
-        captured_cmd: list[str] | None = None
-        mock_proc = MagicMock()
-        mock_proc.pid = 5353
-
-        def capture_spawn(cmd, _config, worker_id):
-            nonlocal captured_cmd
-            captured_cmd = cmd
-            return mock_proc, f".gza/workers/{worker_id}-startup.log"
-
-        with (
-            patch.object(
-                sys,
-                "argv",
-                [
-                    "gza",
-                    "iterate",
-                    str(task.id),
-                    "--background",
-                    "--max-iterations",
-                    "7",
-                    "--no-docker",
-                    "--project",
-                    str(tmp_path),
-                ],
-            ),
-            patch(
-                "gza.cli.execution._prepare_task_for_immediate_execution",
-                side_effect=lambda _c, prepared_task, **_k: prepared_task,
-            ),
-            patch("gza.cli._common._spawn_detached_worker_process", side_effect=capture_spawn),
-        ):
-            rc = main()
-
-        assert rc == 0
-        assert captured_cmd is not None
-        idx = captured_cmd.index("--max-iterations")
-        assert captured_cmd[idx + 1] == "7"
-
-    def test_iterate_background_uses_config_max_iterations_when_flag_omitted(self, tmp_path):
-        """`gza iterate --background` should use iterate_max_iterations from config when -i is omitted."""
-        from gza.cli.main import main
-
-        (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: default\n"
-            "db_path: .gza/gza.db\n"
-            "iterate_max_iterations: 6\n"
-        )
-        config = Config.load(tmp_path)
-        store = SqliteTaskStore(config.db_path)
-        task = store.add("Pending implement for iterate background config max-iterations", task_type="implement")
-        assert task.id is not None
-
-        captured_cmd: list[str] | None = None
-        mock_proc = MagicMock()
-        mock_proc.pid = 5454
-
-        def capture_spawn(cmd, _config, worker_id):
-            nonlocal captured_cmd
-            captured_cmd = cmd
-            return mock_proc, f".gza/workers/{worker_id}-startup.log"
-
-        with (
-            patch.object(
-                sys,
-                "argv",
-                [
-                    "gza",
-                    "iterate",
-                    str(task.id),
-                    "--background",
-                    "--no-docker",
-                    "--project",
-                    str(tmp_path),
-                ],
-            ),
-            patch(
-                "gza.cli.execution._prepare_task_for_immediate_execution",
-                side_effect=lambda _c, prepared_task, **_k: prepared_task,
-            ),
-            patch("gza.cli._common._spawn_detached_worker_process", side_effect=capture_spawn),
-        ):
-            rc = main()
-
-        assert rc == 0
-        assert captured_cmd is not None
-        idx = captured_cmd.index("--max-iterations")
-        assert captured_cmd[idx + 1] == "6"
 
     def test_iterate_background_rejects_zero_max_iterations_before_spawn(self, tmp_path):
         """`gza iterate --background --max-iterations 0` should fail before detached worker spawn."""

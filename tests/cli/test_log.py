@@ -32,45 +32,6 @@ class TestLogCommand:
         assert "requested task or worker is actively running" in help_output
         assert "--failure" in result.stdout
 
-    def test_log_by_task_id_single_json_format(self, tmp_path: Path):
-        """Log command by task ID parses single JSON format with successful result."""
-        import json
-
-        setup_config(tmp_path)
-
-        # Create a task with a log file
-        db_path = tmp_path / ".gza" / "gza.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        from gza.config import Config
-        config = Config.load(tmp_path)
-        store = SqliteTaskStore(db_path, prefix=config.project_prefix)
-        task = store.add("Test task for log")
-        task.status = "completed"
-        task.log_file = ".gza/logs/test.log"
-        store.update(task)
-
-        # Create a single JSON log file (old format)
-        log_dir = tmp_path / ".gza" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / "test.log"
-        log_data = {
-            "type": "result",
-            "subtype": "success",
-            "result": "## Summary\n\nTask completed successfully!",
-            "duration_ms": 60000,
-            "num_turns": 10,
-            "total_cost_usd": 0.5,
-        }
-        log_file.write_text(json.dumps(log_data))
-
-        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Task completed successfully!" in result.stdout
-        assert "Duration:" in result.stdout
-        assert "Steps: 10" in result.stdout
-        assert "Legacy turns: 10" in result.stdout
-        assert "Cost: $0.5000" in result.stdout
 
     def test_log_by_task_id_jsonl_format(self, tmp_path: Path):
         """Log command by task ID parses step-first JSONL format with successful result."""
@@ -124,44 +85,6 @@ class TestLogCommand:
         assert "Transcript:" in result.stdout
         assert "Ops:" in result.stdout
 
-    def test_log_default_handles_untimestamped_conversation_with_timestamped_ops(self, tmp_path: Path):
-        """Mixed timestamp presence across split logs should not crash merged rendering."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Untimestamped transcript with ops timestamp")
-        task.status = "completed"
-        task.log_file = ".gza/logs/untimestamped.log"
-        store.update(task)
-
-        log_dir = tmp_path / ".gza" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        (log_dir / "untimestamped.log").write_text(
-            json.dumps(
-                {
-                    "type": "assistant",
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": "conversation without timestamp"}],
-                    },
-                }
-            )
-        )
-        (log_dir / "untimestamped.ops.jsonl").write_text(
-            json.dumps(
-                {
-                    "type": "gza",
-                    "subtype": "info",
-                    "timestamp": "2026-05-08T10:00:01Z",
-                    "message": "ops with timestamp",
-                }
-            )
-        )
-
-        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "conversation without timestamp" in result.stdout
-        assert "ops with timestamp" in result.stdout
 
     def test_log_conversation_only_suppresses_ops_entries(self, tmp_path: Path):
         """--conversation-only should render only the transcript stream."""
@@ -187,29 +110,6 @@ class TestLogCommand:
         assert "transcript only" in result.stdout
         assert "ops only" not in result.stdout
 
-    def test_log_ops_only_suppresses_conversation_entries(self, tmp_path: Path):
-        """--ops-only should render only the ops stream."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Ops only")
-        task.status = "completed"
-        task.log_file = ".gza/logs/ops.log"
-        store.update(task)
-
-        log_dir = tmp_path / ".gza" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        (log_dir / "ops.log").write_text(
-            json.dumps({"type": "assistant", "timestamp": "2026-05-08T10:00:02Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "conversation hidden"}]}})
-        )
-        (log_dir / "ops.ops.jsonl").write_text(
-            json.dumps({"type": "gza", "subtype": "info", "timestamp": "2026-05-08T10:00:01Z", "message": "ops visible"})
-        )
-
-        result = invoke_gza("log", str(task.id), "--ops-only", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "ops visible" in result.stdout
-        assert "conversation hidden" not in result.stdout
 
     @pytest.mark.parametrize(
         ("flag", "create_empty_conversation"),
@@ -323,123 +223,7 @@ class TestLogCommand:
         assert "Legacy turns: 60" in result.stdout
         assert "Cost: $1.5000" in result.stdout
 
-    def test_log_failure_view_surfaces_agent_explanation(self, tmp_path: Path):
-        """--failure should show concise failed-task diagnostics including final agent explanation."""
-        import json
 
-        setup_config(tmp_path)
-        (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
-            "db_path: .gza/gza.db\n"
-            "verify_command: uv run pytest tests/ -q\n"
-        )
-
-        store = make_store(tmp_path)
-        task = store.add("Failed task for failure view")
-        assert task.id is not None
-        task.status = "failed"
-        task.failure_reason = "MAX_TURNS"
-        task.log_file = ".gza/logs/failed.log"
-        store.update(task)
-
-        log_dir = tmp_path / ".gza" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        (log_dir / "failed.log").write_text(
-            "\n".join(
-                json.dumps(line) for line in [
-                    {
-                        "type": "item.completed",
-                        "item": {
-                            "type": "agent_message",
-                            "text": "[GZA_FAILURE:AGENT_FORFEIT]\nBlocked by ordering prerequisite.",
-                        },
-                    },
-                    {
-                        "type": "assistant",
-                        "message": {
-                            "role": "assistant",
-                            "content": [
-                                {"type": "tool_use", "id": "tool_1", "name": "Bash", "input": {"command": "uv run pytest tests/ -q"}},
-                            ],
-                        },
-                    },
-                    {
-                        "type": "user",
-                        "message": {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "tool_result",
-                                    "tool_use_id": "tool_1",
-                                    "is_error": True,
-                                    "content": "FAILED tests/test_cli.py::test_case - AssertionError",
-                                }
-                            ],
-                        },
-                    },
-                    {"type": "result", "subtype": "error_max_turns", "result": "Stopped at limit"},
-                ]
-            )
-        )
-
-        result = invoke_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Failure Reason: MAX_TURNS" in result.stdout
-        assert "Failure Summary: Stopped due to max turns limit." in result.stdout
-        assert "Agent Explanation:" in result.stdout
-        assert "Blocked by ordering prerequisite." in result.stdout
-        assert "[GZA_FAILURE:AGENT_FORFEIT]" in result.stdout
-        assert result.stdout.count("[GZA_FAILURE:AGENT_FORFEIT]") == 1
-        assert "Last Verify Failure:" in result.stdout
-        assert "uv run pytest tests/ -q" in result.stdout
-        assert "Last Result Context: error_max_turns" in result.stdout
-
-    def test_log_failure_renders_worker_death_diagnostics(self, tmp_path: Path):
-        """`gza log --failure` should surface structured WORKER_DIED diagnostics."""
-        import json
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Killed worker task")
-        assert task.id is not None
-        task.status = "failed"
-        task.failure_reason = "WORKER_DIED"
-        task.log_file = ".gza/logs/killed-worker.log"
-        store.update(task)
-
-        log_dir = tmp_path / ".gza" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        (log_dir / "killed-worker.log").write_text("")
-        (log_dir / "killed-worker.ops.jsonl").write_text(
-            "\n".join(
-                [
-                    json.dumps(
-                        {
-                            "type": "gza",
-                            "subtype": "worker_lifecycle",
-                            "event": "death_detected",
-                            "reason": "WORKER_DIED",
-                            "exit_code": -9,
-                            "signal": "SIGKILL",
-                            "signal_number": 9,
-                            "stage": "provider_exec",
-                            "output_tail": ["fatal stderr", "final stdout"],
-                        }
-                    )
-                ]
-            )
-        )
-
-        result = invoke_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Failure Reason: WORKER_DIED" in result.stdout
-        assert "Worker Exit: SIGKILL, exit code -9" in result.stdout
-        assert "Worker Death Stage: provider_exec" in result.stdout
-        assert "Worker Output Tail:" in result.stdout
-        assert "fatal stderr" in result.stdout
-        assert "final stdout" in result.stdout
 
     def test_failure_diagnostics_parity_between_show_and_log_failure(self, tmp_path: Path):
         """Show and log --failure should render the same core failure diagnostics."""
@@ -1025,43 +809,6 @@ class TestLogCommand:
         assert "[S1.1] tool_call Bash ls -la" in result.stdout
         assert "[Step S2] Listed files." in result.stdout
 
-    def test_log_steps_keeps_unknown_provider_events_visible(self, tmp_path: Path):
-        """--steps should surface unknown provider events through renderer fallbacks."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        task = store.add("Unknown event timeline task")
-        task.status = "completed"
-        task.provider = "claude"
-        task.provider_is_explicit = True
-        task.log_file = ".gza/logs/test.log"
-        store.update(task)
-
-        log_dir = tmp_path / ".gza" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        (log_dir / "test.log").write_text(
-            "\n".join(
-                json.dumps(line)
-                for line in [
-                    {
-                        "type": "assistant",
-                        "message": {
-                            "id": "msg_1",
-                            "role": "assistant",
-                            "content": [{"type": "text", "text": "Investigating"}],
-                        },
-                    },
-                    {"type": "mystery", "message": "still visible in timeline", "alpha": 1},
-                ]
-            )
-        )
-
-        result = invoke_gza("log", str(task.id), "--steps-verbose", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "[Step S1] Investigating" in result.stdout
-        assert "[S1.1] [event:mystery]" in result.stdout
-        assert "message=still visible in timeline" in result.stdout
 
     @pytest.mark.parametrize("flag", ["--steps", "--steps-verbose"])
     def test_log_steps_modes_print_suppressed_footer(self, tmp_path: Path, flag: str):

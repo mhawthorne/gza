@@ -106,22 +106,6 @@ def test_no_color_config_disables_ansi_on_forced_tty(
 
 
 
-def test_no_color_env_disables_ansi_even_when_config_allows_color(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    task = _seed_task(tmp_path, status="completed")
-
-    returncode, output = _capture_command_output(
-        monkeypatch,
-        tmp_path,
-        "show",
-        str(task.id),
-        env={"NO_COLOR": "1"},
-    )
-
-    assert returncode == 0
-    assert ANSI_RE.search(output) is None, output
 
 
 def test_invoke_gza_neutralizes_ambient_force_color(

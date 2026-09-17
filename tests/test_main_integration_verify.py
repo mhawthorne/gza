@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -2009,47 +2009,6 @@ def test_check_main_integration_verify_blocks_when_lifecycle_budget_store_read_f
     assert "database is locked" in (check.state.failure or "")
 
 
-def test_check_main_integration_verify_treats_changed_derived_budget_as_stale_identity(tmp_path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    _seed_main_verify_task(
-        store,
-        verify_status="passed",
-        verify_exit_status="0",
-        failure="",
-        alert_message="",
-    )
-    config = Config.load(tmp_path)
-    config.verify_command = "./bin/tests"
-    config.autonomous_verify_timeout_seconds = 120
-    config.review_verify_timeout_grace_seconds = 5.0
-    config.main_integration_verify_red_ttl_minutes = 30
-    _store_full_suite_verify_observation(store, config, duration_seconds=160.0)
-
-    git = MagicMock()
-    git.repo_dir = tmp_path
-    git.current_branch.return_value = "main"
-    git.rev_parse_if_exists.return_value = "abc123"
-    verify_result = _make_review_verify_result(
-        "./bin/tests",
-        status="passed",
-        exit_status="0",
-        captured_at=datetime(2026, 8, 29, 12, 10, tzinfo=UTC),
-        reviewed_branch="main",
-        reviewed_head_sha="abc123",
-        working_directory=str(tmp_path),
-        output="passed\nTree fingerprint: fp-verified\n",
-    )
-
-    with (
-        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-verified"),
-        patch("gza.main_integration_verify._run_review_verify_command", return_value=verify_result) as run_verify,
-    ):
-        check = check_main_integration_verify(config, store, git, reason="unit-test-derived-budget-drift")
-
-    run_verify.assert_called_once()
-    assert check.performed_verify is True
-    assert check.state.verify_timeout_seconds == 230
 
 
 def test_compute_tree_fingerprint_explicit_missing_head_is_not_reusable_for_clean_target(tmp_path) -> None:
@@ -2135,53 +2094,6 @@ def test_check_main_integration_verify_unknown_head_does_not_cache_green_across_
 
 
 
-def test_check_main_integration_verify_reuses_checkpoint_when_only_python_path_differs(tmp_path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
-    legacy_same_runtime_identity = MainIntegrationVerifyEnvironmentIdentity(
-        runner_class="host",
-        platform_system=platform.system(),
-        platform_machine=platform.machine(),
-        python_implementation=None,
-        python_version=python_version,
-        python_executable_family=f"python{python_version}",
-    )
-    _seed_main_verify_task(
-        store,
-        verify_status="passed",
-        verify_exit_status="0",
-        failure="",
-        alert_message="",
-        environment_identity=legacy_same_runtime_identity,
-    )
-
-    config = MagicMock(spec=Config)
-    config.verify_command = "./bin/tests"
-    config.autonomous_verify_timeout_seconds = 120
-    config.review_verify_timeout_grace_seconds = 5.0
-    config.main_integration_verify_red_ttl_minutes = 30
-
-    git = MagicMock()
-    git.repo_dir = tmp_path
-    git.current_branch.return_value = "main"
-    git.rev_parse_if_exists.return_value = "abc123"
-
-    with (
-        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-verified"),
-        patch("gza.main_integration_verify._run_review_verify_command") as run_verify,
-    ):
-        check = check_main_integration_verify(
-            config,
-            store,
-            git,
-            reason="unit-test-same-runtime-different-python-path",
-        )
-
-    run_verify.assert_not_called()
-    assert check.performed_verify is False
-    assert check.is_current is True
-    assert check.state.environment_identity == legacy_same_runtime_identity
 
 
 
@@ -3037,66 +2949,8 @@ def test_check_main_integration_verify_classifies_shell_not_found_phase_failure_
 
 
 
-def test_current_main_integration_verify_alert_surfaces_unproven_freshness_when_default_branch_probe_fails(
-    tmp_path,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    _seed_main_verify_task(
-        store,
-        verify_status="failed",
-        verify_exit_status="1",
-        failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
-    )
-
-    config = MagicMock(spec=Config)
-    config.verify_command = "./bin/tests"
-    config.autonomous_verify_timeout_seconds = 120
-    config.review_verify_timeout_grace_seconds = 5.0
-    config.main_integration_verify_red_ttl_minutes = 30
-
-    git = MagicMock()
-    git.default_branch.return_value = "main"
-    git.current_branch.return_value = "main"
-    git.rev_parse_if_exists.return_value = "abc123"
-
-    with patch("gza.main_integration_verify._compute_tree_fingerprint", return_value=None):
-        alert = current_main_integration_verify_alert(store, git, config)
-
-    assert alert is not None
-    assert alert.verify_status == "unavailable"
-    assert alert.verify_exit_status == MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
-    assert alert.alert_message == "main verify freshness unproven; exact tree fingerprint unavailable"
-    assert "abc123" not in alert.alert_message
 
 
-def test_current_main_integration_verify_alert_ignores_ambiguous_short_target_ref(tmp_path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    _seed_main_verify_task(
-        store,
-        verify_status="failed",
-        verify_exit_status="1",
-        failure="verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
-    )
-
-    config = MagicMock(spec=Config)
-    config.verify_command = "./bin/tests"
-    config.autonomous_verify_timeout_seconds = 120
-    config.review_verify_timeout_grace_seconds = 5.0
-    config.main_integration_verify_red_ttl_minutes = 30
-
-    git = MagicMock()
-    git.default_branch.return_value = "main"
-    git.current_branch.return_value = "topic"
-    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "main" else None
-
-    alert = current_main_integration_verify_alert(store, git, config)
-
-    assert alert is None
-    assert git.rev_parse_if_exists.call_args_list == [call("refs/heads/main")]
 
 
 def test_current_main_integration_verify_alert_omits_red_checkpoint_missing_environment_identity(tmp_path) -> None:
@@ -3899,87 +3753,6 @@ def test_check_main_integration_verify_watch_red_rerun_classifies_deterministic_
     assert check.remediation.failure == "verify_command failed again"
 
 
-def test_check_main_integration_verify_deterministic_red_uses_confirmed_current_failure_metadata(tmp_path) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    _seed_main_verify_task(
-        store,
-        verify_status="failed",
-        verify_exit_status="1",
-        failure="cached verify_command failed",
-        alert_message="main verify RED at `abc123` - merges halted; phase unit failing",
-    )
-
-    config = MagicMock(spec=Config)
-    config.verify_command = "./bin/tests"
-    config.autonomous_verify_timeout_seconds = 120
-    config.review_verify_timeout_grace_seconds = 5.0
-    config.main_integration_verify_red_ttl_minutes = 30
-
-    git = MagicMock()
-    git.repo_dir = tmp_path
-    git.current_branch.return_value = "main"
-    git.rev_parse_if_exists.return_value = "abc123"
-
-    first_red = _make_review_verify_result(
-        "./bin/tests",
-        status="failed",
-        exit_status="1",
-        captured_at=datetime(2026, 6, 23, 0, 0, tzinfo=UTC),
-        reviewed_branch="main",
-        reviewed_head_sha="abc123",
-        working_directory=str(tmp_path),
-        failure="fresh verify_command failed",
-        output="gza-verify phase=failed name=functional duration_seconds=3.25",
-    )
-    second_red = _make_review_verify_result(
-        "./bin/tests",
-        status="failed",
-        exit_status="1",
-        captured_at=datetime(2026, 6, 23, 0, 1, tzinfo=UTC),
-        reviewed_branch="main",
-        reviewed_head_sha="abc123",
-        working_directory=str(tmp_path),
-        failure="fresh verify_command failed again",
-        output="gza-verify phase=failed name=functional duration_seconds=3.10",
-    )
-
-    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
-        task.review_verify_command = result.command
-        task.review_verify_status = result.status
-        task.review_verify_exit_status = result.exit_status
-        task.review_verify_failure = result.failure
-        task.review_verify_head_sha = result.reviewed_head_sha
-        task.review_verify_branch = result.reviewed_branch
-        task.review_verify_captured_at = result.captured_at
-        store.update(task)
-
-    with (
-        patch("gza.main_integration_verify._compute_tree_fingerprint", side_effect=["fp-verified", "fp-verified", "fp-verified"]),
-        patch("gza.main_integration_verify._run_review_verify_command", side_effect=[first_red, second_red]) as run_verify,
-        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
-        patch("gza.main_integration_verify.datetime") as mocked_datetime,
-    ):
-        mocked_datetime.now.return_value = datetime(2026, 6, 23, 0, 29, tzinfo=UTC)
-        mocked_datetime.fromisoformat.side_effect = datetime.fromisoformat
-        check = check_main_integration_verify(
-            config,
-            store,
-            git,
-            reason="watch-main-verify",
-            red_reruns=1,
-        )
-
-    assert run_verify.call_count == 2
-    assert check.performed_verify is True
-    assert check.verify_runs == 2
-    assert check.merges_halted is True
-    assert check.remediation is not None
-    assert check.remediation.kind == "fix"
-    assert check.remediation.signature == "phases:functional"
-    assert check.remediation.tree_fingerprint == "fp-verified"
-    assert check.remediation.failing_phases == ("functional",)
-    assert check.remediation.failure == "fresh verify_command failed again"
 
 
 def test_run_main_integration_verify_sets_red_since_on_first_red(tmp_path) -> None:

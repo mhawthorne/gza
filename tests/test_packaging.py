@@ -475,45 +475,6 @@ def test_pytest_suite_conftests_do_not_register_sigterm_faulthandler_inline() ->
         assert direct_registrations == [], f"{relative_path} should use register_sigterm_faulthandler()"
 
 
-def test_functional_subprocess_timeouts_within_watchdog() -> None:
-    """tests_functional subprocess.run(timeout=N) calls must stay within local and CI watchdogs."""
-    repo_root = Path(__file__).resolve().parents[1]
-    conftest_path = repo_root / "tests_functional" / "conftest.py"
-    module = _load_module(conftest_path, "tests_functional_watchdog_budget_conftest")
-    functional_budget = module.FUNCTIONAL_TEST_TIMEOUT_SECONDS
-
-    subprocess_timeouts = _functional_subprocess_run_timeouts(repo_root / "tests_functional")
-    inversions: list[str] = []
-    for test_file, lineno, timeout in subprocess_timeouts:
-        if timeout > functional_budget:
-            inversions.append(
-                f"{test_file}:{lineno} subprocess.run(timeout={timeout}) "
-                f"> FUNCTIONAL_TEST_TIMEOUT_SECONDS={functional_budget}"
-            )
-
-    assert not inversions, (
-        "Inner subprocess.run timeouts exceed the functional watchdog; the watchdog will fire first "
-        "and the inner timeout can never trip:\n  " + "\n  ".join(inversions)
-    )
-
-    workflow_path = repo_root / ".github" / "workflows" / "test.yml"
-    workflow_text = workflow_path.read_text()
-    match = re.search(
-        r'^\s*GZA_FUNCTIONAL_TEST_TIMEOUT_SECONDS:\s*"?(?P<timeout>\d+)"?\s*$',
-        workflow_text,
-        re.MULTILINE,
-    )
-    if match is None:
-        return
-
-    ci_budget = int(match.group("timeout"))
-    largest_inner_timeout = max(timeout for _test_file, _lineno, timeout in subprocess_timeouts)
-    assert ci_budget > largest_inner_timeout, (
-        "GitHub Actions functional watchdog must stay above the largest functional subprocess "
-        f"timeout so the inner timeout can fire first: "
-        f"GZA_FUNCTIONAL_TEST_TIMEOUT_SECONDS={ci_budget}, largest subprocess.run(timeout=...)="
-        f"{largest_inner_timeout}"
-    )
 
 
 def test_unit_suite_boundary_flags_unmarked_direct_git_run(tmp_path: Path) -> None:

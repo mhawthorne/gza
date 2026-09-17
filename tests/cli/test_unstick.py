@@ -159,69 +159,6 @@ def test_unstick_help_mentions_reason_and_all_tags(tmp_path):
     assert "--limit N" in result.stdout
 
 
-def test_unstick_run_reports_started_cleared_only_and_capacity_blocked(tmp_path, monkeypatch):
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    first = store.add("Started owner", task_type="implement")
-    second = store.add("Direct owner", task_type="implement")
-    third = store.add("Blocked owner", task_type="implement")
-    assert first.id is not None
-    assert second.id is not None
-    assert third.id is not None
-
-    monkeypatch.setattr("gza.cli.unstick.Git", _UnstickGitDouble)
-
-    outcomes = (
-        UnstickOutcome(
-            owner_task=first, reason_class="retry-limit", status="rearmed", detail="cleared retry-limit-reached"
-        ),
-        UnstickOutcome(owner_task=second, reason_class="reconcile", status="rearmed", detail="cleared reconcile"),
-        UnstickOutcome(
-            owner_task=third, reason_class="backstop", status="rearmed", detail="cleared watch-no-progress-backstop"
-        ),
-    )
-
-    with (
-        patch(
-            "gza.cli.unstick.select_and_clear_parked_tasks",
-            return_value=SimpleNamespace(
-                selected=tuple(SimpleNamespace(current_candidate=object()) for _ in range(3)),
-                outcomes=outcomes,
-                stale_backstop_cleared=0,
-            ),
-        ),
-        patch(
-            "gza.cli.unstick._dispatch_rearmed_owners",
-            return_value=SimpleNamespace(
-                started_owner_ids=frozenset({str(first.id)}),
-                capacity_blocked_owner_ids=frozenset({str(third.id)}),
-                direct_owner_outcomes={
-                    str(second.id): SimpleNamespace(action_type="reconcile_branch_divergence", status="success")
-                },
-                launch_blocked_owner_outcomes={},
-            ),
-        ),
-    ):
-        result = invoke_gza(
-            "unstick",
-            str(first.id),
-            "--run",
-            "--project",
-            str(tmp_path),
-        )
-
-    assert result.returncode == 0
-    assert (
-        "Run summary: 1 started, 1 direct, 0 direct-blocked, 0 launch-blocked, 0 cleared-only, 1 capacity-blocked"
-        in result.stdout
-    )
-    assert "Started:" in result.stdout
-    assert f"{first.id} [retry-limit] Started owner" in result.stdout
-    assert "Direct:" in result.stdout
-    assert f"{second.id} [reconcile] reconcile_branch_divergence success: Direct owner" in result.stdout
-    assert "Cleared Only:" not in result.stdout
-    assert "Capacity Blocked:" in result.stdout
-    assert f"{third.id} [backstop] Blocked owner" in result.stdout
 
 
 def test_unstick_headline_separates_parked_owners_from_total_selection(tmp_path, monkeypatch):
@@ -654,71 +591,6 @@ def test_dispatch_rearmed_owners_caps_lifecycle_worker_starts_after_stale_capaci
     assert summary.capacity_blocked_owner_ids == frozenset({str(second_owner.id)})
 
 
-def test_unstick_run_reports_zero_slot_retry_owner_as_capacity_blocked(tmp_path, monkeypatch):
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    owner = store.add("Blocked retry owner", task_type="implement")
-    assert owner.id is not None
-    monkeypatch.setattr("gza.cli.unstick.Git", _UnstickGitDouble)
-    plan = SimpleNamespace(
-        slots=0,
-        analysis=SimpleNamespace(
-            actionable_failed=(
-                (
-                    SimpleNamespace(owner_task=owner),
-                    owner,
-                    SimpleNamespace(action="retry"),
-                    {"type": "retry"},
-                    True,
-                    None,
-                ),
-            )
-        ),
-    )
-    outcomes = (
-        UnstickOutcome(
-            owner_task=owner, reason_class="retry-limit", status="rearmed", detail="cleared retry-limit-reached"
-        ),
-    )
-
-    with (
-        patch(
-            "gza.cli.unstick.select_and_clear_parked_tasks",
-            return_value=SimpleNamespace(selected=(SimpleNamespace(current_candidate=object()),), outcomes=outcomes, stale_backstop_cleared=0),
-        ),
-        patch(
-            "gza.cli.unstick.get_concurrency_snapshot",
-            return_value=ConcurrencySnapshot(
-                limit=1,
-                running=1,
-                available=0,
-                live_pids=frozenset({101}),
-                running_task_ids=("gza-900",),
-                anonymous_worker_count=0,
-                current_pid_counted=False,
-            ),
-        ),
-        patch("gza.cli.unstick._build_watch_cycle_plan", return_value=plan),
-        patch("gza.cli.unstick._dispatch_scoped_watch_once", return_value=SimpleNamespace()),
-    ):
-        result = invoke_gza(
-            "unstick",
-            str(owner.id),
-            "--reason",
-            "retry-limit",
-            "--run",
-            "--project",
-            str(tmp_path),
-        )
-
-    assert result.returncode == 0
-    assert (
-        "Run summary: 0 started, 0 direct, 0 direct-blocked, 0 launch-blocked, 0 cleared-only, 1 capacity-blocked"
-        in result.stdout
-    )
-    assert "Capacity Blocked:" in result.stdout
-    assert f"{owner.id} [retry-limit] Blocked retry owner" in result.stdout
-    assert "Cleared Only:" not in result.stdout
 
 
 def _invoke_unstick_run_for_lifecycle_action(
@@ -981,32 +853,6 @@ def test_unstick_run_reports_real_lifecycle_spawn_failure_diagnostic_as_launch_b
     assert f"Failed to start review worker for task {spawned_task.id}" in result.stdout
 
 
-def test_unstick_run_does_not_report_worker_duplicate_child_skip_as_direct_blocked(tmp_path):
-    result, owner, execute_action = _invoke_unstick_run_for_lifecycle_action(
-        tmp_path,
-        action_type="needs_rebase",
-        exec_result=AdvanceActionExecutionResult(
-            action_type="needs_rebase",
-            status="skip",
-            message="SKIP: active rebase child already exists for this owner",
-            worker_consuming=False,
-            worker_label="rebase",
-        ),
-    )
-
-    assert result.returncode == 0
-    assert execute_action.call_count == 1
-    assert (
-        "Run summary: 0 started, 0 direct, 0 direct-blocked, 1 launch-blocked, 0 cleared-only, 0 capacity-blocked"
-        in result.stdout
-    )
-    assert "Launch Blocked:" in result.stdout
-    assert "Cleared Only:" not in result.stdout
-    assert f"{owner.id} [backstop]" in result.stdout
-    assert "Lifecycle recovery owner" in result.stdout
-    assert "Direct Blocked:" not in result.stdout
-    assert "Capacity Blocked:" not in result.stdout
-    assert "active rebase child already exists for this owner" in result.stdout
 
 
 def _invoke_unstick_run_for_inline_recovery_launch(

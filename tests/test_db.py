@@ -404,58 +404,6 @@ def test_update_downgrades_changed_rebase_boundary_proof_when_stale_backfill_tar
     assert persisted_provenance.changed_diff_boundary_proven is False
 
 
-def test_update_does_not_upgrade_incomplete_changed_rebase_boundary_proof_when_stale_backfill_target_matches(
-    tmp_path: Path,
-) -> None:
-    store = SqliteTaskStore(tmp_path / "test.db")
-    rebase = store.add(
-        "Rebase feature",
-        task_type="rebase",
-        review_scope="custom review scope from stale object",
-    )
-    proven_incomplete_scope = "\n".join(
-        (
-            "Rebase diff provenance: yes",
-            f"Pre-rebase head SHA: {'a' * 40}",
-            f"Pre-rebase target SHA: {'b' * 40}",
-            f"Pre-rebase merge-base SHA: {'c' * 40}",
-            "Resolved head SHA:",
-            "Resolved target SHA:",
-            "Recovered baseline: no",
-            "Changed-diff boundary proven: yes",
-        )
-    )
-    rebase.review_scope = proven_incomplete_scope
-    store.mark_completed(
-        rebase,
-        has_commits=False,
-        changed_diff=True,
-    )
-
-    stale_rebase = Task(**rebase.__dict__)
-    stale_rebase.review_scope = build_rebase_diff_provenance(
-        baseline=RebaseDiffBaseline(
-            old_tip="a" * 40,
-            target_at_start="b" * 40,
-            merge_base_at_start="c" * 40,
-            recovered=False,
-        ),
-        resolved_head_sha="d" * 40,
-        resolved_target_sha="b" * 40,
-        changed_diff_boundary_proven=False,
-    )
-    store.update(stale_rebase)
-
-    persisted = store.get(rebase.id)
-    assert persisted is not None
-    persisted_provenance = parse_rebase_diff_provenance(persisted.review_scope)
-    assert persisted_provenance is not None
-    assert persisted_provenance.old_tip == "a" * 40
-    assert persisted_provenance.target_at_start == "b" * 40
-    assert persisted_provenance.merge_base_at_start == "c" * 40
-    assert persisted_provenance.resolved_head_sha == "d" * 40
-    assert persisted_provenance.resolved_target_sha == "b" * 40
-    assert persisted_provenance.changed_diff_boundary_proven is False
 
 
 def test_behavior_check_fingerprint_ignores_line_number_churn() -> None:
@@ -2833,79 +2781,6 @@ This plan outlines the implementation of a JWT-based authentication system.
         retrieved = store.get(task.id)
         assert retrieved.output_content is None
 
-    def test_migration_from_v3_to_v4(self, tmp_path: Path):
-        """Test that migration from v3 to v4 adds output_content column."""
-        import sqlite3
-
-        db_path = tmp_path / "test.db"
-
-        # Create a v3 database manually (without output_content)
-        conn = sqlite3.connect(db_path)
-        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
-        conn.execute("INSERT INTO schema_version (version) VALUES (3)")
-        conn.execute("""
-            CREATE TABLE tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                task_type TEXT NOT NULL DEFAULT 'task',
-                task_id TEXT,
-                branch TEXT,
-                log_file TEXT,
-                report_file TEXT,
-                based_on INTEGER REFERENCES tasks(id),
-                has_commits INTEGER,
-                duration_seconds REAL,
-                num_turns INTEGER,
-                cost_usd REAL,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT,
-                "group" TEXT,
-                depends_on INTEGER REFERENCES tasks(id),
-                spec TEXT,
-                create_review INTEGER DEFAULT 0,
-                same_branch INTEGER DEFAULT 0
-            )
-        """)
-
-        # Insert a test task
-        now = datetime.now(UTC).isoformat()
-        conn.execute(
-            "INSERT INTO tasks (prompt, task_type, created_at) VALUES (?, ?, ?)",
-            ("Old task", "plan", now),
-        )
-        conn.commit()
-        conn.close()
-
-        # Open with SqliteTaskStore - auto-migrates up to v24, then manual v25
-        with pytest.raises(ManualMigrationRequired):
-            SqliteTaskStore(db_path)
-        _run_v25_v26_v27_migrations(db_path, "gza")
-        store = SqliteTaskStore(db_path)
-
-        # Check schema version
-        conn = sqlite3.connect(db_path)
-        cur = conn.execute("SELECT version FROM schema_version")
-        version = cur.fetchone()[0]
-        conn.close()
-        assert version == SCHEMA_VERSION
-
-        # Verify old task can be retrieved (with NULL output_content)
-        task = store.get("gza-1")
-        assert task is not None
-        assert task.output_content is None
-
-        # Create new task with output_content
-        new_task = store.add(prompt="New task", task_type="plan")
-        store.mark_completed(
-            new_task,
-            output_content="This is the plan content",
-            has_commits=False,
-        )
-
-        retrieved = store.get(new_task.id)
-        assert retrieved.output_content == "This is the plan content"
 
 
 class TestTaskResume:
@@ -3056,86 +2931,6 @@ class TestNumTurnsFields:
         stats = store.get_stats()
         assert stats["total_steps"] == 16
 
-    def test_migration_v7_to_v8_adds_columns(self, tmp_path: Path):
-        """Test that migration from v7 to v8 adds num_turns_reported and num_turns_computed."""
-        import sqlite3
-        from datetime import datetime
-
-        db_path = tmp_path / "test.db"
-
-        # Create a v7 database manually (without the new columns)
-        conn = sqlite3.connect(db_path)
-        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
-        conn.execute("INSERT INTO schema_version (version) VALUES (7)")
-        conn.execute("""
-            CREATE TABLE tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                task_type TEXT NOT NULL DEFAULT 'task',
-                task_id TEXT,
-                branch TEXT,
-                log_file TEXT,
-                report_file TEXT,
-                based_on INTEGER REFERENCES tasks(id),
-                has_commits INTEGER,
-                duration_seconds REAL,
-                num_turns INTEGER,
-                cost_usd REAL,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT,
-                "group" TEXT,
-                depends_on INTEGER REFERENCES tasks(id),
-                spec TEXT,
-                create_review INTEGER DEFAULT 0,
-                same_branch INTEGER DEFAULT 0,
-                task_type_hint TEXT,
-                output_content TEXT,
-                session_id TEXT,
-                pr_number INTEGER,
-                model TEXT,
-                provider TEXT
-            )
-        """)
-
-        now = datetime.now(UTC).isoformat()
-        conn.execute(
-            "INSERT INTO tasks (prompt, status, created_at, num_turns) VALUES (?, ?, ?, ?)",
-            ("Old task with turns", "completed", now, 15),
-        )
-        conn.commit()
-        conn.close()
-
-        # Open with SqliteTaskStore to trigger auto-migrations, then manual v25
-        with pytest.raises(ManualMigrationRequired):
-            SqliteTaskStore(db_path)
-        _run_v25_v26_v27_migrations(db_path, "gza")
-        store = SqliteTaskStore(db_path)
-
-        # Check schema version updated
-        conn = sqlite3.connect(db_path)
-        cur = conn.execute("SELECT version FROM schema_version")
-        version = cur.fetchone()[0]
-        conn.close()
-        assert version == SCHEMA_VERSION
-
-        # Verify old task migrated: num_turns_reported populated from num_turns
-        task = store.get("gza-1")
-        assert task is not None
-        assert task.num_turns_reported == 15
-        assert task.num_turns_computed is None
-
-        # Verify new tasks can store both fields
-        new_task = store.add(prompt="New task")
-        from gza.db import TaskStats
-        store.mark_completed(new_task, has_commits=False, stats=TaskStats(
-            num_turns_reported=3,
-            num_turns_computed=2,
-        ))
-        retrieved = store.get(new_task.id)
-        assert retrieved.num_turns_reported == 3
-        assert retrieved.num_turns_computed == 2
 
 
 class TestTokenCountFields:
@@ -3242,89 +3037,6 @@ class TestTokenCountFields:
         assert stats["total_input_tokens"] == 0
         assert stats["total_output_tokens"] == 0
 
-    def test_migration_v8_to_v9_adds_token_columns(self, tmp_path: Path):
-        """Test that migration from v8 to v9 adds input_tokens and output_tokens columns."""
-        import sqlite3
-        from datetime import datetime
-
-        db_path = tmp_path / "test.db"
-
-        # Create a v8 database manually (without the token count columns)
-        conn = sqlite3.connect(db_path)
-        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
-        conn.execute("INSERT INTO schema_version (version) VALUES (8)")
-        conn.execute("""
-            CREATE TABLE tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                task_type TEXT NOT NULL DEFAULT 'task',
-                task_id TEXT,
-                branch TEXT,
-                log_file TEXT,
-                report_file TEXT,
-                based_on INTEGER REFERENCES tasks(id),
-                has_commits INTEGER,
-                duration_seconds REAL,
-                num_turns INTEGER,
-                num_turns_reported INTEGER,
-                num_turns_computed INTEGER,
-                cost_usd REAL,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT,
-                "group" TEXT,
-                depends_on INTEGER REFERENCES tasks(id),
-                spec TEXT,
-                create_review INTEGER DEFAULT 0,
-                same_branch INTEGER DEFAULT 0,
-                task_type_hint TEXT,
-                output_content TEXT,
-                session_id TEXT,
-                pr_number INTEGER,
-                model TEXT,
-                provider TEXT
-            )
-        """)
-
-        now = datetime.now(UTC).isoformat()
-        conn.execute(
-            "INSERT INTO tasks (prompt, status, created_at, cost_usd) VALUES (?, ?, ?, ?)",
-            ("Old task", "completed", now, 0.05),
-        )
-        conn.commit()
-        conn.close()
-
-        # Open with SqliteTaskStore to trigger auto-migrations, then manual v25
-        with pytest.raises(ManualMigrationRequired):
-            SqliteTaskStore(db_path)
-        _run_v25_v26_v27_migrations(db_path, "gza")
-        store = SqliteTaskStore(db_path)
-
-        # Check schema version updated
-        conn = sqlite3.connect(db_path)
-        cur = conn.execute("SELECT version FROM schema_version")
-        version = cur.fetchone()[0]
-        conn.close()
-        assert version == SCHEMA_VERSION
-
-        # Verify old task can be retrieved with NULL token counts
-        task = store.get("gza-1")
-        assert task is not None
-        assert task.input_tokens is None
-        assert task.output_tokens is None
-
-        # Verify new tasks can store token counts
-        from gza.db import TaskStats
-        new_task = store.add(prompt="New task")
-        store.mark_completed(new_task, has_commits=False, stats=TaskStats(
-            input_tokens=10000,
-            output_tokens=5000,
-            cost_usd=0.10,
-        ))
-        retrieved = store.get(new_task.id)
-        assert retrieved.input_tokens == 10000
-        assert retrieved.output_tokens == 5000
 
 
 class TestGetReviewsForTask:
@@ -4079,81 +3791,8 @@ class TestMergeStatus:
         assert retrieved is not None
         assert retrieved.merge_status is None
 
-    def test_mark_completed_with_commits_sets_unmerged(self, tmp_path: Path):
-        """mark_completed with has_commits=True sets merge_status='unmerged'."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
 
-        task = store.add(prompt="Test task")
-        store.mark_completed(
-            task,
-            has_commits=True,
-            branch="feature/test",
-            head_sha="abc123",
-            base_sha="def456",
-        )
 
-        retrieved = store.get(task.id)
-        assert retrieved is not None
-        assert retrieved.merge_status == "unmerged"
-        assert retrieved.has_commits is True
-        unit = store.resolve_merge_unit_for_task(task.id)
-        assert unit is not None
-        assert unit.source_branch == "feature/test"
-        assert unit.target_branch == "main"
-        assert unit.state == "unmerged"
-        assert unit.head_sha == "abc123"
-        assert unit.base_sha == "def456"
-
-    def test_refresh_merge_unit_head_preserves_omitted_sha_and_allows_explicit_clear(self, tmp_path: Path) -> None:
-        """Merge-unit SHA updates should be patch-like unless callers explicitly clear a field."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        task = store.add(prompt="Test task")
-        store.mark_completed(
-            task,
-            has_commits=True,
-            branch="feature/test",
-            head_sha="abc123",
-            base_sha="def456",
-        )
-        assert task.id is not None
-        unit = store.resolve_merge_unit_for_task(task.id)
-        assert unit is not None
-
-        store.refresh_merge_unit_head(unit.id, "head456", DB_UNSET)
-        refreshed = store.get_merge_unit(unit.id)
-        assert refreshed is not None
-        assert refreshed.head_sha == "head456"
-        assert refreshed.base_sha == "def456"
-
-        store.refresh_merge_unit_head(unit.id, DB_UNSET, None)
-        cleared = store.get_merge_unit(unit.id)
-        assert cleared is not None
-        assert cleared.head_sha == "head456"
-        assert cleared.base_sha is None
-
-    def test_mark_completed_explore_with_commits_owns_unit_and_is_unmerged(self, tmp_path: Path) -> None:
-        """Explore tasks with commits should own merge state and appear in unmerged views."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        task = store.add(prompt="Explore merge behavior", task_type="explore")
-        store.mark_completed(task, has_commits=True, branch="feature/explore-merge")
-
-        retrieved = store.get(task.id)
-        assert retrieved is not None
-        assert retrieved.merge_status == "unmerged"
-        assert retrieved.has_commits is True
-
-        unit = store.resolve_merge_unit_for_task(task.id)
-        assert unit is not None
-        assert unit.owner_task_id == task.id
-        assert unit.source_branch == "feature/explore-merge"
-        assert unit.state == "unmerged"
-
-        assert [candidate.id for candidate in store.get_unmerged()] == [task.id]
 
     def test_mark_completed_same_branch_improve_keeps_merge_status_on_owner_only(self, tmp_path: Path):
         """Completed same-branch improve rows should not own merge state."""
@@ -4182,88 +3821,14 @@ class TestMergeStatus:
         assert retrieved.merge_status is None
         assert retrieved.has_commits is False
 
-    def test_set_merge_status_updates_field(self, tmp_path: Path):
-        """set_merge_status correctly updates the merge_status field."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        task = store.add(prompt="Test task")
-        store.mark_completed(task, has_commits=True, branch="feature/test")
-
-        # Verify initial state
-        retrieved = store.get(task.id)
-        assert retrieved.merge_status == "unmerged"
-
-        # Update to merged
-        store.set_merge_status(task.id, "merged")
-
-        retrieved = store.get(task.id)
-        assert retrieved.merge_status == "merged"
-
-    def test_set_merge_status_to_none(self, tmp_path: Path):
-        """set_merge_status can set merge_status back to None."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        task = store.add(prompt="Test task")
-        store.mark_completed(task, has_commits=True, branch="feature/test")
-        store.set_merge_status(task.id, None)
-
-        retrieved = store.get(task.id)
-        assert retrieved.merge_status is None
-
-    def test_set_merge_status_to_none_does_not_flip_unit_to_stale(self, tmp_path: Path) -> None:
-        """Legacy None clears the task row without mutating canonical unit state."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        task = store.add(prompt="Test task")
-        store.mark_completed(task, has_commits=True, branch="feature/test")
-        assert task.id is not None
-
-        before = store.resolve_merge_unit_for_task(task.id)
-        assert before is not None
-        assert before.state == "unmerged"
-
-        store.set_merge_status(task.id, None)
-
-        retrieved = store.get(task.id)
-        assert retrieved is not None
-        assert retrieved.merge_status is None
-
-        after = store.resolve_merge_unit_for_task(task.id)
-        assert after is not None
-        assert after.state == "unmerged"
-
-
-    def test_get_unmerged_excludes_merged_tasks(self, tmp_path: Path):
-        """get_unmerged does not return tasks with merge_status='merged'."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        task = store.add(prompt="Test task")
-        store.mark_completed(task, has_commits=True, branch="feature/test")
-        store.set_merge_status(task.id, "merged")
-
-        unmerged = store.get_unmerged()
-        assert len(unmerged) == 0
 
 
 
 
-    def test_needs_merge_status_migration_is_disabled_when_merge_units_are_available(self, tmp_path: Path):
-        """Merge-unit-backed stores no longer report legacy merge-status migration work."""
-        from gza.db import needs_merge_status_migration
 
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
 
-        impl_task = store.add(prompt="Legacy implement", task_type="implement")
-        store.mark_completed(impl_task, has_commits=True, branch="feature/impl")
-        assert impl_task.id is not None
-        store.set_merge_status(impl_task.id, None)
 
-        assert needs_merge_status_migration(store) is False
+
 
     def test_same_branch_followups_share_one_merge_unit(self, tmp_path: Path) -> None:
         """Same-branch improve/verify_fix/fix/review rows attach to the existing merge unit."""
@@ -4338,31 +3903,6 @@ class TestMergeStatus:
         assert {member.id for member in store.list_tasks_for_merge_unit(unit.id)} == {task.id}
 
 
-    def test_default_target_branch_apis_use_store_default_merge_target_not_main(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Store-level merge-unit writes and reads should honor the configured default target."""
-        store = SqliteTaskStore(tmp_path / "test.db")
-        monkeypatch.setattr(store, "default_merge_target", lambda *, strict=False: "trunk")
-
-        task = store.add(prompt="Implement feature", task_type="implement")
-        store.mark_completed(task, has_commits=True, branch="feature/trunk-target")
-
-        assert task.id is not None
-        trunk_unit = store.resolve_merge_unit_for_task(task.id)
-        assert trunk_unit is not None
-        assert trunk_unit.target_branch == "trunk"
-        assert [candidate.id for candidate in store.get_unmerged()] == [task.id]
-
-        store.set_merge_status(task.id, "merged")
-
-        refreshed_trunk_unit = store.resolve_merge_unit_for_task(task.id)
-        assert refreshed_trunk_unit is not None
-        assert refreshed_trunk_unit.state == "merged"
-        assert refreshed_trunk_unit.target_branch == "trunk"
-        assert store.get_unmerged() == []
 
 
 
@@ -4517,58 +4057,7 @@ class TestMergeStatus:
         with pytest.raises(ValueError, match="merged_by_task_id must equal merge-unit owner"):
             store.set_merge_unit_state(impl_unit.id, "merged", merged_by_task_id=improve.id)
 
-    def test_set_merge_unit_state_clears_provenance_for_unmerged_state(self, tmp_path: Path) -> None:
-        """Unmerged states must not retain merged provenance on the unit or owner projection."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
 
-        impl = store.add(prompt="Implement feature", task_type="implement")
-        store.mark_completed(impl, has_commits=True, branch="feature/remerge")
-        assert impl.id is not None
-        impl_unit = store.resolve_merge_unit_for_task(impl.id)
-        assert impl_unit is not None
-
-        store.set_merge_unit_state(impl_unit.id, "merged")
-        store.set_merge_unit_state(impl_unit.id, "unmerged")
-
-        unmerged_unit = store.get_merge_unit(impl_unit.id)
-        assert unmerged_unit is not None
-        assert unmerged_unit.state == "unmerged"
-        assert unmerged_unit.merged_at is None
-        assert unmerged_unit.merged_by_task_id is None
-
-        unmerged_impl = store.get(impl.id)
-        assert unmerged_impl is not None
-        assert unmerged_impl.merge_status == "unmerged"
-        assert unmerged_impl.merged_at is None
-
-    def test_set_merge_unit_state_empty_clears_provenance_and_hides_actionable_listing(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        impl = store.add(prompt="Implement feature", task_type="implement")
-        store.mark_completed(impl, has_commits=True, branch="feature/empty-state")
-        assert impl.id is not None
-        impl_unit = store.resolve_merge_unit_for_task(impl.id)
-        assert impl_unit is not None
-
-        store.set_merge_unit_state(impl_unit.id, "merged")
-        store.set_merge_unit_state(impl_unit.id, "empty")
-
-        empty_unit = store.get_merge_unit(impl_unit.id)
-        assert empty_unit is not None
-        assert empty_unit.state == "empty"
-        assert empty_unit.merged_at is None
-        assert empty_unit.merged_by_task_id is None
-        assert store.get_unmerged_merge_units() == []
-
-        empty_impl = store.get(impl.id)
-        assert empty_impl is not None
-        assert empty_impl.merge_status is None
-        assert empty_impl.merged_at is None
 
     def test_set_merge_unit_state_rejects_explicit_provenance_for_non_merged_states(
         self,
@@ -4614,79 +4103,8 @@ class TestMergeStatus:
         assert refreshed is not None
         assert refreshed.merge_source == merge_source
 
-    def test_set_merge_unit_state_sets_merged_state_and_provenance_together(self, tmp_path: Path) -> None:
-        """Merged writes should stamp owner provenance and merged_at in one state change."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
 
-        impl = store.add(prompt="Implement feature", task_type="implement")
-        store.mark_completed(impl, has_commits=True, branch="feature/remerge")
-        assert impl.id is not None
-        impl_unit = store.resolve_merge_unit_for_task(impl.id)
-        assert impl_unit is not None
 
-        store.set_merge_unit_state(impl_unit.id, "merged", merge_source="manual")
-
-        merged_unit = store.get_merge_unit(impl_unit.id)
-        assert merged_unit is not None
-        assert merged_unit.state == "merged"
-        assert merged_unit.merged_at is not None
-        assert merged_unit.merged_by_task_id == impl.id
-        assert merged_unit.merge_source == "manual"
-
-        merged_impl = store.get(impl.id)
-        assert merged_impl is not None
-        assert merged_impl.merge_status == "merged"
-        assert merged_impl.merged_at == merged_unit.merged_at
-
-    def test_set_merge_unit_state_round_trips_max_cycles_deferred_source(self, tmp_path: Path) -> None:
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        impl = store.add(prompt="Implement capped review feature", task_type="implement")
-        store.mark_completed(impl, has_commits=True, branch="feature/max-cycles")
-        assert impl.id is not None
-        impl_unit = store.resolve_merge_unit_for_task(impl.id)
-        assert impl_unit is not None
-
-        store.set_merge_unit_state(
-            impl_unit.id,
-            "merged",
-            merge_source=MERGE_SOURCE_MAX_CYCLES_DEFERRED,
-        )
-
-        reopened = SqliteTaskStore(db_path)
-        merged_unit = reopened.get_merge_unit(impl_unit.id)
-        assert merged_unit is not None
-        assert merged_unit.merge_source == MERGE_SOURCE_MAX_CYCLES_DEFERRED
-
-        filtered_units = reopened.list_merged_units(source=MERGE_SOURCE_MAX_CYCLES_DEFERRED)
-        assert [unit.id for unit in filtered_units] == [impl_unit.id]
-
-    def test_drop_active_merge_units_owned_by_tombstones_owned_actionable_unit(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        impl = store.add(prompt="Implement feature", task_type="implement")
-        store.mark_completed(impl, has_commits=True, branch="feature/drop-owner")
-        assert impl.id is not None
-        impl_unit = store.resolve_merge_unit_for_task(impl.id)
-        assert impl_unit is not None
-        assert impl_unit.state == "unmerged"
-        assert [unit.id for unit in store.get_unmerged_merge_units()] == [impl_unit.id]
-
-        dropped = store.drop_active_merge_units_owned_by(impl.id)
-
-        assert [unit.id for unit in dropped] == [impl_unit.id]
-        tombstoned = store.get_merge_unit(impl_unit.id)
-        assert tombstoned is not None
-        assert tombstoned.state == "dropped"
-        assert tombstoned.merged_at is None
-        assert tombstoned.merged_by_task_id is None
-        assert store.get_unmerged_merge_units() == []
 
     def test_drop_active_merge_units_owned_by_ignores_units_task_does_not_own(
         self,
@@ -4712,51 +4130,7 @@ class TestMergeStatus:
         assert untouched.state == "unmerged"
         assert [u.id for u in store.get_unmerged_merge_units()] == [unit.id]
 
-    def test_drop_active_merge_units_owned_by_leaves_landed_units_alone(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
 
-        impl = store.add(prompt="Implement feature", task_type="implement")
-        store.mark_completed(impl, has_commits=True, branch="feature/drop-landed")
-        assert impl.id is not None
-        impl_unit = store.resolve_merge_unit_for_task(impl.id)
-        assert impl_unit is not None
-        store.set_merge_unit_state(impl_unit.id, "merged", merge_source="manual")
-
-        dropped = store.drop_active_merge_units_owned_by(impl.id)
-
-        assert dropped == []
-        landed = store.get_merge_unit(impl_unit.id)
-        assert landed is not None
-        assert landed.state == "merged"
-
-    def test_set_merge_unit_state_clears_max_cycles_deferred_source_for_non_merged_state(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        impl = store.add(prompt="Implement capped review feature", task_type="implement")
-        store.mark_completed(impl, has_commits=True, branch="feature/max-cycles-clear")
-        assert impl.id is not None
-        impl_unit = store.resolve_merge_unit_for_task(impl.id)
-        assert impl_unit is not None
-
-        store.set_merge_unit_state(
-            impl_unit.id,
-            "merged",
-            merge_source=MERGE_SOURCE_MAX_CYCLES_DEFERRED,
-        )
-        store.set_merge_unit_state(impl_unit.id, "unmerged")
-
-        unmerged_unit = store.get_merge_unit(impl_unit.id)
-        assert unmerged_unit is not None
-        assert unmerged_unit.state == "unmerged"
-        assert unmerged_unit.merge_source is None
 
     def test_list_merged_units_filters_by_source_and_window(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"
@@ -4795,116 +4169,10 @@ class TestMergeStatus:
         )
         assert [unit.id for unit in units] == [manual_unit.id]
 
-    def test_set_merge_unit_state_preserves_unrelated_task_fields(self, tmp_path: Path) -> None:
-        """Dual-write merge projection should not rewrite unrelated task columns."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        impl = store.add(prompt="Implement feature", task_type="implement")
-        impl.slug = "20260531-merge-projection"
-        impl.output_content = "kept"
-        store.mark_completed(impl, has_commits=True, branch="feature/remerge")
-        store.update(impl)
-        assert impl.id is not None
-
-        impl_unit = store.resolve_merge_unit_for_task(impl.id)
-        assert impl_unit is not None
-
-        synced_at = datetime.now(UTC).replace(microsecond=0)
-        store.set_merge_unit_state(
-            impl_unit.id,
-            "merged",
-            merged_by_task_id=impl.id,
-            pr_number=42,
-            pr_state="open",
-            pr_last_synced_at=synced_at,
-            sync_last_synced_at=synced_at,
-            diff_stats=(3, 10, 2),
-        )
-
-        refreshed = store.get(impl.id)
-        assert refreshed is not None
-        assert refreshed.prompt == "Implement feature"
-        assert refreshed.status == "completed"
-        assert refreshed.slug == "20260531-merge-projection"
-        assert refreshed.output_content == "kept"
-        assert refreshed.merge_status == "merged"
-        assert refreshed.pr_number == 42
-        assert refreshed.pr_state == "open"
-
-    def test_set_merge_unit_state_public_db_unset_preserves_existing_optional_fields(
-        self, tmp_path: Path
-    ) -> None:
-        """Public DB_UNSET should leave merge-unit optional fields untouched."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        impl = store.add(prompt="Implement feature", task_type="implement")
-        store.mark_completed(impl, has_commits=True, branch="feature/db-unset")
-        assert impl.id is not None
-        impl_unit = store.resolve_merge_unit_for_task(impl.id)
-        assert impl_unit is not None
-
-        synced_at = datetime.now(UTC).replace(microsecond=0)
-        store.set_merge_unit_state(
-            impl_unit.id,
-            "merged",
-            merged_by_task_id=impl.id,
-            pr_number=42,
-            pr_state="open",
-            pr_last_synced_at=synced_at,
-            sync_last_synced_at=synced_at,
-        )
-
-        store.set_merge_unit_state(
-            impl_unit.id,
-            "merged",
-            merged_by_task_id=DB_UNSET,
-            pr_number=DB_UNSET,
-            pr_state=DB_UNSET,
-            pr_last_synced_at=DB_UNSET,
-            sync_last_synced_at=DB_UNSET,
-        )
-
-        refreshed_unit = store.get_merge_unit(impl_unit.id)
-        assert refreshed_unit is not None
-        assert refreshed_unit.merged_by_task_id == impl.id
-        assert refreshed_unit.pr_number == 42
-        assert refreshed_unit.pr_state == "open"
-        assert refreshed_unit.pr_last_synced_at == synced_at
-        assert refreshed_unit.sync_last_synced_at == synced_at
 
 
 
-    def test_store_open_repairs_inconsistent_empty_merge_unit_provenance(self, tmp_path: Path) -> None:
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
 
-        impl = store.add(prompt="Repair empty provenance", task_type="implement")
-        store.mark_completed(impl, has_commits=True, branch="feature/open-repair-empty")
-        assert impl.id is not None
-        impl_unit = store.resolve_merge_unit_for_task(impl.id)
-        assert impl_unit is not None
-
-        now_iso = datetime.now(UTC).isoformat()
-        with store._connect() as conn:
-            conn.execute(
-                """
-                UPDATE merge_units
-                SET state = 'empty',
-                    merged_at = ?,
-                    merged_by_task_id = ?
-                WHERE project_id = ? AND id = ?
-                """,
-                (now_iso, impl.id, store._project_id, impl_unit.id),
-            )
-
-        reopened = SqliteTaskStore(db_path)
-        repaired_unit = reopened.get_merge_unit(impl_unit.id)
-        assert repaired_unit is not None
-        assert repaired_unit.state == "empty"
-        assert repaired_unit.merged_at is None
-        assert repaired_unit.merged_by_task_id is None
 
 
     def test_migrate_merge_status_logs_when_remote_probe_fails(self, tmp_path: Path, caplog: pytest.LogCaptureFixture):
@@ -5573,40 +4841,6 @@ class TestFailureReasonTracking:
         assert retrieved is not None
         assert retrieved.changed_diff is True
 
-    def test_mark_completed_persists_branch_backed_empty_merge_unit_for_no_commit_completion(
-        self, tmp_path: Path
-    ) -> None:
-        """Completed branch-backed no-op tasks should still persist authoritative empty merge state."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        task = store.add(prompt="No-op task", task_type="implement")
-        assert task.id is not None
-
-        store.mark_completed(
-            task,
-            has_commits=False,
-            branch="feature/verified-empty-noop",
-            head_sha="deadbeef",
-            base_sha="cafebabe",
-            completion_reason="VERIFIED_EMPTY_NOOP",
-            terminal_merge_state="empty",
-        )
-
-        retrieved = store.get(task.id)
-        assert retrieved is not None
-        assert retrieved.status == "completed"
-        assert retrieved.has_commits is False
-        assert retrieved.completion_reason == "VERIFIED_EMPTY_NOOP"
-        assert retrieved.merge_status is None
-
-        unit = store.resolve_merge_unit_for_task(task.id)
-        assert unit is not None
-        assert unit.source_branch == "feature/verified-empty-noop"
-        assert unit.target_branch == "main"
-        assert unit.state == "empty"
-        assert unit.head_sha == "deadbeef"
-        assert unit.base_sha == "cafebabe"
 
     def test_mark_failed_clears_completion_reason(self, tmp_path: Path):
         """mark_failed clears any prior completion_reason."""
@@ -5859,89 +5093,6 @@ class TestFailureReasonTracking:
         assert retrieved is not None
         assert retrieved.drop_reason is None
 
-    def test_migration_v10_to_v11_adds_failure_reason_column(self, tmp_path: Path):
-        """Migration from v10 to v11 adds failure_reason column and backfills failed tasks."""
-        import sqlite3
-
-        db_path = tmp_path / "test.db"
-
-        # Create a v10 database manually (without failure_reason column)
-        conn = sqlite3.connect(db_path)
-        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
-        conn.execute("INSERT INTO schema_version (version) VALUES (10)")
-        conn.execute("""
-            CREATE TABLE tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                task_type TEXT NOT NULL DEFAULT 'task',
-                task_id TEXT,
-                branch TEXT,
-                log_file TEXT,
-                report_file TEXT,
-                based_on INTEGER REFERENCES tasks(id),
-                has_commits INTEGER,
-                duration_seconds REAL,
-                num_turns INTEGER,
-                num_turns_reported INTEGER,
-                num_turns_computed INTEGER,
-                cost_usd REAL,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT,
-                "group" TEXT,
-                depends_on INTEGER REFERENCES tasks(id),
-                spec TEXT,
-                create_review INTEGER DEFAULT 0,
-                same_branch INTEGER DEFAULT 0,
-                task_type_hint TEXT,
-                output_content TEXT,
-                session_id TEXT,
-                pr_number INTEGER,
-                model TEXT,
-                provider TEXT,
-                input_tokens INTEGER,
-                output_tokens INTEGER,
-                merge_status TEXT
-            )
-        """)
-
-        now = datetime.now(UTC).isoformat()
-        conn.execute(
-            "INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)",
-            ("Failed task", "failed", now),
-        )
-        conn.execute(
-            "INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)",
-            ("Pending task", "pending", now),
-        )
-        conn.commit()
-        conn.close()
-
-        # Open with SqliteTaskStore to trigger auto-migrations, then manual v25
-        with pytest.raises(ManualMigrationRequired):
-            SqliteTaskStore(db_path)
-        _run_v25_v26_v27_migrations(db_path, "gza")
-        store = SqliteTaskStore(db_path)
-
-        # Check schema version updated
-        conn = sqlite3.connect(db_path)
-        cur = conn.execute("SELECT version FROM schema_version")
-        version = cur.fetchone()[0]
-        conn.close()
-        assert version == SCHEMA_VERSION
-
-        # Verify existing failed task was backfilled with 'UNKNOWN'
-        failed_task = store.get("gza-1")
-        assert failed_task is not None
-        assert failed_task.status == "failed"
-        assert failed_task.failure_reason == "UNKNOWN"
-
-        # Verify pending task was NOT backfilled
-        pending_task = store.get("gza-2")
-        assert pending_task is not None
-        assert pending_task.status == "pending"
-        assert pending_task.failure_reason is None
 
     def test_migration_v39_to_v40_adds_completion_reason_column(self, tmp_path: Path):
         """Migration from v39 to v40 adds completion_reason column."""
@@ -6561,172 +5712,11 @@ class TestDiffStats:
         assert retrieved.diff_lines_added is None
         assert retrieved.diff_lines_removed is None
 
-    def test_migration_v11_to_v12_adds_diff_columns(self, tmp_path: Path):
-        """Migration from v11 to v12 adds diff stat columns."""
-        import sqlite3
-        from datetime import datetime
-
-        db_path = tmp_path / "test.db"
-
-        # Create a v11 database (without diff stat columns)
-        conn = sqlite3.connect(db_path)
-        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
-        conn.execute("INSERT INTO schema_version (version) VALUES (11)")
-        conn.execute("""
-            CREATE TABLE tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                task_type TEXT NOT NULL DEFAULT 'task',
-                task_id TEXT,
-                branch TEXT,
-                log_file TEXT,
-                report_file TEXT,
-                based_on INTEGER REFERENCES tasks(id),
-                has_commits INTEGER,
-                duration_seconds REAL,
-                num_turns INTEGER,
-                num_turns_reported INTEGER,
-                num_turns_computed INTEGER,
-                cost_usd REAL,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT,
-                "group" TEXT,
-                depends_on INTEGER REFERENCES tasks(id),
-                spec TEXT,
-                create_review INTEGER DEFAULT 0,
-                same_branch INTEGER DEFAULT 0,
-                task_type_hint TEXT,
-                output_content TEXT,
-                session_id TEXT,
-                pr_number INTEGER,
-                model TEXT,
-                provider TEXT,
-                input_tokens INTEGER,
-                output_tokens INTEGER,
-                merge_status TEXT,
-                failure_reason TEXT
-            )
-        """)
-        now = datetime.now(UTC).isoformat()
-        conn.execute(
-            "INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)",
-            ("Existing task", "completed", now),
-        )
-        conn.commit()
-        conn.close()
-
-        # Open with SqliteTaskStore to trigger auto-migrations, then manual v25
-        with pytest.raises(ManualMigrationRequired):
-            SqliteTaskStore(db_path)
-        _run_v25_v26_v27_migrations(db_path, "gza")
-        store = SqliteTaskStore(db_path)
-
-        # Check schema version updated
-        conn = sqlite3.connect(db_path)
-        cur = conn.execute("SELECT version FROM schema_version")
-        version = cur.fetchone()[0]
-        conn.close()
-        assert version == SCHEMA_VERSION
-
-        # Verify existing task has NULL diff stats
-        task = store.get("gza-1")
-        assert task is not None
-        assert task.diff_files_changed is None
-        assert task.diff_lines_added is None
-        assert task.diff_lines_removed is None
 
 
 class TestReviewClearedAt:
     """Tests for review_cleared_at field and clear_review_state (schema v14)."""
 
-    def test_migration_v13_to_v14_adds_review_cleared_at_column(self, tmp_path: Path):
-        """Migration from v13 to v14 adds review_cleared_at column."""
-        import sqlite3
-
-        db_path = tmp_path / "test.db"
-
-        # Create a v13 database manually (without review_cleared_at column)
-        conn = sqlite3.connect(db_path)
-        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
-        conn.execute("INSERT INTO schema_version (version) VALUES (13)")
-        conn.execute("""
-            CREATE TABLE tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                task_type TEXT NOT NULL DEFAULT 'task',
-                task_id TEXT,
-                branch TEXT,
-                log_file TEXT,
-                report_file TEXT,
-                based_on INTEGER REFERENCES tasks(id),
-                has_commits INTEGER,
-                duration_seconds REAL,
-                num_turns INTEGER,
-                num_turns_reported INTEGER,
-                num_turns_computed INTEGER,
-                cost_usd REAL,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT,
-                "group" TEXT,
-                depends_on INTEGER REFERENCES tasks(id),
-                spec TEXT,
-                create_review INTEGER DEFAULT 0,
-                same_branch INTEGER DEFAULT 0,
-                task_type_hint TEXT,
-                output_content TEXT,
-                session_id TEXT,
-                pr_number INTEGER,
-                model TEXT,
-                provider TEXT,
-                input_tokens INTEGER,
-                output_tokens INTEGER,
-                merge_status TEXT,
-                failure_reason TEXT,
-                skip_learnings INTEGER DEFAULT 0,
-                diff_files_changed INTEGER,
-                diff_lines_added INTEGER,
-                diff_lines_removed INTEGER
-            )
-        """)
-        now = datetime.now(UTC).isoformat()
-        conn.execute(
-            "INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)",
-            ("Existing task", "completed", now),
-        )
-        conn.commit()
-        conn.close()
-
-        # Open with SqliteTaskStore to trigger auto-migrations, then manual v25
-        with pytest.raises(ManualMigrationRequired):
-            SqliteTaskStore(db_path)
-        _run_v25_v26_v27_migrations(db_path, "gza")
-        store = SqliteTaskStore(db_path)
-
-        # Verify schema version updated
-        conn = sqlite3.connect(db_path)
-        cur = conn.execute("SELECT version FROM schema_version")
-        version = cur.fetchone()[0]
-        conn.close()
-        assert version == SCHEMA_VERSION
-
-        # Verify existing task can be retrieved with NULL review_cleared_at
-        task = store.get("gza-1")
-        assert task is not None
-        assert task.review_cleared_at is None
-
-        # Verify the column is readable and writable on new tasks
-        new_task = store.add(prompt="New task", task_type="implement")
-        assert new_task.id is not None
-        assert new_task.review_cleared_at is None
-
-        store.clear_review_state(new_task.id)
-        updated = store.get(new_task.id)
-        assert updated is not None
-        assert updated.review_cleared_at is not None
 
     def test_clear_review_state_on_nonexistent_task_is_graceful(self, tmp_path: Path):
         """clear_review_state does not raise when task_id does not exist."""
@@ -7090,19 +6080,6 @@ class TestRetryChainDependencyResolution:
         assert is_blocked is False
 
 
-    def test_completed_unmerged_implement_dependency_does_not_block_review(self, tmp_path: Path):
-        """Non-code downstream tasks only require completed prerequisites, not merged code."""
-        store = self._make_store(tmp_path)
-        dep = store.add("Dependency", task_type="implement")
-        self._complete_implement_with_branch(store, dep, branch="feature/dep-unmerged-review", merge_state="unmerged")
-        review = store.add("Review dependency output", task_type="review", depends_on=dep.id)
-
-        is_blocked, blocking_id, blocking_status = store.is_task_blocked(review)
-        assert is_blocked is False
-        assert blocking_id is None
-        assert blocking_status is None
-        assert store.get_next_pending() is not None
-        assert store.get_next_pending().id == review.id
 
     def test_failed_dep_no_retry_still_blocked(self, tmp_path: Path):
         """Task blocked by a failed dep with no retry stays blocked."""
@@ -7338,82 +6315,6 @@ class TestRetryChainDependencyResolution:
 class TestStepColumnsMigration:
     """Tests for step-metric columns migration (v14 -> v15)."""
 
-    def test_migration_v14_to_v15_adds_step_columns_and_backfills(self, tmp_path: Path):
-        """v14 databases should gain step columns and copy turn values into them."""
-        import sqlite3
-        from datetime import datetime
-
-        db_path = tmp_path / "test.db"
-        conn = sqlite3.connect(db_path)
-        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
-        conn.execute("INSERT INTO schema_version (version) VALUES (14)")
-        conn.execute(
-            """
-            CREATE TABLE tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                task_type TEXT NOT NULL DEFAULT 'task',
-                task_id TEXT,
-                branch TEXT,
-                log_file TEXT,
-                report_file TEXT,
-                based_on INTEGER REFERENCES tasks(id),
-                has_commits INTEGER,
-                duration_seconds REAL,
-                num_turns INTEGER,
-                num_turns_reported INTEGER,
-                num_turns_computed INTEGER,
-                cost_usd REAL,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT,
-                "group" TEXT,
-                depends_on INTEGER REFERENCES tasks(id),
-                spec TEXT,
-                create_review INTEGER DEFAULT 0,
-                same_branch INTEGER DEFAULT 0,
-                task_type_hint TEXT,
-                output_content TEXT,
-                session_id TEXT,
-                pr_number INTEGER,
-                model TEXT,
-                provider TEXT,
-                input_tokens INTEGER,
-                output_tokens INTEGER,
-                merge_status TEXT,
-                failure_reason TEXT,
-                skip_learnings INTEGER DEFAULT 0,
-                diff_files_changed INTEGER,
-                diff_lines_added INTEGER,
-                diff_lines_removed INTEGER,
-                review_cleared_at TEXT
-            )
-            """
-        )
-        now = datetime.now(UTC).isoformat()
-        conn.execute(
-            "INSERT INTO tasks (prompt, status, created_at, num_turns_reported, num_turns_computed) VALUES (?, ?, ?, ?, ?)",
-            ("Legacy task", "completed", now, 4, 3),
-        )
-        conn.commit()
-        conn.close()
-
-        with pytest.raises(ManualMigrationRequired):
-            SqliteTaskStore(db_path)
-        _run_v25_v26_v27_migrations(db_path, "gza")
-        store = SqliteTaskStore(db_path)
-
-        conn = sqlite3.connect(db_path)
-        cur = conn.execute("SELECT version FROM schema_version")
-        version = cur.fetchone()[0]
-        conn.close()
-        assert version == SCHEMA_VERSION
-
-        migrated = store.get("gza-1")
-        assert migrated is not None
-        assert migrated.num_steps_reported == 4
-        assert migrated.num_steps_computed == 3
 
 
 class TestRunStepPersistence:
@@ -7589,77 +6490,6 @@ class TestRunStepPersistence:
         assert reloaded is not None
         assert reloaded.log_schema_version == 1
 
-    def test_migration_v16_to_v17_adds_log_schema_version(self, tmp_path: Path):
-        """v16 databases should gain log_schema_version with default value 1."""
-        import sqlite3
-
-        db_path = tmp_path / "test.db"
-        conn = sqlite3.connect(db_path)
-        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
-        conn.execute("INSERT INTO schema_version (version) VALUES (16)")
-        conn.execute(
-            """
-            CREATE TABLE tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                task_type TEXT NOT NULL DEFAULT 'task',
-                task_id TEXT,
-                branch TEXT,
-                log_file TEXT,
-                report_file TEXT,
-                based_on INTEGER REFERENCES tasks(id),
-                has_commits INTEGER,
-                duration_seconds REAL,
-                num_steps_reported INTEGER,
-                num_steps_computed INTEGER,
-                num_turns INTEGER,
-                num_turns_reported INTEGER,
-                num_turns_computed INTEGER,
-                cost_usd REAL,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT,
-                "group" TEXT,
-                depends_on INTEGER REFERENCES tasks(id),
-                spec TEXT,
-                create_review INTEGER DEFAULT 0,
-                same_branch INTEGER DEFAULT 0,
-                task_type_hint TEXT,
-                output_content TEXT,
-                session_id TEXT,
-                pr_number INTEGER,
-                model TEXT,
-                provider TEXT,
-                input_tokens INTEGER,
-                output_tokens INTEGER,
-                merge_status TEXT,
-                failure_reason TEXT,
-                skip_learnings INTEGER DEFAULT 0,
-                diff_files_changed INTEGER,
-                diff_lines_added INTEGER,
-                diff_lines_removed INTEGER,
-                review_cleared_at TEXT
-            )
-            """
-        )
-        now = datetime.now(UTC).isoformat()
-        conn.execute("INSERT INTO tasks (prompt, status, created_at) VALUES (?, ?, ?)", ("legacy", "pending", now))
-        conn.commit()
-        conn.close()
-
-        with pytest.raises(ManualMigrationRequired):
-            SqliteTaskStore(db_path)
-        _run_v25_v26_v27_migrations(db_path, "gza")
-        SqliteTaskStore(db_path)
-
-        conn = sqlite3.connect(db_path)
-        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-        value = conn.execute("SELECT log_schema_version FROM tasks WHERE id = 'gza-1'").fetchone()[0]
-        conn.close()
-
-        assert version == SCHEMA_VERSION
-        assert value == 1
 
     def test_set_log_schema_version_updates_task(self, tmp_path: Path):
         """set_log_schema_version should persist explicit schema marker values."""
@@ -7981,29 +6811,6 @@ class TestGetBasedOnChildren:
         ids = [c.id for c in children]
         assert ids == [c1.id, c2.id, c3.id]
 
-    def test_chronological_order_across_decimal_width_boundary(self, tmp_path: Path):
-        """Children spanning seq=9→10 remain in numeric creation order."""
-        store = SqliteTaskStore(tmp_path / "test.db")
-
-        # Advance the sequence counter so parent lands at seq=9
-        for _ in range(8):
-            store.add("filler")
-
-        parent = store.add("parent")  # seq=9
-        assert parent.id is not None
-        prefix = parent.id.rsplit("-", 1)[0]
-        assert parent.id == f"{prefix}-9", f"expected seq-9 parent, got {parent.id}"
-
-        # Create children: seq 10..36.
-        children = [store.add(f"child {i}", based_on=parent.id) for i in range(27)]
-
-        assert children[0].id == f"{prefix}-10", f"expected {prefix}-10, got {children[0].id}"
-        assert children[26].id == f"{prefix}-36", f"expected {prefix}-36, got {children[26].id}"
-
-        result = store.get_based_on_children(parent.id)
-        assert [t.id for t in result] == [t.id for t in children], (
-            "get_based_on_children returned wrong order across decimal width boundary"
-        )
 
     def test_identical_timestamps_do_not_invert_via_id_lexicographic_sort(self, tmp_path: Path):
         """With identical created_at, ordering must not invert at seq=9→10."""
@@ -8105,208 +6912,11 @@ class TestGetLineageChildren:
 class TestMigrationV19ToV20:
     """Tests for database migration v19 → v20 (task → implement default type)."""
 
-    def test_migration_converts_task_type_to_implement(self, tmp_path: Path):
-        """Migration v19->v20 updates existing rows with task_type='task' to 'implement'."""
-        import sqlite3
-
-        from gza.db import SCHEMA_VERSION
-
-        db_path = tmp_path / "test.db"
-
-        # Manually create a v19 database with a 'task' type row
-        conn = sqlite3.connect(db_path)
-        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
-        conn.execute("INSERT INTO schema_version (version) VALUES (19)")
-        conn.execute("""
-            CREATE TABLE tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                task_type TEXT NOT NULL DEFAULT 'task',
-                task_id TEXT,
-                branch TEXT,
-                log_file TEXT,
-                report_file TEXT,
-                based_on INTEGER,
-                has_commits INTEGER,
-                duration_seconds REAL,
-                num_steps_reported INTEGER,
-                num_steps_computed INTEGER,
-                num_turns_reported INTEGER,
-                num_turns_computed INTEGER,
-                cost_usd REAL,
-                input_tokens INTEGER,
-                output_tokens INTEGER,
-                created_at TEXT,
-                started_at TEXT,
-                completed_at TEXT,
-                "group" TEXT,
-                depends_on INTEGER,
-                spec TEXT,
-                create_review INTEGER NOT NULL DEFAULT 0,
-                same_branch INTEGER NOT NULL DEFAULT 0,
-                task_type_hint TEXT,
-                output_content TEXT,
-                session_id TEXT,
-                pr_number INTEGER,
-                model TEXT,
-                provider TEXT,
-                merge_status TEXT,
-                failure_reason TEXT,
-                skip_learnings INTEGER NOT NULL DEFAULT 0,
-                diff_files_changed INTEGER,
-                diff_lines_added INTEGER,
-                diff_lines_removed INTEGER,
-                review_cleared_at TEXT,
-                log_schema_version INTEGER NOT NULL DEFAULT 1,
-                cycle_id INTEGER,
-                cycle_iteration_index INTEGER,
-                cycle_role TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS task_cycles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                implementation_task_id INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                max_iterations INTEGER NOT NULL DEFAULT 3,
-                started_at TEXT NOT NULL,
-                ended_at TEXT,
-                stop_reason TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS task_cycle_iterations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cycle_id INTEGER NOT NULL,
-                iteration_index INTEGER NOT NULL,
-                review_task_id INTEGER,
-                review_verdict TEXT,
-                improve_task_id INTEGER,
-                state TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                ended_at TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS run_steps (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL,
-                step_type TEXT NOT NULL,
-                payload TEXT,
-                timestamp TEXT NOT NULL,
-                legacy_turn_id INTEGER,
-                legacy_event_id INTEGER
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_type_based_on ON tasks(task_type, based_on)")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_task_cycle_iterations_cycle_iter ON task_cycle_iterations(cycle_id, iteration_index)")
-        conn.execute(
-            "INSERT INTO tasks (prompt, task_type, created_at) VALUES (?, ?, ?)",
-            ("Old task", "task", "2024-01-01T00:00:00+00:00")
-        )
-        conn.commit()
-        conn.close()
-
-        # Open the store — auto-migrations, then manual v25
-        with pytest.raises(ManualMigrationRequired):
-            SqliteTaskStore(db_path)
-        _run_v25_v26_v27_migrations(db_path, "gza")
-        store = SqliteTaskStore(db_path)
-        tasks = store.get_all()
-
-        assert len(tasks) == 1
-        assert tasks[0].task_type == "implement"
-
-        # Verify schema version was bumped
-        conn2 = sqlite3.connect(db_path)
-        row = conn2.execute("SELECT version FROM schema_version").fetchone()
-        conn2.close()
-        assert row[0] == SCHEMA_VERSION
 
 
 class TestMigrationV21ToV22:
     """Tests for database migration v21 → v22 (learn → internal)."""
 
-    def test_migration_converts_learn_task_type_to_internal(self, tmp_path: Path):
-        """Migration v21->v22 updates existing rows with task_type='learn' to 'internal'."""
-        import sqlite3
-
-        from gza.db import SCHEMA_VERSION
-
-        db_path = tmp_path / "test.db"
-
-        conn = sqlite3.connect(db_path)
-        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
-        conn.execute("INSERT INTO schema_version (version) VALUES (21)")
-        conn.execute("""
-            CREATE TABLE tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prompt TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                task_type TEXT NOT NULL DEFAULT 'implement',
-                task_id TEXT,
-                branch TEXT,
-                log_file TEXT,
-                report_file TEXT,
-                based_on INTEGER,
-                has_commits INTEGER,
-                duration_seconds REAL,
-                num_steps_reported INTEGER,
-                num_steps_computed INTEGER,
-                num_turns_reported INTEGER,
-                num_turns_computed INTEGER,
-                cost_usd REAL,
-                input_tokens INTEGER,
-                output_tokens INTEGER,
-                created_at TEXT,
-                started_at TEXT,
-                completed_at TEXT,
-                "group" TEXT,
-                depends_on INTEGER,
-                spec TEXT,
-                create_review INTEGER NOT NULL DEFAULT 0,
-                same_branch INTEGER NOT NULL DEFAULT 0,
-                task_type_hint TEXT,
-                output_content TEXT,
-                session_id TEXT,
-                pr_number INTEGER,
-                model TEXT,
-                provider TEXT,
-                provider_is_explicit INTEGER NOT NULL DEFAULT 0,
-                merge_status TEXT,
-                failure_reason TEXT,
-                skip_learnings INTEGER NOT NULL DEFAULT 0,
-                diff_files_changed INTEGER,
-                diff_lines_added INTEGER,
-                diff_lines_removed INTEGER,
-                review_cleared_at TEXT,
-                log_schema_version INTEGER NOT NULL DEFAULT 1,
-                cycle_id INTEGER,
-                cycle_iteration_index INTEGER,
-                cycle_role TEXT
-            )
-        """)
-        conn.execute(
-            "INSERT INTO tasks (prompt, task_type, created_at) VALUES (?, ?, ?)",
-            ("Learn prompt", "learn", "2024-01-01T00:00:00+00:00"),
-        )
-        conn.commit()
-        conn.close()
-
-        with pytest.raises(ManualMigrationRequired):
-            SqliteTaskStore(db_path)
-        _run_v25_v26_v27_migrations(db_path, "gza")
-        store = SqliteTaskStore(db_path)
-        tasks = store.get_all()
-
-        assert len(tasks) == 1
-        assert tasks[0].task_type == "internal"
-
-        conn2 = sqlite3.connect(db_path)
-        row = conn2.execute("SELECT version FROM schema_version").fetchone()
-        conn2.close()
-        assert row[0] == SCHEMA_VERSION
 
 
 class TestResolveTaskId:
@@ -9217,44 +7827,6 @@ class TestSharedDbIsolationAndImportGating:
         assert reopened is not None
         fingerprint.assert_called_once_with(local_db)
 
-    def test_marker_check_verifies_fingerprint_when_local_db_ctime_changes(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        from gza import db as db_module
-        from gza.config import Config
-
-        project_dir = tmp_path / "project"
-        project_dir.mkdir(parents=True, exist_ok=True)
-        shared_db = tmp_path / "shared" / "gza.db"
-        (project_dir / "gza.yaml").write_text(
-            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: demomarkerctime01\n"
-            "project_prefix: demo\n"
-            f"db_path: {shared_db}\n",
-            encoding="utf-8",
-        )
-
-        local_db = project_dir / ".gza" / "gza.db"
-        local_db.parent.mkdir(parents=True, exist_ok=True)
-        legacy_store = SqliteTaskStore(local_db, prefix="demo")
-        legacy_store.add("legacy task")
-
-        config = Config.load(project_dir)
-        self._bootstrap_shared_fixture(config)
-        result = import_legacy_local_db(config)
-        assert result["status"] == "imported"
-
-        before = local_db.stat()
-        os.chmod(local_db, before.st_mode ^ stat.S_IXUSR)
-        after = local_db.stat()
-        if after.st_ctime_ns == before.st_ctime_ns:
-            pytest.skip("filesystem did not update ctime on chmod")
-
-        with patch("gza.db._db_fingerprint", wraps=db_module._db_fingerprint) as fingerprint:
-            reopened = SqliteTaskStore.from_config(config)
-        assert reopened is not None
-        fingerprint.assert_called_once_with(local_db)
 
     def test_marker_check_metadata_equality_still_requires_fingerprint_match(
         self,
@@ -9371,35 +7943,6 @@ class TestSharedDbIsolationAndImportGating:
         assert row is not None
         assert row[0] == legacy_task.id
 
-    def test_import_local_db_pre_v37_missing_create_pr_imports_with_false(self, tmp_path: Path) -> None:
-        from gza.config import Config
-
-        project_dir = tmp_path / "project"
-        project_dir.mkdir(parents=True, exist_ok=True)
-        shared_db = tmp_path / "shared" / "gza.db"
-        (project_dir / "gza.yaml").write_text(
-            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: demoimport03\n"
-            "project_prefix: demo\n"
-            f"db_path: {shared_db}\n",
-            encoding="utf-8",
-        )
-
-        local_db = project_dir / ".gza" / "gza.db"
-        local_db.parent.mkdir(parents=True, exist_ok=True)
-        legacy_store = SqliteTaskStore(local_db, prefix="demo")
-        legacy_task = legacy_store.add("legacy task before v37")
-        _drop_tasks_column(local_db, "create_pr")
-
-        config = Config.load(project_dir)
-        self._bootstrap_shared_fixture(config)
-        result = import_legacy_local_db(config)
-        assert result["status"] == "imported"
-
-        shared_store = self._bootstrap_shared_fixture(config)
-        imported = shared_store.get(legacy_task.id)
-        assert imported is not None
-        assert imported.create_pr is False
 
     def test_import_local_db_pre_v40_missing_completion_reason_imports_with_null(
         self,
@@ -9434,71 +7977,7 @@ class TestSharedDbIsolationAndImportGating:
         assert imported is not None
         assert imported.completion_reason is None
 
-    def test_import_local_db_then_add_task_continues_sequence(self, tmp_path: Path) -> None:
-        from gza.config import Config
 
-        project_dir = tmp_path / "project"
-        project_dir.mkdir(parents=True, exist_ok=True)
-        shared_db = tmp_path / "shared" / "gza.db"
-        (project_dir / "gza.yaml").write_text(
-            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: demoproject01\n"
-            "project_prefix: demo\n"
-            f"db_path: {shared_db}\n",
-            encoding="utf-8",
-        )
-
-        local_db = project_dir / ".gza" / "gza.db"
-        local_db.parent.mkdir(parents=True, exist_ok=True)
-        legacy_store = SqliteTaskStore(local_db, prefix="demo")
-        legacy_store.add("legacy-1")
-        legacy_store.add("legacy-2")
-
-        config = Config.load(project_dir)
-        self._bootstrap_shared_fixture(config)
-        result = import_legacy_local_db(config)
-        assert result["status"] == "imported"
-
-        shared_store = self._bootstrap_shared_fixture(config)
-        created = shared_store.add("post-import")
-        assert created.id == "demo-3"
-
-    def test_import_local_db_preserves_higher_existing_shared_sequence(self, tmp_path: Path) -> None:
-        from gza.config import Config
-
-        project_dir = tmp_path / "project"
-        project_dir.mkdir(parents=True, exist_ok=True)
-        shared_db = tmp_path / "shared" / "gza.db"
-        (project_dir / "gza.yaml").write_text(
-            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: demoproject02\n"
-            "project_prefix: demo\n"
-            f"db_path: {shared_db}\n",
-            encoding="utf-8",
-        )
-
-        config = Config.load(project_dir)
-        shared_store = self._bootstrap_shared_fixture(config)
-        with sqlite3.connect(shared_db) as conn:
-            conn.execute(
-                """
-                INSERT INTO project_sequences(project_id, prefix, next_seq)
-                VALUES (?, ?, ?)
-                ON CONFLICT(project_id) DO UPDATE SET next_seq = excluded.next_seq
-                """,
-                (config.project_id, config.project_prefix, 50),
-            )
-
-        local_db = project_dir / ".gza" / "gza.db"
-        local_db.parent.mkdir(parents=True, exist_ok=True)
-        legacy_store = SqliteTaskStore(local_db, prefix="demo")
-        legacy_store.add("legacy-1")
-
-        result = import_legacy_local_db(config)
-        assert result["status"] == "imported"
-
-        created = shared_store.add("post-import")
-        assert created.id == "demo-51"
 
     def test_import_local_db_run_substeps_link_to_same_project_run_steps(self, tmp_path: Path) -> None:
         from gza.config import Config
@@ -9548,57 +8027,6 @@ class TestSharedDbIsolationAndImportGating:
         assert substeps[0].step_id == imported_step.id
         assert substeps[0].step_id != other_step.id
 
-    def test_import_local_db_preserves_step_substep_graph(self, tmp_path: Path) -> None:
-        from gza.config import Config
-
-        shared_db = tmp_path / "shared" / "gza.db"
-        other_store = SqliteTaskStore(shared_db, prefix="other", project_id="other2")
-        other_task = other_store.add("other task")
-        other_step = other_store.emit_step(other_task.id, "other step", provider="codex")
-        other_store.emit_substep(other_step, "tool_call", {"other": True}, source="assistant")
-
-        project_dir = tmp_path / "project"
-        project_dir.mkdir(parents=True, exist_ok=True)
-        (project_dir / "gza.yaml").write_text(
-            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
-            "project_id: demoimport02\n"
-            "project_prefix: demo\n"
-            f"db_path: {shared_db}\n",
-            encoding="utf-8",
-        )
-
-        local_db = project_dir / ".gza" / "gza.db"
-        local_db.parent.mkdir(parents=True, exist_ok=True)
-        legacy_store = SqliteTaskStore(local_db, prefix="demo")
-        task = legacy_store.add("legacy task")
-        step = legacy_store.emit_step(task.id, "legacy step", provider="codex")
-        legacy_store.emit_substep(step, "tool_call", {"ok": True}, source="assistant")
-
-        config = Config.load(project_dir)
-        self._bootstrap_shared_fixture(config)
-        result = import_legacy_local_db(config)
-        assert result["status"] == "imported"
-
-        with sqlite3.connect(shared_db) as conn:
-            mismatches = conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM run_substeps sub
-                JOIN run_steps step ON sub.step_id = step.id
-                WHERE sub.project_id != step.project_id
-                """
-            ).fetchone()[0]
-            demo_links = conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM run_substeps sub
-                JOIN run_steps step ON sub.step_id = step.id
-                WHERE sub.project_id = ? AND step.project_id = ?
-                """,
-                (config.project_id, config.project_id),
-            ).fetchone()[0]
-        assert mismatches == 0
-        assert demo_links == 1
 
     def test_import_local_db_normalizes_naive_timestamps_without_false_conflicts(self, tmp_path: Path) -> None:
         from gza.config import Config
@@ -9892,54 +8320,6 @@ class TestExecutionProjectResolver:
         assert result.project_id == "core"
         assert result.db_path == anchored_db.resolve()
 
-    def test_execution_path_selection_ignores_ambient_db_override(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        anchor_db = tmp_path / "anchor.db"
-        anchor = SqliteTaskStore(anchor_db, prefix="gza", project_id="anchor")
-        alpha_dir = tmp_path / "alpha"
-        beta_dir = tmp_path / "beta"
-        alpha_db = tmp_path / "alpha.db"
-        beta_db = tmp_path / "beta.db"
-        _write_project_config(alpha_dir, project_name="Alpha", project_id="alpha", db_path=alpha_db)
-        _write_project_config(beta_dir, project_name="Beta", project_id="beta", db_path=beta_db)
-        monkeypatch.setenv("GZA_DB_PATH", str(anchor_db))
-
-        alpha_result, beta_result = resolve_execution_projects(
-            anchor,
-            (
-                ExecutionProjectSelector("alpha", "path", alpha_dir),
-                ExecutionProjectSelector("beta", "path", beta_dir),
-            ),
-        )
-
-        assert isinstance(alpha_result, ExecutionProjectResolved)
-        assert isinstance(beta_result, ExecutionProjectResolved)
-        assert (alpha_result.db_path, alpha_result.project_id) == (alpha_db.resolve(), "alpha")
-        assert (beta_result.db_path, beta_result.project_id) == (beta_db.resolve(), "beta")
-
-        SqliteTaskStore(alpha_db, prefix="gza", project_id="alpha")
-        SqliteTaskStore(beta_db, prefix="gza", project_id="beta")
-        alpha_runtime = alpha_result.open_runtime_store()
-        beta_runtime = beta_result.open_runtime_store()
-        assert (alpha_runtime.config.db_path.resolve(), alpha_runtime.config.project_id) == (
-            alpha_db.resolve(),
-            "alpha",
-        )
-        assert (alpha_runtime.store.db_path.resolve(), alpha_runtime.store.project_id) == (
-            alpha_db.resolve(),
-            "alpha",
-        )
-        assert (beta_runtime.config.db_path.resolve(), beta_runtime.config.project_id) == (
-            beta_db.resolve(),
-            "beta",
-        )
-        assert (beta_runtime.store.db_path.resolve(), beta_runtime.store.project_id) == (
-            beta_db.resolve(),
-            "beta",
-        )
 
     def test_registry_id_selection_asserts_anchor_db_under_ambient_override(
         self,
@@ -10965,31 +9345,6 @@ class TestExecutionProjectResolver:
         assert linked_warning == ""
         assert f"projects register --project {linked.resolve()}" not in linked_warning
 
-    def test_execution_resolution_does_not_apply_repairable_startup_writes(self, tmp_path: Path) -> None:
-
-        project_dir = tmp_path / "project"
-        project_db = tmp_path / "project.db"
-        _write_project_config(project_dir, project_name="Repairable", project_id="repairable", db_path=project_db)
-        store = SqliteTaskStore(project_db, prefix="gza", project_id="repairable")
-        task = store.add("grouped task", group="release")
-        assert task.id is not None
-        with sqlite3.connect(project_db) as conn:
-            conn.execute("DELETE FROM task_tags WHERE project_id = ? AND task_id = ?", ("repairable", task.id))
-        before = self._sqlite_user_schema_and_rows(project_db)
-
-        anchor = SqliteTaskStore(tmp_path / "anchor.db", prefix="gza", project_id="anchor")
-        (result,) = resolve_execution_projects(anchor, (ExecutionProjectSelector("repairable", "path", project_dir),))
-
-        assert isinstance(result, ExecutionProjectResolved)
-        assert self._sqlite_user_schema_and_rows(project_db) == before
-
-        result.open_runtime_store()
-        with sqlite3.connect(project_db) as conn:
-            repaired = conn.execute(
-                "SELECT tag FROM task_tags WHERE project_id = ? AND task_id = ?",
-                ("repairable", task.id),
-            ).fetchall()
-        assert repaired == []
 
     @pytest.mark.parametrize(
         "damage",
@@ -12540,50 +10895,6 @@ class TestExecutionProjectResolver:
         ]
         assert not shared_db.exists()
 
-    def test_duplicate_registry_id_and_path_alias_does_not_mutate_registry(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        anchor = SqliteTaskStore(tmp_path / "anchor.db", prefix="gza", project_id="anchor")
-        project_dir = tmp_path / "project"
-        _write_project_config(project_dir, project_name="Alias", project_id="aliased", db_path=anchor.db_path)
-        with sqlite3.connect(anchor.db_path) as conn:
-            now = "2026-08-21T00:00:00+00:00"
-            conn.execute(
-                """
-                INSERT INTO projects (
-                    id, root_path, config_path, project_name, project_prefix,
-                    db_layout_version, created_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    "aliased",
-                    str(project_dir.resolve()),
-                    str((project_dir / "gza.yaml").resolve()),
-                    "RegistryAlias",
-                    "gza",
-                    SCHEMA_VERSION,
-                    now,
-                    now,
-                ),
-            )
-            before = conn.execute("SELECT * FROM projects WHERE id = ?", ("aliased",)).fetchone()
-
-        results = resolve_execution_projects(
-            anchor,
-            (
-                ExecutionProjectSelector("registry", "registry_id", "aliased"),
-                ExecutionProjectSelector("path", "path", project_dir),
-            ),
-        )
-
-        assert [r.reason for r in results if isinstance(r, ExecutionProjectDisabled)] == [
-            "duplicate_selection",
-            "duplicate_selection",
-        ]
-        with sqlite3.connect(anchor.db_path) as conn:
-            after = conn.execute("SELECT * FROM projects WHERE id = ?", ("aliased",)).fetchone()
-        assert after == before
 
     def test_duplicate_registry_key_member_claims_identity_for_unique_path_alias_without_mutation(
         self,
@@ -13096,41 +11407,6 @@ class TestExecutionProjectResolver:
             ).fetchone()
         assert row == ("", "", "Mutable")
 
-    def test_registry_db_path_mismatch_is_disabled(self, tmp_path: Path) -> None:
-        anchor = SqliteTaskStore(tmp_path / "anchor.db", prefix="gza", project_id="anchor")
-        project_dir = tmp_path / "project"
-        other_db = tmp_path / "other.db"
-        _write_project_config(project_dir, project_name="Other", project_id="other", db_path=other_db)
-
-        with sqlite3.connect(anchor.db_path) as conn:
-            now = "2026-08-21T00:00:00+00:00"
-            conn.execute(
-                """
-                INSERT INTO projects (
-                    id, root_path, config_path, project_name, project_prefix,
-                    db_layout_version, created_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    "other",
-                    str(project_dir.resolve()),
-                    str((project_dir / "gza.yaml").resolve()),
-                    "Other",
-                    "gza",
-                    SCHEMA_VERSION,
-                    now,
-                    now,
-                ),
-            )
-
-        (result,) = resolve_execution_projects(
-            anchor,
-            (ExecutionProjectSelector("other", "registry_id", "other"),),
-        )
-
-        assert isinstance(result, ExecutionProjectDisabled)
-        assert result.reason == "db_path_mismatch"
-        assert result.db_path == other_db.resolve()
 
     def test_registry_config_path_mismatch_is_disabled(self, tmp_path: Path) -> None:
         anchor = SqliteTaskStore(tmp_path / "anchor.db", prefix="gza", project_id="anchor")
@@ -13302,40 +11578,6 @@ class TestExecutionProjectResolver:
             result.open_runtime_store()
         assert not project_db.exists()
 
-    def test_absent_execution_db_under_file_parent_is_disabled_and_sibling_continues(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        anchor = SqliteTaskStore(tmp_path / "anchor.db", prefix="gza", project_id="anchor")
-        blocked_parent = tmp_path / "blocked-parent"
-        blocked_parent.write_text("not a directory\n", encoding="utf-8")
-        blocked_dir = tmp_path / "blocked"
-        blocked_db = blocked_parent / "blocked.db"
-        _write_project_config(blocked_dir, project_name="Blocked", project_id="blocked", db_path=blocked_db)
-        healthy_dir = tmp_path / "healthy"
-        healthy_db = tmp_path / "healthy.db"
-        _write_project_config(healthy_dir, project_name="Healthy", project_id="healthy", db_path=healthy_db)
-
-        results = resolve_execution_projects(
-            anchor,
-            (
-                ExecutionProjectSelector("blocked", "path", blocked_dir),
-                ExecutionProjectSelector("healthy", "path", healthy_dir),
-            ),
-        )
-
-        assert isinstance(results[0], ExecutionProjectDisabled)
-        assert results[0].reason == "db_unavailable"
-        assert results[0].db_path == blocked_db.resolve()
-        assert "Database ancestor path is not a directory" in results[0].message
-        assert str(blocked_parent) in results[0].message
-        assert isinstance(results[1], ExecutionProjectResolved)
-        assert results[1].project_id == "healthy"
-        assert results[1].db_path == healthy_db.resolve()
-        assert not healthy_db.exists()
-        with pytest.raises(ForwardSchemaMigrationDeferred):
-            results[1].open_runtime_store()
-        assert not healthy_db.exists()
 
     def test_absent_execution_db_below_regular_file_ancestor_is_disabled_and_sibling_continues(
         self,
@@ -13874,61 +12116,7 @@ class TestExecutionProjectResolver:
         assert status["current_version"] == 25
         assert status["pending_manual"] == [26, 27]
 
-    def test_migration_preserves_fk_references(self, tmp_path: Path) -> None:
-        """Manual migrations preserve based_on and depends_on FK values."""
-        import sqlite3
 
-        db_path = tmp_path / "test.db"
-        _make_v24_db(db_path)
-
-        # Insert two tasks: task 1 is standalone, task 2 has based_on=1 and depends_on=1
-        conn = sqlite3.connect(db_path)
-        conn.execute(
-            "INSERT INTO tasks (id, prompt, created_at) VALUES (1, 'parent', '2024-01-01T00:00:00+00:00')"
-        )
-        conn.execute(
-            "INSERT INTO tasks (id, prompt, based_on, depends_on, created_at) VALUES (2, 'child', 1, 1, '2024-01-01T00:00:00+00:00')"
-        )
-        conn.commit()
-        conn.close()
-
-        _run_v25_v26_v27_migrations(db_path, "gza")
-        store = SqliteTaskStore(db_path)
-
-        parent = store.get("gza-1")
-        child = store.get("gza-2")
-        assert parent is not None
-        assert child is not None
-        # FK columns must stay consistent after v25->v26 rewrite.
-        assert child.based_on == "gza-1"
-        assert child.depends_on == "gza-1"
-
-    def test_run_v26_migration_rewrites_base36_to_decimal(self, tmp_path: Path) -> None:
-        db_path = tmp_path / "test.db"
-        _make_v24_db(db_path)
-
-        import sqlite3
-        conn = sqlite3.connect(db_path)
-        conn.execute(
-            "INSERT INTO tasks (id, prompt, created_at) VALUES (1, 'parent', '2024-01-01T00:00:00+00:00')"
-        )
-        conn.execute(
-            "INSERT INTO tasks (id, prompt, based_on, depends_on, created_at) VALUES (2, 'child', 1, 1, '2024-01-01T00:00:00+00:00')"
-        )
-        conn.commit()
-        conn.close()
-
-        run_v25_migration(db_path, "gza")
-        run_v26_migration(db_path)
-        run_v27_migration(db_path)
-        store = SqliteTaskStore(db_path)
-
-        parent = store.get("gza-1")
-        child = store.get("gza-2")
-        assert parent is not None
-        assert child is not None
-        assert child.based_on == "gza-1"
-        assert child.depends_on == "gza-1"
 
     def test_run_v26_migration_rewrites_slug_lineage_segments(self, tmp_path: Path) -> None:
         import sqlite3
@@ -13999,45 +12187,6 @@ class TestExecutionProjectResolver:
         assert task is not None
         assert task.slug == "20260410-10-impl-rollout"
 
-    def test_run_v26_migration_preserves_monotonic_project_sequences(self, tmp_path: Path) -> None:
-        import sqlite3
-
-        db_path = tmp_path / "test.db"
-        _make_v24_db(db_path)
-
-        conn = sqlite3.connect(db_path)
-        conn.execute(
-            "INSERT INTO tasks (id, prompt, created_at) VALUES (?, ?, ?)",
-            (1, "first", "2024-01-01T00:00:00+00:00"),
-        )
-        conn.execute(
-            "INSERT INTO tasks (id, prompt, created_at) VALUES (?, ?, ?)",
-            (2, "second", "2024-01-01T00:00:00+00:00"),
-        )
-        conn.commit()
-        conn.close()
-
-        run_v25_migration(db_path, "gza")
-
-        conn = sqlite3.connect(db_path)
-        conn.execute("UPDATE project_sequences SET next_seq = 50 WHERE prefix = 'gza'")
-        conn.commit()
-        conn.close()
-
-        run_v26_migration(db_path)
-        run_v27_migration(db_path)
-
-        conn = sqlite3.connect(db_path)
-        row = conn.execute(
-            "SELECT next_seq FROM project_sequences WHERE prefix = 'gza'"
-        ).fetchone()
-        conn.close()
-        assert row is not None
-        assert row[0] == 50
-
-        store = SqliteTaskStore(db_path, prefix="gza")
-        created = store.add("post-migration task")
-        assert created.id == "gza-51"
 
     def test_run_v26_migration_idempotent_on_v26_db(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"
@@ -14069,114 +12218,7 @@ class TestExecutionProjectResolver:
             assert "-" in old_id and "-" in new_id
             assert new_id.rsplit("-", 1)[-1].isdigit()
 
-    def test_auto_migration_v27_to_v28_adds_attach_columns(self, tmp_path: Path) -> None:
-        """Opening a v27 DB with SqliteTaskStore auto-migrates to v28, adding attach columns.
 
-        Note: the v27 manual migration's CREATE TABLE already includes the columns,
-        so this test verifies the version bump and that record_attach_session works.
-        For pre-v27 DBs that somehow reached v27 without the columns, the ALTER TABLE
-        in the v28 migration adds them (OperationalError for duplicates is silently ignored).
-        """
-        import sqlite3
-
-        db_path = tmp_path / "test.db"
-        _make_v24_db(db_path)
-        _run_v25_v26_v27_migrations(db_path, "gza")
-
-        # Verify DB is at v27
-        conn = sqlite3.connect(db_path)
-        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-        conn.close()
-        assert version == 27
-
-        # SqliteTaskStore auto-migrates to latest schema.
-        store = SqliteTaskStore(db_path, prefix="gza")
-
-        conn = sqlite3.connect(db_path)
-        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
-        conn.close()
-
-        assert version == SCHEMA_VERSION
-        assert "attach_count" in columns
-        assert "attach_duration_seconds" in columns
-        assert "urgent" in columns
-
-        # store.update() should succeed
-        task = store.get("gza-1")
-        if task is None:
-            task = store.add("test v28 migration")
-        store.update(task)
-
-        # record_attach_session should work on migrated DB
-        store.record_attach_session(task, 42.5)
-        refreshed = store.get(task.id)
-        assert refreshed is not None
-        assert refreshed.attach_count == 1
-        assert refreshed.attach_duration_seconds == 42.5
-
-    def test_auto_migration_v27_to_v28_adds_columns_when_missing(self, tmp_path: Path) -> None:
-        """If a v27 DB lacks attach columns (e.g. old v27 CREATE TABLE), v28 migration adds them."""
-        import sqlite3
-
-        db_path = tmp_path / "test.db"
-        _make_v24_db(db_path)
-        _run_v25_v26_v27_migrations(db_path, "gza")
-
-        # Simulate a v27 DB where attach columns are missing by dropping them
-        def _quote(column: str) -> str:
-            return f'"{column}"' if column in ("group",) else column
-
-        conn = sqlite3.connect(db_path)
-        # SQLite doesn't support DROP COLUMN easily; recreate without the columns
-        conn.execute("ALTER TABLE tasks RENAME TO tasks_old")
-        # Get existing columns minus attach ones
-        cols = [row[1] for row in conn.execute("PRAGMA table_info(tasks_old)")]
-        kept_cols = [c for c in cols if c not in ("attach_count", "attach_duration_seconds")]
-        cols_str = ", ".join(_quote(c) for c in kept_cols)
-        # Recreate with same columns minus attach
-        col_defs = []
-        for row in conn.execute("PRAGMA table_info(tasks_old)"):
-            if row[1] in ("attach_count", "attach_duration_seconds"):
-                continue
-            name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
-            quoted_name = f'"{name}"' if name in ("group",) else name
-            parts = [quoted_name, typ]
-            if pk:
-                parts.append("PRIMARY KEY")
-            if notnull and not pk:
-                parts.append("NOT NULL")
-            if dflt is not None:
-                parts.append(f"DEFAULT {dflt}")
-            col_defs.append(" ".join(parts))
-        conn.execute(f"CREATE TABLE tasks ({', '.join(col_defs)})")
-        conn.execute(f"INSERT INTO tasks ({cols_str}) SELECT {cols_str} FROM tasks_old")
-        conn.execute("DROP TABLE tasks_old")
-        conn.commit()
-
-        # Confirm attach columns are missing
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
-        assert "attach_count" not in columns
-        conn.close()
-
-        # SqliteTaskStore auto-migrates: ALTER TABLE ADD COLUMN succeeds
-        store = SqliteTaskStore(db_path, prefix="gza")
-
-        conn = sqlite3.connect(db_path)
-        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
-        conn.close()
-
-        assert version == SCHEMA_VERSION
-        assert "attach_count" in columns
-        assert "attach_duration_seconds" in columns
-        assert "urgent" in columns
-
-        task = store.add("test missing columns")
-        store.record_attach_session(task, 10.0)
-        refreshed = store.get(task.id)
-        assert refreshed is not None
-        assert refreshed.attach_count == 1
 
     def test_auto_migration_v29_to_v31_adds_provenance_columns(self, tmp_path: Path) -> None:
         """Opening a v29 DB should migrate through v31 and create provenance columns."""
@@ -14226,79 +12268,8 @@ class TestExecutionProjectResolver:
         assert version == SCHEMA_VERSION
         assert "task_comments" in tables
 
-    def test_auto_migration_v32_to_v33_adds_review_score_column(self, tmp_path: Path) -> None:
-        """Opening a v32 DB should migrate to v33 and create tasks.review_score."""
-        import sqlite3
 
-        db_path = tmp_path / "test.db"
-        SqliteTaskStore(db_path, prefix="gza")
 
-        conn = sqlite3.connect(db_path)
-        conn.execute("UPDATE schema_version SET version = 32")
-        conn.commit()
-        conn.close()
-
-        SqliteTaskStore(db_path, prefix="gza")
-
-        conn = sqlite3.connect(db_path)
-        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
-        conn.close()
-
-        assert version == SCHEMA_VERSION
-        assert "review_score" in columns
-
-    def test_auto_migration_v33_to_v34_adds_queue_position_column(self, tmp_path: Path) -> None:
-        """Opening a v33 DB should migrate to v34 and create tasks.queue_position."""
-        import sqlite3
-
-        db_path = tmp_path / "test.db"
-        SqliteTaskStore(db_path, prefix="gza")
-
-        conn = sqlite3.connect(db_path)
-        conn.execute("UPDATE schema_version SET version = 33")
-        conn.commit()
-        conn.close()
-
-        SqliteTaskStore(db_path, prefix="gza")
-
-        conn = sqlite3.connect(db_path)
-        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
-        conn.close()
-
-        assert version == SCHEMA_VERSION
-        assert "queue_position" in columns
-
-    def test_open_current_v32_db_repairs_missing_task_comments_table(self, tmp_path: Path) -> None:
-        """Opening an already-v32 DB should repair missing comment artifacts."""
-        import sqlite3
-
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path, prefix="gza")
-        task = store.add("Task before table damage")
-        assert task.id is not None
-
-        conn = sqlite3.connect(db_path)
-        conn.execute("UPDATE schema_version SET version = 32")
-        conn.execute("DROP TABLE task_comments")
-        conn.commit()
-        conn.close()
-
-        SqliteTaskStore(db_path, prefix="gza")
-
-        conn = sqlite3.connect(db_path)
-        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-        tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='task_comments'"
-            ).fetchall()
-        }
-        conn.close()
-
-        assert version == SCHEMA_VERSION
-        assert "task_comments" in tables
 
     def test_open_current_v32_db_repairs_missing_execution_mode_column(self, tmp_path: Path) -> None:
         """Opening an already-v32 DB should repair missing tasks.execution_mode."""
@@ -14334,26 +12305,6 @@ class TestExecutionProjectResolver:
 
         assert "urgent_bumped_at" in columns
 
-    def test_open_current_db_repairs_missing_create_pr_column(self, tmp_path: Path) -> None:
-        """Opening a current DB should repair missing tasks.create_pr and restore writes."""
-        import sqlite3
-
-        db_path = tmp_path / "test.db"
-        SqliteTaskStore(db_path, prefix="gza")
-
-        _drop_tasks_column(db_path, "create_pr")
-
-        repaired_store = SqliteTaskStore(db_path, prefix="gza")
-        created = repaired_store.add("Task after create_pr repair", create_pr=True)
-
-        conn = sqlite3.connect(db_path)
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
-        conn.close()
-
-        assert "create_pr" in columns
-        reloaded = repaired_store.get(created.id)
-        assert reloaded is not None
-        assert reloaded.create_pr is True
 
     def test_open_current_db_repairs_missing_pr_state_column(self, tmp_path: Path) -> None:
         """Opening a current DB should repair missing tasks.pr_state and preserve PR cache writes."""
@@ -14451,62 +12402,6 @@ class TestExecutionProjectResolver:
         assert comments[0].source == "direct"
         assert comments[1].source == "github"
 
-    def test_auto_migration_v53_to_v54_adds_task_comments_kind_column(self, tmp_path: Path) -> None:
-        """Opening a v53 DB should migrate task_comments.kind and default legacy rows to feedback."""
-        import sqlite3
-
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path, prefix="gza")
-        task = store.add("Task before task_comments kind migration")
-        assert task.id is not None
-        store.add_comment(task.id, "Legacy comment before kind migration", source="direct")
-
-        conn = sqlite3.connect(db_path)
-        conn.execute("UPDATE schema_version SET version = 53")
-        conn.execute("ALTER TABLE task_comments RENAME TO task_comments_old")
-        conn.execute(
-            """
-            CREATE TABLE task_comments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                source TEXT NOT NULL,
-                author TEXT,
-                created_at TEXT NOT NULL,
-                resolved_at TEXT,
-                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO task_comments (id, project_id, task_id, content, source, author, created_at, resolved_at)
-            SELECT id, project_id, task_id, content, source, author, created_at, resolved_at
-            FROM task_comments_old
-            """
-        )
-        conn.execute("DROP TABLE task_comments_old")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_task_comments_project_task_created ON task_comments(project_id, task_id, created_at ASC)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_task_comments_project_task_unresolved ON task_comments(project_id, task_id, resolved_at)"
-        )
-        conn.commit()
-        conn.close()
-
-        migrated_store = SqliteTaskStore(db_path, prefix="gza")
-
-        conn = sqlite3.connect(db_path)
-        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(task_comments)")}
-        conn.close()
-
-        comments = migrated_store.get_comments(task.id)
-        assert version == SCHEMA_VERSION
-        assert "kind" in columns
-        assert [comment.kind for comment in comments] == ["feedback"]
 
     def test_open_current_db_repairs_missing_task_comments_kind_column(self, tmp_path: Path) -> None:
         """Opening a current DB should repair missing task_comments.kind and preserve legacy rows as feedback."""
@@ -15081,34 +12976,6 @@ class TestExecutionProjectResolver:
         assert observation.observed_at == observed_at
         assert any("watch-progress liveness columns" in warning for warning in query_store.startup_warnings())
 
-    def test_auto_migration_v55_to_v56_adds_watch_recovery_backoffs_table(self, tmp_path: Path) -> None:
-        import sqlite3
-
-        db_path = tmp_path / "test.db"
-        SqliteTaskStore(db_path, prefix="gza")
-
-        with sqlite3.connect(db_path) as conn:
-            conn.execute("DROP INDEX IF EXISTS idx_watch_recovery_backoffs_due")
-            conn.execute("DROP TABLE IF EXISTS watch_recovery_backoffs")
-            conn.execute("UPDATE schema_version SET version = 55")
-            conn.commit()
-
-        SqliteTaskStore(db_path, prefix="gza")
-
-        with sqlite3.connect(db_path) as conn:
-            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-            tables = {
-                row[0]
-                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            }
-            indexes = {
-                row[0]
-                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
-            }
-
-        assert version == SCHEMA_VERSION
-        assert "watch_recovery_backoffs" in tables
-        assert "idx_watch_recovery_backoffs_due" in indexes
 
     def test_auto_migration_v57_to_v58_adds_parked_task_rearms_table(self, tmp_path: Path) -> None:
         import sqlite3
@@ -16439,33 +14306,6 @@ class TestExecutionProjectResolver:
             for warning in query_store.startup_warnings()
         )
 
-    def test_query_only_open_pre_v57_missing_last_edited_at_reads_with_null(
-        self, tmp_path: Path
-    ) -> None:
-        """Query-only open should read v56 snapshots without forcing last_edited_at."""
-        import sqlite3
-
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path, prefix="gza")
-        task = store.add("Task before last-edited migration")
-        assert task.id is not None
-
-        _drop_tasks_column(db_path, "last_edited_at")
-        with sqlite3.connect(db_path) as conn:
-            conn.execute("UPDATE schema_version SET version = 56")
-            conn.commit()
-
-        db_path.chmod(0o444)
-        try:
-            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
-            reloaded = query_store.get(task.id)
-        finally:
-            db_path.chmod(0o644)
-
-        assert reloaded is not None
-        assert reloaded.prompt == "Task before last-edited migration"
-        assert reloaded.last_edited_at is None
-        assert any("tasks.last_edited_at" in warning for warning in query_store.startup_warnings())
 
     def test_query_only_open_pre_v56_incomplete_watch_recovery_backoffs_warns_and_degrades(
         self, tmp_path: Path
@@ -17035,84 +14875,7 @@ class TestExecutionProjectResolver:
         conn.close()
         assert version == 31
 
-    def test_run_v27_migration_drops_cycle_schema_and_preserves_task_data(self, tmp_path: Path) -> None:
-        import sqlite3
 
-        db_path = tmp_path / "test.db"
-        _make_v24_db(db_path)
-
-        conn = sqlite3.connect(db_path)
-        conn.execute(
-            "INSERT INTO tasks (id, prompt, created_at) VALUES (1, 'parent', '2024-01-01T00:00:00+00:00')"
-        )
-        conn.execute(
-            "INSERT INTO tasks (id, prompt, based_on, depends_on, created_at, cycle_id, cycle_iteration_index, cycle_role) "
-            "VALUES (2, 'child', 1, 1, '2024-01-01T00:00:00+00:00', 9, 0, 'review')"
-        )
-        conn.commit()
-        conn.close()
-
-        run_v25_migration(db_path, "gza")
-        run_v26_migration(db_path)
-
-        conn = sqlite3.connect(db_path)
-        before_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-        conn.close()
-
-        run_v27_migration(db_path)
-
-        conn = sqlite3.connect(db_path)
-        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
-        after_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-        conn.close()
-
-        assert "task_cycles" not in tables
-        assert "task_cycle_iterations" not in tables
-        assert "idx_tasks_cycle_id" not in indexes
-        assert "cycle_id" not in columns
-        assert "cycle_iteration_index" not in columns
-        assert "cycle_role" not in columns
-        assert before_count == after_count
-
-        store = SqliteTaskStore(db_path, prefix="gza")
-        child = store.get("gza-2")
-        assert child is not None
-        assert child.based_on == "gza-1"
-        assert child.depends_on == "gza-1"
-
-    def test_run_v27_migration_defaults_missing_legacy_create_pr_to_false(self, tmp_path: Path) -> None:
-        import sqlite3
-
-        db_path = tmp_path / "test.db"
-        _make_v24_db(db_path)
-
-        conn = sqlite3.connect(db_path)
-        conn.execute(
-            "INSERT INTO tasks (id, prompt, created_at) VALUES (1, 'parent', '2024-01-01T00:00:00+00:00')"
-        )
-        conn.commit()
-        conn.close()
-
-        run_v25_migration(db_path, "gza")
-        run_v26_migration(db_path)
-        _drop_tasks_column(db_path, "create_pr")
-
-        run_v27_migration(db_path)
-
-        conn = sqlite3.connect(db_path)
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
-        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-        conn.close()
-
-        assert version == 27
-        assert "create_pr" in columns
-
-        store = SqliteTaskStore(db_path, prefix="gza")
-        migrated = store.get("gza-1")
-        assert migrated is not None
-        assert migrated.create_pr is False
 
     def test_run_v27_migration_defaults_missing_legacy_attach_columns_to_null(self, tmp_path: Path) -> None:
         import sqlite3
@@ -17328,31 +15091,6 @@ class TestSyncCandidates:
         assert task.id not in cached_candidate_ids
         assert task.id in uncached_candidate_ids
 
-    def test_get_sync_candidates_unions_merge_units_and_legacy_rows_during_migration(self, tmp_path: Path) -> None:
-        store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
-        now = datetime.now(UTC)
-
-        unit_task = store.add("Unit-backed task", task_type="implement")
-        unit_task.status = "completed"
-        unit_task.completed_at = now
-        unit_task.branch = "feature/unit-backed"
-        unit_task.has_commits = True
-        unit_task.merge_status = "unmerged"
-        store.update(unit_task)
-        unit = store.get_or_create_merge_unit_for_task(unit_task)
-        assert unit is not None
-
-        legacy_task = store.add("Legacy task", task_type="implement")
-        legacy_task.status = "completed"
-        legacy_task.completed_at = now - timedelta(hours=1)
-        legacy_task.branch = "feature/legacy-only"
-        legacy_task.has_commits = True
-        legacy_task.merge_status = "unmerged"
-        store.update(legacy_task)
-
-        candidate_ids = {task.id for task in store.get_sync_candidates(recent_days=30)}
-
-        assert candidate_ids == {unit_task.id, legacy_task.id}
 
 
 class TestTaskUpdatedAt:
@@ -17503,24 +15241,6 @@ class TestTaskUpdatedAt:
         for task_id in task_ids:
             assert self._updated_at(store, task_id) > before[task_id]
 
-    def test_multi_task_tag_rename_advances_only_affected_tasks(self, tmp_path: Path) -> None:
-        store = self._store(tmp_path)
-        first = store.add("First release task", tags=("release",))
-        second = store.add("Second release task", tags=("release", "backend"))
-        untouched = store.add("Untouched task", tags=("backlog",))
-        assert first.id is not None
-        assert second.id is not None
-        assert untouched.id is not None
-        before = {
-            task_id: self._updated_at(store, task_id)
-            for task_id in (first.id, second.id, untouched.id)
-        }
-
-        assert store.rename_tag("release", "launch") == 2
-
-        assert self._updated_at(store, first.id) > before[first.id]
-        assert self._updated_at(store, second.id) > before[second.id]
-        assert self._updated_at(store, untouched.id) == before[untouched.id]
 
     def test_backdated_completion_does_not_drag_updated_at_backwards(self, tmp_path: Path) -> None:
         """updated_at records when the row changed, not the timestamp the caller wrote."""
