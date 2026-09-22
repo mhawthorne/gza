@@ -21,6 +21,7 @@ gza.local.yaml
 # Claude Code local skills (removed from git, kept locally)
 .claude
 .claude/skills/
+.agents
 
 # AI-generated artifacts (should not be created, but ignore as safety net)
 IMPLEMENTATION_SUMMARY.md
