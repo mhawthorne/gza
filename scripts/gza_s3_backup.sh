@@ -71,7 +71,7 @@ fi
 rm -f "$SNAPSHOT_PATH"
 sqlite3 "$DB_PATH" ".backup $SNAPSHOT_PATH"
 
-s3_base="s3://${bucket}/gza-backups"
+s3_base="s3://${bucket}"
 db_key="${s3_base}/db/gza-${SNAPSHOT_DATE}.db"
 logs_key="${s3_base}/logs/"
 log_insights_key="${s3_base}/logs/log-insights/"
